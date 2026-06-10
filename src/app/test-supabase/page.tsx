@@ -5,36 +5,42 @@
  * - 真实配置后如果返回 404/PGRST116 = 端点通了，缺表正常
  * - 如果返回 network error 或 env error = 配置有问题
  */
-import { getServerSupabase } from "@/lib/supabase";
+import { getSupabaseServer, IS_MOCK_MODE } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
 export default async function TestSupabasePage() {
   let status: "ok" | "env-missing" | "network-error" | "unknown" = "ok";
   let detail = "";
-  let url = "";
-  let keyPrefix = "";
 
   try {
-    const supabase = await getServerSupabase();
-    // 探活：试一个不可能存在的表
-    const { error } = await supabase.from("_health_check_probe").select("*").limit(1);
-    if (error) {
-      // PGRST116 = relation does not exist = 端点通了,缺表(预期)
-      if (error.code === "PGRST116" || /does not exist/i.test(error.message)) {
-        status = "ok";
-        detail = `Supabase 端点可达 ✅ (缺 _health_check_probe 表是预期)`;
-      } else {
-        status = "unknown";
-        detail = `Supabase 报错: ${error.code} - ${error.message}`;
-      }
+    if (IS_MOCK_MODE) {
+      status = "env-missing";
+      detail = "env vars 缺失：当前在 MOCK 模式。复制 .env.example 为 .env.local 并填入真值后重启 dev server 即可切到真 Supabase。";
     } else {
-      status = "ok";
-      detail = "Supabase 端点可达 ✅";
+      const supabase = await getSupabaseServer();
+      if (!supabase) {
+        status = "env-missing";
+        detail = "未获取到 Supabase 客户端";
+      } else {
+        // 用 type assertion 绕过严格 Database 类型的 never 约束（健康探针故意查不存在的表）
+        const sb = supabase as unknown as { from: (t: string) => { select: (c: string) => { limit: (n: number) => Promise<{ error: { code?: string; message: string } | null }> } } };
+        const { error } = await sb.from("_health_check_probe").select("*").limit(1);
+        if (error && (error.code === "PGRST116" || /does not exist/i.test(error.message))) {
+          status = "ok";
+          detail = "Supabase 端点可达 ✅ (缺 _health_check_probe 表是预期)";
+        } else if (error) {
+          status = "unknown";
+          detail = `Supabase 报错: ${error.code ?? "?"} - ${error.message}`;
+        } else {
+          status = "ok";
+          detail = "Supabase 端点可达 ✅";
+        }
+      }
     }
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (/Missing required env var/.test(msg)) {
+    if (/Missing required env var/i.test(msg)) {
       status = "env-missing";
       detail = msg;
     } else {
@@ -43,10 +49,11 @@ export default async function TestSupabasePage() {
     }
   }
 
-  // 显示 env 状态（不显示真实 key）
   const env = await import("@/lib/env");
-  url = env.env.NEXT_PUBLIC_SUPABASE_URL;
-  keyPrefix = env.env.NEXT_PUBLIC_SUPABASE_ANON_KEY.slice(0, 8) + "...";
+  const url = env.env.NEXT_PUBLIC_SUPABASE_URL || "<未配置>";
+  const keyPrefix = env.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    ? env.env.NEXT_PUBLIC_SUPABASE_ANON_KEY.slice(0, 8) + "..."
+    : "<未配置>";
 
   return (
     <main className="container py-10 space-y-4">
