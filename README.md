@@ -14,7 +14,8 @@
 | shadcn 组件 | button / card / input / label / dialog / avatar / separator |
 | Supabase | `@supabase/ssr` + `@supabase/supabase-js`（mock 双轨） |
 | Build | ✅ 通过（6 路由） |
-| GitHub | 6 commits, 本地 ready（推送指南见 `PUSH_TO_GITHUB.md`） |
+| GitHub | 3 分支 (main/staging/dev) + 模板, 8 commits |
+| 本地位置 | E:\projects\city-partner-platform (C 盘 junction 透明访问) |
 
 ## 快速开始
 
@@ -32,6 +33,16 @@ cp .env.example .env.local
 npm run dev
 # 打开 http://localhost:3000
 ```
+
+## 分支策略
+
+| 分支 | 作用 | 谁可合并 |
+|---|---|---|
+| `main` | 正式生产 | **只有你**（受 GitHub 保护，需 PR + review） |
+| `staging` | 验收测试 | 你 + Hermes |
+| `dev` | 日常开发 | 你 + Hermes + Codex（PR 形式） |
+
+Codex **只能**在 `dev` 上提交 PR，**不能**直接 push 任何分支。
 
 ## 路由
 
@@ -60,34 +71,37 @@ src/lib/env.ts (IS_MOCK_MODE) ─┬─ true → src/lib/db/mock.ts (in-memory)
 
 ```
 .
+├── .github/
+│   ├── ISSUE_TEMPLATE/agent-task.md   # AI agent 任务模板
+│   └── pull_request_template.md       # PR 模板
 ├── docs/
-│   ├── setup-supabase.sql     # Supabase 建表 SQL（直接跑）
-│   └── setup-supabase.md      # Supabase 接入操作指南
+│   ├── setup-supabase.sql
+│   └── setup-supabase.md
 ├── src/
 │   ├── app/
 │   │   ├── layout.tsx
 │   │   ├── page.tsx
 │   │   ├── globals.css
 │   │   ├── activities/
-│   │   │   ├── page.tsx       # 列表
-│   │   │   ├── [id]/page.tsx  # 详情
+│   │   │   ├── page.tsx
+│   │   │   ├── [id]/page.tsx
 │   │   │   └── new/
-│   │   │       ├── page.tsx   # 表单 (use client)
-│   │   │       ├── actions.ts # server action
+│   │   │       ├── page.tsx
+│   │   │       ├── actions.ts
 │   │   │       └── client-validate.ts
 │   │   └── test-supabase/page.tsx
-│   ├── components/ui/         # 7 个 shadcn 组件
+│   ├── components/ui/
 │   ├── lib/
-│   │   ├── env.ts             # 统一 env + IS_MOCK_MODE + 三个 supabase 工厂
+│   │   ├── env.ts
 │   │   ├── db/
-│   │   │   ├── activities.ts  # 业务数据访问层
-│   │   │   ├── mock.ts        # in-memory mock
+│   │   │   ├── activities.ts
+│   │   │   ├── mock.ts
 │   │   │   └── index.ts
-│   │   └── utils.ts           # cn() helper
-│   └── types/db.ts            # 业务模型类型（不依赖 Supabase CLI 生成）
-├── components.json            # shadcn/ui 配置
-├── AGENTS.md / CLAUDE.md      # 给 AI agent 看的项目说明
-└── .env.example               # Supabase 变量占位模板
+│   │   └── utils.ts
+│   └── types/db.ts
+├── components.json
+├── AGENTS.md / CLAUDE.md
+└── .env.example
 ```
 
 ## 脚本
@@ -102,16 +116,17 @@ src/lib/env.ts (IS_MOCK_MODE) ─┬─ true → src/lib/db/mock.ts (in-memory)
 ## 文档
 
 - **[`PUSH_TO_GITHUB.md`](./PUSH_TO_GITHUB.md)** — 推到 GitHub 步骤
+- **[`docs/GITHUB_SETUP.md`](./docs/GITHUB_SETUP.md)** — 分支保护规则、Codex 权限、CI 建议
 - **[`docs/setup-supabase.md`](./docs/setup-supabase.md)** — 接 Supabase 真数据库
 - **`src/lib/env.ts` 顶部注释** — env 设计原理
 
 ## 下一步
 
-- [ ] 推 GitHub（`PUSH_TO_GITHUB.md`）
-- [ ] 接 Supabase 真数据库（`docs/setup-supabase.md`）
+- [ ] GitHub 网页设分支保护规则（`docs/GITHUB_SETUP.md`）
+- [ ] 部署到 Vercel
 - [ ] 接登录（决策 MVP 是否先做）
 - [ ] 接入飞书需求池 webhook（已在 Hermes 端搭好）
-- [ ] 接入飞书通知机器人（`%APPDATA%\hermes\feishu\BOT1_SETUP.md`）
+- [ ] 接入飞书通知机器人（已完成）
 - [ ] 跑 Codex 拆任务 → PR 流程
 
 ## 跟 Hermes/飞书的关系
