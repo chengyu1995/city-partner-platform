@@ -25,10 +25,10 @@ Cloudflare Pages **免费 plan** 不限团队，bot 触发也能 deploy。
    - **Build output directory**: `.next`（Next 16 用 `.next`）
    - **Root directory**: `/`（留空）
 5. **Environment variables** (重要! 在这里设):
-   - `NEXT_PUBLIC_SUPABASE_URL` = `https://<your-project-ref>.supabase.co`
-   - `NEXT_PUBLIC_SUPABASE_ANON_KEY` = `<your-anon-key>`
-   - `SUPABASE_SERVICE_ROLE_KEY` = `<your-service-role-key>`
-   - `FEISHU_BOT_WEBHOOK` = (你的 Bot 1 webhook URL)
+   - `NEXT_PUBLIC_SUPABASE_URL` = `https://<your-project-ref>.supabase.co` (从 Supabase Dashboard → Settings → API 复制 Project URL)
+   - `NEXT_PUBLIC_SUPABASE_ANON_KEY` = `<your-anon-publishable-key>` (从同一页面复制 Publishable key)
+   - `SUPABASE_SERVICE_ROLE_KEY` = `<your-service-role-key>` (从同一页面复制 service_role key, **仅服务端用, 不暴露前端**)
+   - `FEISHU_BOT_WEBHOOK` = `<your-feishu-bot-webhook-url>` (从飞书群机器人设置里复制)
 6. **Save and Deploy** → Cloudflare 自动跑 build → 1-2 分钟 Ready
 
 ## 3. 生产域名
