@@ -293,3 +293,155 @@ This version has breaking changes — APIs, conventions, and file structure may 
 ---
 
 **Last updated**: 2026-06-13
+
+---
+
+# Codex 项目开发规则 (city-partner-platform)
+
+> 这个文件是 OpenAI Codex / Claude Code / Cursor 等 AI agent 接 PR 时必读的"项目宪法".
+> 任何 PR 违反下面规则 = 拒绝合并.
+
+## 项目目标
+
+开发一个**同城搭子平台**, 帮助用户寻找:
+- 旅游搭子
+- K 歌搭子
+- 学习搭子
+- 摩友
+- 钓友
+- 等兴趣伙伴
+
+## 技术栈
+
+- **前端**: Next.js 16 (App Router) + React 19 + TypeScript
+- **样式**: Tailwind CSS v4 + 经典 shadcn/ui (slate 主题, Radix Slot + asChild)
+- **数据**: Supabase (PostgREST + RLS) + 双轨模式 (env 缺失 → MOCK)
+- **部署**: Vercel (生产域名 `city-partner-platform.vercel.app`)
+- **CI**: GitHub Actions (lint + typecheck + build)
+- **协作**: 飞书需求池 + Codex 拆任务 + Hermes 汇报
+
+## 开发原则
+
+### 1. 移动端优先
+- 设计稿先想 375px (iPhone SE), 再扩到 768px / 1440px
+- 触摸目标 ≥ 44x44 px
+- 文字 ≥ 16px (iOS 不缩放)
+
+### 2. UI 年轻、社交化、简洁
+- 目标用户: **20-35 岁同城兴趣社交用户**
+- 风格关键词: 年轻 / 轻社交 / 城市生活 / **卡片式** / 移动端舒服
+- **不要**像后台系统
+- 多留白, 大圆角 (rounded-2xl / rounded-3xl), 柔和阴影
+- 配色: 不用纯黑白, 用 slate + accent 色
+
+### 3. 不要过度工程化
+- **MVP 阶段优先上线**, 不追求复杂功能
+- 一次只做一个最小可用切片
+- 不预判未来需求
+
+### 4. 工作流硬规则
+
+| 规则 | 说明 |
+|---|---|
+| **每次任务必须新建分支** | 从 `dev` 拉 feature 分支, 命名 `codex/<short-name>` |
+| **每次任务必须提交 PR** | PR target = `dev` (永远不是 main) |
+| **不允许直接修改 main** | main 受 GitHub 分支保护, push 会失败 |
+| **不允许删除已有功能** | 重构要保留所有 API 兼容 |
+| **不允许修改生产数据库** | Supabase RLS 限定, agent 看不到 service_role |
+| **不允许引入不必要的大型依赖** | 走 PR review, 解释必要性 |
+| **不确定时, 把问题交给 Hermes, 让老板选择** | 拍板不是 agent 的工作 |
+
+## PR 输出格式 (Codex 必填)
+
+每个 PR 描述必须包含这 6 段:
+
+```markdown
+## 本次修改内容
+(1-3 句话, 改动概览)
+
+## 修改文件
+- `src/xxx.tsx` (+30 -5)
+- `src/yyy.ts` (新, 50 行)
+
+## 测试方式
+- [ ] 本地运行通过 (`npm run dev` 无 console 错)
+- [ ] 构建通过 (`npm run build` 0 错)
+- [ ] Lint 通过 (`npm run lint` 0 错)
+- [ ] Typecheck 通过 (`npx tsc --noEmit` 0 错)
+- [ ] 移动端检查 (375px / 768px)
+- [ ] F12 console 0 错
+
+## 风险点
+(1-2 句: 这次改有什么副作用? 需不需要人类额外验证?)
+
+## 预览链接
+(Vercel Preview URL, 推送后自动生成)
+
+## 是否需要老板验收
+- [ ] 是
+- [ ] 否
+```
+
+## 页面风格参考
+
+| 项 | 标准 |
+|---|---|
+| 圆角 | `rounded-2xl` (大块) / `rounded-lg` (按钮/输入框) |
+| 阴影 | `shadow-sm` (轻) / `shadow-md` (卡片悬停) |
+| 间距 | `gap-4` / `gap-6` (卡片间) |
+| 文字 | 标题 `text-2xl`/`text-3xl`, 正文 `text-base`, 注释 `text-sm text-muted-foreground` |
+| 配色 | 主色 `bg-primary text-primary-foreground` (不用纯黑/白) |
+| 图标 | lucide-react 现有图标 (已经装好) |
+| 头像 | 圆形 + border + 彩色 fallback (用户名首字) |
+| 标签 | 圆角胶囊 `rounded-full px-3 py-1` |
+
+## 13 禁止事项 (跟硬规则互补)
+
+1. ❌ 直接 push main
+2. ❌ 删除 GitHub 仓库 / Supabase 项目
+3. ❌ 修改生产环境变量 (Vercel env vars)
+4. ❌ 部署到 production (Vercel 自动 preview 即可)
+5. ❌ 改支付逻辑 (本项目暂无, 但仍禁)
+6. ❌ 批量群发用户消息 (飞书)
+7. ❌ 引入 >1MB 依赖
+8. ❌ 绕过 / 删除测试
+9. ❌ 硬编码任何生产 key
+10. ❌ commit `.env.local` / `.env`
+11. ❌ 改 `src/lib/env.ts` 业务双轨 (除非明确讨论)
+12. ❌ 改 `package.json` / `package-lock.json` (除非 npm 自动)
+13. ❌ 改 `.github/workflows/` / `CODEOWNERS` / `.gitignore`
+
+## 必避的坑 (项目专属)
+
+| 坑 | 表现 | 修法 |
+|---|---|---|
+| 用 `localhost:3000` 测但端口被占 | dev server 起不来 | `netstat -ano \| findstr :3000` 找冲突进程, 或换端口 |
+| 改了 `src/lib/env.ts` 的 fallback 逻辑 | mock 模式失效 | env.ts 是基础设施, 改前必须问人 |
+| 直接改 `package.json` 加依赖 | 引入大型依赖 | 走 PR review, 解释为什么需要 |
+| 用 `next/font/google` | 沙盒拉不到 Google Fonts | 改用系统字体 |
+| `"use server"` 文件 export 同步函数 | "Server Actions must be async" | 同步函数移到 `'use client'` 文件 |
+| 在 server component 里 await sync 函数 | 编译错 | server component 全部 await async |
+| `setState` 在 `useEffect` 里 | React 19 lint 警告 | 用 `useSyncExternalStore` |
+| import `fs` / `path` 在 `'use client'` 文件 | next 编译错 | client component 只能用浏览器 API |
+
+## 求助 / 阻塞 (项目专属)
+
+遇到下面情况, **停下 + 报告人类**, 不要自己拍板:
+
+- 任务描述不清
+- 多个解法, 不知道选哪个
+- 改动会影响 mock/真 Supabase 双轨行为
+- 需要新依赖
+- CI 通过但本地跑不起来 (或反之)
+- 跟现有功能冲突
+- 改基础设施 (env / db / api / workflows / package.json)
+- **不明确用户目标 (K歌 / 旅游 / 学习 等) — 拍板不是 agent 的工作**
+
+## 反馈循环 (项目专属)
+
+每个 PR 合并后:
+
+1. **人类 review comments** — 记下来, 下次同类问题不要犯
+2. **CI failure** — 自己修, push `--force-with-lease` (不是 `--force`)
+3. **Codex review feedback** — 跟人 review 同等对待
+4. **用户反馈 (群里/issue)** — 同样要更新 AGENTS.md, 形成"规则→实现→反馈→更新规则"闭环
