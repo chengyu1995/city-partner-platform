@@ -16,7 +16,7 @@ const _SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() ?? "";
 export const IS_MOCK_MODE = !_URL || !_ANON;
 
 if (IS_MOCK_MODE && process.env.NODE_ENV !== "test") {
-  // eslint-disable-next-line no-console
+   
   console.warn(
     "[supabase] env vars 缺失，进入 MOCK 模式。\n" +
       "  复制 .env.example 为 .env.local 并填入 Supabase 后台真值后，\n" +

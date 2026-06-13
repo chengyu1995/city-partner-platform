@@ -1,0 +1,123 @@
+name: Codex Daily Report
+
+on:
+  schedule:
+    # 每天 UTC 8:00 (北京时间 16:00) 跑
+    - cron: '0 8 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get Codex PRs in last 24h
+        id: prs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all',
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 50
+            });
+            const codexPRs = prs.filter(pr => {
+              const isCodex = pr.user.login.toLowerCase().includes('codex') ||
+                              pr.user.login.toLowerCase().includes('openai') ||
+                              pr.head.ref.startsWith('codex/');
+              return isCodex;
+            });
+            core.setOutput('count', codexPRs.length);
+            const summary = codexPRs.slice(0, 10).map(pr =>
+              `- [#${pr.number}](${pr.html_url}) by ${pr.user.login} (${pr.head.ref} → ${pr.base.ref}) - ${pr.state}`
+            ).join('\n');
+            core.setOutput('summary', summary || '无');
+            return summary;
+
+      - name: Get Codex issues in last 24h
+        id: issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all',
+              since: since,
+              per_page: 50
+            });
+            const codexIssues = issues.filter(issue => {
+              if (issue.pull_request) return false;
+              const isCodex = issue.user.login.toLowerCase().includes('codex') ||
+                              issue.user.login.toLowerCase().includes('openai') ||
+                              (issue.labels || []).some(l => l.name.startsWith('codex'));
+              return isCodex;
+            });
+            core.setOutput('icount', codexIssues.length);
+            const isummary = codexIssues.slice(0, 10).map(issue =>
+              `- [#${issue.number}](${issue.html_url}) "${issue.title}" by ${issue.user.login} - ${issue.state}`
+            ).join('\n');
+            core.setOutput('isummary', isummary || '无');
+            return isummary;
+
+      - name: Post report to issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Codex 活动日报 ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## 📊 Codex 活动日报 (过去 24 小时)',
+              '',
+              `**PR 数**: ${{ steps.prs.outputs.count }}`,
+              `**Issue 数**: ${{ steps.issues.outputs.icount }}`,
+              '',
+              '### PRs',
+              '${{ steps.prs.outputs.summary }}',
+              '',
+              '### Issues',
+              '${{ steps.issues.outputs.isummary }}',
+              '',
+              '---',
+              '*此报告由 GitHub Actions 自动生成. 关闭或删除即可.*'
+            ].join('\n');
+            // 找或创建日报 issue
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'codex-daily-report',
+              per_page: 1
+            });
+            if (issues.length > 0) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues[0].number,
+                title: title,
+                body: body
+              });
+              core.info(`Updated daily report issue #${issues[0].number}`);
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['codex-daily-report']
+              });
+              core.info('Created new daily report issue');
+            }
