@@ -42,3 +42,4 @@ next-env.d.ts
 
 # one-shot push helper (contains token placeholder, never commit)
 push-to-github.bat
+stderr.log
