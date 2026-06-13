@@ -26,9 +26,15 @@ export default async function TestSupabasePage() {
         // 用 type assertion 绕过严格 Database 类型的 never 约束（健康探针故意查不存在的表）
         const sb = supabase as unknown as { from: (t: string) => { select: (c: string) => { limit: (n: number) => Promise<{ error: { code?: string; message: string } | null }> } } };
         const { error } = await sb.from("_health_check_probe").select("*").limit(1);
-        if (error && (error.code === "PGRST116" || /does not exist/i.test(error.message))) {
+        if (
+          error &&
+          (error.code === "PGRST116" ||
+            error.code === "PGRST205" ||
+            /does not exist/i.test(error.message) ||
+            /Could not find the table/i.test(error.message))
+        ) {
           status = "ok";
-          detail = "Supabase 端点可达 ✅ (缺 _health_check_probe 表是预期)";
+          detail = "Supabase 端点可达 ✅ (健康探针查不存在的表是预期, 说明 schema cache 正常)";
         } else if (error) {
           status = "unknown";
           detail = `Supabase 报错: ${error.code ?? "?"} - ${error.message}`;
