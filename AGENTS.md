@@ -245,21 +245,50 @@ This version has breaking changes — APIs, conventions, and file structure may 
 | 头像 | 圆形 + border + 彩色 fallback (用户名首字) |
 | 标签 | 圆角胶囊 `rounded-full px-3 py-1` |
 
-## 13 禁止事项 (跟硬规则互补)
+## Codex 权限清单 (允许 / 禁止)
 
-1. ❌ 直接 push main
-2. ❌ 删除 GitHub 仓库 / Supabase 项目
-3. ❌ 修改生产环境变量 (Vercel env vars)
-4. ❌ 部署到 production (Vercel 自动 preview 即可)
-5. ❌ 改支付逻辑 (本项目暂无, 但仍禁)
-6. ❌ 批量群发用户消息 (飞书)
-7. ❌ 引入 >1MB 依赖
-8. ❌ 绕过 / 删除测试
-9. ❌ 硬编码任何生产 key
-10. ❌ commit `.env.local` / `.env`
-11. ❌ 改 `src/lib/env.ts` 业务双轨 (除非明确讨论)
-12. ❌ 改 `package.json` / `package-lock.json` (除非 npm 自动)
-13. ❌ 改 `.github/workflows/` / `CODEOWNERS` / `.gitignore`
+### ✅ 允许事项 (Codex 可以做)
+
+| # | 权限 | 备注 |
+|---|---|---|
+| 1 | **读取仓库** | 所有 .md / 源码 / docs / AGENTS.md |
+| 2 | **创建分支** | 必须从 `dev` 拉, 命名 `codex/<short-name>` |
+| 3 | **提交代码** | 在自己的 feature 分支, 多次 commit 可以 |
+| 4 | **创建 PR** | target = `dev`, 6 字段必填 |
+| 5 | **评论 PR** | 包括自己 / 别人的 PR, 提改进建议 |
+| 6 | **review PR** | 检查 13 禁止 + 11 原则 + 测试覆盖 |
+| 7 | **修复 bug** | 在自己的 PR / 别人 PR 下游修 |
+| 8 | **写测试** | 单测 / 端到端 / mock 数据 |
+| 9 | **重构 / 重命名 / 格式化** | 不改功能, 不删已有 API |
+
+### ❌ 禁止事项 (违反任一 = 拒绝合并)
+
+| # | 禁止 | 原因 |
+|---|---|---|
+| 1 | **直接 push `main`** | main 受保护, push 会失败 |
+| 2 | **直接合并 PR 到 `main`** | 必须人类 review + approve (Codex 只开 PR, 不合) |
+| 3 | **删除 GitHub 仓库** | Codex 无此权限, 走保护 |
+| 4 | **删除 Supabase 项目 / 表 / 数据** | service_role 不给 agent, RLS 限定 |
+| 5 | **修改生产环境变量 (Vercel env)** | env vars 不在仓库, agent 看不到 |
+| 6 | **正式上线生产环境** | Codex 只触发 preview deploy, production 由人触发 |
+| 7 | **改支付逻辑** | 本项目暂无, 但规则保留 |
+| 8 | **批量群发用户消息 (飞书)** | 不能改 `notify.py` 任何循环发送逻辑 |
+| 9 | **引入大型依赖 (>1MB)** | 走 PR review, 解释必要性 |
+| 10 | **绕过 / 删除测试** | 走 PR review, 解释必要性 |
+| 11 | **硬编码任何生产 key** | pre-commit hook 检查 |
+| 12 | **commit `.env.local` / `.env`** | `.gitignore` 已保护, agent 不能 `git add -f` |
+| 13 | **改基础设施** (`src/lib/env.ts` / `package.json` / `.github/workflows/` / `CODEOWNERS` / `.gitignore`) | 这些是"宪法层"文件, 改前必须问人 |
+
+### 灰区 (可做但要问人)
+
+- 改 PR 模板 / Issue 模板
+- 加新 radix-ui 子组件 (不在已装的 6 个里)
+- 改 env.ts 之外的 lib/ 文件
+- 跑 npm install 加依赖
+- 删 mock 数据
+
+**以上灰区操作**: PR 描述里**必填**"为什么需要"和"影响范围"两段, 等人 review。
+
 
 ## 必避的坑 (项目专属)
 
