@@ -1,0 +1,40 @@
+# CODEOWNERS — 强制 review 规则
+# 任何改动以下文件必须经过 chengyu1995 + Hermes 共同 review
+# GitHub 自动指派 — 用户/团队必须严格
+
+# 默认: 任何人改都要 chengyu1995 review
+*   @chengyu1995
+
+# ===== 业务核心 (敏感, 改前必须多 review) =====
+/src/lib/env.ts                 @chengyu1995
+/src/lib/db/                    @chengyu1995
+/src/lib/supabase.ts            @chengyu1995
+/src/app/api/                   @chengyu1995
+
+# ===== 部署/基础设施 =====
+/.github/workflows/             @chengyu1995
+/docs/setup-supabase.md         @chengyu1995
+/docs/CODEX_SETUP.md            @chengyu1995
+/docs/GITHUB_SETUP.md           @chengyu1995
+/push-to-github.bat             @chengyu1995
+/PUSH_TO_GITHUB.md              @chengyu1995
+/.gitignore                     @chengyu1995
+/package.json                   @chengyu1995
+/package-lock.json              @chengyu1995
+/next.config.ts                 @chengyu1995
+/tsconfig.json                  @chengyu1995
+/components.json                @chengyu1995
+
+# ===== 业务 UI (可让 Codex 自由改, 但仍要 chengyu1995 review) =====
+/src/app/activities/            @chengyu1995
+/src/app/page.tsx               @chengyu1995
+/src/app/layout.tsx             @chengyu1995
+/src/components/                @chengyu1995
+
+# ===== 自动生成的文件 (Codex 可以改) =====
+# AGENTS.md 自动生成部分 — 不要手动改 (next.js 会重写)
+# CLAUDE.md 同
+
+# ===== Hermes/飞书侧 (完全隔离, 不应进仓库) =====
+# 注意: 这些在另一个仓库 (hermes-agent 的家目录), 不在这个仓库
+# 此处仅作 reminder
