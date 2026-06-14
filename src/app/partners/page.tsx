@@ -22,7 +22,8 @@ const CATEGORY_MAP: Record<string, { emoji: string; color: string }> = Object.fr
 export default async function PartnersPage({ searchParams }: SearchProps) {
   const params = await searchParams;
   const category = (PARTNER_CATEGORIES.some((c) => c.key === params.category) ? params.category : undefined) as PartnerCategory | undefined;
-  const items = await listPartnerPosts({ category, city: params.city });
+  const city = params.city && params.city.trim().length > 0 ? params.city.trim() : undefined;
+  const items = await listPartnerPosts({ category, city });
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-violet-50 via-white to-amber-50">
@@ -31,7 +32,7 @@ export default async function PartnersPage({ searchParams }: SearchProps) {
         <div className="mb-6 flex items-end justify-between sm:mb-8">
           <div>
             <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 sm:text-4xl">
-              找搭子
+              {city ? `📍 ${city} 的搭子` : category ? `${PARTNER_CATEGORIES.find((c) => c.key === category)?.emoji} ${category}搭子` : "找搭子"}
             </h1>
             <p className="mt-1 text-sm text-slate-600">
               {items.length > 0 ? `${items.length} 个同城搭子在等你` : "还没有搭子帖，发第一个吧"}
@@ -44,6 +45,32 @@ export default async function PartnersPage({ searchParams }: SearchProps) {
             ✨ 发搭子
           </Link>
         </div>
+
+        {/* 当前过滤标签 */}
+        {(category || city) && (
+          <div className="mb-4 flex flex-wrap items-center gap-2 text-sm text-slate-600">
+            <span>当前筛选:</span>
+            {category && (
+              <Link
+                href={city ? `/partners?city=${encodeURIComponent(city)}` : "/partners"}
+                className="inline-flex items-center gap-1 rounded-full bg-violet-100 px-3 py-1 text-violet-700 hover:bg-violet-200"
+              >
+                {category} ✕
+              </Link>
+            )}
+            {city && (
+              <Link
+                href={category ? `/partners?category=${encodeURIComponent(category)}` : "/partners"}
+                className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-3 py-1 text-amber-700 hover:bg-amber-200"
+              >
+                {city} ✕
+              </Link>
+            )}
+            <Link href="/partners" className="text-slate-500 underline-offset-2 hover:underline">
+              清除全部
+            </Link>
+          </div>
+        )}
 
         {/* 分类筛选 */}
         <CategoryFilter active={category} />

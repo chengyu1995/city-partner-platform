@@ -40,6 +40,7 @@ export async function GET(req: NextRequest) {
 
   const params = new URLSearchParams();
   params.set("select", "*");
+  params.set("status", "eq.approved");
   params.set("order", "created_at.desc");
   if (category) params.set("category", `eq.${category}`);
   if (city) params.set("city", `ilike.*${city}*`);
@@ -77,7 +78,11 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const data = await sbJson<[{ id: string }]>("POST", "partner_posts", body);
+    // MVP: status=pending, 等 admin 审核
+    const data = await sbJson<[{ id: string }]>("POST", "partner_posts", {
+      ...body,
+      status: "pending",
+    });
     return NextResponse.json({ ok: true, id: data[0].id });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
