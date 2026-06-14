@@ -8,7 +8,7 @@ import { validatePartnerPostInput } from "@/lib/db/partner-posts";
 import type { NewPartnerPost, PartnerCategory } from "@/types/db";
 
 export const dynamic = "force-dynamic";
-export const runtime = "edge";
+export const runtime = "nodejs";
 
 /** 用纯 fetch + TextEncoder (绕开 supabase-js edge runtime UTF-8 bug) */
 async function sbJson<T>(method: "GET" | "POST" | "PATCH", path: string, body?: unknown): Promise<T> {

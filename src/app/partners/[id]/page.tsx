@@ -11,7 +11,7 @@ import { zhCN } from "date-fns/locale";
 import { ReportButton } from "./ReportButton";
 
 export const dynamic = "force-dynamic";
-export const runtime = "edge";
+export const runtime = "nodejs";
 
 interface Props {
   params: Promise<{ id: string }>;

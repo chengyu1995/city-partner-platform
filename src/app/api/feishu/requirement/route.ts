@@ -6,7 +6,7 @@
 import { NextResponse, NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
-export const runtime = "edge";
+export const runtime = "nodejs";
 
 /** 直接 fetch (不用 supabase-js, 避免 edge runtime JSON 序列化问题) */
 async function sbInsert(table: string, row: Record<string, unknown>) {

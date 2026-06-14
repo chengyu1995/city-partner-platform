@@ -8,7 +8,7 @@
 import { getSupabaseServer, IS_MOCK_MODE } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
-export const runtime = "edge";
+export const runtime = "nodejs";
 
 export default async function TestSupabasePage() {
   let status: "ok" | "env-missing" | "network-error" | "unknown" = "ok";

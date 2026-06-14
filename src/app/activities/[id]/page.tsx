@@ -9,7 +9,7 @@ import { format } from "date-fns"
 import { zhCN } from "date-fns/locale"
 
 export const dynamic = "force-dynamic"
-export const runtime = "edge";
+export const runtime = "nodejs";
 
 export default async function ActivityDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params

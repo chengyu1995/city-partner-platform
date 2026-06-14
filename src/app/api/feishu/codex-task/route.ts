@@ -6,7 +6,7 @@
 import { NextResponse, NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
-export const runtime = "edge";
+export const runtime = "nodejs";
 
 async function sbInsert(table: string, row: Record<string, unknown>) {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
