@@ -4,37 +4,48 @@
  * 入队到 Supabase hermes_queue
  */
 import { NextResponse, NextRequest } from "next/server";
-import { getSupabaseService } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 export const runtime = "edge";
 
+async function sbInsert(table: string, row: Record<string, unknown>) {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+  const body = JSON.stringify(row);
+  const bytes = new TextEncoder().encode(body);
+  const res = await fetch(`${url}/rest/v1/${table}`, {
+    method: "POST",
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json; charset=utf-8",
+      Prefer: "return=representation",
+    },
+    body: bytes,
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Supabase ${res.status}: ${err}`);
+  }
+  return await res.json();
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const payload = await req.json();
-    const supabase = await getSupabaseService();
-    if (!supabase) {
-      return NextResponse.json(
-        { ok: false, error: "service client not available" },
-        { status: 500 }
-      );
+    const rawText = await req.text();
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(rawText);
+    } catch (e) {
+      return NextResponse.json({ ok: false, error: "invalid JSON" }, { status: 400 });
     }
-    const { data, error } = await supabase
-      .from("hermes_queue")
-      .insert({
-        event_type: "codex_task_ready",
-        payload,
-        status: "pending",
-      })
-      .select()
-      .single();
-    if (error) {
-      return NextResponse.json(
-        { ok: false, error: error.message },
-        { status: 500 }
-      );
-    }
-    return NextResponse.json({ ok: true, queue_id: data.id });
+
+    const data = await sbInsert("hermes_queue", {
+      event_type: "codex_task_ready",
+      payload,
+      status: "pending",
+    });
+    return NextResponse.json({ ok: true, queue_id: data[0].id });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return NextResponse.json({ ok: false, error: msg }, { status: 500 });
