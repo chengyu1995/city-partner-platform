@@ -15,10 +15,11 @@ import type {
   PartnerPostFormErrors,
 } from "@/types/db";
 
-/** 读：搭子需求列表（按创建时间倒序） */
+/** 读：搭子需求列表（按创建时间倒序，默认只读 approved） */
 export async function listPartnerPosts(opts?: {
   category?: PartnerCategory;
   city?: string;
+  status?: "pending" | "approved" | "rejected";
 }): Promise<PartnerPost[]> {
   if (IS_MOCK_MODE) return listPartnerPostsMock(opts);
 
@@ -28,8 +29,12 @@ export async function listPartnerPosts(opts?: {
   let q = supabase
     .from("partner_posts")
     .select("*")
-    .eq("status", "approved")
     .order("created_at", { ascending: false });
+
+  // 公开读强制 approved; 显式传 status=pending 仅 admin 用
+  if (opts?.status) q = q.eq("status", opts.status);
+  else q = q.eq("status", "approved");
+
   if (opts?.category) q = q.eq("category", opts.category);
   if (opts?.city) q = q.ilike("city", `%${opts.city}%`);
 

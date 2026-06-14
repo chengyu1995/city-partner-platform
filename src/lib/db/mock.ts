@@ -11,8 +11,8 @@ const _store: Activity[] = [
 ];
 
 const _partnerStore: PartnerPost[] = [
-  { id: "p1", category: "旅游", city: "北京", title: "周末去阿那亚看海", description: "想找个搭子周末一起去看海拍照", contact: "wx: alice_99", host_name: "小爱", starts_at: "2026-06-20T09:00:00+08:00", created_at: "2026-06-10T10:00:00+08:00" },
-  { id: "p2", category: "K歌", city: "上海", title: "周五下班唱歌", description: "人民广场附近 KTV，找 2-3 个朋友一起", contact: "13800001111", host_name: "阿凯", starts_at: "2026-06-19T19:30:00+08:00", created_at: "2026-06-10T11:00:00+08:00" },
+  { id: "p1", category: "旅游", city: "北京", title: "周末去阿那亚看海", description: "想找个搭子周末一起去看海拍照", contact: "wx: alice_99", host_name: "小爱", starts_at: "2026-06-20T09:00:00+08:00", created_at: "2026-06-10T10:00:00+08:00", status: "approved" },
+  { id: "p2", category: "K歌", city: "上海", title: "周五下班唱歌", description: "人民广场附近 KTV，找 2-3 个朋友一起", contact: "13800001111", host_name: "阿凯", starts_at: "2026-06-19T19:30:00+08:00", created_at: "2026-06-10T11:00:00+08:00", status: "approved" },
 ];
 
 let _idSeq = 100;
@@ -40,10 +40,11 @@ export function createActivityMock(input: NewActivity): Promise<Activity> {
  * partner_posts mock
  * ========================================================== */
 
-export function listPartnerPostsMock(opts?: { category?: PartnerCategory; city?: string }): Promise<PartnerPost[]> {
+export function listPartnerPostsMock(opts?: { category?: PartnerCategory; city?: string; status?: "pending" | "approved" | "rejected" }): Promise<PartnerPost[]> {
   let rows = [..._partnerStore];
   if (opts?.category) rows = rows.filter((r) => r.category === opts.category);
   if (opts?.city) rows = rows.filter((r) => r.city.includes(opts.city!));
+  if (opts?.status) rows = rows.filter((r) => r.status === opts.status);
   return Promise.resolve(rows.sort((a, b) => b.created_at.localeCompare(a.created_at)));
 }
 
@@ -52,10 +53,13 @@ export function getPartnerPostMock(id: string): Promise<PartnerPost | null> {
 }
 
 export function createPartnerPostMock(input: NewPartnerPost): Promise<PartnerPost> {
+  // mock 模式默认 approved (真实模式走审核, status=pending)
+  const { status: _ignored, ...rest } = input as any;
   const row: PartnerPost = {
     id: `p${++_partnerIdSeq}`,
     created_at: new Date().toISOString(),
-    ...input,
+    status: "approved",
+    ...rest,
   };
   _partnerStore.unshift(row);
   return Promise.resolve(row);

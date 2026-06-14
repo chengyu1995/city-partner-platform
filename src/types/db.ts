@@ -42,6 +42,7 @@ export interface PartnerPost {
   host_name: string;
   starts_at: string | null;     // ISO 8601 timestamptz
   created_at: string;
+  status: "pending" | "approved" | "rejected";
 }
 
 export type NewPartnerPost = Omit<PartnerPost, "id" | "created_at">;
