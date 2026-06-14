@@ -142,3 +142,4 @@ Hermes (本机) ───┴──→ 飞书 Bitable 新行 (Bot 2) ──→ we
 ```
 
 两个飞书通道独立，但可以打通：consume_queue.py 跑完后调 notify.py 回写到群。
+# trigger
