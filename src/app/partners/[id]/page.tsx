@@ -9,6 +9,7 @@ import { PARTNER_CATEGORIES } from "@/types/db";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
 import { ReportButton } from "./ReportButton";
+import { CopyButton } from "./CopyButton";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -82,17 +83,7 @@ export default async function PartnerDetailPage({ params }: Props) {
               <p className="text-lg font-bold text-slate-900">👤 {post.host_name}</p>
               <p className="mt-1 text-base text-violet-600">{post.contact}</p>
             </div>
-            <button
-              onClick={() => {
-                if (typeof navigator !== "undefined" && navigator.clipboard) {
-                  navigator.clipboard.writeText(post.contact);
-                  alert("联系方式已复制到剪贴板");
-                }
-              }}
-              className="rounded-full bg-slate-900 px-4 py-2 text-sm font-bold text-white shadow-md transition-transform hover:scale-105"
-            >
-              📋 复制
-            </button>
+            <CopyButton text={post.contact} />
           </div>
         </div>
 
