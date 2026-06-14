@@ -34,17 +34,22 @@ async function sbInsert(table: string, row: Record<string, unknown>) {
 
 export async function POST(req: NextRequest) {
   try {
-    // 用 req.text() + 显式 JSON.parse 处理, 而不是 req.json() 避免潜在编码问题
-    const rawText = await req.text();
+    // 关键: 不能用 req.text() — Next 16 / undici 在 content-type 缺 charset 时
+    // 会按 latin-1 解码, 中文变乱码. 直接拿 ArrayBuffer 强制按 UTF-8 解.
+    const buf = await req.arrayBuffer();
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    const rawText = decoder.decode(buf);
     let payload: Record<string, unknown>;
     try {
       payload = JSON.parse(rawText);
     } catch (e) {
       return NextResponse.json(
-        { ok: false, error: "invalid JSON" },
+        { ok: false, error: "invalid JSON", raw_head: rawText.slice(0, 200) },
         { status: 400 }
       );
     }
+    // 调试: 记录实际收到的 payload 头 200 字符, 排查乱码
+    console.log("[feishu/requirement] received:", rawText.slice(0, 500));
 
     const data = await sbInsert("hermes_queue", {
       event_type: "new_requirement",
