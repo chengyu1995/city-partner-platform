@@ -13,18 +13,19 @@ import urllib.request
 import urllib.error
 
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 # 兼容 SUPABASE_URL 带不带 /rest/v1 后缀
 for suffix in ("/rest/v1", "/rest"):
     if SUPABASE_URL.endswith(suffix):
         SUPABASE_URL = SUPABASE_URL[: -len(suffix)]
         break
 SUPABASE_URL = SUPABASE_URL.rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-LLM_KEY = os.environ.get("MINIMAX_CN_API_KEY", "")
-BOT_HOOK = os.environ.get("FEISHU_BOT_WEBHOOK", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+LLM_KEY = os.environ.get("MINIMAX_CN_API_KEY", "").strip()
+BOT_HOOK = os.environ.get("FEISHU_BOT_WEBHOOK", "").strip()
 
-print(f"[debug] SUPABASE_URL={SUPABASE_URL!r} len(SUPABASE_KEY)={len(SUPABASE_KEY)}", flush=True)
+print(f"[debug] SUPABASE_URL={SUPABASE_URL!r} (len={len(SUPABASE_URL)}) len(SUPABASE_KEY)={len(SUPABASE_KEY)}", flush=True)
+print(f"[debug] SUPABASE_URL hex={SUPABASE_URL.encode().hex() if SUPABASE_URL else 'EMPTY'}", flush=True)
 
 
 def sb(method, path, body=None):
