@@ -25,7 +25,11 @@ export async function listPartnerPosts(opts?: {
   const supabase = await getSupabaseServer();
   if (!supabase) return listPartnerPostsMock(opts);
 
-  let q = supabase.from("partner_posts").select("*").order("created_at", { ascending: false });
+  let q = supabase
+    .from("partner_posts")
+    .select("*")
+    .eq("status", "approved")
+    .order("created_at", { ascending: false });
   if (opts?.category) q = q.eq("category", opts.category);
   if (opts?.city) q = q.ilike("city", `%${opts.city}%`);
 

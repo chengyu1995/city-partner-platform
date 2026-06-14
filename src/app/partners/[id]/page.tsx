@@ -3,16 +3,35 @@
  */
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import type { Metadata } from "next";
 import { getPartnerPost } from "@/lib/db";
 import { PARTNER_CATEGORIES } from "@/types/db";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
+import { ReportButton } from "./ReportButton";
 
 export const dynamic = "force-dynamic";
 export const runtime = "edge";
 
 interface Props {
   params: Promise<{ id: string }>;
+}
+
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { id } = await params;
+  const post = await getPartnerPost(id);
+  if (!post) return { title: "搭子详情 - 同城搭子" };
+  const cat = PARTNER_CATEGORIES.find((c) => c.key === post.category);
+  return {
+    title: `${post.title} - ${post.city} ${cat?.key ?? ""}搭子 | 同城搭子`,
+    description: `${post.description.slice(0, 100)}... 📍 ${post.city} ${cat?.emoji ?? ""} ${cat?.key ?? ""}搭子, 快来联系 ${post.host_name}!`,
+    openGraph: {
+      title: post.title,
+      description: post.description.slice(0, 200),
+      type: "article",
+      locale: "zh_CN",
+    },
+  };
 }
 
 export default async function PartnerDetailPage({ params }: Props) {
@@ -79,6 +98,10 @@ export default async function PartnerDetailPage({ params }: Props) {
 
         <div className="mt-6 text-center text-xs text-slate-400">
           发布于 {format(new Date(post.created_at), "yyyy-MM-dd HH:mm", { locale: zhCN })}
+        </div>
+
+        <div className="mt-4 flex justify-center">
+          <ReportButton postId={post.id} />
         </div>
       </div>
     </div>
