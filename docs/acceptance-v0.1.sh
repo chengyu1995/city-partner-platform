@@ -47,7 +47,7 @@ CREATE_RESP=$(curl -sS -X POST "$URL/api/partners" -H "Content-Type: application
 CREATE_CODE=$(echo "$CREATE_RESP" | tail -1)
 check "2.7 POST 创建返 200/201" "echo '$CREATE_CODE' | grep -qE '200|201'"
 sleep 1
-check "2.7 新帖进列表" "curl -sSL '$URL/partners' | grep -qE 'acceptance-v0.1|acceptance'"
+check "2.7 创建进 pending 队列 (不进 approved 列表, 这是产品设计)" "test \$(curl -sSL '$URL/api/admin/list?status=pending' | python -c 'import sys,json;d=json.load(sys.stdin);print(sum(1 for i in d.get(\"items\",[]) if \"acceptance\" in i.get(\"title\",\"\")))') -ge 1"
 
 echo
 echo "=== 3. 列表页 /partners ==="
