@@ -39,20 +39,15 @@ export async function getSupabaseBrowser(): Promise<SupabaseClient | null> {
   return createBrowserClient(env.NEXT_PUBLIC_SUPABASE_URL, env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
 }
 
-/** 服务端 supabase：mock 时返回 null */
+/** 服务端 supabase：mock 时返回 null
+ *  - 简化为 service role (避开 @supabase/ssr 在 edge runtime 的兼容问题)
+ *  - 失去 user session-based RLS 隔离, 业务层要自己加 auth 检查
+ */
 export async function getSupabaseServer(): Promise<SupabaseClient | null> {
-  if (IS_MOCK_MODE) return null;
-  const { createServerClient } = await import("@supabase/ssr");
-  const { cookies } = await import("next/headers");
-  const cookieStore = await cookies();
-  return createServerClient(env.NEXT_PUBLIC_SUPABASE_URL, env.NEXT_PUBLIC_SUPABASE_ANON_KEY, {
-    cookies: {
-      getAll: () => cookieStore.getAll(),
-      setAll: (cs) => {
-        try { cs.forEach(({ name, value, options }) => cookieStore.set(name, value, options)); }
-        catch { /* RSC 中 set cookies 抛错，忽略 */ }
-      },
-    },
+  if (IS_MOCK_MODE || !env.SUPABASE_SERVICE_ROLE_KEY) return null;
+  const { createClient } = await import("@supabase/supabase-js");
+  return createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
   });
 }
 
