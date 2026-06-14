@@ -1,7 +1,0 @@
-name = "city-partner-platform"
-compatibility_date = "2026-06-01"
-compatibility_flags = ["nodejs_compat"]
-
-# Pages 项目自动通过 Cloudflare dashboard 配 env vars
-# 这个文件主要给 Cloudflare Pages Functions / Workers 用
-# Pages 静态站主要靠 dashboard 配
