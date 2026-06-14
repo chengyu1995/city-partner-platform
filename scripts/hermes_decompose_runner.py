@@ -69,10 +69,11 @@ def notify(text):
         print(f"NO BOT_HOOK, skip notify: {text[:80]}")
         return
     try:
+        # ensure_ascii=False 让中文正常编码 (否则飞书收到 \uXXXX 转义, 渲染为乱码)
         req = urllib.request.Request(
             BOT_HOOK,
-            data=json.dumps({"msg_type": "text", "content": {"text": text}}).encode(),
-            headers={"Content-Type": "application/json"},
+            data=json.dumps({"msg_type": "text", "content": {"text": text}}, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
             method="POST",
         )
         result = json.loads(urllib.request.urlopen(req, timeout=10).read())
