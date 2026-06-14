@@ -102,7 +102,7 @@ def main():
         return 1
 
     # 拉 pending
-    tasks = sb("GET", "hermes_queue?status=eq.pending&order=created_at.asc&limit=5")
+    tasks = sb("GET", "hermes_queue?status=eq.pending&order=created_at.asc&limit=5&select=*")
     print(f"pending: {len(tasks)}")
 
     if not tasks:
