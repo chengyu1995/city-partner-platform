@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function GET() {
-  const supabase = getSupabaseService();
+  const supabase = await getSupabaseService();
   if (!supabase) {
     return NextResponse.json({ ok: false, error: "service client not available" }, { status: 500 });
   }

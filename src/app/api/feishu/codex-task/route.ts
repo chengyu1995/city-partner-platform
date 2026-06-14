@@ -12,7 +12,7 @@ export const runtime = "nodejs";
 export async function POST(req: NextRequest) {
   try {
     const payload = await req.json();
-    const supabase = getSupabaseService();
+    const supabase = await getSupabaseService();
     if (!supabase) {
       return NextResponse.json(
         { ok: false, error: "service client not available" },
