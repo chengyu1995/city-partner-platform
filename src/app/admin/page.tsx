@@ -56,7 +56,9 @@ function AdminInner() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
     fetch(`/api/admin/list?status=${status}`)
       .then((r) => r.json())

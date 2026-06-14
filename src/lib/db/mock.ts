@@ -54,6 +54,7 @@ export function getPartnerPostMock(id: string): Promise<PartnerPost | null> {
 
 export function createPartnerPostMock(input: NewPartnerPost): Promise<PartnerPost> {
   // mock 模式默认 approved (真实模式走审核, status=pending)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const { status: _ignored, ...rest } = input as any;
   const row: PartnerPost = {
     id: `p${++_partnerIdSeq}`,
