@@ -1,31 +1,32 @@
 "use client";
 
-import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useState } from "react";
 
 interface Props {
   id: string;
   action: "approved" | "rejected";
+  onChanged?: () => void;
 }
 
-export function ApproveButton({ id, action }: Props) {
-  const router = useRouter();
-  const [isPending, startTransition] = useTransition();
+export function ApproveButton({ id, action, onChanged }: Props) {
+  const [isPending, setIsPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function onClick() {
     setError(null);
+    setIsPending(true);
     const res = await fetch(`/api/partners/${id}/moderate`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json; charset=utf-8" },
       body: JSON.stringify({ status: action }),
     });
+    setIsPending(false);
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       setError(data.error || "操作失败");
       return;
     }
-    startTransition(() => router.refresh());
+    onChanged?.();
   }
 
   return (
