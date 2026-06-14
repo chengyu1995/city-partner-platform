@@ -8,6 +8,7 @@ import { format } from "date-fns"
 import { zhCN } from "date-fns/locale"
 
 export const dynamic = "force-dynamic" // 总是从 server 拉最新数据
+export const runtime = "edge";
 
 export default async function ActivitiesPage() {
   const activities = await listActivities()

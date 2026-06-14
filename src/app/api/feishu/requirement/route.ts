@@ -7,7 +7,7 @@ import { NextResponse, NextRequest } from "next/server";
 import { getSupabaseService } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
+export const runtime = "edge";
 
 export async function POST(req: NextRequest) {
   try {
