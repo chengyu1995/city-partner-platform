@@ -1,0 +1,71 @@
+name: PR Audit (Secret Scan + Permissions Check)
+
+on:
+  pull_request:
+    branches: [main, staging, dev]
+  push:
+    branches: [main, staging, dev]
+
+jobs:
+  secret-scan:
+    name: Scan for secrets in PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 检查 .env / .pem / .key 等敏感文件未被 commit
+      - name: Check for sensitive files
+        run: |
+          echo "=== 检查敏感文件是否被提交 ==="
+          PATTERNS='(\.env$|\.env\.local$|\.env\.production$|\.pem$|\.key$|id_rsa|service_role|supabase.*token|sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|sb_secret_|sb_publishable_)'
+          if git diff --name-only origin/${{ github.base_branch }}...HEAD | grep -E "$PATTERNS"; then
+            echo "::error::检测到敏感文件, 请勿提交到仓库"
+            exit 1
+          fi
+          echo "✅ 无敏感文件"
+
+      # 检查 commit message 是否包含疑似 token
+      - name: Check commit messages for secrets
+        run: |
+          echo "=== 检查 commit message ==="
+          for sha in $(git rev-list origin/${{ github.base_branch }}...HEAD); do
+            MSG=$(git log -1 --format=%B "$sha")
+            if echo "$MSG" | grep -qE "(sk-|ghp_|sb_secret_|sb_publishable_|password|token|api[_-]?key)"; then
+              echo "::warning::commit $sha message 包含敏感关键词"
+            fi
+          done
+          echo "✅ commit message 检查通过"
+
+  permissions-check:
+    name: Verify PR doesn't touch protected paths
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check no production env changes
+        run: |
+          # PR 不能修改 vercel.json / production-only 配置
+          echo "=== 检查生产环境配置 ==="
+          CHANGED=$(git diff --name-only origin/${{ github.base_branch }}...HEAD)
+          if echo "$CHANGED" | grep -qE "^(vercel\.json|\.github/workflows/prod-|\.github/workflows/deploy-|\.env\.production)"; then
+            echo "::error::PR 包含生产配置变更, 需老板确认"
+            exit 1
+          fi
+          echo "✅ 无生产配置变更"
+
+      - name: Check Codex scope (no payment / auth / delete)
+        run: |
+          echo "=== 检查 Code 改动范围 ==="
+          # PR 不应包含支付 / 登录 / 数据库 schema / 隐私政策
+          CHANGED=$(git diff --name-only origin/${{ github.base_sha }}...HEAD)
+          SUSPICIOUS="(auth/|payment|privacy|pricing|delete|drop|migrate|alter table)"
+          if echo "$CHANGED" | grep -iE "$SUSPICIOUS"; then
+            echo "::warning::PR 改动范围可能涉及老板授权项"
+            echo "需要老板亲自 review 才能合"
+            # 不强制 fail, 老板自己 review 即可
+          fi
+          echo "✅ 权限检查完成"
