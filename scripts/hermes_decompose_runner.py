@@ -13,7 +13,13 @@ import urllib.request
 import urllib.error
 
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+# 兼容 SUPABASE_URL 带不带 /rest/v1 后缀
+for suffix in ("/rest/v1", "/rest"):
+    if SUPABASE_URL.endswith(suffix):
+        SUPABASE_URL = SUPABASE_URL[: -len(suffix)]
+        break
+SUPABASE_URL = SUPABASE_URL.rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 LLM_KEY = os.environ.get("MINIMAX_CN_API_KEY", "")
 BOT_HOOK = os.environ.get("FEISHU_BOT_WEBHOOK", "")
