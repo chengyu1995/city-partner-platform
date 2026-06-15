@@ -178,6 +178,39 @@ def main():
                 {"status": "done", "processed_at": "now()"},
             )
 
+            # 同步拆解结果到飞书 Bitable 任务看板 (失败不影响主流程)
+            try:
+                cb_url = os.environ.get("DECOMPOSE_CALLBACK_URL", "").strip()
+                cb_token = os.environ.get("FEISHU_API_TOKEN", "").strip()
+                if cb_url and result.get("subtasks"):
+                    cb_body = {
+                        "tasks": [
+                            {
+                                "title": st.get("title", "(无标题)"),
+                                "status": "待执行",
+                                "assignee": st.get("owner", ""),
+                            }
+                            for st in result["subtasks"]
+                        ],
+                        "parentTaskId": qid,
+                    }
+                    cb_req = urllib.request.Request(
+                        cb_url,
+                        data=json.dumps(cb_body, ensure_ascii=False).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json; charset=utf-8",
+                            **({"Authorization": f"Bearer {cb_token}"} if cb_token else {}),
+                        },
+                        method="POST",
+                    )
+                    cb_resp = json.loads(urllib.request.urlopen(cb_req, timeout=15).read())
+                    if cb_resp.get("code") == 0:
+                        print(f"BITABLE OK: {cb_resp.get('data', {}).get('count')} subtasks synced")
+                    else:
+                        print(f"BITABLE FAIL: {cb_resp.get('message')}")
+            except Exception as e:
+                print(f"BITABLE ERROR (non-fatal): {e}")
+
             # 推群
             sub_count = len(result.get("subtasks", []))
             msg = (
