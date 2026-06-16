@@ -94,6 +94,20 @@ async function addTaskRecord(
   // 兼容 URL 形式 (用户可能直接粘整个 Bitable URL)
   const appToken = parseBitableAppToken(rawAppToken);
   const tableId = parseBitableTableId(rawTableId);
+
+  // 调试: 列出真字段名 (一次性, 帮助用户排查字段不匹配)
+  const fieldsListUrl = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/fields`;
+  const fieldsListRes = await fetch(fieldsListUrl, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const fieldsListBody = await fieldsListRes.text();
+  let fieldsList: { data?: { items?: { field_name: string; type: number }[] } } = {};
+  try { fieldsList = JSON.parse(fieldsListBody); } catch {}
+  const realFields = (fieldsList.data?.items ?? []).map((f) => `${f.field_name}(type=${f.type})`).join(", ");
+  if (process.env.DEBUG_BITABLE_FIELDS) {
+    console.log(`[addTaskRecord] Bitable real fields: ${realFields}`);
+  }
+
   const url = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`;
 
   // 字段映射区: 必须和 Bitable 表字段名一字不差
@@ -175,7 +189,9 @@ export async function POST(req: NextRequest) {
           results.push({ ok: true, title: task.title, data: r });
         } catch (e) {
           // Bitable 失败不阻塞主流程
-          results.push({ ok: false, title: task.title, error: e instanceof Error ? e.message : String(e) });
+          const errMsg = e instanceof Error ? e.message : String(e);
+          // debug: 包含真实字段名信息
+          results.push({ ok: false, title: task.title, error: errMsg, realFields });
         }
       }
 
