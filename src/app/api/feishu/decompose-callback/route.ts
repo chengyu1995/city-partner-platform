@@ -101,12 +101,12 @@ async function addTaskRecord(
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   const fieldsListBody = await fieldsListRes.text();
-  let fieldsList: { data?: { items?: { field_name: string; type: number }[] } } = {};
+  console.log(`[DEBUG_Bitable] fields list status=${fieldsListRes.status} body=${fieldsListBody.slice(0, 500)}`);
+  let fieldsList: { code?: number; msg?: string; data?: { items?: { field_name: string; type: number }[] } } = {};
   try { fieldsList = JSON.parse(fieldsListBody); } catch {}
   const realFields = (fieldsList.data?.items ?? []).map((f) => `${f.field_name}(type=${f.type})`).join(", ");
-  if (process.env.DEBUG_BITABLE_FIELDS) {
-    console.log(`[addTaskRecord] Bitable real fields: ${realFields}`);
-  }
+  // 把 list 错也带上
+  const fieldsListErr = fieldsList.code !== 0 ? `code=${fieldsList.code} msg=${fieldsList.msg}` : "ok";
 
   const url = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`;
 
@@ -191,7 +191,7 @@ export async function POST(req: NextRequest) {
           // Bitable 失败不阻塞主流程
           const errMsg = e instanceof Error ? e.message : String(e);
           // debug: 包含真实字段名信息
-          results.push({ ok: false, title: task.title, error: errMsg, realFields });
+          results.push({ ok: false, title: task.title, error: errMsg, realFields: realFields || "(empty)", fieldsListErr });
         }
       }
 
