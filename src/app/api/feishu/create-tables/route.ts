@@ -57,13 +57,16 @@ async function createTable(
   table: { table: { name: string; default_view_name: string }; fields: unknown[] }
 ) {
   const url = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables`;
-  const bytes = new TextEncoder().encode(JSON.stringify(table));
+  const bodyStr = JSON.stringify(table);
+  const bytes = new TextEncoder().encode(bodyStr);
+  console.log(`[createTable] ${table.table.name} body: ${bodyStr.slice(0, 800)}`);
   const res = await fetch(url, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json; charset=utf-8" },
     body: bytes,
   });
   const raw = await res.text();
+  console.log(`[createTable] ${table.table.name} status=${res.status} body: ${raw.slice(0, 500)}`);
   let data: { code: number; msg: string; data?: { table_id: string; fields: { field_name: string; type: number }[] } };
   try { data = JSON.parse(raw); }
   catch { throw new Error(`non-json: ${raw.slice(0, 200)}`); }
