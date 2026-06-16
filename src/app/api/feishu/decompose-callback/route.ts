@@ -18,6 +18,35 @@ function getEnv(name: string): string | null {
 }
 
 /**
+ * 从 Vercel env 取 app_token, 兼容 URL 形式
+ * 接受:
+ *   - 纯 token: "Ops1buCiWaJPqqshzdpc3A90n4b"
+ *   - URL: "https://rcn961k35z7m.feishu.cn/base/Ops1bu...n4b?table=tblXXX"
+ *   - 路径: "/base/Ops1bu...n4b"
+ */
+function parseBitableAppToken(raw: string): string {
+  const v = raw.trim();
+  // 提取 base/ 后面那串
+  const m = v.match(/\/base\/([A-Za-z0-9]+)/);
+  if (m) return m[1];
+  return v;
+}
+
+/**
+ * 从 Vercel env 取 table_id, 兼容 URL 形式
+ * 接受:
+ *   - 纯 ID: "tbl2TFCHgCpm6Gxr"
+ *   - URL: "https://...?table=tbl2TFCHgCpm6Gxr&view=..."
+ */
+function parseBitableTableId(raw: string): string {
+  const v = raw.trim();
+  // 提取 table= 后面那串
+  const m = v.match(/[?&]table=([A-Za-z0-9]+)/);
+  if (m) return m[1];
+  return v;
+}
+
+/**
  * 缓存 tenant_access_token (2 小时, 飞书官方有效期 2h)
  */
 let _tokenCache: { token: string; expiresAt: number } | null = null;
@@ -57,11 +86,14 @@ async function addTaskRecord(
   accessToken: string,
   task: { title: string; status?: string; assignee?: string; parentTaskId?: string }
 ) {
-  const appToken = getEnv("BITABLE_APP_TOKEN");
-  const tableId = getEnv("BITABLE_TABLE_ID");
-  if (!appToken || !tableId) {
+  const rawAppToken = getEnv("BITABLE_APP_TOKEN");
+  const rawTableId = getEnv("BITABLE_TABLE_ID");
+  if (!rawAppToken || !rawTableId) {
     throw new Error("missing BITABLE_APP_TOKEN or BITABLE_TABLE_ID env");
   }
+  // 兼容 URL 形式 (用户可能直接粘整个 Bitable URL)
+  const appToken = parseBitableAppToken(rawAppToken);
+  const tableId = parseBitableTableId(rawTableId);
   const url = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`;
 
   // 字段映射区: 必须和 Bitable 表字段名一字不差
