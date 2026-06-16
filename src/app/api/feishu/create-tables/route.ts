@@ -79,8 +79,8 @@ async function createTable(
 }
 
 function fText(name: string) { return { field_name: name, type: T_TEXT }; }
-// 自动编号 (1001) 是 Bitable 系统字段, 创表时不能传, 用户表里"需求 ID" 改用普通文本
-function fIdText(name: string) { return { field_name: name, type: T_TEXT }; }
+// "需求 ID" 等 ID 字段用普通文本 (Bitable 创表不支持传自动编号 type=1001)
+function fIdText(name: string) { return fText(name); }
 function fSelect(name: string, options: string[]) {
   // 飞书 API 单选字段 options 需要 color 字段 (0-7), 否则部分版本会返 1254001
   return {
@@ -91,7 +91,6 @@ function fSelect(name: string, options: string[]) {
 }
 function fCheckbox(name: string) { return { field_name: name, type: T_CHECKBOX }; }
 function fUrl(name: string) { return { field_name: name, type: T_URL }; }
-function fIdText(name: string) { return { field_name: name, type: T_TEXT }; }
 function fDate(name: string, withTime = false) {
   return { field_name: name, type: T_DATE, property: { date_formatter: "yyyy-MM-dd" + (withTime ? " HH:mm" : "") } };
 }
