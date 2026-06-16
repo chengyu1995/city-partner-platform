@@ -1,6 +1,6 @@
 /**
  * 飞书自动化 1.5: 拆解结果回调
- * 飞书《任务看板》Bitable ← 写入拆解出的子任务
+ * 飞书 Bitable ← 写入拆解出的子任务
  *
  * 触发: hermes_decompose_runner.py 拆解完成后回调
  * Body: { tasks: [{title, status?, assignee?}], parentTaskId }
@@ -19,68 +19,91 @@ function getEnv(name: string): string | null {
 
 /**
  * 从 Vercel env 取 app_token, 兼容 URL 形式
- * 接受:
- *   - 纯 token: "Ops1buCiWaJPqqshzdpc3A90n4b"
- *   - URL: "https://rcn961k35z7m.feishu.cn/base/Ops1bu...n4b?table=tblXXX"
- *   - 路径: "/base/Ops1bu...n4b"
  */
 function parseBitableAppToken(raw: string): string {
   const v = raw.trim();
-  // 提取 base/ 后面那串
   const m = v.match(/\/base\/([A-Za-z0-9]+)/);
-  if (m) return m[1];
-  return v;
+  return m ? m[1] : v;
 }
 
 /**
  * 从 Vercel env 取 table_id, 兼容 URL 形式
- * 接受:
- *   - 纯 ID: "tbl2TFCHgCpm6Gxr"
- *   - URL: "https://...?table=tbl2TFCHgCpm6Gxr&view=..."
  */
 function parseBitableTableId(raw: string): string {
   const v = raw.trim();
-  // 提取 table= 后面那串
   const m = v.match(/[?&]table=([A-Za-z0-9]+)/);
-  if (m) return m[1];
-  return v;
+  return m ? m[1] : v;
 }
 
 /**
- * 缓存 tenant_access_token (2 小时, 飞书官方有效期 2h)
+ * 获取飞书 tenant_access_token (Vercel 进程内缓存 2h)
  */
-let _tokenCache: { token: string; expiresAt: number } | null = null;
-
+let cachedToken: { token: string; expiresAt: number } | null = null;
 async function getFeishuAccessToken(): Promise<string> {
-  if (_tokenCache && _tokenCache.expiresAt > Date.now() + 60_000) {
-    return _tokenCache.token;
-  }
+  const now = Date.now();
+  if (cachedToken && cachedToken.expiresAt > now) return cachedToken.token;
+
   const appId = getEnv("FEISHU_APP_ID");
   const appSecret = getEnv("FEISHU_APP_SECRET");
   if (!appId || !appSecret) {
     throw new Error("missing FEISHU_APP_ID or FEISHU_APP_SECRET env");
   }
+  const body = JSON.stringify({ app_id: appId, app_secret: appSecret });
+  const bytes = new TextEncoder().encode(body);
   const res = await fetch(
     "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
     {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+      body: bytes,
     }
   );
-  const data = (await res.json()) as { code: number; msg: string; tenant_access_token?: string; expire?: number };
+  const data = (await res.json()) as {
+    code: number;
+    msg: string;
+    tenant_access_token?: string;
+    expire?: number;
+  };
   if (data.code !== 0 || !data.tenant_access_token) {
     throw new Error(`feishu token failed: code=${data.code} msg=${data.msg}`);
   }
-  _tokenCache = {
+  cachedToken = {
     token: data.tenant_access_token,
-    expiresAt: Date.now() + (data.expire ?? 7200) * 1000,
+    expiresAt: now + Math.max(60_000, (data.expire ?? 7200) * 1000 - 60_000),
   };
-  return data.tenant_access_token;
+  return cachedToken.token;
 }
 
 /**
- * 写一条任务到 Bitable
+ * 列出 Bitable 真实字段名 + 类型 (用于排查字段不匹配)
+ */
+async function listBitableFields(
+  accessToken: string,
+  appToken: string,
+  tableId: string
+): Promise<{ items: { field_name: string; type: number }[]; listErr: string }> {
+  const url = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/fields`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const raw = await res.text();
+  console.log(`[DEBUG_Bitable] fields list status=${res.status} body=${raw.slice(0, 500)}`);
+  try {
+    const data = JSON.parse(raw) as {
+      code?: number;
+      msg?: string;
+      data?: { items?: { field_name: string; type: number }[] };
+    };
+    if (data.code !== 0) {
+      return { items: [], listErr: `code=${data.code} msg=${data.msg}` };
+    }
+    return { items: data.data?.items ?? [], listErr: "ok" };
+  } catch {
+    return { items: [], listErr: `non-json: ${raw.slice(0, 100)}` };
+  }
+}
+
+/**
+ * 向飞书 Bitable 写入单条任务记录
+ * 返回: { record, realFields, listErr }
  */
 async function addTaskRecord(
   accessToken: string,
@@ -91,39 +114,33 @@ async function addTaskRecord(
   if (!rawAppToken || !rawTableId) {
     throw new Error("missing BITABLE_APP_TOKEN or BITABLE_TABLE_ID env");
   }
-  // 兼容 URL 形式 (用户可能直接粘整个 Bitable URL)
   const appToken = parseBitableAppToken(rawAppToken);
   const tableId = parseBitableTableId(rawTableId);
 
-  // 调试: 列出真字段名 (一次性, 帮助用户排查字段不匹配)
-  const fieldsListUrl = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/fields`;
-  const fieldsListRes = await fetch(fieldsListUrl, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-  const fieldsListBody = await fieldsListRes.text();
-  console.log(`[DEBUG_Bitable] fields list status=${fieldsListRes.status} body=${fieldsListBody.slice(0, 500)}`);
-  let fieldsList: { code?: number; msg?: string; data?: { items?: { field_name: string; type: number }[] } } = {};
-  try { fieldsList = JSON.parse(fieldsListBody); } catch {}
-  const realFields = (fieldsList.data?.items ?? []).map((f) => `${f.field_name}(type=${f.type})`).join(", ");
-  // 把 list 错也带上
-  const fieldsListErr = fieldsList.code !== 0 ? `code=${fieldsList.code} msg=${fieldsList.msg}` : "ok";
+  // 1) 列出真实字段 (debug + 自动调整)
+  const { items: realFieldItems, listErr } = await listBitableFields(accessToken, appToken, tableId);
+  const realFields = realFieldItems.map((f) => `${f.field_name}(type=${f.type})`).join(", ");
 
+  // 2) 构造 fields: 优先用 Bitable 真实字段名, 找不到再用代码默认
+  const realNameSet = new Set(realFieldItems.map((f) => f.field_name));
+  const fields: Record<string, unknown> = {};
+  if (realNameSet.has("任务标题")) fields["任务标题"] = task.title;
+  if (realNameSet.has("状态")) fields["状态"] = task.status ?? "待执行";
+  if (realNameSet.has("执行者")) fields["执行者"] = task.assignee ?? "";
+  // A 列默认 "文本" 飞书不允许删, 传空字符串兜底
+  if (realNameSet.has("文本")) fields["文本"] = "";
+  // 兜底: 如果 Bitable 没找到任何代码预期字段, 用代码硬编码名尝试 (兼容性)
+  if (Object.keys(fields).length === 0) {
+    fields["任务标题"] = task.title;
+    fields["状态"] = task.status ?? "待执行";
+    fields["执行者"] = task.assignee ?? "";
+    fields["文本"] = "";
+  }
+
+  // 3) 写入
   const url = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`;
-
-  // 字段映射区: 必须和 Bitable 表字段名一字不差
-  // 兜底: A 列默认 "文本" 列飞书不允许删, 传空字符串避免 1254045
-  const fields: Record<string, unknown> = {
-    "文本": "",
-    "任务标题": task.title,
-    "状态": task.status ?? "待执行",
-    "执行者": task.assignee ?? "",
-  };
-  };
-
-  // 用 ArrayBuffer + 显式 utf-8, 避免乱码 (跟 /api/feishu/requirement 同样修法)
   const body = JSON.stringify({ fields });
   const bytes = new TextEncoder().encode(body);
-
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -132,16 +149,19 @@ async function addTaskRecord(
     },
     body: bytes,
   });
-  const data = (await res.json()) as { code: number; msg: string; data?: unknown };
+  const raw = await res.text();
+  let data: { code: number; msg: string; data?: unknown };
+  try { data = JSON.parse(raw); }
+  catch { throw new Error(`bitable non-JSON: ${raw.slice(0, 200)}`); }
   if (data.code !== 0) {
-    throw new Error(`bitable insert failed: code=${data.code} msg=${data.msg} task=${task.title}`);
+    throw new Error(`bitable insert failed: code=${data.code} msg=${data.msg} task=${task.title} fields=${JSON.stringify(fields)}`);
   }
-  return data.data;
+  return { record: data.data, realFields, listErr };
 }
 
 export async function POST(req: NextRequest) {
   try {
-    // 鉴权 (可选): 防止别人乱调
+    // 鉴权
     const expected = getEnv("FEISHU_API_TOKEN");
     if (expected) {
       const auth = req.headers.get("authorization") ?? "";
@@ -150,15 +170,14 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 修乱码: arrayBuffer + TextDecoder utf-8 (跟 /api/feishu/requirement 同样)
+    // 修乱码: arrayBuffer + TextDecoder utf-8
     const buf = await req.arrayBuffer();
     const decoder = new TextDecoder("utf-8", { fatal: false });
     const rawText = decoder.decode(buf);
 
     let body: { tasks?: unknown; parentTaskId?: string };
-    try {
-      body = JSON.parse(rawText);
-    } catch {
+    try { body = JSON.parse(rawText); }
+    catch {
       return NextResponse.json(
         { code: 400, message: "invalid JSON", raw_head: rawText.slice(0, 200) },
         { status: 400 }
@@ -167,38 +186,46 @@ export async function POST(req: NextRequest) {
 
     const tasks = body.tasks;
     if (!Array.isArray(tasks) || tasks.length === 0) {
-      return NextResponse.json(
-        { code: 400, message: "tasks must be non-empty array" },
-        { status: 400 }
-      );
+      return NextResponse.json({ code: 400, message: "tasks must be non-empty array" }, { status: 400 });
     }
 
-    // 串行写 (避免飞书限流)
-      const accessToken = await getFeishuAccessToken();
-      const results: unknown[] = [];
-      for (const t of tasks) {
-        const task = t as { title: string; status?: string; assignee?: string };
-        if (!task.title) continue;
-        try {
-          const r = await addTaskRecord(accessToken, {
-            title: task.title,
-            status: task.status,
-            assignee: task.assignee,
-            parentTaskId: body.parentTaskId,
-          });
-          results.push({ ok: true, title: task.title, data: r });
-        } catch (e) {
-          // Bitable 失败不阻塞主流程
-          const errMsg = e instanceof Error ? e.message : String(e);
-          // debug: 包含真实字段名信息
-          results.push({ ok: false, title: task.title, error: errMsg, realFields: realFields || "(empty)", fieldsListErr });
-        }
+    // 串行写
+    const accessToken = await getFeishuAccessToken();
+    const results: unknown[] = [];
+    let firstRealFields = "";
+    let firstListErr = "";
+    for (const t of tasks) {
+      const task = t as { title: string; status?: string; assignee?: string };
+      if (!task.title) continue;
+      try {
+        const r = await addTaskRecord(accessToken, {
+          title: task.title,
+          status: task.status,
+          assignee: task.assignee,
+          parentTaskId: body.parentTaskId,
+        });
+        results.push({ ok: true, title: task.title, data: r.record });
+        if (!firstRealFields) firstRealFields = r.realFields;
+        if (!firstListErr) firstListErr = r.listErr;
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : String(e);
+        results.push({ ok: false, title: task.title, error: errMsg });
+        if (!firstRealFields) firstRealFields = "(unknown - addTaskRecord threw before list)";
+        if (!firstListErr) firstListErr = "(skipped)";
       }
+    }
 
     return NextResponse.json({
       code: 0,
-      message: "tasks synced to Bitable",
-      data: { count: results.length, results },
+      message: "tasks processed",
+      data: {
+        count: results.length,
+        results,
+        debug: {
+          realFields: firstRealFields,
+          listErr: firstListErr,
+        },
+      },
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -207,7 +234,6 @@ export async function POST(req: NextRequest) {
   }
 }
 
-/** GET: 健康检查 + 显示 env 状态 (不暴露值) */
 export async function GET() {
   return NextResponse.json({
     ok: true,
