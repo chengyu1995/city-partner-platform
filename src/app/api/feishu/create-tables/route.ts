@@ -59,18 +59,22 @@ async function createTable(
   const url = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables`;
   const bodyStr = JSON.stringify(table);
   const bytes = new TextEncoder().encode(bodyStr);
-  console.log(`[createTable] ${table.table.name} body: ${bodyStr.slice(0, 800)}`);
   const res = await fetch(url, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json; charset=utf-8" },
     body: bytes,
   });
   const raw = await res.text();
-  console.log(`[createTable] ${table.table.name} status=${res.status} body: ${raw.slice(0, 500)}`);
   let data: { code: number; msg: string; data?: { table_id: string; fields: { field_name: string; type: number }[] } };
   try { data = JSON.parse(raw); }
   catch { throw new Error(`non-json: ${raw.slice(0, 200)}`); }
-  if (data.code !== 0) throw new Error(`create table ${table.table.name} failed: code=${data.code} msg=${data.msg}`);
+  if (data.code !== 0) {
+    // 把请求 body + 飞书 raw 响应都包到错里, 方便排查
+    const err = new Error(`create table ${table.table.name} failed: code=${data.code} msg=${data.msg}`);
+    (err as Error & { body?: string; raw?: string }).body = bodyStr.slice(0, 1500);
+    (err as Error & { body?: string; raw?: string }).raw = raw.slice(0, 500);
+    throw err;
+  }
   return data.data!;
 }
 
@@ -272,8 +276,17 @@ export async function POST(req: NextRequest) {
 
     for (const { name, build } of TABLES) {
       const spec = build();
-      const data = await createTable(token, appToken, spec);
-      created.push({ name, table_id: data.table_id, fields: data.fields });
+      try {
+        const data = await createTable(token, appToken, spec);
+        created.push({ name, table_id: data.table_id, fields: data.fields });
+      } catch (e) {
+        const err = e as Error & { body?: string; raw?: string };
+        return NextResponse.json({
+          code: 500,
+          message: err.message,
+          data: { failed_table: name, body: err.body, raw: err.raw },
+        }, { status: 500 });
+      }
     }
 
     return NextResponse.json({ code: 0, message: "8 tables created", data: { app_token: appToken, tables: created } });
