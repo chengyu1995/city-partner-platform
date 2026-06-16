@@ -20,9 +20,9 @@ const T_SELECT = 3;
 const T_DATE = 5;
 const T_CHECKBOX = 7;
 const T_URL = 15;
-const T_AUTO_NUM = 1005;
-const T_CREATED = 1001;
-const T_MODIFIED = 1002;
+const T_AUTO_NUM = 1001;
+const T_CREATED = 21;
+const T_MODIFIED = 22;
 
 function getEnv(name: string): string | null {
   const v = process.env[name];
