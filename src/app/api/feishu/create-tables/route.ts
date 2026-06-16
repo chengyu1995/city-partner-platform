@@ -91,7 +91,7 @@ function fSelect(name: string, options: string[]) {
 }
 function fCheckbox(name: string) { return { field_name: name, type: T_CHECKBOX }; }
 function fUrl(name: string) { return { field_name: name, type: T_URL }; }
-function fIdText(name: string) { return { field_name: name, type: T_AUTO_NUM }; }
+function fIdText(name: string) { return { field_name: name, type: T_TEXT }; }
 function fDate(name: string, withTime = false) {
   return { field_name: name, type: T_DATE, property: { date_formatter: "yyyy-MM-dd" + (withTime ? " HH:mm" : "") } };
 }
