@@ -80,7 +80,12 @@ async function createTable(
 
 function fText(name: string) { return { field_name: name, type: T_TEXT }; }
 function fSelect(name: string, options: string[]) {
-  return { field_name: name, type: T_SELECT, property: { options: options.map((o) => ({ name: o })) } };
+  // 飞书 API 单选字段 options 需要 color 字段 (0-7), 否则部分版本会返 1254001
+  return {
+    field_name: name,
+    type: T_SELECT,
+    property: { options: options.map((o, i) => ({ name: o, color: i % 8 })) },
+  };
 }
 function fCheckbox(name: string) { return { field_name: name, type: T_CHECKBOX }; }
 function fUrl(name: string) { return { field_name: name, type: T_URL }; }
