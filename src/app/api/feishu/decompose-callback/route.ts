@@ -85,7 +85,7 @@ async function listBitableFields(
   const url = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/fields`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
   const raw = await res.text();
-  console.log(`[DEBUG_Bitable] fields list status=${res.status} body=${raw.slice(0, 500)}`);
+  // 静默成功 (debug 时可加回 console.log)
   try {
     const data = JSON.parse(raw) as {
       code?: number;
