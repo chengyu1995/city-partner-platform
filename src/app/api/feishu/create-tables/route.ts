@@ -79,6 +79,8 @@ async function createTable(
 }
 
 function fText(name: string) { return { field_name: name, type: T_TEXT }; }
+// 自动编号 (1001) 是 Bitable 系统字段, 创表时不能传, 用户表里"需求 ID" 改用普通文本
+function fIdText(name: string) { return { field_name: name, type: T_TEXT }; }
 function fSelect(name: string, options: string[]) {
   // 飞书 API 单选字段 options 需要 color 字段 (0-7), 否则部分版本会返 1254001
   return {
@@ -89,7 +91,7 @@ function fSelect(name: string, options: string[]) {
 }
 function fCheckbox(name: string) { return { field_name: name, type: T_CHECKBOX }; }
 function fUrl(name: string) { return { field_name: name, type: T_URL }; }
-function fAutoNum(name: string) { return { field_name: name, type: T_AUTO_NUM }; }
+function fIdText(name: string) { return { field_name: name, type: T_AUTO_NUM }; }
 function fDate(name: string, withTime = false) {
   return { field_name: name, type: T_DATE, property: { date_formatter: "yyyy-MM-dd" + (withTime ? " HH:mm" : "") } };
 }
@@ -102,7 +104,7 @@ const TABLES: { name: string; build: () => { table: { name: string; default_view
     build: () => ({
       table: { name: "需求池", default_view_name: "全部需求" },
       fields: [
-        fAutoNum("需求 ID"),
+        fIdText("需求 ID"),
         fText("需求名称"),
         fText("需求描述"),
         fSelect("需求来源", ["老板", "Hermes", "用户反馈", "Codex", "其他"]),
@@ -124,7 +126,7 @@ const TABLES: { name: string; build: () => { table: { name: string; default_view
     build: () => ({
       table: { name: "任务看板", default_view_name: "全部任务" },
       fields: [
-        fAutoNum("任务 ID"),
+        fIdText("任务 ID"),
         fText("关联需求 ID"),
         fText("任务名称"),
         fText("任务说明"),
@@ -149,7 +151,7 @@ const TABLES: { name: string; build: () => { table: { name: string; default_view
     build: () => ({
       table: { name: "老板决策中心", default_view_name: "待确认" },
       fields: [
-        fAutoNum("决策 ID"),
+        fIdText("决策 ID"),
         fText("问题"),
         fText("背景"),
         fText("选项 A"),
@@ -172,7 +174,7 @@ const TABLES: { name: string; build: () => { table: { name: string; default_view
     build: () => ({
       table: { name: "设计稿与页面", default_view_name: "全部页面" },
       fields: [
-        fAutoNum("页面 ID"),
+        fIdText("页面 ID"),
         fText("页面名称"),
         fSelect("页面类型", ["首页", "列表页", "详情页", "发布页", "后台", "登录", "其他"]),
         fSelect("页面状态", ["待设计", "设计中", "待开发", "开发中", "待验收", "已上线", "暂缓"]),
@@ -192,7 +194,7 @@ const TABLES: { name: string; build: () => { table: { name: string; default_view
     build: () => ({
       table: { name: "Bug 与风险", default_view_name: "全部 Bug" },
       fields: [
-        fAutoNum("Bug ID"),
+        fIdText("Bug ID"),
         fText("问题标题"),
         fText("问题描述"),
         fSelect("严重程度", ["致命", "高", "中", "低"]),
