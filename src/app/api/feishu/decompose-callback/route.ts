@@ -97,11 +97,13 @@ async function addTaskRecord(
   const url = `https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/records`;
 
   // 字段映射区: 必须和 Bitable 表字段名一字不差
+  // 兜底: A 列默认 "文本" 列飞书不允许删, 传空字符串避免 1254045
   const fields: Record<string, unknown> = {
+    "文本": "",
     "任务标题": task.title,
     "状态": task.status ?? "待执行",
     "执行者": task.assignee ?? "",
-    "父任务ID": task.parentTaskId ?? "",
+  };
   };
 
   // 用 ArrayBuffer + 显式 utf-8, 避免乱码 (跟 /api/feishu/requirement 同样修法)
