@@ -126,19 +126,24 @@ export async function POST(req: NextRequest) {
     }
 
     // 串行写 (避免飞书限流)
-    const accessToken = await getFeishuAccessToken();
-    const results: unknown[] = [];
-    for (const t of tasks) {
-      const task = t as { title: string; status?: string; assignee?: string };
-      if (!task.title) continue;
-      const r = await addTaskRecord(accessToken, {
-        title: task.title,
-        status: task.status,
-        assignee: task.assignee,
-        parentTaskId: body.parentTaskId,
-      });
-      results.push(r);
-    }
+      const accessToken = await getFeishuAccessToken();
+      const results: unknown[] = [];
+      for (const t of tasks) {
+        const task = t as { title: string; status?: string; assignee?: string };
+        if (!task.title) continue;
+        try {
+          const r = await addTaskRecord(accessToken, {
+            title: task.title,
+            status: task.status,
+            assignee: task.assignee,
+            parentTaskId: body.parentTaskId,
+          });
+          results.push({ ok: true, title: task.title, data: r });
+        } catch (e) {
+          // Bitable 失败不阻塞主流程
+          results.push({ ok: false, title: task.title, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
 
     return NextResponse.json({
       code: 0,
