@@ -139,7 +139,7 @@ export async function POST(req: NextRequest) {
   try {
     // 1. 飞书 URL 验证 (challenge) - 可能加密 or 公开
     const bodyText = await req.text();
-    let body: { encrypt?: string; challenge?: string; type?: string; event?: FeishuEvent; token?: string };
+    let body: any;
     try { body = JSON.parse(bodyText); }
     catch { return NextResponse.json({ code: 400, msg: "invalid json" }, { status: 400 }); }
 
@@ -148,7 +148,7 @@ export async function POST(req: NextRequest) {
     const FEISHU_VERIFICATION_TOKEN = process.env.FEISHU_VERIFICATION_TOKEN || "";
 
     // 飞书 v2.0 事件加密方式: 整个 payload 是 { encrypt: "..." }, URL 验证也走加密
-    let payload: { challenge?: string; type?: string; event?: FeishuEvent; token?: string; ts?: string };
+    let payload: any;
     if (body.encrypt && FEISHU_ENCRYPT_KEY) {
       const decrypted = decryptFeishuEvent(body.encrypt, FEISHU_ENCRYPT_KEY);
       try { payload = JSON.parse(decrypted); }
@@ -176,11 +176,7 @@ export async function POST(req: NextRequest) {
       "";
 
     // 兼容: event 可能在 payload.event 也可能在 payload 本身
-    const ev = (payload.event ?? payload) as {
-      header?: { event_type?: string };
-      sender?: { sender_id?: { open_id?: string } };
-      message?: { message_id?: string; chat_id?: string; chat_type?: string; content?: string };
-    };
+    const ev: any = payload.event ?? payload;
 
     // 仅处理 im.message.receive_v1
     if (eventType !== "im.message.receive_v1") {
