@@ -167,22 +167,37 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ challenge: payload.challenge });
     }
 
-    // 3. 事件类型
-    const ev = payload.event;
-    if (!ev) {
-      return NextResponse.json({ code: 0 }); // ignore
-    }
+    // 兼容飞书新版/旧版事件类型
+    const eventType =
+      payload?.header?.event_type ||
+      payload?.event?.header?.event_type ||
+      payload?.event_type ||
+      payload?.type ||
+      "";
 
-    // 4. 仅处理 im.message.receive_v1
-    if (ev.header.event_type !== "im.message.receive_v1") {
+    // 兼容: event 可能在 payload.event 也可能在 payload 本身
+    const ev = (payload.event ?? payload) as {
+      header?: { event_type?: string };
+      sender?: { sender_id?: { open_id?: string } };
+      message?: { message_id?: string; chat_id?: string; chat_type?: string; content?: string };
+    };
+
+    // 仅处理 im.message.receive_v1
+    if (eventType !== "im.message.receive_v1") {
       return NextResponse.json({ code: 0 });
     }
 
-    // 5. 群聊仅 @Hermes 才处理
+    // 安全读 message
+    const message = ev?.message;
+    if (!message) {
+      return NextResponse.json({ code: 0 });
+    }
+    const rawContent = message.content || "{}";
     let text = "";
-    try { text = JSON.parse(ev.event.message.content).text ?? ""; }
+    try { text = JSON.parse(rawContent).text ?? ""; }
     catch { text = ""; }
-    if (ev.event.message.chat_type === "group") {
+
+    if (message.chat_type === "group") {
       // 简化: 群里必须包含 "@Hermes" 或 "@_user_1" (bot mention)
       if (!text.includes("Hermes") && !text.match(/@\S+/)) {
         return NextResponse.json({ code: 0 });
@@ -199,19 +214,19 @@ export async function POST(req: NextRequest) {
       // 兜底: 直接返回错误消息给用户
       await sendFeishuMessage(
         await getFeishuToken(),
-        ev.event.message.chat_id,
-        ev.event.message.chat_type === "p2p" ? "open_id" : "chat_id",
+        ev.message.chat_id,
+        ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
         "❌ Supabase 未配置, 请联系管理员"
       );
       return NextResponse.json({ code: 0 });
     }
 
-    const userId = ev.event.sender.sender_id.open_id;
+    const userId = ev.sender.sender_id.open_id;
     const convId = await getOrCreateConversation(
       supabase,
       userId,
-      ev.event.message.chat_id,
-      ev.event.message.chat_type
+      ev.message.chat_id,
+      ev.message.chat_type
     );
 
     // 7. 加载历史
@@ -228,7 +243,7 @@ export async function POST(req: NextRequest) {
         content: m.content,
         tool_call_id: m.tool_call_id ?? null,
         // tool_calls 字段 (jsonb) 暂不存
-        feishu_message_id: m.role === "user" ? ev.event.message.message_id : null,
+        feishu_message_id: m.role === "user" ? ev.message.message_id : null,
       }))
     );
 
@@ -236,8 +251,8 @@ export async function POST(req: NextRequest) {
     const token = await getFeishuToken();
     await sendFeishuMessage(
       token,
-      ev.event.message.chat_id,
-      ev.event.message.chat_type === "p2p" ? "open_id" : "chat_id",
+      ev.message.chat_id,
+      ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
       reply || "✅"
     );
 
