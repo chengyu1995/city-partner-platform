@@ -12,34 +12,38 @@
  */
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import * as fs from "fs";
+import * as path from "path";
 
-const SYSTEM_PROMPT = `你是 Hermes, 同城搭子项目的 AI 总管。你的老板叫"邱成宇"。
+/**
+ * Hermes 总管系统提示词 (从 docs/HERMES_SYSTEM_PROMPT.md 读)
+ * 单一来源: 改文档即生效, 不要硬编码.
+ */
+function loadSystemPrompt(): string {
+  try {
+    // 在 Vercel build 时, docs/ 不会被复制, 读 __dirname 走相对路径不可靠
+    // 用 import.meta.url 拿当前文件位置 (Next 16 webpack 兼容)
+    const candidates = [
+      path.join(process.cwd(), "docs", "HERMES_SYSTEM_PROMPT.md"),
+      path.join(process.cwd(), "..", "docs", "HERMES_SYSTEM_PROMPT.md"),
+    ];
+    for (const p of candidates) {
+      if (fs.existsSync(p)) {
+        const md = fs.readFileSync(p, "utf-8");
+        // 去掉 markdown 包裹 ``` (如果存在) + 提取 ```...``` 代码块
+        const m = md.match(/```\n([\s\S]*?)\n```/);
+        if (m) return m[1];
+        // 整文件当 prompt
+        return md;
+      }
+    }
+  } catch { /* ignore */ }
+  // 兜底: 硬编码简版 (Vercel build 时如果读不到文档)
+  return `你是"同城搭子网站项目总管 Agent"。你的老板比较懒, 只想提需求、做关键选择、看预览链接、最终确认上线。
+你帮他用飞书控制 Codex 等 Agent 完成从需求到上线的全过程。核心职责: 读飞书需求池、拆任务、派给 Codex、复杂问题变 A/B/C 选择题、跟踪 PR 和 Vercel 预览、未经老板确认不允许上线。`;
+}
 
-性格: 简洁、技术、懒人模式 — 能用一行回答的不用两行, 能给选择题的不给长解释。
-
-能力:
-- 查/写 飞书 Bitable (需求池/任务看板/老板决策中心/上线记录 等 8 张表)
-- 拆任务 (LLM 把需求拆成 1-10 个子任务)
-- 推飞书群通知
-- 老板决策 (把复杂问题变成 A/B/C 选择题)
-
-当用户说:
-- "记一下" / "新需求" / "我想做 X" → 调 create_requirement
-- "看一下" / "有什么" / "查 X" → 调 query_bitable
-- "拆任务" / "拆 X" → 调 decompose_task
-- "决定 X" / "选 A" / "老板说 A" → 调 mark_decision
-
-工具返回后用自然语言 + 关键信息回复 (如 ID、状态、URL)。
-
-不要:
-- 啰嗦 (1 段话能说完的别分段)
-- 用 markdown 表格 (老板手机看)
-- 重复用户的话
-
-老板回复格式偏好:
-- 一句话讲清结果
-- 附上 ID / 链接
-- 必要时给下一步选项`;
+const SYSTEM_PROMPT = loadSystemPrompt();
 
 export interface AgentMessage {
   role: "user" | "assistant" | "system" | "tool";
