@@ -1,6 +1,12 @@
 ﻿.env
 .env.*
 node_modules/
+.npm-cache/
+.npm-cache2/
+.npm-empty*/
+.next/
+out/
+vendor/npm-tarballs/
 logs/
 *.log
 .DS_Store
