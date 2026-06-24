@@ -1,48 +1,58 @@
 -- ============================================================
--- Hermes Worker 任务队列 (hermes_jobs + hermes_job_results)
--- 腾讯云中转 + Windows 本地拉取 模式
+-- Hermes Worker 任务队列 (1 需求 = 1 任务, 不拆)
 -- ============================================================
 
--- 1. 任务队列
 create table if not exists hermes_jobs (
   id uuid primary key default gen_random_uuid(),
-  source text not null,                 -- 'feishu_event' / 'cron' / 'manual'
-  source_id text,                        -- 飞书 message_id / cron task_id
-  chat_id text,                          -- 飞书 chat_id
-  user_id text,                          -- 飞书 sender open_id
-  job_type text not null,                -- 'decompose' / 'codex_task' / 'query' / 'send_group'
-  payload jsonb not null default '{}'::jsonb,
-  priority int default 5,                -- 1-10, 越小越优先
-  status text not null default 'pending' check (status in ('pending', 'claimed', 'done', 'failed', 'timeout')),
-  claimed_by text,                       -- worker ID (hostname-pid)
+
+  -- 来源
+  source text not null default 'feishu',
+  feishu_message_id text,
+  feishu_event_id text,
+  feishu_chat_id text,
+  feishu_user_id text,
+
+  -- 任务字段 (固定: 1 需求 = 1 任务, 不拆分)
+  job_id text,                          -- 自动编号如 TASK-001 (可选, 给老板看的)
+  title text not null,                  -- 需求名称
+  description text,                     -- 需求描述
+  priority text default 'P1' check (priority in ('P0', 'P1', 'P2')),
+  acceptance text,                      -- 验收标准
+  branch text default 'agent/TASK-001', -- agent/<job_id> 形式
+
+  -- 执行
+  executor text default 'local_codex',
+  repo text default 'C:\Users\admin\city-partner-platform',
+  prompt text,                          -- 完整 prompt (拼装给 codex exec)
+
+  -- 状态枚举 (简化)
+  status text not null default 'pending' check (status in (
+    'pending',          -- 待本地执行
+    'running',          -- 执行中
+    'awaiting_review',  -- 待验收
+    'completed',        -- 已完成
+    'failed'            -- 执行失败
+  )),
+
+  -- 抢占/超时 (跟 status 配套)
+  claimed_by text,
   claimed_at timestamptz,
-  expires_at timestamptz,                -- claim 5 分钟后超时
+  expires_at timestamptz,               -- 5 分钟超时
   attempts int default 0,
-  max_attempts int default 3,
-  result jsonb,                          -- done 时的结果
-  error text,                            -- failed 时的错
+  max_attempts int default 2,           -- 失败最多重试 2 次
+
+  -- 结果
+  result jsonb,                         -- { pr_url, output, files_changed, build_passed, test_passed, duration_ms }
+  error text,
+
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
 
 create index if not exists idx_jobs_status_priority on hermes_jobs(status, priority, created_at);
-create index if not exists idx_jobs_expires on hermes_jobs(expires_at) where status = 'claimed';
+create index if not exists idx_jobs_expires on hermes_jobs(expires_at) where status = 'running';
 
--- 2. 任务结果
-create table if not exists hermes_job_results (
-  id uuid primary key default gen_random_uuid(),
-  job_id uuid not null references hermes_jobs(id) on delete cascade,
-  output text,                           -- codex / hermes 输出
-  files_changed text[],                  -- 修改的文件列表
-  pr_url text,                           -- GitHub PR URL
-  venv_preview text,                     -- Vercel preview URL
-  duration_ms int,                       -- 执行耗时
-  created_at timestamptz default now()
-);
-
-create index if not exists idx_results_job on hermes_job_results(job_id);
-
--- 3. 自动更新 updated_at
+-- 自动更新 updated_at
 create or replace function update_jobs_updated_at() returns trigger as $$
 begin
   new.updated_at = now();
@@ -55,11 +65,5 @@ create trigger trg_jobs_updated
   before update on hermes_jobs
   for each row execute function update_jobs_updated_at();
 
--- 4. RLS: service_role 读写
+-- RLS
 alter table hermes_jobs enable row level security;
-alter table hermes_job_results enable row level security;
-
--- service_role bypass RLS automatically; anon 不能读
--- 公开读用于状态查询 (可选)
--- create policy "jobs read" on hermes_jobs for select using (true);
--- create policy "results read" on hermes_job_results for select using (true);
