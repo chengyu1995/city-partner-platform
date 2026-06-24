@@ -1,0 +1,1 @@
+Windows Worker 开机自启测试成功
