@@ -43,3 +43,13 @@ next-env.d.ts
 # one-shot push helper (contains token placeholder, never commit)
 push-to-github.bat
 stderr.log
+
+# OpenNext
+.open-next
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+
+!.env.example
