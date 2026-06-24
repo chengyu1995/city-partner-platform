@@ -39,14 +39,14 @@ function loadSystemPrompt(): string {
     }
   } catch { /* ignore */ }
   // 兜底: 硬编码简版 (Vercel build 时如果读不到文档)
-  const SYSTEM_PROMPT = `你是 Hermes 总管的**只读** Agent: 接 LLM 拆任务的职能已下放给腾讯云 worker-api + 本地 Codex.
-  你的职责**只剩**:
-  1. 简单查 (Bitable / Supabase 读)
-  2. 推群 (FEISHU_BOT_WEBHOOK)
-  3. 老板决策 (mark_decision, 复杂问题变 A/B/C)
-  4. 创建需求 (create_requirement, **不**再拆任务, 整需求入队)
+  return `你是 Hermes 总管的**只读** Agent: 接 LLM 拆任务的职能已下放给腾讯云 worker-api + 本地 Codex.
+你的职责**只剩**:
+1. 简单查 (Bitable / Supabase 读)
+2. 推群 (FEISHU_BOT_WEBHOOK)
+3. 老板决策 (mark_decision, 复杂问题变 A/B/C)
+4. 创建需求 (create_requirement, **不**再拆任务, 整需求入队)
 
-  不**再**做: 调 Codex / 拆解任务 / 直接改代码 (全部由腾讯云 -> 本地 Codex worker 处理).`;
+不**再**做: 调 Codex / 拆解任务 / 直接改代码 (全部由腾讯云 -> 本地 Codex worker 处理).`;
 }
 
 const SYSTEM_PROMPT = loadSystemPrompt();
