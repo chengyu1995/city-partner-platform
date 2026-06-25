@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * 飞书事件订阅 webhook
  * POST /api/feishu/event
