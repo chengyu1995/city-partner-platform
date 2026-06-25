@@ -1,0 +1,62 @@
+﻿name: Sync Vercel Deployment Status
+
+on:
+  deployment_status:
+
+permissions:
+  contents: read
+  deployments: read
+
+jobs:
+  sync:
+    if: >
+      github.event.deployment_status.state != 'inactive' &&
+      github.event.deployment.ref == 'master'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Prepare deployment payload
+        id: payload
+        shell: bash
+        env:
+          DEPLOY_STATE: ${{ github.event.deployment_status.state }}
+          DEPLOY_URL: ${{ github.event.deployment_status.environment_url }}
+          DEPLOY_ENVIRONMENT: ${{ github.event.deployment.environment }}
+          DEPLOY_DESCRIPTION: ${{ github.event.deployment_status.description }}
+          COMMIT_SHA: ${{ github.event.deployment.sha }}
+        run: |
+          python3 - <<'PY' > payload.json
+          import json
+          import os
+
+          print(json.dumps({
+              "commit_sha": os.environ.get("COMMIT_SHA", ""),
+              "status": os.environ.get("DEPLOY_STATE", ""),
+              "deploy_url": os.environ.get("DEPLOY_URL", ""),
+              "environment": os.environ.get("DEPLOY_ENVIRONMENT", ""),
+              "description": os.environ.get("DEPLOY_DESCRIPTION", ""),
+          }, ensure_ascii=False))
+          PY
+
+          cat payload.json
+
+      - name: Send status to Worker API
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ secrets.DEPLOY_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
+        run: |
+          test -n "$CALLBACK_URL"
+          test -n "$CALLBACK_SECRET"
+
+          curl \
+            --fail-with-body \
+            --retry 3 \
+            --retry-delay 5 \
+            --connect-timeout 15 \
+            --max-time 60 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-Deploy-Secret: $CALLBACK_SECRET" \
+            --data-binary @payload.json \
+            "$CALLBACK_URL"
