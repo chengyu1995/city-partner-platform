@@ -1,0 +1,6 @@
+name = "city-partner-platform"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Cloudflare Pages 项目 (不是 Workers). 
+# 启用 nodejs_compat 标志, 让 @supabase/ssr 用的 Node API 能在 edge runtime 里跑
