@@ -9,14 +9,11 @@ permissions:
 
 jobs:
   sync:
-    if: >
-      github.event.deployment_status.state != 'inactive' &&
-      github.event.deployment.ref == 'master'
+    if: github.event.deployment_status.state != 'inactive'
     runs-on: ubuntu-latest
 
     steps:
       - name: Prepare deployment payload
-        id: payload
         shell: bash
         env:
           DEPLOY_STATE: ${{ github.event.deployment_status.state }}
