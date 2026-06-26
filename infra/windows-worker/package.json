@@ -6,7 +6,9 @@
   "scripts": {
     "test": "node --test --test-isolation=none tests/git-safety.test.js",
     "test:integration": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/git-integration.ps1",
-    "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File verify-worker.ps1"
+    "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File verify-worker.ps1",
+    "deploy:dry-run": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy-worker.ps1",
+    "deploy:apply": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy-worker.ps1 -Apply"
   },
   "keywords": [],
   "author": "",

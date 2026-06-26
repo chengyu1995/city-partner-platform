@@ -206,3 +206,66 @@ Before production deployment, the logs must include:
 If the Node test sandbox cannot spawn Git, do not skip critical Git coverage in `node:test`. Keep the pure unit tests in Node and verify real Git behavior through the PowerShell integration suite.
 
 When no dependencies are added, do not rerun `npm install`. If `node_modules` has file locks or EPERM errors, do not force-delete or reinstall it. These verification commands use the existing dependency tree.
+
+## Safe production deployment
+
+Before deploying this repository copy to the production Worker directory, run the local verification first:
+
+```powershell
+cd E:\projects\city-partner-platform\infra\windows-worker
+npm run verify
+```
+
+Always start with a dry-run. Dry-run is the default mode and does not stop the scheduled task, stop `node.exe`, create backups, copy files, overwrite files, delete files, or read the production env file:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy-worker.ps1
+```
+
+Only run a real deployment when you intentionally pass `-Apply`:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy-worker.ps1 -Apply
+```
+
+The deployment copies Worker source files only. It never copies `.env` from the repository, and it fails if a source `.env` is present. `.env.example` may be copied because it contains placeholders only.
+
+The production env file must remain on the Worker machine as:
+
+```text
+C:\city-partner-worker.env
+```
+
+Do not manually copy real tokens, secrets, passwords, private keys, Supabase keys, Feishu secrets, or GitHub tokens into the repository.
+
+Use `-SkipRestart` when you want to copy files but leave restart control to a human operator:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy-worker.ps1 -Apply -SkipRestart
+```
+
+Backups are written under timestamped directories in:
+
+```text
+C:\city-partner-worker-backups
+```
+
+For example:
+
+```text
+C:\city-partner-worker-backups\yyyyMMdd-HHmmss
+```
+
+If deployment restart verification fails, the script automatically stops the scheduled task, stops the `local_worker.js` node process, restores files from the current backup, restarts the scheduled task, and exits with a non-zero code.
+
+Success is indicated by:
+
+```text
+WORKER_DEPLOYMENT_SUCCEEDED
+```
+
+Rollback is indicated by:
+
+```text
+WORKER_DEPLOYMENT_ROLLED_BACK
+```
