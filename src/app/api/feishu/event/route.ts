@@ -48,6 +48,36 @@ function sb(): SupabaseClient | null {
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
+function isDuplicateReceiptError(error: { code?: string } | null): boolean {
+  return error?.code === "23505";
+}
+
+function errorToText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function markReceiptCompleted(supabase: SupabaseClient, eventId: string): Promise<void> {
+  const now = new Date().toISOString();
+  const { error } = await supabase
+    .from("feishu_event_receipts")
+    .update({ status: "completed", completed_at: now, updated_at: now })
+    .eq("event_id", eventId);
+  if (error) throw new Error(`complete feishu receipt failed: ${error.message}`);
+}
+
+async function markReceiptFailed(
+  supabase: SupabaseClient,
+  eventId: string,
+  errorText: string
+): Promise<void> {
+  const now = new Date().toISOString();
+  const { error } = await supabase
+    .from("feishu_event_receipts")
+    .update({ status: "failed", error_text: errorText, updated_at: now })
+    .eq("event_id", eventId);
+  if (error) console.error("[feishu-event] receipt fail update failed:", error);
+}
+
 async function getOrCreateConversation(
   supabase: SupabaseClient,
   userId: string,
@@ -219,7 +249,28 @@ export async function POST(req: NextRequest) {
     }
 
     const userId = ev.sender.sender_id.open_id;
-    const convId = await getOrCreateConversation(
+    const eventId =
+      payload?.header?.event_id ||
+      payload?.event?.header?.event_id ||
+      ev?.header?.event_id ||
+      "";
+    const { error: receiptError } = await supabase.from("feishu_event_receipts").insert({
+      event_id: eventId,
+      message_id: ev.message.message_id,
+      event_type: eventType,
+      chat_id: ev.message.chat_id,
+      sender_open_id: userId,
+      status: "processing",
+    });
+
+    if (isDuplicateReceiptError(receiptError)) {
+      return NextResponse.json({ code: 0, duplicate: true });
+    }
+    if (receiptError) {
+      throw new Error(`create feishu receipt failed: ${receiptError.message}`);
+    }
+    try {
+      const convId = await getOrCreateConversation(
       supabase,
       userId,
       ev.message.chat_id,
@@ -253,10 +304,16 @@ export async function POST(req: NextRequest) {
       reply || "✅"
     );
 
+      await markReceiptCompleted(supabase, eventId);
+    } catch (e) {
+      await markReceiptFailed(supabase, eventId, errorToText(e));
+      throw e;
+    }
+
     return NextResponse.json({ code: 0 });
   } catch (e) {
     console.error("[feishu-event]", e);
-    return NextResponse.json({ code: 500, msg: e instanceof Error ? e.message : String(e) }, { status: 500 });
+    return NextResponse.json({ code: 500, msg: errorToText(e) }, { status: 500 });
   }
 }
 
