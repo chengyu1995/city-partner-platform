@@ -157,3 +157,34 @@ Move-Item -LiteralPath <file> -Destination <safe-directory>
 - 不要写入飞书 App Secret。
 - 不要写入 GitHub Token。
 - 日志目录和备份文件应保持在 `.gitignore` 中。
+
+## Git safety tests
+
+Run the worker safety tests from this directory:
+
+```powershell
+cd E:\projects\city-partner-platform\infra\windows-worker
+npm install
+npm test
+```
+
+The test suite uses Node.js built-in `node:test` and creates isolated temporary Git repositories under the system temp directory. It does not connect to the real Worker API, does not claim production jobs, does not read production `.env` files, and does not run `git push`.
+
+Coverage includes:
+
+- `git status --porcelain=v1 -z` parsing for modified, untracked, staged, deleted, renamed, spaced, Chinese, mixed index/worktree, and rename double-path output.
+- Pre-task clean-worktree blocking for modified, untracked, staged, deleted, and renamed files.
+- Windows path and Git relative path normalization. Backslashes are converted to `/`, repeated slashes are collapsed, leading `./` is removed, and sensitive path checks are case-insensitive.
+- Safe staging with explicit `git add -- <path...>` path lists and exact `git diff --cached --name-only` verification.
+- Sensitive content detection for fake `WORKER_TOKEN`, `SUPABASE_SERVICE_ROLE_KEY`, `FEISHU_APP_SECRET`, `GITHUB_TOKEN`, `password`, and private key markers.
+
+Before deploying to the production Worker directory, `C:\city-partner-worker`, these checks must pass:
+
+```powershell
+npm test
+node --check local_worker.js
+node --check git-safety.js
+git diff --check
+```
+
+`.env.example` may be committed, but it must contain placeholder values only. Real `.env` files, files under `logs`, and `*.bak` backups are always forbidden from commits. Files such as `.env.example`, `infra/windows-worker/.env.example`, `README.md`, and ordinary source files are allowed by path rules, but their contents are still scanned for sensitive values before staging.
