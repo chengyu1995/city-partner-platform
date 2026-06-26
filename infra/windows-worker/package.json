@@ -4,7 +4,9 @@
   "description": "",
   "main": "local_worker.js",
   "scripts": {
-    "test": "node --test --test-isolation=none tests/*.test.js"
+    "test": "node --test --test-isolation=none tests/git-safety.test.js",
+    "test:integration": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/git-integration.ps1",
+    "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File verify-worker.ps1"
   },
   "keywords": [],
   "author": "",

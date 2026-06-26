@@ -44,7 +44,7 @@ function parseGitStatusPorcelain(output) {
         status,
         path: filePath,
         originalPath,
-        paths: uniqueSortedPaths([filePath, originalPath]),
+        paths: [filePath],
       });
       continue;
     }

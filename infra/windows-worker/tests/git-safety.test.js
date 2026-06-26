@@ -3,12 +3,12 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { execFileSync } = require("child_process");
 
 const {
   assertCleanStatusEntries,
   comparePathSets,
   getStatusPaths,
+  getTrackedStatusPaths,
   isSensitivePath,
   normalizeGitPath,
   parseGitStatusPorcelain,
@@ -18,65 +18,6 @@ const {
 } = require("../git-safety");
 
 const workerRoot = path.resolve(__dirname, "..");
-let gitSpawnAvailable;
-
-function canSpawnGit() {
-  if (gitSpawnAvailable !== undefined) {
-    return gitSpawnAvailable;
-  }
-
-  try {
-    execFileSync("git", ["--version"], { encoding: "utf8" });
-    gitSpawnAvailable = true;
-  } catch (error) {
-    gitSpawnAvailable = false;
-  }
-
-  return gitSpawnAvailable;
-}
-
-function git(cwd, args) {
-  return execFileSync("git", args, {
-    cwd,
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      GIT_CONFIG_NOSYSTEM: "1",
-    },
-  });
-}
-
-function writeFile(root, relativePath, content = "test\n") {
-  const absolutePath = path.join(root, relativePath);
-  fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-  fs.writeFileSync(absolutePath, content, "utf8");
-}
-
-function removeFile(root, relativePath) {
-  fs.rmSync(path.join(root, relativePath), { force: true });
-}
-
-function createRepo(t) {
-  if (!canSpawnGit()) {
-    t.skip("Node child_process cannot spawn git in this environment");
-    return null;
-  }
-
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "git-safety-"));
-
-  t.after(() => {
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-
-  git(root, ["init"]);
-  git(root, ["config", "user.email", "worker-test@example.invalid"]);
-  git(root, ["config", "user.name", "Worker Test"]);
-  writeFile(root, "tracked.txt", "initial\n");
-  git(root, ["add", "--", "tracked.txt"]);
-  git(root, ["commit", "-m", "init"]);
-
-  return root;
-}
 
 function createTempRoot(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "git-safety-files-"));
@@ -88,23 +29,15 @@ function createTempRoot(t) {
   return root;
 }
 
-function statusEntries(root) {
-  return parseGitStatusPorcelain(git(root, ["status", "--porcelain=v1", "-z"]));
-}
-
-function cachedNames(root) {
-  return git(root, ["diff", "--cached", "--name-only"])
-    .split(/\r?\n/)
-    .filter(Boolean);
+function writeFile(root, relativePath, content = "test\n") {
+  const absolutePath = path.join(root, relativePath);
+  fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+  fs.writeFileSync(absolutePath, content, "utf8");
 }
 
 test("Git porcelain v1 -z status parsing", async (t) => {
-  await t.test("ordinary modified file", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "tracked.txt", "changed\n");
-
-    assert.deepEqual(statusEntries(root), [
+  await t.test("ordinary modified file", () => {
+    assert.deepEqual(parseGitStatusPorcelain(" M tracked.txt\0"), [
       {
         status: " M",
         path: "tracked.txt",
@@ -114,140 +47,135 @@ test("Git porcelain v1 -z status parsing", async (t) => {
     ]);
   });
 
-  await t.test("new untracked file", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "new.txt", "new\n");
+  await t.test("new untracked file", () => {
+    const entries = parseGitStatusPorcelain("?? new.txt\0");
 
-    assert.equal(statusEntries(root)[0].status, "??");
-    assert.deepEqual(getStatusPaths(statusEntries(root)), ["new.txt"]);
+    assert.equal(entries[0].status, "??");
+    assert.deepEqual(getStatusPaths(entries), ["new.txt"]);
+    assert.deepEqual(getTrackedStatusPaths(entries), []);
   });
 
-  await t.test("staged file", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "tracked.txt", "staged\n");
-    git(root, ["add", "--", "tracked.txt"]);
-
-    assert.equal(statusEntries(root)[0].status, "M ");
+  await t.test("staged file", () => {
+    assert.equal(parseGitStatusPorcelain("M  tracked.txt\0")[0].status, "M ");
   });
 
-  await t.test("deleted file", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    removeFile(root, "tracked.txt");
+  await t.test("deleted file", () => {
+    const entries = parseGitStatusPorcelain(" D tracked.txt\0");
 
-    assert.equal(statusEntries(root)[0].status, " D");
-    assert.deepEqual(getStatusPaths(statusEntries(root)), ["tracked.txt"]);
+    assert.equal(entries[0].status, " D");
+    assert.deepEqual(getStatusPaths(entries), ["tracked.txt"]);
+    assert.deepEqual(getTrackedStatusPaths(entries), ["tracked.txt"]);
   });
 
-  await t.test("renamed file", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    git(root, ["mv", "tracked.txt", "renamed.txt"]);
+  await t.test("renamed file has new and original path", () => {
+    const entry = parseGitStatusPorcelain("R  renamed.txt\0tracked.txt\0")[0];
 
-    const entry = statusEntries(root)[0];
     assert.equal(entry.status, "R ");
     assert.equal(entry.path, "renamed.txt");
     assert.equal(entry.originalPath, "tracked.txt");
+    assert.deepEqual(entry.paths, ["renamed.txt"]);
   });
 
-  await t.test("file name with spaces", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "file with spaces.txt", "space\n");
-
-    assert.deepEqual(getStatusPaths(statusEntries(root)), ["file with spaces.txt"]);
-  });
-
-  await t.test("Chinese file name", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "中文文件.txt", "cn\n");
-
-    assert.deepEqual(getStatusPaths(statusEntries(root)), ["中文文件.txt"]);
-  });
-
-  await t.test("simultaneous worktree and staged modifications", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "tracked.txt", "staged\n");
-    git(root, ["add", "--", "tracked.txt"]);
-    writeFile(root, "tracked.txt", "worktree\n");
-
-    assert.equal(statusEntries(root)[0].status, "MM");
-  });
-
-  await t.test("rename double path in porcelain -z output", () => {
-    const entries = parseGitStatusPorcelain("R  new name.txt\0old name.txt\0");
-
-    assert.deepEqual(entries, [
-      {
-        status: "R ",
-        path: "new name.txt",
-        originalPath: "old name.txt",
-        paths: ["new name.txt", "old name.txt"],
-      },
+  await t.test("file name with spaces is not split", () => {
+    assert.deepEqual(getStatusPaths(parseGitStatusPorcelain("?? file with spaces.txt\0")), [
+      "file with spaces.txt",
     ]);
+  });
+
+  await t.test("Chinese file name is preserved", () => {
+    assert.deepEqual(getStatusPaths(parseGitStatusPorcelain("?? 中文文件.txt\0")), [
+      "中文文件.txt",
+    ]);
+  });
+
+  await t.test("simultaneous worktree and staged modifications", () => {
+    assert.equal(parseGitStatusPorcelain("MM tracked.txt\0")[0].status, "MM");
+  });
+
+  await t.test("Windows backslash paths are normalized", () => {
+    assert.deepEqual(getStatusPaths(parseGitStatusPorcelain(" M src\\worker\\file.ts\0")), [
+      "src/worker/file.ts",
+    ]);
+  });
+
+  await t.test("Git slash paths are preserved", () => {
+    assert.deepEqual(getStatusPaths(parseGitStatusPorcelain(" M src/worker/file.ts\0")), [
+      "src/worker/file.ts",
+    ]);
+  });
+
+  await t.test("empty output parses as clean", () => {
+    assert.deepEqual(parseGitStatusPorcelain(""), []);
+  });
+});
+
+test("path normalization and path-set comparison", async (t) => {
+  await t.test("normalizes Windows and relative path forms", () => {
+    assert.equal(normalizeGitPath(".\\src\\\\file.ts"), "src/file.ts");
+    assert.equal(normalizeGitPath("./src/file.ts"), "src/file.ts");
+    assert.equal(normalizeGitPath("src//file.ts"), "src/file.ts");
+  });
+
+  await t.test("path comparisons are exact and case-sensitive", () => {
+    const comparison = comparePathSets(["README.md"], ["readme.md"]);
+
+    assert.equal(comparison.ok, false);
+    assert.deepEqual(comparison.missing, ["README.md"]);
+    assert.deepEqual(comparison.extra, ["readme.md"]);
+  });
+
+  await t.test("path comparisons ignore ordering and duplicate paths", () => {
+    const comparison = comparePathSets(["b.txt", "a.txt", "a.txt"], ["a.txt", "b.txt"]);
+
+    assert.equal(comparison.ok, true);
+    assert.deepEqual(comparison.expected, ["a.txt", "b.txt"]);
+    assert.deepEqual(comparison.actual, ["a.txt", "b.txt"]);
   });
 });
 
 test("pre-task worktree checks", async (t) => {
-  await t.test("clean worktree is allowed", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-
-    assert.doesNotThrow(() => assertCleanStatusEntries(statusEntries(root)));
+  await t.test("clean worktree is allowed", () => {
+    assert.doesNotThrow(() => assertCleanStatusEntries([]));
   });
 
-  await t.test("modified file blocks task", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "tracked.txt", "changed\n");
-
-    assert.throws(() => assertCleanStatusEntries(statusEntries(root)), /tracked\.txt/);
-  });
-
-  await t.test("untracked file blocks task", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "new.txt", "new\n");
-
-    assert.throws(() => assertCleanStatusEntries(statusEntries(root)), /\?\? new\.txt/);
-  });
-
-  await t.test("staged file blocks task", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "tracked.txt", "staged\n");
-    git(root, ["add", "--", "tracked.txt"]);
-
-    assert.throws(() => assertCleanStatusEntries(statusEntries(root)), /M  tracked\.txt/);
-  });
-
-  await t.test("deleted file blocks task", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    removeFile(root, "tracked.txt");
-
-    assert.throws(() => assertCleanStatusEntries(statusEntries(root)), / D tracked\.txt/);
-  });
-
-  await t.test("renamed file blocks task", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    git(root, ["mv", "tracked.txt", "renamed.txt"]);
-
-    assert.throws(() => assertCleanStatusEntries(statusEntries(root)), /R  renamed\.txt/);
-  });
-
-  await t.test("error message contains path and status but not file content", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "tracked.txt", "DO_NOT_PRINT_THIS_CONTENT\n");
-
+  await t.test("modified file blocks task", () => {
     assert.throws(
-      () => assertCleanStatusEntries(statusEntries(root)),
+      () => assertCleanStatusEntries(parseGitStatusPorcelain(" M tracked.txt\0")),
+      /tracked\.txt/
+    );
+  });
+
+  await t.test("untracked file blocks task", () => {
+    assert.throws(
+      () => assertCleanStatusEntries(parseGitStatusPorcelain("?? new.txt\0")),
+      /\?\? new\.txt/
+    );
+  });
+
+  await t.test("staged file blocks task", () => {
+    assert.throws(
+      () => assertCleanStatusEntries(parseGitStatusPorcelain("M  tracked.txt\0")),
+      /M  tracked\.txt/
+    );
+  });
+
+  await t.test("deleted file blocks task", () => {
+    assert.throws(
+      () => assertCleanStatusEntries(parseGitStatusPorcelain(" D tracked.txt\0")),
+      / D tracked\.txt/
+    );
+  });
+
+  await t.test("renamed file blocks task", () => {
+    assert.throws(
+      () => assertCleanStatusEntries(parseGitStatusPorcelain("R  renamed.txt\0tracked.txt\0")),
+      /R  renamed\.txt/
+    );
+  });
+
+  await t.test("error message contains path and status but not file content", () => {
+    assert.throws(
+      () => assertCleanStatusEntries(parseGitStatusPorcelain(" M tracked.txt\0")),
       (error) =>
         error.message.includes(" M tracked.txt") &&
         !error.message.includes("DO_NOT_PRINT_THIS_CONTENT")
@@ -302,111 +230,101 @@ test("sensitive path rules", async (t) => {
   });
 });
 
-test("safe staging checks", async (t) => {
-  await t.test("new file can be staged by explicit path", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "new.txt", "new\n");
-    git(root, ["add", "--", "new.txt"]);
-
-    assert.deepEqual(validateStagedPaths(["new.txt"], cachedNames(root)), ["new.txt"]);
+test("safe staging path validation", async (t) => {
+  await t.test("matching staged paths pass", () => {
+    assert.deepEqual(validateStagedPaths(["new.txt"], ["new.txt"]), ["new.txt"]);
   });
 
-  await t.test("modified file can be staged by explicit path", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "tracked.txt", "modified\n");
-    git(root, ["add", "--", "tracked.txt"]);
-
-    assert.deepEqual(validateStagedPaths(["tracked.txt"], cachedNames(root)), ["tracked.txt"]);
-  });
-
-  await t.test("deleted file can be staged by explicit path", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    removeFile(root, "tracked.txt");
-    git(root, ["add", "--", "tracked.txt"]);
-
-    assert.deepEqual(validateStagedPaths(["tracked.txt"], cachedNames(root)), ["tracked.txt"]);
-  });
-
-  await t.test("file name with spaces can be staged", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "file with spaces.txt", "space\n");
-    git(root, ["add", "--", "file with spaces.txt"]);
-
-    assert.deepEqual(validateStagedPaths(["file with spaces.txt"], cachedNames(root)), [
-      "file with spaces.txt",
+  await t.test("modified file path can be validated", () => {
+    assert.deepEqual(validateStagedPaths(["tracked.txt"], ["tracked.txt"]), [
+      "tracked.txt",
     ]);
   });
 
-  await t.test("Chinese file name can be staged", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "中文文件.txt", "cn\n");
-    git(root, ["add", "--", "中文文件.txt"]);
-
-    assert.deepEqual(validateStagedPaths(["中文文件.txt"], cachedNames(root)), ["中文文件.txt"]);
+  await t.test("deleted file path can be validated", () => {
+    assert.deepEqual(validateStagedPaths(["tracked.txt"], ["tracked.txt"]), [
+      "tracked.txt",
+    ]);
   });
 
-  await t.test("unrestricted git add all is absent from worker implementation", () => {
+  await t.test("file name with spaces can be validated", () => {
+    assert.deepEqual(
+      validateStagedPaths(["file with spaces.txt"], ["file with spaces.txt"]),
+      ["file with spaces.txt"]
+    );
+  });
+
+  await t.test("Chinese file name can be validated", () => {
+    assert.deepEqual(validateStagedPaths(["中文文件.txt"], ["中文文件.txt"]), [
+      "中文文件.txt",
+    ]);
+  });
+
+  await t.test("extra staged file fails validation with paths only", () => {
+    assert.throws(
+      () => validateStagedPaths(["expected.txt"], ["expected.txt", "extra.txt"]),
+      (error) =>
+        error.message.includes("extra.txt") &&
+        !error.message.includes("extra file content")
+    );
+  });
+
+  await t.test("missing staged file fails validation", () => {
+    assert.throws(
+      () => validateStagedPaths(["expected.txt", "missing.txt"], ["expected.txt"]),
+      /missing\.txt/
+    );
+  });
+
+  await t.test("worker source does not contain unrestricted or destructive git commands", () => {
     const source = fs.readFileSync(path.join(workerRoot, "local_worker.js"), "utf8");
 
     assert.doesNotMatch(source, /git\s+add\s+-A/i);
     assert.doesNotMatch(source, /reset",\s*"--hard|reset --hard/i);
     assert.doesNotMatch(source, /clean",\s*"-fd|clean -fd/i);
   });
+});
 
-  await t.test("cached diff names must exactly match expected paths", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "new.txt", "new\n");
-    git(root, ["add", "--", "new.txt"]);
+test("committable path and sensitive content validation", async (t) => {
+  await t.test(".env.example is allowed by path", (t) => {
+    const root = createTempRoot(t);
+    writeFile(root, ".env.example", "PLACEHOLDER_ONLY=true\n");
 
-    const comparison = comparePathSets(["new.txt"], cachedNames(root));
-    assert.equal(comparison.ok, true);
-    assert.deepEqual(comparison.extra, []);
-    assert.deepEqual(comparison.missing, []);
-  });
-
-  await t.test("extra staged file fails validation", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "expected.txt", "expected\n");
-    writeFile(root, "extra.txt", "extra\n");
-    git(root, ["add", "--", "expected.txt", "extra.txt"]);
-
-    assert.throws(
-      () => validateStagedPaths(["expected.txt"], cachedNames(root)),
-      /extra\.txt/
+    assert.doesNotThrow(() =>
+      validateCommittablePaths([".env.example"], { projectRoot: root })
     );
   });
 
-  await t.test("failed validation can unstage without deleting worktree files", (t) => {
-    const root = createRepo(t);
-    if (!root) return;
-    writeFile(root, "expected.txt", "expected\n");
-    writeFile(root, "extra.txt", "extra\n");
-    git(root, ["add", "--", "expected.txt", "extra.txt"]);
+  await t.test(".env is blocked by path", (t) => {
+    const root = createTempRoot(t);
+    writeFile(root, ".env", "placeholder=true\n");
 
-    assert.throws(() => validateStagedPaths(["expected.txt"], cachedNames(root)));
-    git(root, ["restore", "--staged", "--", ...cachedNames(root)]);
-
-    assert.equal(fs.existsSync(path.join(root, "expected.txt")), true);
-    assert.equal(fs.existsSync(path.join(root, "extra.txt")), true);
-    assert.deepEqual(cachedNames(root), []);
+    assert.throws(
+      () => validateCommittablePaths([".env"], { projectRoot: root }),
+      /\.env \(sensitive path\)/
+    );
   });
 
-  await t.test("worker source does not contain destructive cleanup commands", () => {
-    const source = fs.readFileSync(path.join(workerRoot, "local_worker.js"), "utf8");
+  await t.test("logs directory is blocked by path", (t) => {
+    const root = createTempRoot(t);
+    writeFile(root, "logs/worker.log", "log\n");
 
-    assert.doesNotMatch(source, /reset\s+--hard/i);
-    assert.doesNotMatch(source, /clean\s+-fd/i);
+    assert.throws(
+      () => validateCommittablePaths(["logs/worker.log"], { projectRoot: root }),
+      /logs\/worker\.log \(sensitive path\)/
+    );
   });
-});
 
-test("sensitive content scanning", async (t) => {
+  await t.test("bak files are blocked by path", (t) => {
+    const root = createTempRoot(t);
+    writeFile(root, "folder/file.BAK", "backup\n");
+
+    assert.throws(
+      () => validateCommittablePaths(["folder/file.BAK"], { projectRoot: root }),
+      /folder\/file\.BAK \(sensitive path\)/
+    );
+  });
+
   const fakeSamples = [
     ["WORKER_TOKEN", "WORKER_TOKEN=fake_worker_token_1234567890"],
     [
@@ -442,12 +360,12 @@ test("sensitive content scanning", async (t) => {
     );
   });
 
-  await t.test("test suite does not access production API or execute remote pushes", () => {
+  await t.test("test suite does not access production API or remote writes", () => {
     const source = fs.readFileSync(__filename, "utf8");
     const workerApiPattern = new RegExp("WORKER" + "_API_URL");
-    const gitPushPattern = new RegExp("git\\([^\\n]*\"pu" + "sh\"");
+    const remoteWritePattern = new RegExp("git\\s*\\([^\\n]*\"pu" + "sh\"");
 
     assert.doesNotMatch(source, workerApiPattern);
-    assert.doesNotMatch(source, gitPushPattern);
+    assert.doesNotMatch(source, remoteWritePattern);
   });
 });

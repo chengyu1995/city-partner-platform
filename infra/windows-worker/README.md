@@ -188,3 +188,21 @@ git diff --check
 ```
 
 `.env.example` may be committed, but it must contain placeholder values only. Real `.env` files, files under `logs`, and `*.bak` backups are always forbidden from commits. Files such as `.env.example`, `infra/windows-worker/.env.example`, `README.md`, and ordinary source files are allowed by path rules, but their contents are still scanned for sensitive values before staging.
+
+## Worker verification split
+
+`npm test` is the pure Node.js unit test suite for `git-safety.js`. It must not spawn `git.exe`; it only validates parsing, path normalization, path-set comparison, staged-path validation, committable-path validation, sensitive content scanning, and clean-status assertions. Production deployment is blocked unless this command reports 0 failed and 0 skipped tests.
+
+`npm run test:integration` is the local real Git integration suite. It is implemented in `tests/git-integration.ps1`, calls the system Git directly from PowerShell, creates isolated repositories only under the system temp directory, configures a local test identity, and never connects to a real remote repository.
+
+`npm run verify` is the deployment preflight entry point. It runs Node and Git version checks, `node --check local_worker.js`, `node --check git-safety.js`, `npm test`, the PowerShell Git integration suite, and static safety checks for unrestricted staging, destructive cleanup, remote writes, Worker API access, and production env-file reads.
+
+Before production deployment, the logs must include:
+
+- `GIT_INTEGRATION_TESTS_PASSED`
+- `WORKER_VERIFICATION_PASSED`
+- Node unit tests with 0 skipped tests
+
+If the Node test sandbox cannot spawn Git, do not skip critical Git coverage in `node:test`. Keep the pure unit tests in Node and verify real Git behavior through the PowerShell integration suite.
+
+When no dependencies are added, do not rerun `npm install`. If `node_modules` has file locks or EPERM errors, do not force-delete or reinstall it. These verification commands use the existing dependency tree.
