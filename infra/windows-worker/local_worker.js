@@ -1,7 +1,9 @@
 ﻿require("dotenv").config();
 
 const { spawn, execFile } = require("child_process");
+const fs = require("fs");
 const os = require("os");
+const path = require("path");
 
 const WORKER_API_URL = String(process.env.WORKER_API_URL || "").replace(/\/+$/, "");
 const WORKER_TOKEN = process.env.WORKER_TOKEN;
@@ -144,6 +146,225 @@ async function runGit(args) {
   return runCommand("git", args, PROJECT_DIR);
 }
 
+function parseGitStatusPorcelain(output) {
+  const entries = [];
+  const parts = String(output || "").split("\0").filter(Boolean);
+
+  for (let index = 0; index < parts.length; index += 1) {
+    const record = parts[index];
+    const status = record.slice(0, 2);
+    const filePath = record.slice(3);
+
+    if (!filePath) {
+      continue;
+    }
+
+    if (status[0] === "R" || status[0] === "C") {
+      const originalPath = parts[index + 1] || "";
+      index += 1;
+
+      entries.push({
+        status,
+        path: filePath,
+        originalPath,
+        paths: [filePath, originalPath].filter(Boolean),
+      });
+      continue;
+    }
+
+    entries.push({
+      status,
+      path: filePath,
+      originalPath: null,
+      paths: [filePath],
+    });
+  }
+
+  return entries;
+}
+
+async function readGitStatusEntries() {
+  const status = await runGit(["status", "--porcelain=v1", "-z"]);
+  return parseGitStatusPorcelain(status.stdout);
+}
+
+function uniqueSortedPaths(paths) {
+  return [...new Set(paths.filter(Boolean))].sort((a, b) =>
+    a.localeCompare(b)
+  );
+}
+
+function formatPathList(paths) {
+  return uniqueSortedPaths(paths).map((filePath) => `- ${filePath}`).join("\n");
+}
+
+function getStatusPaths(entries) {
+  return uniqueSortedPaths(entries.flatMap((entry) => entry.paths));
+}
+
+function isEnvFile(filePath) {
+  return path.basename(filePath.replace(/\\/g, "/")) === ".env";
+}
+
+function isUnderLogsDirectory(filePath) {
+  return filePath
+    .replace(/\\/g, "/")
+    .split("/")
+    .some((part) => part.toLowerCase() === "logs");
+}
+
+function isBackupFile(filePath) {
+  return filePath.toLowerCase().endsWith(".bak");
+}
+
+function isExplicitlyForbiddenPath(filePath) {
+  const normalized = filePath.replace(/\\/g, "/");
+  const lower = normalized.toLowerCase();
+
+  return (
+    isEnvFile(normalized) ||
+    isUnderLogsDirectory(normalized) ||
+    isBackupFile(normalized) ||
+    lower === "infra/windows-worker.env" ||
+    lower === "c:/city-partner-worker.env"
+  );
+}
+
+function looksLikeSensitiveContent(content) {
+  const secretPatterns = [
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+    /\bgithub_pat_[A-Za-z0-9_]{30,}\b/,
+    /\bgh[pousr]_[A-Za-z0-9_]{30,}\b/,
+    /\bsk-[A-Za-z0-9_-]{20,}\b/,
+    /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/,
+    /\beyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b/,
+    /\b(?:token|secret|password|private[_-]?key)\b\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{16,}/i,
+  ];
+
+  return secretPatterns.some((pattern) => pattern.test(content));
+}
+
+function hasSensitiveContent(filePath) {
+  const absolutePath = path.resolve(PROJECT_DIR, filePath);
+  const projectRoot = path.resolve(PROJECT_DIR);
+
+  if (
+    absolutePath !== projectRoot &&
+    !absolutePath.startsWith(`${projectRoot}${path.sep}`)
+  ) {
+    return true;
+  }
+
+  if (!fs.existsSync(absolutePath)) {
+    return false;
+  }
+
+  const stat = fs.statSync(absolutePath);
+
+  if (!stat.isFile()) {
+    return false;
+  }
+
+  const maxBytesToScan = 1024 * 1024;
+  const buffer = Buffer.alloc(Math.min(stat.size, maxBytesToScan));
+  const fd = fs.openSync(absolutePath, "r");
+
+  try {
+    fs.readSync(fd, buffer, 0, buffer.length, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  return looksLikeSensitiveContent(buffer.toString("utf8"));
+}
+
+function validateCommittablePaths(paths) {
+  const forbidden = [];
+
+  for (const filePath of paths) {
+    if (isExplicitlyForbiddenPath(filePath) || hasSensitiveContent(filePath)) {
+      forbidden.push(filePath);
+    }
+  }
+
+  if (forbidden.length > 0) {
+    throw new Error(
+      [
+        "检测到禁止提交的文件，本次任务拒绝提交。",
+        "以下仅列出文件路径，不包含文件内容：",
+        formatPathList(forbidden),
+      ].join("\n")
+    );
+  }
+}
+
+async function assertCleanWorktreeBeforeCodex() {
+  const entries = await readGitStatusEntries();
+
+  if (entries.length === 0) {
+    return;
+  }
+
+  throw new Error(
+    [
+      "任务开始前 Git 工作区不干净，本次任务拒绝执行。",
+      "请先手工处理以下文件后再重试；以下仅列出文件路径，不包含文件内容：",
+      formatPathList(getStatusPaths(entries)),
+    ].join("\n")
+  );
+}
+
+async function getTaskChangedPaths() {
+  const entries = await readGitStatusEntries();
+  return getStatusPaths(entries);
+}
+
+async function unstagePaths(paths) {
+  const uniquePaths = uniqueSortedPaths(paths);
+
+  if (uniquePaths.length === 0) {
+    return;
+  }
+
+  await runGit(["restore", "--staged", "--", ...uniquePaths]);
+}
+
+async function getCachedDiffPaths() {
+  const diff = await runGit(["diff", "--cached", "--name-only"]);
+  return uniqueSortedPaths(String(diff.stdout || "").split(/\r?\n/).filter(Boolean));
+}
+
+async function stageTaskPaths(paths) {
+  const taskPaths = uniqueSortedPaths(paths);
+
+  if (taskPaths.length === 0) {
+    return [];
+  }
+
+  validateCommittablePaths(taskPaths);
+
+  await runGit(["add", "--", ...taskPaths]);
+
+  const stagedPaths = await getCachedDiffPaths();
+  const allowed = new Set(taskPaths);
+  const unexpected = stagedPaths.filter((filePath) => !allowed.has(filePath));
+
+  if (unexpected.length > 0) {
+    await unstagePaths(stagedPaths);
+    throw new Error(
+      [
+        "Git 暂存结果包含非本次任务文件，已取消本次暂存。",
+        "以下仅列出文件路径，不包含文件内容：",
+        formatPathList(unexpected),
+      ].join("\n")
+    );
+  }
+
+  validateCommittablePaths(stagedPaths);
+
+  return stagedPaths;
+}
+
 async function prepareGitTask(job) {
   if (!GIT_AUTO_COMMIT) {
     return {
@@ -153,6 +374,8 @@ async function prepareGitTask(job) {
   }
 
   await runGit(["rev-parse", "--is-inside-work-tree"]);
+
+  await assertCleanWorktreeBeforeCodex();
 
   const syncBranch = GIT_PUSH_BRANCH || (
     await runGit(["branch", "--show-current"])
@@ -170,17 +393,7 @@ async function prepareGitTask(job) {
 
   console.log(`远程分支同步完成：${GIT_REMOTE_NAME}/${syncBranch}`);
 
-  const status = await runGit(["status", "--porcelain"]);
-
-  if (status.stdout) {
-    throw new Error(
-      [
-        "Git 工作区存在未提交修改，本次任务拒绝执行。",
-        "请先提交或撤销以下文件：",
-        status.stdout,
-      ].join("\n")
-    );
-  }
+  await assertCleanWorktreeBeforeCodex();
 
   const head = await runGit(["rev-parse", "HEAD"]);
 
@@ -209,16 +422,24 @@ async function commitGitTask(job) {
     };
   }
 
-  const status = await runGit(["status", "--porcelain"]);
+  const taskChangedPaths = await getTaskChangedPaths();
 
-  if (!status.stdout) {
+  if (taskChangedPaths.length === 0) {
     return {
       committed: false,
       message: "Codex 没有产生文件变更",
     };
   }
 
-  await runGit(["add", "-A"]);
+  const stagedPaths = await stageTaskPaths(taskChangedPaths);
+
+  if (stagedPaths.length === 0) {
+    return {
+      committed: false,
+      message: "Codex 没有产生可提交的文件变更",
+    };
+  }
+
   await runGit(["commit", "-m", createCommitMessage(job)]);
 
   const commit = await runGit(["rev-parse", "HEAD"]);

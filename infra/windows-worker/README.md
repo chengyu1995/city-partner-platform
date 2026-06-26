@@ -119,6 +119,36 @@ Worker 可根据 `.env` 配置自动执行 Git 操作：
 
 启用自动推送前，请确认运行账号的 Git 凭据、远端分支和仓库保护规则符合项目协作要求。
 
+## Git 工作区隔离规则
+
+Worker 在启动 Codex 前要求 `PROJECT_DIR` 的 Git 工作区保持干净。工作区存在已修改、已删除、已暂存、未跟踪或重命名文件时，任务会安全失败，并只上报阻塞文件路径，不上报文件内容。
+
+任务成功运行后，Worker 会重新读取 `git status --porcelain=v1 -z`，只把本次任务产生的文件列表作为允许提交范围。暂存时禁止使用无范围的 `git add -A`；Worker 会通过 `git add -- <本次任务文件...>` 显式暂存路径，以支持新增、修改、删除、包含空格的文件名和中文文件名。暂存后还会执行 `git diff --cached --name-only` 校验，若发现暂存结果包含非本次任务文件，会取消本次暂存并上报失败。
+
+以下文件无论何种情况都禁止提交：任意目录下名为 `.env` 的文件、`infra/windows-worker.env`、`C:\city-partner-worker.env`、`logs` 目录下文件、`*.bak` 文件，以及检测到真实 Token、Secret、Password 或 Private Key 的文件。错误报告和日志只应包含文件路径，不应包含文件内容、Token、密钥或密码。
+
+处理任务前可先检查阻塞文件：
+
+```powershell
+git status --short
+```
+
+如果需要保留已有改动，可手工选择一种处理方式：
+
+```powershell
+# 已完成的改动：先提交到自己的分支
+git add -- <file>
+git commit -m "chore: save local work"
+
+# 暂时搁置改动和未跟踪文件，不丢失内容
+git stash push -u -m "save work before worker task"
+
+# 不需要提交但要保留的文件：移动到仓库外的安全目录
+Move-Item -LiteralPath <file> -Destination <safe-directory>
+```
+
+不要通过无范围的 `git add -A` 把整个工作区交给 Worker 自动提交。
+
 ## 安全要求
 
 - 不要提交 `.env`、`.env.local` 或任何真实环境变量文件。
