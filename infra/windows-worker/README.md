@@ -320,6 +320,50 @@ Watchdog status markers:
 - `WORKER_WATCHDOG_FAILED`: recovery failed and the command returned a non-zero exit code.
 
 Never print `.env` contents, tokens, secrets, passwords, private keys, Supabase
-keys, Feishu secrets, or GitHub tokens in Worker logs. A future deployment may
-register the watchdog as a separate scheduled task that runs once per minute,
-but this repository task does not register that scheduled task.
+keys, Feishu secrets, or GitHub tokens in Worker logs.
+
+## Watchdog scheduled task registration
+
+`worker-watchdog.ps1` is responsible for Worker health checks and recovery. It
+checks whether `local_worker.js` is running and, only when called with `-Apply`,
+tries to start the main Worker scheduled task.
+
+`register-watchdog-task.ps1` is responsible for registering the Windows
+scheduled task that runs the watchdog every minute. The scheduled task name is:
+
+```text
+CityPartnerCodexWorkerWatchdog
+```
+
+The task runs once every 1 minute and executes:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\city-partner-worker\worker-watchdog.ps1" -Apply
+```
+
+Start with a dry-run from the Worker directory:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File register-watchdog-task.ps1
+```
+
+Register or update the task from an administrator PowerShell:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File register-watchdog-task.ps1 -Apply -Force
+```
+
+Registration status markers:
+
+- `WATCHDOG_TASK_REGISTERED`: the scheduled task was created or updated.
+- `WATCHDOG_TASK_ALREADY_EXISTS`: the task already exists and was not overwritten.
+- `WATCHDOG_TASK_REGISTER_FAILED`: registration failed and the command returned a non-zero exit code.
+
+The registration script requires an administrator PowerShell. If Windows reports
+access denied, reopen PowerShell with "Run as administrator" and run the command
+again.
+
+`register-watchdog-task.ps1` checks whether `C:\city-partner-worker.env` exists
+but never reads or prints `.env` contents. Deployment copies this script to the
+Worker directory but does not automatically register the scheduled task; a human
+operator must run the registration command intentionally.
