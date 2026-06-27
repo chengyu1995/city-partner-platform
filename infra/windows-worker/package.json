@@ -9,8 +9,6 @@
     "verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File verify-worker.ps1",
     "watchdog:dry-run": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File worker-watchdog.ps1",
     "watchdog:apply": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File worker-watchdog.ps1 -Apply",
-    "watchdog:register:dry-run": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File register-watchdog-task.ps1",
-    "watchdog:register:apply": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File register-watchdog-task.ps1 -Apply -Force",
     "deploy:dry-run": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy-worker.ps1",
     "deploy:apply": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File deploy-worker.ps1 -Apply"
   },

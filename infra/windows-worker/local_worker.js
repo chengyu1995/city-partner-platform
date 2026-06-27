@@ -18,10 +18,6 @@ const WORKER_NAME = process.env.WORKER_NAME || os.hostname();
 const PROJECT_DIR = process.env.PROJECT_DIR;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
 const CODEX_TIMEOUT_MS = Number(process.env.CODEX_TIMEOUT_MS || 1800000);
-const CODEX_IDLE_TIMEOUT_MS = Number(process.env.CODEX_IDLE_TIMEOUT_MS || 300000);
-const CODEX_EXE =
-  process.env.CODEX_EXE ||
-  "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe";
 
 const required = {
   WORKER_API_URL,
@@ -185,48 +181,13 @@ async function unstagePaths(paths) {
   await runGit(["restore", "--staged", "--", ...uniquePaths]);
 }
 
-async function unstageAllPaths() {
-  await runGit(["restore", "--staged", "--", "."]);
-}
-
-function getEntryStagePath(entry) {
-  const rawPath =
-    entry?.path ||
-    entry?.newPath ||
-    entry?.file ||
-    entry?.to ||
-    "";
-
-  return String(rawPath)
-    .replace(/\\/g, "/")
-    .replace(/^\.\//, "")
-    .trim();
-}
-
-function getSafeStagePathsFromStatusEntries(entries) {
-  const paths = [];
-
-  for (const entry of entries || []) {
-    const pathValue = getEntryStagePath(entry);
-
-    if (!pathValue) {
-      console.warn("跳过空 Git pathspec");
-      continue;
-    }
-
-    paths.push(pathValue);
-  }
-
-  return uniqueSortedPaths(paths);
-}
-
 async function getCachedDiffPaths() {
   const diff = await runGit(["diff", "--cached", "--name-only"]);
   return uniqueSortedPaths(String(diff.stdout || "").split(/\r?\n/).filter(Boolean));
 }
 
 async function stageTaskPaths(paths) {
-  let taskPaths = getSafeStagePathsFromStatusEntries(await readGitStatusEntries());
+  const taskPaths = uniqueSortedPaths(paths);
 
   if (taskPaths.length === 0) {
     return [];
@@ -234,35 +195,18 @@ async function stageTaskPaths(paths) {
 
   validateCommittablePaths(taskPaths, { projectRoot: PROJECT_DIR });
 
-  try {
-    await runGit(["add", "--", ...taskPaths]);
-  } catch (firstError) {
-    console.warn(
-      "Git 暂存失败，重新读取 git status 并剔除坏 pathspec 后重试一次：",
-      firstError instanceof Error ? firstError.message : String(firstError)
-    );
-
-    await unstageAllPaths();
-
-    taskPaths = getSafeStagePathsFromStatusEntries(await readGitStatusEntries());
-
-    if (taskPaths.length === 0) {
-      throw new Error("Git 暂存失败，重新读取状态后没有可提交文件");
-    }
-
-    validateCommittablePaths(taskPaths, { projectRoot: PROJECT_DIR });
-
-    await runGit(["add", "--", ...taskPaths]);
-  }
+  await runGit(["add", "--", ...taskPaths]);
 
   const stagedPaths = await getCachedDiffPaths();
 
   try {
     validateStagedPaths(taskPaths, stagedPaths);
   } catch (error) {
-    await unstageAllPaths();
+    await unstagePaths(stagedPaths);
     throw error;
   }
+
+  validateCommittablePaths(stagedPaths, { projectRoot: PROJECT_DIR });
 
   return stagedPaths;
 }
@@ -505,44 +449,12 @@ async function rollbackGitTask(checkpoint) {
   };
 }
 
-function killProcessTree(pid) {
-  return new Promise((resolve) => {
-    if (!pid) {
-      resolve();
-      return;
-    }
-
-    execFile(
-      "taskkill",
-      ["/PID", String(pid), "/T", "/F"],
-      { windowsHide: true },
-      () => resolve()
-    );
-  });
-}
-
-function killProcessTree(pid) {
-  return new Promise((resolve) => {
-    if (!pid) {
-      resolve();
-      return;
-    }
-
-    execFile(
-      "taskkill",
-      ["/PID", String(pid), "/T", "/F"],
-      { windowsHide: true },
-      () => resolve()
-    );
-  });
-}
-
 function runCodex(prompt) {
   return new Promise((resolve, reject) => {
     console.log(`开始执行 Codex，项目目录：${PROJECT_DIR}`);
 
     const child = spawn(
-      CODEX_EXE,
+      "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe",
       [
         "exec",
         "-C",
@@ -554,88 +466,46 @@ function runCodex(prompt) {
       ],
       {
         shell: false,
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          CI: "1",
-          NO_COLOR: "1",
-        },
+        windowsHide: false,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: process.env,
       }
     );
 
-    if (child.stdin) {
-      child.stdin.end();
-    }
-
     let stdout = "";
     let stderr = "";
-    let finished = false;
-    let lastOutputAt = Date.now();
-
-    function finish(fn, value) {
-      if (finished) {
-        return;
-      }
-
-      finished = true;
-      clearTimeout(hardTimer);
-      clearInterval(idleTimer);
-      fn(value);
-    }
-
-    async function failAndKill(message) {
-      console.error(message);
-      await killProcessTree(child.pid);
-      finish(reject, new Error(message));
-    }
-
-    child.on("spawn", () => {
-      console.log(`Codex PID：${child.pid}`);
-    });
 
     child.stdout.on("data", (chunk) => {
-      lastOutputAt = Date.now();
       const text = chunk.toString();
       stdout += text;
       process.stdout.write(text);
     });
 
     child.stderr.on("data", (chunk) => {
-      lastOutputAt = Date.now();
       const text = chunk.toString();
       stderr += text;
       process.stderr.write(text);
     });
 
-    const hardTimer = setTimeout(() => {
-      failAndKill(`Codex 执行总超时：${CODEX_TIMEOUT_MS}ms，已强制结束进程树`);
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`Codex 执行超时：${CODEX_TIMEOUT_MS}ms`));
     }, CODEX_TIMEOUT_MS);
 
-    const idleTimer = setInterval(() => {
-      const idleMs = Date.now() - lastOutputAt;
-
-      if (idleMs >= CODEX_IDLE_TIMEOUT_MS) {
-        failAndKill(`Codex 空闲超时：${idleMs}ms 无输出，已强制结束进程树`);
-      }
-    }, 15000);
-
     child.on("error", (error) => {
-      finish(reject, error);
+      clearTimeout(timer);
+      reject(error);
     });
 
     child.on("close", (code) => {
-      if (finished) {
-        return;
-      }
+      clearTimeout(timer);
 
       if (code === 0) {
-        finish(resolve, stdout.trim() || "Codex 执行完成");
+        resolve(stdout.trim() || "Codex 执行完成");
         return;
       }
 
-      finish(
-        reject,
+      reject(
         new Error(
           `Codex 退出码 ${code}\n${stderr || stdout || "没有输出"}`
         )

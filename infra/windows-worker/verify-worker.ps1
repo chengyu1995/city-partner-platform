@@ -48,22 +48,8 @@ try {
     "-NoProfile",
     "-ExecutionPolicy",
     "Bypass",
-    "-Command",
-    '$null = [scriptblock]::Create((Get-Content -LiteralPath "register-watchdog-task.ps1" -Raw))'
-  )
-  Invoke-CheckedCommand -FileName "powershell.exe" -Arguments @(
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
     "-File",
     "worker-watchdog.ps1"
-  )
-  Invoke-CheckedCommand -FileName "powershell.exe" -Arguments @(
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    "register-watchdog-task.ps1"
   )
   Invoke-CheckedCommand -FileName "npm" -Arguments @("test")
   Invoke-CheckedCommand -FileName "powershell.exe" -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tests/git-integration.ps1")
