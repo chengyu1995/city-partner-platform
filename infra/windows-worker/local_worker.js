@@ -18,6 +18,10 @@ const WORKER_NAME = process.env.WORKER_NAME || os.hostname();
 const PROJECT_DIR = process.env.PROJECT_DIR;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
 const CODEX_TIMEOUT_MS = Number(process.env.CODEX_TIMEOUT_MS || 1800000);
+const CODEX_IDLE_TIMEOUT_MS = Number(process.env.CODEX_IDLE_TIMEOUT_MS || 300000);
+const CODEX_EXE =
+  process.env.CODEX_EXE ||
+  "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe";
 
 const required = {
   WORKER_API_URL,
@@ -501,12 +505,44 @@ async function rollbackGitTask(checkpoint) {
   };
 }
 
+function killProcessTree(pid) {
+  return new Promise((resolve) => {
+    if (!pid) {
+      resolve();
+      return;
+    }
+
+    execFile(
+      "taskkill",
+      ["/PID", String(pid), "/T", "/F"],
+      { windowsHide: true },
+      () => resolve()
+    );
+  });
+}
+
+function killProcessTree(pid) {
+  return new Promise((resolve) => {
+    if (!pid) {
+      resolve();
+      return;
+    }
+
+    execFile(
+      "taskkill",
+      ["/PID", String(pid), "/T", "/F"],
+      { windowsHide: true },
+      () => resolve()
+    );
+  });
+}
+
 function runCodex(prompt) {
   return new Promise((resolve, reject) => {
     console.log(`开始执行 Codex，项目目录：${PROJECT_DIR}`);
 
     const child = spawn(
-      "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe",
+      CODEX_EXE,
       [
         "exec",
         "-C",
@@ -518,46 +554,88 @@ function runCodex(prompt) {
       ],
       {
         shell: false,
-        windowsHide: false,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          CI: "1",
+          NO_COLOR: "1",
+        },
       }
     );
 
+    if (child.stdin) {
+      child.stdin.end();
+    }
+
     let stdout = "";
     let stderr = "";
+    let finished = false;
+    let lastOutputAt = Date.now();
+
+    function finish(fn, value) {
+      if (finished) {
+        return;
+      }
+
+      finished = true;
+      clearTimeout(hardTimer);
+      clearInterval(idleTimer);
+      fn(value);
+    }
+
+    async function failAndKill(message) {
+      console.error(message);
+      await killProcessTree(child.pid);
+      finish(reject, new Error(message));
+    }
+
+    child.on("spawn", () => {
+      console.log(`Codex PID：${child.pid}`);
+    });
 
     child.stdout.on("data", (chunk) => {
+      lastOutputAt = Date.now();
       const text = chunk.toString();
       stdout += text;
       process.stdout.write(text);
     });
 
     child.stderr.on("data", (chunk) => {
+      lastOutputAt = Date.now();
       const text = chunk.toString();
       stderr += text;
       process.stderr.write(text);
     });
 
-    const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error(`Codex 执行超时：${CODEX_TIMEOUT_MS}ms`));
+    const hardTimer = setTimeout(() => {
+      failAndKill(`Codex 执行总超时：${CODEX_TIMEOUT_MS}ms，已强制结束进程树`);
     }, CODEX_TIMEOUT_MS);
 
+    const idleTimer = setInterval(() => {
+      const idleMs = Date.now() - lastOutputAt;
+
+      if (idleMs >= CODEX_IDLE_TIMEOUT_MS) {
+        failAndKill(`Codex 空闲超时：${idleMs}ms 无输出，已强制结束进程树`);
+      }
+    }, 15000);
+
     child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+      finish(reject, error);
     });
 
     child.on("close", (code) => {
-      clearTimeout(timer);
-
-      if (code === 0) {
-        resolve(stdout.trim() || "Codex 执行完成");
+      if (finished) {
         return;
       }
 
-      reject(
+      if (code === 0) {
+        finish(resolve, stdout.trim() || "Codex 执行完成");
+        return;
+      }
+
+      finish(
+        reject,
         new Error(
           `Codex 退出码 ${code}\n${stderr || stdout || "没有输出"}`
         )
