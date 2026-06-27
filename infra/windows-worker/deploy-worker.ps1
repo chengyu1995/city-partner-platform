@@ -87,6 +87,15 @@ function Get-RelativePath {
   return [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($fullUri).ToString()).Replace("/", "\")
 }
 
+function Join-WorkerEnvPath {
+  param([string]$WorkerDir)
+
+  $fullDir = [System.IO.Path]::GetFullPath($WorkerDir).TrimEnd('\')
+  $parentDir = Split-Path -Parent $fullDir
+  $leafName = Split-Path -Leaf $fullDir
+  return Join-Path $parentDir "$leafName.env"
+}
+
 function Assert-SafeDeploymentPaths {
   param(
     [string]$ResolvedSourceDir,
@@ -115,6 +124,12 @@ function Get-DeploymentPlan {
   $copyFiles = New-Object System.Collections.Generic.List[string]
   $skipFiles = New-Object System.Collections.Generic.List[string]
   $reportedSkippedDirs = New-Object "System.Collections.Generic.HashSet[string]"
+  $sourceEnvPath = Join-WorkerEnvPath -WorkerDir $ResolvedSourceDir
+
+  if (Test-Path -LiteralPath $sourceEnvPath -PathType Leaf) {
+    throw "Source env file is forbidden: $sourceEnvPath"
+  }
+
   $items = Get-ChildItem -LiteralPath $ResolvedSourceDir -Recurse -File -Force
 
   foreach ($dirName in @("logs", "node_modules", "tests")) {
@@ -235,7 +250,8 @@ function Backup-WorkerFiles {
   param(
     [string]$ResolvedTargetDir,
     [string]$TargetEnvPath,
-    [string]$BackupDir
+    [string]$BackupDir,
+    [string]$BackupEnvPath
   )
 
   New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
@@ -250,8 +266,7 @@ function Backup-WorkerFiles {
   }
 
   if (Test-Path -LiteralPath $TargetEnvPath -PathType Leaf) {
-    $envBackupPath = Join-Path $BackupDir ([System.IO.Path]::GetFileName($TargetEnvPath))
-    Copy-Item -LiteralPath $TargetEnvPath -Destination $envBackupPath -Force
+    Copy-Item -LiteralPath $TargetEnvPath -Destination $BackupEnvPath -Force
     Write-DeployLog "Backed up production env file without printing contents."
   }
 }
@@ -276,6 +291,7 @@ function Copy-WorkerFiles {
 function Restore-WorkerBackup {
   param(
     [string]$BackupDir,
+    [string]$BackupEnvPath,
     [string]$ResolvedTargetDir,
     [string]$TargetEnvPath,
     [string]$Name
@@ -293,10 +309,9 @@ function Restore-WorkerBackup {
     }
   }
 
-  $envBackupPath = Join-Path $BackupDir ([System.IO.Path]::GetFileName($TargetEnvPath))
-  if ((Test-Path -LiteralPath $envBackupPath -PathType Leaf) -and
+  if ((Test-Path -LiteralPath $BackupEnvPath -PathType Leaf) -and
       -not (Test-Path -LiteralPath $TargetEnvPath -PathType Leaf)) {
-    Copy-Item -LiteralPath $envBackupPath -Destination $TargetEnvPath -Force
+    Copy-Item -LiteralPath $BackupEnvPath -Destination $TargetEnvPath -Force
     Write-DeployLog "Restored missing production env file without printing contents."
   }
 
@@ -337,12 +352,18 @@ function Assert-RequiredSourceFiles {
 }
 
 $ResolvedSourceDir = Resolve-ExistingDirectory -Path $SourceDir -Label "SourceDir"
+$SourceEnvPath = Join-WorkerEnvPath -WorkerDir $ResolvedSourceDir
+$TargetEnvPath = Join-WorkerEnvPath -WorkerDir $TargetDir
+$BackupEnvPathPattern = Join-Path $BackupRoot "yyyyMMdd-HHmmss.env"
 $Plan = Get-DeploymentPlan -ResolvedSourceDir $ResolvedSourceDir
 
 Write-DeployLog "SourceDir: $ResolvedSourceDir"
+Write-DeployLog "Source env path forbidden for deployment: $SourceEnvPath"
 Write-DeployLog "TargetDir: $TargetDir"
+Write-DeployLog "Production env path: $TargetEnvPath"
 Write-DeployLog "BackupRoot: $BackupRoot"
 Write-DeployLog "BackupDir: $BackupRoot\<yyyyMMdd-HHmmss>"
+Write-DeployLog "Backup env path: $BackupEnvPathPattern"
 Write-DeployLog "TaskName: $TaskName"
 Write-DeployLog "SkipRestart: $([bool]$SkipRestart)"
 Write-DeployLog "Default mode is dry-run. Pass -Apply to deploy."
@@ -363,7 +384,7 @@ if (-not (Test-Path -LiteralPath $ResolvedBackupRoot -PathType Container)) {
 }
 $ResolvedBackupRoot = (Resolve-Path -LiteralPath $ResolvedBackupRoot).Path
 
-$TargetEnvPath = "$($ResolvedTargetDir.TrimEnd('\')).env"
+$TargetEnvPath = Join-WorkerEnvPath -WorkerDir $ResolvedTargetDir
 Assert-RequiredSourceFiles -ResolvedSourceDir $ResolvedSourceDir
 Assert-VerificationPassed -ResolvedSourceDir $ResolvedSourceDir
 
@@ -372,10 +393,12 @@ if (-not (Test-Path -LiteralPath $TargetEnvPath -PathType Leaf)) {
 }
 
 $BackupDir = Join-Path $ResolvedBackupRoot (Get-Date -Format "yyyyMMdd-HHmmss")
+$BackupEnvPath = Join-WorkerEnvPath -WorkerDir $BackupDir
 Write-DeployLog "Backup directory: $BackupDir"
+Write-DeployLog "Backup env path: $BackupEnvPath"
 
 try {
-  Backup-WorkerFiles -ResolvedTargetDir $ResolvedTargetDir -TargetEnvPath $TargetEnvPath -BackupDir $BackupDir
+  Backup-WorkerFiles -ResolvedTargetDir $ResolvedTargetDir -TargetEnvPath $TargetEnvPath -BackupDir $BackupDir -BackupEnvPath $BackupEnvPath
   Stop-WorkerTask -Name $TaskName
   Stop-WorkerProcesses
   Copy-WorkerFiles -ResolvedSourceDir $ResolvedSourceDir -ResolvedTargetDir $ResolvedTargetDir -Plan $Plan
@@ -407,7 +430,7 @@ try {
 } catch {
   Write-DeployLog "Deployment failed: $(ConvertTo-SafeLogLine -Line $_.Exception.Message)"
   if (Test-Path -LiteralPath $BackupDir -PathType Container) {
-    Restore-WorkerBackup -BackupDir $BackupDir -ResolvedTargetDir $ResolvedTargetDir -TargetEnvPath $TargetEnvPath -Name $TaskName
+    Restore-WorkerBackup -BackupDir $BackupDir -BackupEnvPath $BackupEnvPath -ResolvedTargetDir $ResolvedTargetDir -TargetEnvPath $TargetEnvPath -Name $TaskName
   }
   exit 1
 }

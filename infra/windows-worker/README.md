@@ -236,6 +236,14 @@ The production env file must remain on the Worker machine as:
 C:\city-partner-worker.env
 ```
 
+This path is a sibling file of the production Worker directory, not a file inside the directory. Do not create:
+
+```text
+C:\city-partner-worker\.env
+```
+
+`C:\city-partner-worker\.env` is not a valid production configuration file path.
+
 Do not manually copy real tokens, secrets, passwords, private keys, Supabase keys, Feishu secrets, or GitHub tokens into the repository.
 
 Use `-SkipRestart` when you want to copy files but leave restart control to a human operator:
