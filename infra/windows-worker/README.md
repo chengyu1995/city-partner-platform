@@ -277,3 +277,15 @@ Rollback is indicated by:
 ```text
 WORKER_DEPLOYMENT_ROLLED_BACK
 ```
+
+## Codex and Git ownership
+
+Codex is responsible only for file edits and for reporting the changed files and verification results. It must not run `git add`, `git commit`, `git push`, create branches, edit Git configuration, create GitHub commits, call GitHub write APIs, or clone a temporary repository to submit changes.
+
+The outer Windows Worker owns Git staging, commit creation, and push. Feishu tasks may still say "must generate Git Commit" or "must push to origin/master"; those phrases are acceptance criteria for the Worker pipeline, not instructions for Codex to run Git itself.
+
+If Codex attempts to execute Git commands during the task, that is incorrect behavior. Before production deployment, still run:
+
+```powershell
+npm run verify
+```

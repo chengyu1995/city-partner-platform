@@ -17,6 +17,10 @@ const {
   validateStagedPaths,
 } = require("../git-safety");
 
+const {
+  buildWorkerGuardedPrompt,
+} = require("../local_worker");
+
 const workerRoot = path.resolve(__dirname, "..");
 
 function createTempRoot(t) {
@@ -367,5 +371,29 @@ test("committable path and sensitive content validation", async (t) => {
 
     assert.doesNotMatch(source, workerApiPattern);
     assert.doesNotMatch(source, remoteWritePattern);
+  });
+});
+
+test("Codex prompt git operation guard", async (t) => {
+  await t.test("adds required git prohibitions around the task", () => {
+    const prompt = buildWorkerGuardedPrompt("请修改 README，并必须生成 Git Commit。");
+
+    assert.match(prompt, /不允许执行 git add/);
+    assert.match(prompt, /不允许执行 git commit/);
+    assert.match(prompt, /不允许执行 git push/);
+    assert.match(prompt, /Git 提交和推送由外层 Worker 自动完成/);
+    assert.match(prompt, /如果任务要求生成 Git Commit，Codex 不应自行执行/);
+  });
+
+  await t.test("keeps git-related acceptance text but explains worker ownership", () => {
+    const requestText = "验收标准：必须生成 Git Commit，并必须推送到 origin/master。";
+    const prompt = buildWorkerGuardedPrompt(requestText);
+
+    assert.match(prompt, /必须生成 Git Commit/);
+    assert.match(prompt, /必须推送到 origin\/master/);
+    assert.match(
+      prompt,
+      /Codex 应理解为外层 Worker 的验收目标，而不是自己执行 Git/
+    );
   });
 });

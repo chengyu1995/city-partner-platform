@@ -260,6 +260,41 @@ function createCommitMessage(job) {
   return `worker: ${job.id} ${summary}`;
 }
 
+const CODEX_GIT_OPERATION_GUARD = [
+  "【Windows Worker 强制规则】",
+  "Codex 只负责修改文件和汇报结果，Git 提交和推送由外层 Worker 自动完成。",
+  "只允许修改任务要求的文件。",
+  "不允许执行 git add。",
+  "不允许执行 git commit。",
+  "不允许执行 git push。",
+  "不允许创建分支。",
+  "不允许修改 Git 配置。",
+  "不允许创建 GitHub commit。",
+  "不允许调用 GitHub 写入接口。",
+  "不允许尝试临时 clone 仓库来提交。",
+  "Codex 完成后只需要汇报修改文件和验证结果。",
+  "如果任务描述中出现“必须生成 Git Commit”“必须推送到 origin/master”，Codex 应理解为外层 Worker 的验收目标，而不是自己执行 Git。",
+  "如果任务要求生成 Git Commit，Codex 不应自行执行。",
+].join("\n");
+
+function buildWorkerGuardedPrompt(requestText) {
+  const taskText = String(requestText || "").trim();
+
+  return [
+    CODEX_GIT_OPERATION_GUARD,
+    "",
+    "【原始任务内容】",
+    taskText,
+    "",
+    "【再次强调】",
+    CODEX_GIT_OPERATION_GUARD,
+  ].join("\n");
+}
+
+function buildCodexPrompt(job) {
+  return buildWorkerGuardedPrompt(job?.request_text || "");
+}
+
 async function commitGitTask(job) {
   if (!GIT_AUTO_COMMIT) {
     return {
@@ -615,7 +650,7 @@ async function pollOnce() {
       "正在启动 Codex"
     );
 
-    const result = await runCodex(job.request_text);
+    const result = await runCodex(buildCodexPrompt(job));
 
     await updateProgress(
       job.id,
@@ -790,6 +825,8 @@ if (require.main === module) {
 
 module.exports = {
   assertCleanWorktreeBeforeCodex,
+  buildCodexPrompt,
+  buildWorkerGuardedPrompt,
   commitGitTask,
   getTaskChangedPaths,
   main,
