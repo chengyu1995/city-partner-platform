@@ -16,7 +16,8 @@ $RequiredSourceFiles = @(
   "start-worker.ps1",
   "package.json",
   "git-safety.js",
-  "verify-worker.ps1"
+  "verify-worker.ps1",
+  "worker-watchdog.ps1"
 )
 $BackupFileNames = @(
   "local_worker.js",
@@ -25,6 +26,7 @@ $BackupFileNames = @(
   "package-lock.json",
   "git-safety.js",
   "verify-worker.ps1",
+  "worker-watchdog.ps1",
   "README.md"
 )
 

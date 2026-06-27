@@ -37,6 +37,20 @@ try {
   Invoke-CheckedCommand -FileName "git" -Arguments @("--version")
   Invoke-CheckedCommand -FileName "node" -Arguments @("--check", "local_worker.js")
   Invoke-CheckedCommand -FileName "node" -Arguments @("--check", "git-safety.js")
+  Invoke-CheckedCommand -FileName "powershell.exe" -Arguments @(
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    '$null = [scriptblock]::Create((Get-Content -LiteralPath "worker-watchdog.ps1" -Raw))'
+  )
+  Invoke-CheckedCommand -FileName "powershell.exe" -Arguments @(
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    "worker-watchdog.ps1"
+  )
   Invoke-CheckedCommand -FileName "npm" -Arguments @("test")
   Invoke-CheckedCommand -FileName "powershell.exe" -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tests/git-integration.ps1")
 

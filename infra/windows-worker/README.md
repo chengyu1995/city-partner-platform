@@ -289,3 +289,37 @@ If Codex attempts to execute Git commands during the task, that is incorrect beh
 ```powershell
 npm run verify
 ```
+
+## Worker watchdog
+
+When Feishu jobs stay in `queued` or pending state, first check whether the
+`local_worker.js` process is running on the Windows Worker host. The watchdog
+script is a health-check and recovery helper for that situation:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File worker-watchdog.ps1
+```
+
+The default mode is dry-run. Dry-run checks the Worker directory, `local_worker.js`,
+`.env` existence, the `CityPartnerCodexWorker` scheduled task, the `node.exe`
+process whose command line contains `local_worker.js`, and the recent tail of
+`logs/scheduled-worker.log`. It does not start or stop scheduled tasks, stop
+`node.exe`, modify files, or print `.env` contents.
+
+Use `-Apply` only when you intentionally want the watchdog to start the scheduled
+task if the Worker is not running:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File worker-watchdog.ps1 -Apply
+```
+
+Watchdog status markers:
+
+- `WORKER_WATCHDOG_HEALTHY`: the Worker process is already running and the task is healthy.
+- `WORKER_WATCHDOG_RECOVERED`: `-Apply` started the scheduled task and the Worker process appeared.
+- `WORKER_WATCHDOG_FAILED`: recovery failed and the command returned a non-zero exit code.
+
+Never print `.env` contents, tokens, secrets, passwords, private keys, Supabase
+keys, Feishu secrets, or GitHub tokens in Worker logs. A future deployment may
+register the watchdog as a separate scheduled task that runs once per minute,
+but this repository task does not register that scheduled task.
