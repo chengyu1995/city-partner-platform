@@ -181,13 +181,48 @@ async function unstagePaths(paths) {
   await runGit(["restore", "--staged", "--", ...uniquePaths]);
 }
 
+async function unstageAllPaths() {
+  await runGit(["restore", "--staged", "--", "."]);
+}
+
+function getEntryStagePath(entry) {
+  const rawPath =
+    entry?.path ||
+    entry?.newPath ||
+    entry?.file ||
+    entry?.to ||
+    "";
+
+  return String(rawPath)
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .trim();
+}
+
+function getSafeStagePathsFromStatusEntries(entries) {
+  const paths = [];
+
+  for (const entry of entries || []) {
+    const pathValue = getEntryStagePath(entry);
+
+    if (!pathValue) {
+      console.warn("跳过空 Git pathspec");
+      continue;
+    }
+
+    paths.push(pathValue);
+  }
+
+  return uniqueSortedPaths(paths);
+}
+
 async function getCachedDiffPaths() {
   const diff = await runGit(["diff", "--cached", "--name-only"]);
   return uniqueSortedPaths(String(diff.stdout || "").split(/\r?\n/).filter(Boolean));
 }
 
 async function stageTaskPaths(paths) {
-  const taskPaths = uniqueSortedPaths(paths);
+  let taskPaths = getSafeStagePathsFromStatusEntries(await readGitStatusEntries());
 
   if (taskPaths.length === 0) {
     return [];
@@ -195,18 +230,35 @@ async function stageTaskPaths(paths) {
 
   validateCommittablePaths(taskPaths, { projectRoot: PROJECT_DIR });
 
-  await runGit(["add", "--", ...taskPaths]);
+  try {
+    await runGit(["add", "--", ...taskPaths]);
+  } catch (firstError) {
+    console.warn(
+      "Git 暂存失败，重新读取 git status 并剔除坏 pathspec 后重试一次：",
+      firstError instanceof Error ? firstError.message : String(firstError)
+    );
+
+    await unstageAllPaths();
+
+    taskPaths = getSafeStagePathsFromStatusEntries(await readGitStatusEntries());
+
+    if (taskPaths.length === 0) {
+      throw new Error("Git 暂存失败，重新读取状态后没有可提交文件");
+    }
+
+    validateCommittablePaths(taskPaths, { projectRoot: PROJECT_DIR });
+
+    await runGit(["add", "--", ...taskPaths]);
+  }
 
   const stagedPaths = await getCachedDiffPaths();
 
   try {
     validateStagedPaths(taskPaths, stagedPaths);
   } catch (error) {
-    await unstagePaths(stagedPaths);
+    await unstageAllPaths();
     throw error;
   }
-
-  validateCommittablePaths(stagedPaths, { projectRoot: PROJECT_DIR });
 
   return stagedPaths;
 }
