@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$SourceDir = $PSScriptRoot,
   [string]$TargetDir = "C:\city-partner-worker",
   [string]$BackupRoot = "C:\city-partner-worker-backups",
@@ -124,7 +124,7 @@ function Get-DeploymentPlan {
   $copyFiles = New-Object System.Collections.Generic.List[string]
   $skipFiles = New-Object System.Collections.Generic.List[string]
   $reportedSkippedDirs = New-Object "System.Collections.Generic.HashSet[string]"
-  $sourceEnvPath = Join-WorkerEnvPath -WorkerDir $ResolvedSourceDir
+$SourceEnvPath = Join-Path $SourceDir ".env"
 
   if (Test-Path -LiteralPath $sourceEnvPath -PathType Leaf) {
     throw "Source env file is forbidden: $sourceEnvPath"
@@ -352,9 +352,9 @@ function Assert-RequiredSourceFiles {
 }
 
 $ResolvedSourceDir = Resolve-ExistingDirectory -Path $SourceDir -Label "SourceDir"
-$SourceEnvPath = Join-WorkerEnvPath -WorkerDir $ResolvedSourceDir
-$TargetEnvPath = Join-WorkerEnvPath -WorkerDir $TargetDir
-$BackupEnvPathPattern = Join-Path $BackupRoot "yyyyMMdd-HHmmss.env"
+$SourceEnvPath = Join-Path $SourceDir ".env"
+$TargetEnvPath = Join-Path $TargetDir ".env"
+$BackupEnvPathPattern = Join-Path (Join-Path $BackupRoot "yyyyMMdd-HHmmss") ".env"
 $Plan = Get-DeploymentPlan -ResolvedSourceDir $ResolvedSourceDir
 
 Write-DeployLog "SourceDir: $ResolvedSourceDir"
@@ -384,7 +384,7 @@ if (-not (Test-Path -LiteralPath $ResolvedBackupRoot -PathType Container)) {
 }
 $ResolvedBackupRoot = (Resolve-Path -LiteralPath $ResolvedBackupRoot).Path
 
-$TargetEnvPath = Join-WorkerEnvPath -WorkerDir $ResolvedTargetDir
+$TargetEnvPath = Join-Path $TargetDir ".env"
 Assert-RequiredSourceFiles -ResolvedSourceDir $ResolvedSourceDir
 Assert-VerificationPassed -ResolvedSourceDir $ResolvedSourceDir
 
@@ -393,7 +393,7 @@ if (-not (Test-Path -LiteralPath $TargetEnvPath -PathType Leaf)) {
 }
 
 $BackupDir = Join-Path $ResolvedBackupRoot (Get-Date -Format "yyyyMMdd-HHmmss")
-$BackupEnvPath = Join-WorkerEnvPath -WorkerDir $BackupDir
+$BackupEnvPath = Join-Path $BackupDir ".env"
 Write-DeployLog "Backup directory: $BackupDir"
 Write-DeployLog "Backup env path: $BackupEnvPath"
 
