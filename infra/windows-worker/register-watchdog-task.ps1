@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$WorkerDir = "C:\city-partner-worker",
   [string]$WatchdogTaskName = "CityPartnerCodexWorkerWatchdog",
   [string]$WorkerTaskName = "CityPartnerCodexWorker",
@@ -178,7 +178,7 @@ if ($FrequencyMinutes -lt 1) {
 $workerDirExists = Test-Path -LiteralPath $WorkerDir -PathType Container
 $watchdogPath = Join-Path $WorkerDir "worker-watchdog.ps1"
 $watchdogExists = Test-Path -LiteralPath $watchdogPath -PathType Leaf
-$workerEnvPath = Join-WorkerEnvPath -Path $WorkerDir
+$WorkerEnvPath = Join-Path $WorkerDir ".env"
 $workerEnvExists = Test-Path -LiteralPath $workerEnvPath -PathType Leaf
 $workerTaskExists = Test-ScheduledTaskExists -Name $WorkerTaskName
 $watchdogTaskExists = Test-ScheduledTaskExists -Name $WatchdogTaskName
