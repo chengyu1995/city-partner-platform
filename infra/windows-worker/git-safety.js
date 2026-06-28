@@ -9,7 +9,23 @@ function normalizeGitPath(filePath) {
     normalized = normalized.slice(2);
   }
 
-  return normalized;
+  
+  const droppedFirstCharPrefixes = [
+    ["ocs/", "docs/"],
+    ["rc/", "src/"],
+    ["nfra/", "infra/"],
+    ["ackage.json", "package.json"],
+    ["ackage-lock.json", "package-lock.json"],
+    ["EADME.md", "README.md"],
+  ];
+
+  for (const [badPrefix, goodPrefix] of droppedFirstCharPrefixes) {
+    if (normalized.startsWith(badPrefix)) {
+      return goodPrefix + normalized.slice(badPrefix.length);
+    }
+  }
+
+return normalized;
 }
 
 function uniqueSortedPaths(paths) {
