@@ -20,6 +20,7 @@ const PROJECT_DIR = process.env.PROJECT_DIR;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
 const CODEX_TIMEOUT_MS = Number(process.env.CODEX_TIMEOUT_MS || 900000);
 const CODEX_IDLE_TIMEOUT_MS = Number(process.env.CODEX_IDLE_TIMEOUT_MS || 60000);
+const CODEX_PROGRESS_HEARTBEAT_INTERVAL_MS = 30 * 1000;
 const CODEX_EXE = process.env.CODEX_EXE || "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe";
 
 function repairKnownDroppedFirstCharPath(filePath) {
@@ -505,7 +506,40 @@ function killProcessTree(pid, reason) {
   });
 }
 
-function runCodex(prompt) {
+function startCodexProgressHeartbeat(jobId) {
+  if (!jobId) {
+    return () => {};
+  }
+
+  let stopped = false;
+
+  const timer = setInterval(async () => {
+    if (stopped) {
+      return;
+    }
+
+    try {
+      await updateProgress(
+        jobId,
+        35,
+        "执行 Codex",
+        "Codex 仍在运行，Worker 心跳正常"
+      );
+    } catch (error) {
+      console.warn(
+        "Codex 执行期间心跳上报异常：",
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  }, CODEX_PROGRESS_HEARTBEAT_INTERVAL_MS);
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
+function runCodex(prompt, jobId) {
   return new Promise((resolve, reject) => {
     console.log(`开始执行 Codex，项目目录：${PROJECT_DIR}`);
 
@@ -536,8 +570,10 @@ function runCodex(prompt) {
     let stderr = "";
     let settled = false;
     let lastOutputAt = Date.now();
+    const stopCodexProgressHeartbeat = startCodexProgressHeartbeat(jobId);
 
     const cleanupTimers = () => {
+      stopCodexProgressHeartbeat();
       clearTimeout(hardTimer);
       clearTimeout(idleTimer);
     };
@@ -764,7 +800,7 @@ async function pollOnce() {
       "正在启动 Codex"
     );
 
-    const result = await runCodex(buildCodexPrompt(job));
+    const result = await runCodex(buildCodexPrompt(job), job.id);
 
     await updateProgress(
       job.id,
