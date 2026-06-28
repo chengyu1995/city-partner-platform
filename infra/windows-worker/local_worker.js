@@ -506,7 +506,9 @@ function killProcessTree(pid, reason) {
   });
 }
 
-function startCodexProgressHeartbeat(jobId) {
+function startCodexHeartbeat(job) {
+  const jobId = job?.id;
+
   if (!jobId) {
     return () => {};
   }
@@ -539,7 +541,7 @@ function startCodexProgressHeartbeat(jobId) {
   };
 }
 
-function runCodex(prompt, jobId) {
+function runCodex(prompt, job) {
   return new Promise((resolve, reject) => {
     console.log(`开始执行 Codex，项目目录：${PROJECT_DIR}`);
 
@@ -570,10 +572,10 @@ function runCodex(prompt, jobId) {
     let stderr = "";
     let settled = false;
     let lastOutputAt = Date.now();
-    const stopCodexProgressHeartbeat = startCodexProgressHeartbeat(jobId);
+    const stopCodexHeartbeat = startCodexHeartbeat(job);
 
     const cleanupTimers = () => {
-      stopCodexProgressHeartbeat();
+      stopCodexHeartbeat();
       clearTimeout(hardTimer);
       clearTimeout(idleTimer);
     };
@@ -800,7 +802,7 @@ async function pollOnce() {
       "正在启动 Codex"
     );
 
-    const result = await runCodex(buildCodexPrompt(job), job.id);
+    const result = await runCodex(buildCodexPrompt(job), job);
 
     await updateProgress(
       job.id,
