@@ -267,7 +267,6 @@ function validateStagedPaths(taskPaths, stagedPaths) {
 
     if (!parent || !child) return false;
     if (child === parent) return true;
-
     return child.startsWith(parent + "/");
   };
 
