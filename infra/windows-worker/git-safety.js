@@ -247,27 +247,60 @@ function validateCommittablePaths(paths, options = {}) {
   }
 }
 
-function validateStagedPaths(expectedPaths, actualPaths) {
-  const comparison = comparePathSets(expectedPaths, actualPaths);
+function validateStagedPaths(taskPaths, stagedPaths) {
+  const normalizeForCompare = (value) =>
+    String(value || "")
+      .replace(/\\/g, "/")
+      .replace(/^\.\/+/, "")
+      .replace(/^\/+/, "")
+      .replace(/\/+$/, "");
 
-  if (comparison.ok) {
-    return comparison.actual;
+  const uniqueSorted = (values) =>
+    Array.from(new Set((values || []).map(normalizeForCompare).filter(Boolean))).sort();
+
+  const expectedPaths = uniqueSorted(taskPaths);
+  const actualPaths = uniqueSorted(stagedPaths);
+
+  const isSameOrInside = (expected, actual) => {
+    const parent = normalizeForCompare(expected);
+    const child = normalizeForCompare(actual);
+
+    if (!parent || !child) return false;
+    if (child === parent) return true;
+
+    return child.startsWith(parent + "/");
+  };
+
+  const extraStagedPaths = actualPaths.filter(
+    (actualPath) => !expectedPaths.some((expectedPath) => isSameOrInside(expectedPath, actualPath))
+  );
+
+  const missingStagedPaths = expectedPaths.filter(
+    (expectedPath) => !actualPaths.some((actualPath) => isSameOrInside(expectedPath, actualPath))
+  );
+
+  if (extraStagedPaths.length > 0 || missingStagedPaths.length > 0) {
+    const details = [
+      "Git 暂存结果与本次任务文件不一致，已取消本次暂存。",
+      "以下仅列出文件路径，不包含文件内容：",
+    ];
+
+    if (extraStagedPaths.length > 0) {
+      details.push("额外暂存文件：");
+      for (const path of extraStagedPaths) {
+        details.push("- " + path);
+      }
+    }
+
+    if (missingStagedPaths.length > 0) {
+      details.push("缺少暂存文件：");
+      for (const path of missingStagedPaths) {
+        details.push("- " + path);
+      }
+    }
+
+    throw new Error(details.join("\n"));
   }
-
-  const lines = [
-    "Git 暂存结果与本次任务文件不一致，已取消本次暂存。",
-    "以下仅列出文件路径，不包含文件内容：",
-  ];
-
-  if (comparison.extra.length > 0) {
-    lines.push("额外暂存文件：", formatPathList(comparison.extra));
-  }
-
-  if (comparison.missing.length > 0) {
-    lines.push("缺少暂存文件：", formatPathList(comparison.missing));
-  }
-
-  throw new Error(lines.filter(Boolean).join("\n"));
 }
 
 module.exports = {
