@@ -301,6 +301,8 @@ function validateStagedPaths(taskPaths, stagedPaths) {
 
     throw new Error(details.join("\n"));
   }
+
+  return actualPaths;
 }
 
 module.exports = {
