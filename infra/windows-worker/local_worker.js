@@ -21,6 +21,27 @@ const CODEX_TIMEOUT_MS = Number(process.env.CODEX_TIMEOUT_MS || 900000);
 const CODEX_IDLE_TIMEOUT_MS = Number(process.env.CODEX_IDLE_TIMEOUT_MS || 60000);
 const CODEX_EXE = process.env.CODEX_EXE || "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe";
 
+function repairKnownDroppedFirstCharPath(filePath) {
+  const value = String(filePath || "").trim();
+
+  const knownPrefixes = [
+    ["ocs/", "docs/"],
+    ["rc/", "src/"],
+    ["nfra/", "infra/"],
+    ["ackage.json", "package.json"],
+    ["EADME.md", "README.md"],
+  ];
+
+  for (const [badPrefix, goodPrefix] of knownPrefixes) {
+    if (value.startsWith(badPrefix)) {
+      return goodPrefix + value.slice(badPrefix.length);
+    }
+  }
+
+  return value;
+}
+
+
 const required = {
   WORKER_API_URL,
   WORKER_TOKEN,
@@ -185,11 +206,11 @@ async function unstagePaths(paths) {
 
 async function getCachedDiffPaths() {
   const diff = await runGit(["diff", "--cached", "--name-only"]);
-  return uniqueSortedPaths(String(diff.stdout || "").split(/\r?\n/).filter(Boolean));
+  return uniqueSortedPaths(String(diff.stdout || "").split(/\r?\n/).filter(Boolean).map(repairKnownDroppedFirstCharPath));
 }
 
 async function stageTaskPaths(paths) {
-  const taskPaths = uniqueSortedPaths(paths);
+  const taskPaths = uniqueSortedPaths(paths.map(repairKnownDroppedFirstCharPath));
 
   if (taskPaths.length === 0) {
     return [];
@@ -426,8 +447,8 @@ async function rollbackGitTask(checkpoint) {
   }
 
   const entries = await readGitStatusEntries();
-  const changedPaths = getStatusPaths(entries);
-  const trackedPaths = getTrackedStatusPaths(entries);
+  const changedPaths = getStatusPaths(entries).map(repairKnownDroppedFirstCharPath);
+  const trackedPaths = getTrackedStatusPaths(entries).map(repairKnownDroppedFirstCharPath);
 
   await unstagePaths(changedPaths);
 
