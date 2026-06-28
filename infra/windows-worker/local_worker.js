@@ -572,7 +572,7 @@ function runCodex(prompt, job) {
     let stderr = "";
     let settled = false;
     let lastOutputAt = Date.now();
-    const stopCodexHeartbeat = startCodexHeartbeat(job);
+    let stopCodexHeartbeat = () => {};
 
     const cleanupTimers = () => {
       stopCodexHeartbeat();
@@ -630,6 +630,10 @@ function runCodex(prompt, job) {
     const hardTimer = setTimeout(() => {
       failAndKill(`Codex 执行总超时：${CODEX_TIMEOUT_MS}ms，已强制结束进程树`);
     }, CODEX_TIMEOUT_MS);
+
+    child.on("spawn", () => {
+      stopCodexHeartbeat = startCodexHeartbeat(job);
+    });
 
     child.stdout.on("data", (chunk) => appendOutput("stdout", chunk));
     child.stderr.on("data", (chunk) => appendOutput("stderr", chunk));
