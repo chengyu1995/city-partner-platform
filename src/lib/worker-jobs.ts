@@ -9,6 +9,19 @@ interface SupabaseWriteError {
   code?: string;
 }
 
+interface DuplicateFeishuJob {
+  id: string;
+  job_id?: string | null;
+  request_text?: string | null;
+  created_at?: string | null;
+}
+
+export interface DuplicateFeishuJobCheckResult {
+  duplicate: DuplicateFeishuJob | null;
+  normalizedText: string;
+  error: SupabaseWriteError | null;
+}
+
 const RECORD_ID_KEYS = [
   "bitable_record_id",
   "feishu_record_id",
@@ -52,6 +65,50 @@ export async function parseJsonBody<T>(req: NextRequest): Promise<T | NextRespon
 
 export function responseFromMaybe<T>(value: T | NextResponse): value is NextResponse {
   return value instanceof NextResponse;
+}
+
+export function normalizeFeishuTaskText(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+async function findDuplicateByRequestText(
+  supabase: SupabaseClient,
+  requestText: string,
+  createdAfter: string
+): Promise<{ data: DuplicateFeishuJob | null; error: SupabaseWriteError | null }> {
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .select("id, job_id, request_text, created_at")
+    .eq("source", "feishu")
+    .in("status", ["queued", "running"])
+    .eq("request_text", requestText)
+    .gte("created_at", createdAfter)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return { data: (data as DuplicateFeishuJob | null) ?? null, error };
+}
+
+export async function findRecentDuplicateFeishuJob(
+  supabase: SupabaseClient,
+  rawText: string,
+  now = Date.now()
+): Promise<DuplicateFeishuJobCheckResult> {
+  const normalizedText = normalizeFeishuTaskText(rawText);
+  if (!normalizedText) return { duplicate: null, normalizedText, error: null };
+
+  const createdAfter = new Date(now - 30 * 60 * 1000).toISOString();
+  const candidates = [normalizedText];
+  if (rawText !== normalizedText) candidates.push(rawText);
+
+  for (const candidate of candidates) {
+    const { data, error } = await findDuplicateByRequestText(supabase, candidate, createdAfter);
+    if (error) return { duplicate: null, normalizedText, error };
+    if (data) return { duplicate: data, normalizedText, error: null };
+  }
+
+  return { duplicate: null, normalizedText, error: null };
 }
 
 function isMissingColumnError(error: SupabaseWriteError | null): boolean {

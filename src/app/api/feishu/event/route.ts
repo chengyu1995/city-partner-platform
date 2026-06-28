@@ -16,6 +16,7 @@ import { NextResponse, NextRequest } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { decryptFeishuEvent } from "@/lib/feishu-crypto";
 import { runAgent, AgentMessage } from "@/lib/hermes-agent";
+import { findRecentDuplicateFeishuJob, normalizeFeishuTaskText } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -54,6 +55,12 @@ function isDuplicateReceiptError(error: { code?: string } | null): boolean {
 
 function errorToText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sanitizeLogText(text: string): string {
+  return text
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
+    .replace(/(token|secret|password|key)["':=\s]+[^"',\s}]+/gi, "$1=[redacted]");
 }
 
 async function markReceiptCompleted(supabase: SupabaseClient, eventId: string): Promise<void> {
@@ -270,6 +277,50 @@ export async function POST(req: NextRequest) {
       throw new Error(`create feishu receipt failed: ${receiptError.message}`);
     }
     try {
+      try {
+        const duplicateCheck = await findRecentDuplicateFeishuJob(supabase, text);
+        if (duplicateCheck.error) {
+          console.error(
+            "[feishu-event] duplicate job check skipped:",
+            sanitizeLogText(duplicateCheck.error.message ?? "unknown error")
+          );
+          text = duplicateCheck.normalizedText;
+        } else if (duplicateCheck.duplicate) {
+          const existingJobNo = duplicateCheck.duplicate.job_id ?? duplicateCheck.duplicate.id;
+          console.log(`[feishu-event] duplicate task skipped: existing_job=${existingJobNo}`);
+          try {
+            const token = await getFeishuToken();
+            await sendFeishuMessage(
+              token,
+              ev.message.chat_id,
+              ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+              `检测到重复任务，已跳过入队。已有任务编号：${existingJobNo}`
+            );
+          } catch (replyError) {
+            console.error("[feishu-event] duplicate reply failed:", sanitizeLogText(errorToText(replyError)));
+          }
+          try {
+            await markReceiptCompleted(supabase, eventId);
+          } catch (receiptCompleteError) {
+            console.error(
+              "[feishu-event] duplicate receipt complete failed:",
+              sanitizeLogText(errorToText(receiptCompleteError))
+            );
+          }
+          return NextResponse.json({
+            code: 0,
+            duplicate_task: true,
+            existing_job_id: duplicateCheck.duplicate.id,
+            existing_job_no: duplicateCheck.duplicate.job_id ?? null,
+          });
+        } else {
+          text = duplicateCheck.normalizedText;
+        }
+      } catch (duplicateCheckError) {
+        console.error("[feishu-event] duplicate job check failed:", sanitizeLogText(errorToText(duplicateCheckError)));
+        text = normalizeFeishuTaskText(text);
+      }
+
       const convId = await getOrCreateConversation(
       supabase,
       userId,
