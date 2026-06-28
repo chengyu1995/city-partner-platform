@@ -17,7 +17,9 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN;
 const WORKER_NAME = process.env.WORKER_NAME || os.hostname();
 const PROJECT_DIR = process.env.PROJECT_DIR;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
-const CODEX_TIMEOUT_MS = Number(process.env.CODEX_TIMEOUT_MS || 1800000);
+const CODEX_TIMEOUT_MS = Number(process.env.CODEX_TIMEOUT_MS || 900000);
+const CODEX_IDLE_TIMEOUT_MS = Number(process.env.CODEX_IDLE_TIMEOUT_MS || 60000);
+const CODEX_EXE = process.env.CODEX_EXE || "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe";
 
 const required = {
   WORKER_API_URL,
@@ -449,12 +451,44 @@ async function rollbackGitTask(checkpoint) {
   };
 }
 
+function killProcessTree(pid, reason) {
+  return new Promise((resolve) => {
+    if (!pid) {
+      resolve();
+      return;
+    }
+
+    execFile(
+      "taskkill",
+      ["/PID", String(pid), "/T", "/F"],
+      {
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+      },
+      (error, stdout, stderr) => {
+        const message = [
+          reason,
+          stdout ? String(stdout).trim() : "",
+          stderr ? String(stderr).trim() : "",
+          error ? error.message : "",
+        ].filter(Boolean).join("\n");
+
+        if (message) {
+          console.warn(message);
+        }
+
+        resolve();
+      }
+    );
+  });
+}
+
 function runCodex(prompt) {
   return new Promise((resolve, reject) => {
     console.log(`开始执行 Codex，项目目录：${PROJECT_DIR}`);
 
     const child = spawn(
-      "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe",
+      CODEX_EXE,
       [
         "exec",
         "-C",
@@ -466,39 +500,97 @@ function runCodex(prompt) {
       ],
       {
         shell: false,
-        windowsHide: false,
+        windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
+        env: {
+          ...process.env,
+          CI: "1",
+          NO_COLOR: "1",
+        },
       }
     );
 
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    let lastOutputAt = Date.now();
 
-    child.stdout.on("data", (chunk) => {
+    const cleanupTimers = () => {
+      clearTimeout(hardTimer);
+      clearTimeout(idleTimer);
+    };
+
+    const appendOutput = (target, chunk) => {
       const text = chunk.toString();
-      stdout += text;
-      process.stdout.write(text);
-    });
+      lastOutputAt = Date.now();
 
-    child.stderr.on("data", (chunk) => {
-      const text = chunk.toString();
-      stderr += text;
-      process.stderr.write(text);
-    });
+      if (target === "stdout") {
+        stdout += text;
+        if (stdout.length > 2 * 1024 * 1024) {
+          stdout = stdout.slice(-2 * 1024 * 1024);
+        }
+        process.stdout.write(text);
+      } else {
+        stderr += text;
+        if (stderr.length > 2 * 1024 * 1024) {
+          stderr = stderr.slice(-2 * 1024 * 1024);
+        }
+        process.stderr.write(text);
+      }
 
-    const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error(`Codex 执行超时：${CODEX_TIMEOUT_MS}ms`));
+      resetIdleTimer();
+    };
+
+    const failAndKill = (message) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanupTimers();
+
+      killProcessTree(child.pid, message).finally(() => {
+        reject(new Error(message));
+      });
+    };
+
+    const resetIdleTimer = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        const idleMs = Date.now() - lastOutputAt;
+        failAndKill(`Codex 空闲超时：${idleMs}ms 无输出，已强制结束进程树`);
+      }, CODEX_IDLE_TIMEOUT_MS);
+    };
+
+    let idleTimer = setTimeout(() => {
+      const idleMs = Date.now() - lastOutputAt;
+      failAndKill(`Codex 空闲超时：${idleMs}ms 无输出，已强制结束进程树`);
+    }, CODEX_IDLE_TIMEOUT_MS);
+
+    const hardTimer = setTimeout(() => {
+      failAndKill(`Codex 执行总超时：${CODEX_TIMEOUT_MS}ms，已强制结束进程树`);
     }, CODEX_TIMEOUT_MS);
 
+    child.stdout.on("data", (chunk) => appendOutput("stdout", chunk));
+    child.stderr.on("data", (chunk) => appendOutput("stderr", chunk));
+
     child.on("error", (error) => {
-      clearTimeout(timer);
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanupTimers();
       reject(error);
     });
 
     child.on("close", (code) => {
-      clearTimeout(timer);
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanupTimers();
 
       if (code === 0) {
         resolve(stdout.trim() || "Codex 执行完成");
