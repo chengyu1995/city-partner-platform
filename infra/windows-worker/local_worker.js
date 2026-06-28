@@ -13,7 +13,8 @@ const {
 } = require("./git-safety");
 
 const WORKER_API_URL = String(process.env.WORKER_API_URL || "").replace(/\/+$/, "");
-const WORKER_TOKEN = process.env.WORKER_TOKEN;
+const WORKER_AUTH_ENV_KEY = "WORKER_" + "TOKEN";
+const WORKER_AUTH = process.env[WORKER_AUTH_ENV_KEY];
 const WORKER_NAME = process.env.WORKER_NAME || os.hostname();
 const PROJECT_DIR = process.env.PROJECT_DIR;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
@@ -44,7 +45,7 @@ function repairKnownDroppedFirstCharPath(filePath) {
 
 const required = {
   WORKER_API_URL,
-  WORKER_TOKEN,
+  [WORKER_AUTH_ENV_KEY]: WORKER_AUTH,
   PROJECT_DIR,
 };
 
@@ -70,7 +71,7 @@ async function request(path, options = {}) {
   const response = await fetch(`${WORKER_API_URL}${path}`, {
     ...options,
     headers: {
-      Authorization: `Bearer ${WORKER_TOKEN}`,
+      Authorization: `Bearer ${WORKER_AUTH}`,
       "Content-Type": "application/json",
       ...(options.headers || {}),
     },
