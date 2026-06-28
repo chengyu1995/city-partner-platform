@@ -357,14 +357,22 @@ export async function POST(req: NextRequest) {
 
       await markReceiptCompleted(supabase, eventId);
     } catch (e) {
-      await markReceiptFailed(supabase, eventId, errorToText(e));
-      throw e;
+      console.error("[feishu-event] processing failed:", sanitizeLogText(errorToText(e)));
+      try {
+        await markReceiptFailed(supabase, eventId, errorToText(e));
+      } catch (receiptFailError) {
+        console.error(
+          "[feishu-event] receipt fail update failed:",
+          sanitizeLogText(errorToText(receiptFailError))
+        );
+      }
+      return NextResponse.json({ code: 0, processing_error: true });
     }
 
     return NextResponse.json({ code: 0 });
   } catch (e) {
-    console.error("[feishu-event]", e);
-    return NextResponse.json({ code: 500, msg: errorToText(e) }, { status: 500 });
+    console.error("[feishu-event]", sanitizeLogText(errorToText(e)));
+    return NextResponse.json({ code: 0, callback_error: true });
   }
 }
 
