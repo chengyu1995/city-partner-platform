@@ -1,25 +1,31 @@
 # Database Audit
 
-Audit date: 2026-06-29
+Audit scope: Supabase schema as represented by repository SQL/docs and runtime code. No SQL was executed.
 
-Environment files were not read. No SQL was executed.
+## Tables In Scope
+
+- `hermes_jobs`
+- `hermes_queue`
+- `task_results`
+- `hermes_conversations`
+- `hermes_messages`
+- `feishu_event_receipts` as used by code, although no matching setup SQL was found in the audited files.
 
 ## `hermes_jobs`
 
-Source: `docs/setup-hermes-jobs.sql`
+Schema source: `docs/setup-hermes-jobs.sql`.
 
 Defined columns:
 
-- `id uuid primary key default gen_random_uuid()`
-- Source fields: `source`, `feishu_message_id`, `feishu_event_id`, `feishu_chat_id`, `feishu_user_id`
+- Identity/source: `id`, `source`, `feishu_message_id`, `feishu_event_id`, `feishu_chat_id`, `feishu_user_id`
 - Task fields: `job_id`, `title`, `description`, `priority`, `acceptance`, `branch`
-- Execution fields: `executor`, `repo`, `prompt`
-- Status field: `status`
-- Claim fields: `claimed_by`, `claimed_at`, `expires_at`, `attempts`, `max_attempts`
-- Result fields: `result`, `error`
+- Execution: `executor`, `repo`, `prompt`
+- State: `status`
+- Claim/lease: `claimed_by`, `claimed_at`, `expires_at`, `attempts`, `max_attempts`
+- Result/error: `result`, `error`
 - Timestamps: `created_at`, `updated_at`
 
-Defined status values:
+Defined statuses:
 
 - `pending`
 - `running`
@@ -32,129 +38,147 @@ Indexes:
 - `idx_jobs_status_priority` on `(status, priority, created_at)`
 - `idx_jobs_expires` on `expires_at` where `status = 'running'`
 
-Trigger:
+Runtime expectations not present in this SQL:
 
-- `trg_jobs_updated` updates `updated_at` before update.
-
-RLS:
-
-- RLS is enabled.
-- No explicit `hermes_jobs` policies were found in `docs/setup-hermes-jobs.sql`, so current server-side access depends on service-role behavior.
-
-## Runtime Access to `hermes_jobs`
-
-`GET /api/worker/next`:
-
-- Reads table `hermes_jobs`.
-- Filters status in `queued`, `pending`.
-- Orders by `priority` ascending, then `created_at` ascending.
-- Limits to 1 row.
-- Updates the row to `running` with `claimed_by`, `claimed_at`, `expires_at`, `progress_percent`, `current_step`, `status_message`, `updated_at`.
-
-`POST /api/worker/progress`:
-
-- Updates `status`, `progress_percent`, `current_step`, `status_message`, `updated_at`.
-
-`POST /api/worker/report`:
-
-- Updates `status`, `progress_percent`, `current_step`, `status_message`, `git_commit_sha`, `error_text`, `result`, `completed_at`, `updated_at`.
-
-`src/lib/worker-jobs.ts`:
-
-- `updateHermesJob()` retries updates while dropping missing columns when PostgREST reports a missing-column error.
-- This compatibility behavior masks schema drift and allows runtime to continue with incomplete database shape.
-
-## Schema Drift Observed
-
-The runtime writes or reads fields that are not in `docs/setup-hermes-jobs.sql`:
-
+- `queued`
+- `succeeded`
 - `progress_percent`
 - `current_step`
 - `status_message`
 - `git_commit_sha`
 - `error_text`
 - `completed_at`
-- `bitable_record_id` / `feishu_record_id` / `record_id` via payload/result lookup
-- `request_text`, used by duplicate Feishu task detection
+- `request_text`
+- `bitable_record_id` / `feishu_record_id` / `record_id`
 
-The runtime also uses status values not allowed by the SQL setup:
+The helper `updateHermesJob` dynamically skips missing columns for updates, which keeps runtime partially tolerant but hides schema drift.
 
-- `queued`
-- `succeeded`
+## Claim Query
 
-This means either production schema has out-of-band migrations not captured in docs, or the current routes rely on missing-column skipping and may fail on status check constraints.
+Source: `src/app/api/worker/next/route.ts`.
 
-## `hermes_queue`
+Current query:
 
-Source: `docs/setup-hermes-queue.sql`
+- Table: `hermes_jobs`
+- Filter: `.in("status", ["queued", "pending"])`
+- Sort: `priority` ascending, then `created_at` ascending
+- Limit: `1`
+- Fetch: `.maybeSingle()`
 
-Defined columns:
+Claim update:
 
-- `id`
-- `event_type`
-- `payload`
+- Sets `status = running`
+- Sets `claimed_by`, `claimed_at`, `expires_at`
+- Sets progress fields if columns exist
+- Attempts Feishu sync after claim
+
+Risk:
+
+- The select and update are two separate operations. There is no `FOR UPDATE SKIP LOCKED`, compare-and-set `status` condition, RPC, or unique claim token, so duplicate claim is possible.
+
+## Report Query
+
+Source: `src/app/api/worker/report/route.ts`.
+
+Input status is normalized:
+
+- `failed` / `error` -> `failed`
+- `succeeded` / `success` / `completed` -> `succeeded`
+- `queued` / `pending` -> `queued`
+- other/missing -> `running`
+
+Report update:
+
+- Updates `status`, progress fields, `git_commit_sha`, `error_text`, `result`, `completed_at`, `updated_at`
+- Terminal states are `succeeded` and `failed`
+
+Risk:
+
+- Runtime terminal statuses do not match `docs/setup-hermes-jobs.sql`, which defines `completed` rather than `succeeded`.
+- Worker sends `result_text` and `deploy_status`; route does not explicitly persist those keys unless they are covered by `result` construction or tolerated as ignored extras.
+
+## Progress Query
+
+Source: `src/app/api/worker/progress/route.ts`.
+
+Updates:
+
 - `status`
-- `attempt_count`
-- `last_error`
-- `created_at`
-- `processed_at`
+- `progress_percent`
+- `current_step`
+- `status_message`
+- `updated_at`
 
-Defined status values:
+Risk:
+
+- It writes `body.status ?? "running"` rather than the normalized status in the database update.
+
+## `hermes_queue` and `task_results`
+
+Schema source: `docs/setup-hermes-queue.sql`.
+
+`hermes_queue` columns:
+
+- `id`, `event_type`, `payload`, `status`, `attempt_count`, `last_error`, `created_at`, `processed_at`
+
+Statuses:
 
 - `pending`
 - `processing`
 - `done`
 - `failed`
 
-Usage:
+Producers:
 
-- `/api/feishu/requirement` inserts `event_type = new_requirement`.
-- `/api/feishu/codex-task` inserts `event_type = codex_task_ready`.
-- `scripts/hermes_decompose_runner.py` reads `pending`, patches `processing`, writes `task_results`, then patches `done` or `failed`.
+- `POST /api/feishu/requirement`
+- `POST /api/feishu/codex-task`
 
-Risk:
+Consumer:
 
-- RLS policies in setup allow anon read/insert/update. That is broad for a production queue unless the only exposed path is service-side.
+- `.github/workflows/hermes-decompose.yml` runs `scripts/hermes_decompose_runner.py` every 5 minutes.
 
-## `task_results`
+`task_results` columns:
 
-Source: `docs/setup-hermes-queue.sql`
-
-Defined columns:
-
-- `id`
-- `source_queue_id`
-- `summary`
-- `subtasks`
-- `model`
-- `tokens_used`
-- `created_at`
-
-Usage:
-
-- `scripts/hermes_decompose_runner.py` writes decomposition results.
-- `GET /api/queue/status` reads recent results.
-
-## `hermes_conversations` and `hermes_messages`
-
-Source: `docs/setup-hermes-conversations.sql`
-
-Usage:
-
-- `/api/feishu/event` stores conversational context for `runAgent()`.
-- Conversation lookup is by `user_id`, `chat_type`, `is_active`, sorted by `last_msg_at`.
+- `id`, `source_queue_id`, `summary`, `subtasks`, `model`, `tokens_used`, `created_at`
 
 Risk:
 
-- Policies allow public select. Inserts are performed through service-role code, but read exposure should be reviewed before V2 stores sensitive operational prompts or user messages.
+- This is a separate queue from `hermes_jobs`. V2 needs one explicit relationship between requirement records, decomposition results, and executable Worker jobs.
+
+## Conversation Tables
+
+Schema source: `docs/setup-hermes-conversations.sql`.
+
+`hermes_conversations`:
+
+- Stores Feishu user/chat session metadata.
+- Read policies are public; writes are expected through service role.
+
+`hermes_messages`:
+
+- Stores chat history and tool metadata.
+- Has trigger to update `last_msg_at`.
+
+Risk:
+
+- Public read policy may expose conversation data if anon access is enabled in deployed clients. V2 should lock this down unless public read is intentional.
+
+## RLS and Access
+
+The runtime API uses Supabase service-role access through `getSupabaseService()` or direct REST calls with service key. Service role bypasses RLS. This is acceptable for server-only routes if auth is enforced at the route boundary.
+
+High-risk route boundary:
+
+- Worker routes have optional auth if no Worker token env is set.
+- Feishu Bitable HTTP queue routes do not implement a route-specific token in `requirement` and `codex-task`.
 
 ## V2 Database Requirements
 
-Before Phase 1:
-
-1. Create a canonical `hermes_jobs` migration matching runtime fields.
-2. Define one status enum/state table used by API and Worker.
-3. Add atomic claim support, preferably an RPC such as `claim_next_hermes_job(worker_id)`.
-4. Add heartbeat fields and stale lease recovery fields.
-5. Decide whether `hermes_queue` is an ingest queue only or part of the execution job model.
-6. Add uniqueness/idempotency constraints for Feishu event ids and task fingerprints.
+1. Create a normalized V2 schema with parent task and subtask support.
+2. Add an atomic claim RPC or conditional update that includes current status and lease expiry.
+3. Align status enum across SQL and code.
+4. Add heartbeat columns and stale lease recovery fields.
+5. Add execution attempt records rather than overwriting the job row.
+6. Add Feishu sync outbox with retry/error persistence.
+7. Add deployment status records keyed by commit SHA and linked to job attempt.
+8. Add migrations for all runtime-used columns before code depends on them.

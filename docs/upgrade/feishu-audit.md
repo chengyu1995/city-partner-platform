@@ -1,157 +1,187 @@
 # Feishu Audit
 
-Audit date: 2026-06-29
+Audit scope: Feishu event receiver, Bitable automations, Bitable sync, and Feishu-related environment variable names. No real env values were read or printed.
 
-Environment files were not read. This document lists variable names only.
+## Feishu Event Flow
 
-## Feishu Event Subscription
+Entry: `POST /api/feishu/event`
 
-Route: `POST /api/feishu/event`
+Steps:
 
-Primary purpose:
+1. Receives Feishu event JSON or encrypted payload.
+2. Decrypts with `FEISHU_ENCRYPT_KEY` when payload has `encrypt`.
+3. Verifies `FEISHU_VERIFICATION_TOKEN` if configured.
+4. Handles URL verification challenge.
+5. Filters event type to `im.message.receive_v1`.
+6. Extracts text message content.
+7. For group chats, requires an `@` mention or `Hermes` keyword, then removes mention.
+8. Uses Supabase service role client.
+9. Inserts `feishu_event_receipts` row with `processing` status.
+10. Checks duplicate Feishu jobs in `hermes_jobs`.
+11. Loads/creates Hermes conversation and history.
+12. Calls `runAgent`.
+13. Stores conversation messages.
+14. Sends Feishu reply.
+15. Marks receipt `completed` or `failed`.
 
-- Receive Feishu message events.
-- Handle challenge verification.
-- Decrypt event payload when configured.
-- Filter message events.
-- Run Hermes agent and reply to Feishu.
+ENV variable names:
 
-Message rules:
+- `FEISHU_ENCRYPT_KEY`
+- `FEISHU_VERIFICATION_TOKEN`
+- `FEISHU_APP_ID`
+- `FEISHU_APP_SECRET`
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
 
-- Only `im.message.receive_v1` is processed.
-- p2p messages are accepted when text exists.
-- group messages require `Hermes` or a mention-like token.
-- Text is extracted from `message.content` JSON.
+Risks:
 
-Idempotency:
-
-- Inserts into `feishu_event_receipts`.
-- Duplicate event insert error `23505` is treated as already processed.
-- A second duplicate check looks for recent `hermes_jobs` with same normalized request text.
-
-Risk:
-
-- If `feishu_event_receipts` does not exist or lacks a unique `event_id`, idempotency can fail.
+- Feishu event processing does substantial work inline.
+- `feishu_event_receipts` table/migration was not found in audited SQL.
 - Duplicate task detection depends on `hermes_jobs.request_text`, not present in audited SQL setup.
 
-## Feishu Bitable Automation Ingress
+## Bitable Automation Ingress
 
 Routes:
 
 - `POST /api/feishu/requirement`
 - `POST /api/feishu/codex-task`
 
-Expected source:
+Configured in docs:
 
-- Feishu Bitable automation rules.
+- `docs/feishu-automation.md` describes Bitable automation rules pointing at Vercel routes.
 
-Behavior:
+`requirement` route:
 
-- Requirement route inserts `event_type = new_requirement` into `hermes_queue`.
-- Codex task route inserts `event_type = codex_task_ready` into `hermes_queue`.
+- Inserts `{ event_type: "new_requirement", payload, status: "pending" }` into `hermes_queue`.
+- Uses UTF-8 `arrayBuffer` decoding.
 
-Risk:
+`codex-task` route:
 
-- No route-level authentication was found for these two routes.
-- They insert raw payloads into `hermes_queue`.
-- They do not directly create `hermes_jobs`.
+- Inserts `{ event_type: "codex_task_ready", payload, status: "pending" }` into `hermes_queue`.
 
-## Feishu Bitable Table Creation
+ENV variable names:
 
-Route: `POST /api/feishu/create-tables`
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
 
-Behavior:
+Risks:
 
-- Creates eight Bitable tables and fields:
-  - requirements pool
-  - task board
-  - boss decision center
-  - design/page tracking
-  - bug/risk
-  - release records
-  - daily/weekly reports
-  - agent configuration
+- Neither route verifies a Feishu/Bitable shared secret.
+- They enqueue raw payloads without schema validation.
 
-Authentication:
+## Decomposition and Bitable Task Sync
 
-- Checks `Authorization: Bearer <FEISHU_API_TOKEN>` only when `FEISHU_API_TOKEN` is configured.
+GitHub Action:
 
-Risk:
+- `.github/workflows/hermes-decompose.yml`
+- Runs every 5 minutes and manually via `workflow_dispatch`.
+- Runs `scripts/hermes_decompose_runner.py`.
 
-- This route mutates Feishu schema and should not be publicly reachable without mandatory auth.
+Runner:
 
-## Decomposition Result Sync
+- Reads up to 5 `hermes_queue` pending rows.
+- Marks each `processing`.
+- Calls MiniMax LLM.
+- Writes `task_results`.
+- Marks queue row `done` or `failed`.
+- Optionally calls `DECOMPOSE_CALLBACK_URL` with `FEISHU_API_TOKEN`.
+- Sends group notification via `FEISHU_BOT_WEBHOOK`.
 
-Flow:
+ENV variable names used by runner:
 
-1. `.github/workflows/hermes-decompose.yml` runs every 5 minutes.
-2. `scripts/hermes_decompose_runner.py` reads `hermes_queue`.
-3. Runner calls MiniMax and writes `task_results`.
-4. Runner optionally posts subtasks to `DECOMPOSE_CALLBACK_URL`.
-5. `POST /api/feishu/decompose-callback` writes subtasks into Bitable.
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `MINIMAX_CN_API_KEY`
+- `FEISHU_BOT_WEBHOOK`
+- `DECOMPOSE_CALLBACK_URL`
+- `FEISHU_API_TOKEN`
 
-Callback route behavior:
+Decompose callback:
 
-- Lists Bitable fields dynamically.
-- Maps task title/status/assignee to matching fields.
-- Inserts one Bitable record per task.
-- Returns debug field info.
+- `POST /api/feishu/decompose-callback`
+- Writes Bitable task records.
 
-Risk:
+ENV variable names:
 
-- Bitable sync is non-fatal in the GitHub Action runner, so decomposition can be marked done while Bitable task sync failed.
-- Callback auth is disabled if `FEISHU_API_TOKEN` is not configured.
+- `FEISHU_API_TOKEN`
+- `FEISHU_APP_ID`
+- `FEISHU_APP_SECRET`
+- `BITABLE_APP_TOKEN`
+- `BITABLE_TABLE_ID`
 
-## Worker Status Sync to Bitable
+Risks:
 
-Code: `src/lib/feishu-worker-sync.ts`
+- If `FEISHU_API_TOKEN` is missing, auth is disabled.
+- Field matching is dynamic but still tied to expected human field names.
+- Failures are returned/logged but not stored in a retryable outbox.
 
-Behavior:
+## Worker Status to Feishu Sync
 
-- Gets Feishu tenant access token with in-process cache.
-- Reads Bitable app/table config.
-- Lists fields from Bitable.
-- Updates an existing Bitable record by `recordId`.
-- Maps status/progress/current step/status message/git commit/error/completed/updated fields by trying multiple Chinese and English field names.
-- Catches and logs errors without throwing.
+Implementation: `src/lib/feishu-worker-sync.ts`.
 
-Record id sources:
+Called by:
+
+- `/api/worker/next`
+- `/api/worker/progress`
+- `/api/worker/report`
+
+Record ID sources:
 
 - API body: `bitable_record_id`, `feishu_record_id`, `record_id`
-- camelCase variants
-- `job.payload`
-- `job.result`
-- `job.raw`
+- Job row direct fields
+- Job `payload`
+- Job `result`
 
-Risk:
-
-- If `recordId` is missing, sync is skipped.
-- If Bitable fields differ, partial update is skipped field by field.
-- Status sync is best-effort and not a durable outbox.
-
-## Feishu Environment Variable Names
-
-Used by audited code:
+ENV variable names:
 
 - `FEISHU_APP_ID`
 - `FEISHU_APP_SECRET`
-- `FEISHU_ENCRYPT_KEY`
-- `FEISHU_VERIFICATION_TOKEN`
-- `FEISHU_BOT_WEBHOOK`
-- `FEISHU_API_TOKEN`
 - `BITABLE_APP_TOKEN`
 - `FEISHU_BITABLE_APP_TOKEN`
 - `BITABLE_WORKER_TABLE_ID`
 - `BITABLE_TASK_TABLE_ID`
 - `BITABLE_TABLE_ID`
 - `FEISHU_BITABLE_TABLE_ID`
-- `DECOMPOSE_CALLBACK_URL`
 
-## V2 Feishu Recommendations
+Fields attempted:
 
-1. Make Feishu automation route auth mandatory.
-2. Add a durable Feishu sync outbox instead of only inline best-effort sync.
-3. Store Feishu app/table/record ids in canonical job fields.
-4. Separate user-facing replies from backend task creation.
-5. Avoid inline LLM calls in the Feishu event route for long-running actions.
-6. Add explicit idempotency constraints for event ids and Bitable record ids.
+- Task status
+- Stage
+- Progress percent
+- Current step
+- Status message
+- Git commit
+- Error text
+- Completed time
+- Updated time
+
+Risk:
+
+- Sync is non-blocking and only logs errors.
+- No durable retry or last-sync status exists.
+- Missing record ID silently skips sync.
+
+## Feishu Table Creation
+
+Route: `POST /api/feishu/create-tables`.
+
+ENV variable names:
+
+- `FEISHU_API_TOKEN`
+- `FEISHU_APP_ID`
+- `FEISHU_APP_SECRET`
+- `BITABLE_APP_TOKEN`
+
+Risk:
+
+- Infrastructure-changing route should not be generally reachable in production.
+- If `FEISHU_API_TOKEN` is absent, auth is disabled.
+
+## V2 Feishu Requirements
+
+1. Add explicit auth to all Feishu/Bitable write routes.
+2. Move all Bitable writes to a sync outbox with retry and last error.
+3. Store Feishu record IDs on canonical requirement/task/subtask rows.
+4. Keep event receipts with unique event/message constraints.
+5. Avoid long-running LLM work inside Feishu event callbacks.
+6. Add field mapping configuration rather than scattered hard-coded names.

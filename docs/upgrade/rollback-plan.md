@@ -1,39 +1,41 @@
 # Rollback Plan
 
-Audit date: 2026-06-29
+This plan covers future V2 implementation phases. No rollback action was performed during this audit.
 
-This is a planning document only. No rollback was performed.
+## Principles
 
-## General Rollback Rules
-
-- Keep V2 changes behind explicit feature flags where possible.
-- Never delete V1 tables during V2 rollout.
-- Add nullable columns first, backfill separately, enforce constraints last.
+- Do not run destructive SQL without a reviewed rollback.
+- Keep old routes and tables until V2 is verified.
+- Make every migration additive first.
 - Keep Worker deployment reversible through `infra/windows-worker/deploy-worker.ps1` backups.
-- Keep Feishu Bitable schema changes additive until V2 is accepted.
+- Keep Codex prohibited from Git operations; outer Worker remains responsible for Git.
 
 ## Phase 1 Rollback: Data Model
 
-If a V2 schema migration causes issues:
+If V2 schema causes issues:
 
-1. Disable V2 routes or feature flag.
-2. Keep new tables/columns in place but stop writing to them.
-3. Continue using existing `hermes_queue` and `hermes_jobs` behavior.
-4. Revert application code through normal Git/Worker pipeline.
+1. Stop writing to V2 tables from API routes.
+2. Keep old `hermes_queue`, `task_results`, and `hermes_jobs` paths active.
+3. Do not drop V2 tables immediately; mark them unused.
+4. Revert code routes to legacy reads/writes.
 
-Do not drop V2 tables immediately unless data privacy or production safety requires it.
+Data risk:
+
+- Additive tables are low rollback risk.
+- Data copied from legacy to V2 may need reconciliation; avoid destructive migration.
 
 ## Phase 2 Rollback: Atomic Claim
 
-If atomic claim RPC fails:
+If atomic claim blocks Workers:
 
-1. Switch Worker API back to old `/api/worker/next` behavior.
-2. Disable multi-Worker concurrency.
-3. Manually inspect running jobs before requeue.
+1. Disable V2 claim endpoint.
+2. Restore old `/api/worker/next` behavior.
+3. Pause multiple Workers to reduce duplicate claim risk.
+4. Leave claim RPC in database unused until fixed.
 
-Residual risk:
+Data risk:
 
-- Duplicate claim risk returns until atomic claim is restored.
+- Attempts created during failed rollout may need manual status cleanup.
 
 ## Phase 3 Rollback: Heartbeat
 
@@ -44,35 +46,35 @@ If heartbeat creates false failures:
 3. Continue logging heartbeat but do not fail jobs based on it.
 4. Revert Worker heartbeat interval changes if needed.
 
-Residual risk:
+Data risk:
 
-- Stalled Worker detection becomes manual again.
+- Heartbeat timestamps are diagnostic only and can remain.
 
-## Phase 4 Rollback: Feishu Auth and Sync
+## Phase 4 Rollback: API Auth/Contract
 
-If Feishu automation stops working after auth changes:
+If new auth breaks Feishu or Worker:
 
-1. Confirm Feishu automation headers/secrets with a human operator.
-2. Temporarily disable only the failing route.
-3. Do not open unauthenticated production routes as a permanent fix.
-4. Queue failed Bitable sync records for retry after configuration is corrected.
+1. Do not remove auth entirely in production.
+2. Add temporary allowlist or compatibility token path.
+3. Restore legacy payload parsing while logging missing V2 fields.
+4. Rotate any token suspected to have been exposed during troubleshooting.
 
-Residual risk:
+Data risk:
 
-- Bitable may lag backend truth during rollback.
+- Partial reports may need manual reconciliation.
 
-## Phase 5 Rollback: Worker Git Guardrails
+## Phase 5 Rollback: Feishu Sync Outbox
 
-If new path restrictions block valid tasks:
+If Feishu sync outbox fails:
 
-1. Mark affected jobs `waiting_review` or equivalent.
-2. Have a human approve expanded allowed paths.
-3. Avoid disabling sensitive path checks globally.
-4. Re-run only after allowed scope is explicit.
+1. Disable outbox processor.
+2. Keep writing core job state to database.
+3. Fall back to manual Feishu board updates.
+4. Preserve queued sync rows for replay after fix.
 
-Residual risk:
+Data risk:
 
-- Overly broad allowed paths can recreate current production misoperation risk.
+- Feishu board can lag behind database but should not corrupt core job state.
 
 ## Phase 6 Rollback: Deployment Status Writeback
 
@@ -83,7 +85,7 @@ If deployment callback is noisy or wrong:
 3. Stop Feishu deployment sync.
 4. Continue using GitHub/Vercel native deployment views manually.
 
-Residual risk:
+Data risk:
 
 - Hermes job status will not reflect deployment state.
 
@@ -91,26 +93,31 @@ Residual risk:
 
 Use existing deployment design:
 
-1. `deploy-worker.ps1` creates timestamped backups under `C:\city-partner-worker-backups`.
+1. `deploy-worker.ps1 -Apply` creates timestamped backups under `C:\city-partner-worker-backups`.
 2. If deployment verification fails, the script restores files and restarts the scheduled task.
-3. For manual rollback, restore the previous backup files to `C:\city-partner-worker`.
-4. Do not copy or print production env file contents.
+3. Use `-SkipRestart` when copy should be separated from process restart.
+4. Watch for script markers:
+   - `WORKER_DEPLOYMENT_SUCCEEDED`
+   - `WORKER_DEPLOYMENT_ROLLED_BACK`
 
-Expected markers:
+## Emergency Manual Recovery
 
-- Success: `WORKER_DEPLOYMENT_SUCCEEDED`
-- Rollback: `WORKER_DEPLOYMENT_ROLLED_BACK`
+If jobs are stuck:
 
-## Emergency Stop
+1. Stop or pause Worker scheduled task.
+2. Inspect database job rows by status and lease time.
+3. Requeue only jobs known safe to retry.
+4. Do not modify production data without owner approval.
+5. Restart Worker after queue state is consistent.
+6. Pause Feishu writeback if it is producing bad updates.
+7. Pause deployment callback workflow if it is causing bad writes.
 
-If automation behaves unexpectedly:
+## Owner Approval Gates
 
-1. Stop the Windows scheduled task `CityPartnerCodexWorker`.
-2. Disable or rotate Worker API token with human approval.
-3. Disable Feishu automation rules or route traffic at the platform layer.
-4. Pause GitHub deployment status callback workflow if it is causing bad writes.
-5. Preserve logs and job records for audit.
+Rollback-sensitive operations require owner approval:
 
-## Review Gate
-
-After this Phase 0 audit, the recommended status is `waiting_review`. Phase 1 should not begin until the owner approves the V2 state model and rollout order.
+- Any SQL migration on production.
+- Any destructive cleanup.
+- Worker production deployment with `-Apply`.
+- Feishu table creation or field changes.
+- Deployment callback activation.

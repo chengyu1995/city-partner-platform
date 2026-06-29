@@ -1,54 +1,66 @@
-# Current Automation Architecture Audit
+# Current Architecture Audit
 
 Audit date: 2026-06-29
+Repository: `C:\city-partner`
+Scope: Phase 0 audit only. No business code, database migration, Feishu configuration, deployment, Git staging, Git commit, or Git push was performed.
 
-Scope: audit only. No business code, database migration, Feishu configuration, deployment, Git staging, Git commit, or Git push was performed.
+## Preflight
 
-Environment files: not read. This document lists environment variable names only.
+- `git status --short`: clean.
+- `git branch --show-current`: `master`.
+- `git rev-parse HEAD`: `1209360ea7396cd729fd66cf94e4ed8f7bd67646`.
+- Git safe-directory warning was bypassed with a one-shot `git -c safe.directory=C:/city-partner ...`; no Git configuration was changed.
+- No `.env` file contents or real environment variable values were read or printed.
 
-## Repository Evidence
+## Audited Flow
 
-- Feishu event ingress: `src/app/api/feishu/event/route.ts`
-- Feishu Bitable automation ingress: `src/app/api/feishu/requirement/route.ts`, `src/app/api/feishu/codex-task/route.ts`
-- Feishu Bitable table creation: `src/app/api/feishu/create-tables/route.ts`
-- Feishu decomposition callback: `src/app/api/feishu/decompose-callback/route.ts`
-- Worker APIs: `src/app/api/worker/next/route.ts`, `src/app/api/worker/progress/route.ts`, `src/app/api/worker/report/route.ts`
-- Worker shared helpers: `src/lib/worker-jobs.ts`, `src/lib/feishu-worker-sync.ts`
-- Windows Worker: `infra/windows-worker/local_worker.js`, `infra/windows-worker/start-worker.ps1`, `infra/windows-worker/deploy-worker.ps1`
-- Decomposition cron: `.github/workflows/hermes-decompose.yml`, `scripts/hermes_decompose_runner.py`
+Current automation is a single-layer task execution prototype:
+
+1. Feishu sends either event callbacks or Bitable automation HTTP calls.
+2. Vercel Next.js API routes receive the calls.
+3. Some routes write to Supabase `hermes_queue`; Feishu event chat flow can also interact with Hermes conversation tables and `hermes_jobs`.
+4. Windows Worker polls Vercel `GET /api/worker/next`.
+5. `/api/worker/next` reads one queued/pending row from Supabase `hermes_jobs`, marks it `running`, and returns it.
+6. Windows Worker runs Codex CLI in `PROJECT_DIR`.
+7. Outer Worker performs Git synchronization, optional commit, optional push, and rollback on failure.
+8. Worker reports progress to `POST /api/worker/progress` and final result to `POST /api/worker/report`.
+9. Worker status updates attempt non-blocking Feishu Bitable sync.
+10. GitHub deployment status workflow posts deployment status to a configured callback URL, but no matching receiver route was found in this repository.
+
+## Main Entry Points
+
+- Feishu event receiver: `src/app/api/feishu/event/route.ts`
+- Feishu Bitable requirement queue: `src/app/api/feishu/requirement/route.ts`
+- Feishu Bitable Codex-task queue: `src/app/api/feishu/codex-task/route.ts`
+- Feishu decompose callback: `src/app/api/feishu/decompose-callback/route.ts`
+- Feishu table creator: `src/app/api/feishu/create-tables/route.ts`
+- Worker claim: `src/app/api/worker/next/route.ts`
+- Worker progress: `src/app/api/worker/progress/route.ts`
+- Worker report: `src/app/api/worker/report/route.ts`
+- Worker shared helpers: `src/lib/worker-jobs.ts`
+- Feishu Worker status sync: `src/lib/feishu-worker-sync.ts`
+- Windows Worker: `infra/windows-worker/local_worker.js`
+- Worker deployment scripts: `infra/windows-worker/*.ps1`
+- Legacy/architecture docs: `docs/WORKER_ARCHITECTURE.md`, `docs/feishu-automation.md`
 - Deployment status workflow: `.github/workflows/sync-vercel-deployment.yml`
-- Database setup docs: `docs/setup-hermes-jobs.sql`, `docs/setup-hermes-queue.sql`, `docs/setup-hermes-conversations.sql`
 
-## Actual End-to-End Flow
+## Observed Gaps
 
-1. Feishu message events post to `POST /api/feishu/event`.
-2. The event route verifies/decrypts Feishu payloads, filters `im.message.receive_v1`, handles p2p and group mention rules, records `feishu_event_receipts`, loads/creates `hermes_conversations`, calls `runAgent()`, stores `hermes_messages`, and replies to Feishu.
-3. Feishu Bitable automations can also post to `POST /api/feishu/requirement` and `POST /api/feishu/codex-task`; these routes insert raw records into `hermes_queue`.
-4. `.github/workflows/hermes-decompose.yml` runs every 5 minutes and calls `scripts/hermes_decompose_runner.py`.
-5. The runner reads pending `hermes_queue`, calls MiniMax, writes `task_results`, optionally calls `DECOMPOSE_CALLBACK_URL` to sync subtasks to Feishu Bitable, and posts a Feishu bot notification.
-6. The Windows Worker polls `GET /api/worker/next`, receives one row from `hermes_jobs`, runs Codex CLI in `PROJECT_DIR`, reports progress to `/api/worker/progress`, and reports final output to `/api/worker/report`.
-7. Worker APIs update `hermes_jobs` and call `syncWorkerStatusToFeishu()` to update the Feishu Bitable record when a record id is available.
-8. The Worker can automatically commit and push through its own Git pipeline after Codex exits, controlled by Worker environment variables.
-9. `.github/workflows/sync-vercel-deployment.yml` listens for GitHub deployment status events and posts commit deployment status to a configured callback URL, but no matching receiver route was found in this repository.
+- `/api/worker/heartbeat` is called by `local_worker.js`, but no route exists under `src/app/api/worker`.
+- `expires_at` is written on claim, but no audited route or scheduled process requeues expired running jobs.
+- Claim is not atomic: `/api/worker/next` selects a row and then updates by `id`, so concurrent Workers can race.
+- Worker sends `result_text` and `deploy_status`, but `/api/worker/report` mainly stores `output`, `pr_url`, `files_changed`, `build_passed`, `test_passed`, `duration_ms`, and `git_commit_sha`.
+- Deployment callback receiver is missing for `.github/workflows/sync-vercel-deployment.yml`.
+- SQL setup for `hermes_jobs` is older than runtime expectations: runtime uses columns such as `progress_percent`, `current_step`, `status_message`, `git_commit_sha`, `error_text`, `completed_at`, and `request_text`, while audited SQL does not define all of them.
+- Feishu sync is best-effort and non-blocking. Failures are logged but not persisted as retryable sync jobs.
 
-## Important Architecture Split
+## V2 Direction
 
-There are two partially separate queues:
+Hermes V2 should first normalize one durable state machine before feature work:
 
-- `hermes_queue`: receives Feishu Bitable automation events and is processed by GitHub Actions decomposition.
-- `hermes_jobs`: is polled by the Windows Worker and is the actual Codex execution queue.
-
-The audited code does not show a complete, reliable bridge from `hermes_queue` decomposition results into executable `hermes_jobs` rows. This is the main Phase 0 finding for the V2 upgrade.
-
-## Missing or Incomplete Components
-
-- `POST /api/worker/heartbeat`: called by `local_worker.js`, but no route exists under `src/app/api/worker`.
-- Atomic job claim: `/api/worker/next` selects a candidate row and then updates it; there is no single SQL/RPC claim operation.
-- Lease recovery: `expires_at` is written, but no audited route or scheduled job requeues expired running jobs.
-- Deployment callback receiver: workflow posts `X-Deploy-Secret` to `DEPLOY_CALLBACK_URL`, but no repository API route handles it.
-- Status compatibility: SQL setup allows `pending`, `running`, `awaiting_review`, `completed`, `failed`; API/Worker code also uses `queued` and `succeeded`.
-- Worker result compatibility: Worker sends `result_text` and `deploy_status`, but `/api/worker/report` mainly consumes `output`, `pr_url`, `files_changed`, `build_passed`, `test_passed`, `duration_ms`, and `git_commit_sha`.
-
-## Phase 0 Conclusion
-
-The current system is usable as a single-layer automation prototype, but V2 should first normalize the execution model around one durable job state machine, one atomic claim path, heartbeat/lease recovery, and a defined parent-child task structure before starting Phase 1 feature work.
+- Requirement -> parent task -> subtask -> execution attempt.
+- Atomic claim with lease and heartbeat.
+- Explicit retry/requeue policy.
+- Separate Feishu sync outbox.
+- Separate Git commit/push/deployment state.
+- Clear human approval gates before production operations.

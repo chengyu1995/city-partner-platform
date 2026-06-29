@@ -1,42 +1,42 @@
-# Windows Worker Audit
+# Worker Audit
 
-Audit date: 2026-06-29
+Audit scope: `infra/windows-worker` implementation and related docs/scripts.
 
-## Files Audited
+## Runtime Entry
 
-- `infra/windows-worker/local_worker.js`
-- `infra/windows-worker/start-worker.ps1`
+Main file: `infra/windows-worker/local_worker.js`
+
+Startup options:
+
+- Manual: `node local_worker.js`
+- Scheduled task wrapper: `infra/windows-worker/start-worker.ps1`
+- Production directory described in docs: `C:\city-partner-worker`
+- Scheduled task name: `CityPartnerCodexWorker`
+
+Deployment helper:
+
 - `infra/windows-worker/deploy-worker.ps1`
-- `infra/windows-worker/git-safety.js`
-- `infra/windows-worker/README.md`
-
-## Startup
-
-`start-worker.ps1`:
-
-- Uses production Worker directory `C:\city-partner-worker`.
-- Expects `local_worker.js` under that directory.
-- Writes logs to `C:\city-partner-worker\logs\scheduled-worker.log`.
-- Refuses duplicate startup when a `node.exe` process command line contains `local_worker.js`.
-- Starts `C:\Program Files\nodejs\node.exe .\local_worker.js`.
-
-`deploy-worker.ps1`:
-
 - Default mode is dry-run.
-- Copies selected Worker files from repository source to `C:\city-partner-worker` only when `-Apply` is passed.
-- Backs up existing files and the production env file without printing env contents.
-- Blocks source `.env`.
-- Runs verification before apply.
-- Can restart scheduled task `CityPartnerCodexWorker`.
+- `-Apply` copies allowed Worker files to `C:\city-partner-worker`, backs up files, verifies syntax/tests, restarts scheduled task unless `-SkipRestart`.
+- It refuses source `.env` and avoids printing production env contents.
 
-## Required Runtime Configuration Names
+Watchdog:
 
-From `local_worker.js` and README:
+- `infra/windows-worker/worker-watchdog.ps1`
+- Checks scheduled task, Worker file, env file presence, node process, and log tail.
+- Default mode is dry-run.
+
+## Required Runtime ENV Names
+
+`local_worker.js` requires:
 
 - `WORKER_API_URL`
 - `WORKER_TOKEN`
-- `WORKER_NAME`
 - `PROJECT_DIR`
+
+Other supported names:
+
+- `WORKER_NAME`
 - `POLL_INTERVAL_MS`
 - `CODEX_TIMEOUT_MS`
 - `CODEX_IDLE_TIMEOUT_MS`
@@ -47,98 +47,116 @@ From `local_worker.js` and README:
 - `GIT_REMOTE_NAME`
 - `GIT_PUSH_BRANCH`
 
-No env file values were read.
+No real values were read or printed.
 
 ## Polling Logic
 
-`main()` runs forever until `SIGINT` or `SIGTERM`.
+Flow in `pollOnce()`:
 
-Loop behavior:
+1. Skip if already `working` or stopping.
+2. Request `GET /api/worker/next?worker_name=<WORKER_NAME>`.
+3. If no job, return.
+4. Mark `working = true`.
+5. Report 5 percent progress.
+6. Start heartbeat.
+7. Prepare Git task.
+8. Run Codex.
+9. Commit changes if configured.
+10. Push changes if configured.
+11. Report final result.
+12. Stop heartbeat and clear `working`.
 
-1. Calls `pollOnce()`.
-2. Catches and logs polling errors.
-3. Sleeps `POLL_INTERVAL_MS`, default 5000 ms.
+Poll interval:
 
-`pollOnce()`:
-
-1. Skips if already `working` or stopping.
-2. Requests `GET /api/worker/next?worker_name=<WORKER_NAME>`.
-3. If no `job.id`, returns.
-4. Marks `working = true`.
-5. Reports progress at 5%.
-6. Starts heartbeat.
-7. Runs Git preparation.
-8. Runs Codex CLI.
-9. Runs Git commit and optional push through Worker-owned logic.
-10. Reports success or failure.
-11. Stops heartbeat and clears `working`.
+- `POLL_INTERVAL_MS`, default `5000`.
 
 ## Codex CLI Invocation
 
-The Worker spawns:
+Source: `runCodex(prompt, job)`.
+
+Executable:
+
+- `CODEX_EXE`, default `C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe`
+
+Arguments:
 
 ```text
-codex.exe exec -C <PROJECT_DIR> --sandbox workspace-write --skip-git-repo-check <guarded prompt>
+exec
+-C
+<PROJECT_DIR>
+--sandbox
+workspace-write
+--skip-git-repo-check
+<guarded prompt>
 ```
 
-Default executable:
-
-```text
-C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe
-```
-
-Runtime environment additions:
+Environment additions:
 
 - `CI=1`
 - `NO_COLOR=1`
 
-The prompt is wrapped by `CODEX_GIT_OPERATION_GUARD`, which tells Codex not to run Git add/commit/push or create branches. Git operations are owned by the outer Worker.
-
 Timeouts:
 
-- Hard timeout: `CODEX_TIMEOUT_MS`, default 900000 ms.
-- Idle timeout: `CODEX_IDLE_TIMEOUT_MS`, default 60000 ms.
-- During Codex execution, the Worker also posts progress every 30 seconds.
+- Hard timeout: `CODEX_TIMEOUT_MS`, default `900000`.
+- Idle timeout: `CODEX_IDLE_TIMEOUT_MS`, default `60000`.
+- Kills process tree with `taskkill /T /F` on timeout.
 
-## Git Logic
+Prompt guard:
 
-When `GIT_AUTO_COMMIT=true`:
+- Prepends and appends Windows Worker rules forbidding Codex from running Git add/commit/push, creating branches, changing Git config, GitHub writes, or cloning to submit.
+- Original task text is included between guard blocks.
 
-1. Asserts the worktree is clean before Codex.
-2. Fetches remote and switches/pulls the configured branch.
-3. Captures base commit.
-4. After Codex exits, reads changed paths.
-5. Stages only those paths.
-6. Validates staged paths match task paths.
-7. Scans for sensitive paths/content.
-8. Commits with `worker: <job.id> <summary>`.
+## Git Handling
 
-When `GIT_AUTO_PUSH=true`:
+The outer Worker, not Codex, owns Git operations.
 
-- Pushes `HEAD:<branch>` to configured remote.
-- On first push failure, pulls with rebase and retries.
+Before Codex:
 
-On task failure:
+- Verifies inside Git worktree.
+- Requires clean worktree.
+- Fetches remote with prune.
+- Switches to target branch.
+- Pulls with rebase.
+- Records base commit.
 
-- If enabled, restores tracked files to the pre-task base commit.
-- Untracked file rollback is limited; the code unstages changed paths and restores tracked paths.
+After Codex:
+
+- Reads changed paths from `git status --porcelain=v1 -z`.
+- Validates paths.
+- Stages only task-changed paths via explicit `git add -- <paths>`.
+- Validates staged paths with `git diff --cached --name-only`.
+- Scans for sensitive paths/content.
+- Commits with message `worker: <job.id> <summary>`.
+- Optionally pushes `HEAD:<branch>`.
+- On failure, optionally restores tracked changes to checkpoint.
+
+Safety helper:
+
+- `infra/windows-worker/git-safety.js`
+
+Risks:
+
+- `git switch` and `git pull --rebase` are performed by Worker automatically. This is intentional for Worker but must remain outside Codex.
+- Commit message is generated from `job.request_text`, so it should be sanitized/limited. Current code truncates and normalizes whitespace.
+- Untracked files are not restored by rollback because rollback restores tracked paths only.
 
 ## Heartbeat
 
-Worker implements a heartbeat client:
+Worker implements two liveness mechanisms:
 
 - `sendHeartbeat(jobId)` posts to `/api/worker/heartbeat`.
 - `startHeartbeat(jobId)` sends immediately and every 60 seconds.
+- `startCodexHeartbeat(job)` sends progress updates every 30 seconds while Codex runs.
 
-Findings:
+Gaps:
 
 - No `/api/worker/heartbeat` route exists in the audited repository.
-- README mentions `HEARTBEAT_INTERVAL_MS`, but code uses a fixed 60 seconds.
+- README mentions `HEARTBEAT_INTERVAL_MS`, but code uses a fixed 60 seconds for heartbeat.
 - Heartbeat failures are logged and do not stop Codex.
 
-## Result Handling
+## Result Reporting
 
-Success report includes:
+Success report sends:
 
 - `job_id`
 - `status = succeeded`
@@ -146,7 +164,7 @@ Success report includes:
 - `git_commit_sha`
 - `deploy_status = pending` when push occurred
 
-Failure report includes:
+Failure report sends:
 
 - `job_id`
 - `status = failed`
@@ -156,20 +174,12 @@ Mismatch:
 
 - `/api/worker/report` does not explicitly consume `result_text` or `deploy_status`.
 
-## Worker Risks
+## V2 Worker Requirements
 
-- Worker can auto-commit and auto-push even though Codex itself is guarded; this is intentional but high impact.
-- Missing heartbeat route makes liveness incomplete.
-- Non-atomic server claim means multiple Workers can duplicate work.
-- Worker does not appear to check claim owner on progress/report.
-- If Codex exits successfully but validation misses a semantic issue, Worker may commit/push automatically.
-- If Git push triggers Vercel deployment, deployment state writeback is not closed because callback receiver is missing.
-
-## V2 Worker Recommendations
-
-1. Keep Codex prohibited from Git; keep Worker as the only Git actor.
-2. Add explicit allowed path constraints per job, not only post-hoc changed path detection.
-3. Add heartbeat route and configurable heartbeat interval.
-4. Require server claim ownership token or lease id for progress/report.
-5. Store Worker version, hostname, PID, Codex version, and base commit in job metadata.
-6. Make deployment status a separate state after push, not a loose report field.
+1. Align Worker query parameter with API claim identity (`worker_id` or header).
+2. Add heartbeat route and configurable heartbeat interval.
+3. Add attempt IDs; report progress and final result against attempt, not only job.
+4. Make rollback behavior explicit for untracked files.
+5. Store Codex stdout/stderr artifacts outside primary DB row or truncate consistently.
+6. Make deployment status a separate state after push.
+7. Keep Codex Git prohibition guard.
