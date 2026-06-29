@@ -52,3 +52,5 @@ stderr.log
 
 .npm-empty/
 vendor/
+
+.npm-empty/
