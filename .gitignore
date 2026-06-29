@@ -63,3 +63,5 @@ vendor/
 .npm-empty/
 /vendor/
 vendor/
+/.npm-empty*/
+.npm-empty*/
