@@ -1,246 +1,194 @@
-# API audit
+# API Audit
 
-## Route inventory
+Audit date: 2026-06-29
 
-Current `src/app/api` routes:
+## Feishu Event API
 
-- `/api/admin/list`
-- `/api/feishu/codex-task`
-- `/api/feishu/create-tables`
-- `/api/feishu/decompose-callback`
-- `/api/feishu/event`
-- `/api/feishu/requirement`
-- `/api/partners/[id]/moderate`
-- `/api/partners`
-- `/api/queue/status`
-- `/api/reports`
-- `/api/worker/next`
-- `/api/worker/progress`
-- `/api/worker/report`
+Route: `src/app/api/feishu/event/route.ts`
 
-All inspected route files use Next.js route handlers and set `runtime = "nodejs"` where relevant.
+Methods:
 
-## Worker API
+- `POST /api/feishu/event`
+- `GET /api/feishu/event`
 
-### `GET /api/worker/next`
+Runtime:
 
-File: `src/app/api/worker/next/route.ts`
-
-Auth:
-
-- Uses `assertWorkerAuthorized(req)` from `src/lib/worker-jobs.ts`.
-- Accepts `Authorization: Bearer <token>` when one of these env names is configured: `WORKER_TOKEN`, `WORKER_API_TOKEN`, `HERMES_WORKER_TOKEN`.
-- If no expected token is configured, auth is effectively disabled.
-
-Request:
-
-- Worker id from `x-worker-id` header, or `worker_id` query param, or fallback `unknown-worker`.
+- `nodejs`
+- `force-dynamic`
 
 Behavior:
 
-- Gets Supabase service client.
-- Selects first `hermes_jobs` row with status in `queued` or `pending`, ordered by priority then created time.
-- If no job: returns `{ ok: true, job: null }`.
-- Updates selected job to `running` with claim metadata and 5-minute expiry.
-- Calls Feishu status sync if a Bitable record id is available.
-
-Response:
-
-- Success with job: `{ ok: true, job, feishu_sync }`
-- Success without job: `{ ok: true, job: null }`
-- Auth failure: `{ ok: false, error: "unauthorized" }` with 401.
-- Supabase failure: `{ ok: false, error }` with 500.
-
-### `POST /api/worker/next`
-
-Same implementation as GET.
-
-### `POST /api/worker/progress`
-
-File: `src/app/api/worker/progress/route.ts`
-
-Auth:
-
-- Same Worker bearer auth helper.
-
-Request body:
-
-- `id` or `job_id`
-- `status`
-- `progress_percent`
-- `current_step`
-- `status_message`
-- `bitable_record_id`, `feishu_record_id`, or `record_id`
-
-Behavior:
-
-- Requires `job_id`.
-- Normalizes status for Feishu sync.
-- Updates `hermes_jobs` with progress fields.
-- Calls Feishu status sync.
-
-Response:
-
-- `{ ok: true, job, feishu_sync }`
-- `{ ok: false, error: "job_id is required" }` with 400.
-- `{ ok: false, error }` with 500.
-
-### `POST /api/worker/report`
-
-File: `src/app/api/worker/report/route.ts`
-
-Auth:
-
-- Same Worker bearer auth helper.
-
-Request body:
-
-- `id` or `job_id`
-- `status`
-- `progress_percent`
-- `current_step`
-- `status_message`
-- `git_commit_sha`
-- `error_text` or `error`
-- `output`
-- `pr_url`
-- `files_changed`
-- `build_passed`
-- `test_passed`
-- `duration_ms`
-- record id aliases
-
-Behavior:
-
-- Requires `job_id`.
-- Normalizes final statuses to `succeeded` or `failed` when applicable.
-- Builds `result` JSON with output, PR URL, changed files, test/build status, duration, and commit SHA.
-- Writes completion timestamp for terminal states.
-- Calls Feishu status sync.
-
-Response:
-
-- `{ ok: true, job, feishu_sync }`
-- `{ ok: false, error: "job_id is required" }` with 400.
-- `{ ok: false, error }` with 500.
-
-### `GET /api/worker/report`
-
-Returns `{ ok: true, route: "worker-report" }`.
-
-## Feishu API
-
-### `POST /api/feishu/event`
-
-File: `src/app/api/feishu/event/route.ts`
-
-Auth and verification:
-
-- Optional decrypt using `FEISHU_ENCRYPT_KEY`.
-- Optional token check using `FEISHU_VERIFICATION_TOKEN`.
-- Feishu app token call uses `FEISHU_APP_ID` and `FEISHU_APP_SECRET`.
-
-Request:
-
-- Feishu event payload, encrypted or plain.
+- Parses JSON body.
+- Supports encrypted Feishu events using `FEISHU_ENCRYPT_KEY`.
+- Verifies `FEISHU_VERIFICATION_TOKEN` when configured.
 - Handles URL verification challenge.
-- Handles `im.message.receive_v1`.
-
-Behavior:
-
-- For group chat, requires text mention containing `Hermes` or any `@\S+`.
-- Inserts `feishu_event_receipts` with status `processing`.
-- Duplicate `event_id` returns `{ code: 0, duplicate: true }`.
-- Loads conversation history from `hermes_messages`.
+- Processes only `im.message.receive_v1`.
+- For group chat, requires text containing `Hermes` or a mention-like token, then strips mentions.
+- Inserts a receipt into `feishu_event_receipts` with `status = processing`.
+- Uses duplicate event id handling via unique constraint error `23505`.
+- Checks recent duplicate Feishu jobs through `findRecentDuplicateFeishuJob()`.
+- Creates or loads a conversation in `hermes_conversations`.
+- Loads recent `hermes_messages`.
 - Calls `runAgent()`.
-- Inserts user and assistant/tool messages.
-- Sends Feishu reply.
-- Marks receipt completed or failed.
+- Inserts new user/assistant/tool messages.
+- Sends a Feishu text reply.
+- Marks receipt `completed` or `failed`.
 
-Response:
+Environment variable names used:
 
-- Feishu-style `{ code: 0 }` on success or ignored events.
-- `{ code: 500, msg }` on failure.
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `FEISHU_ENCRYPT_KEY`
+- `FEISHU_VERIFICATION_TOKEN`
+- `FEISHU_APP_ID`
+- `FEISHU_APP_SECRET`
+- `MINIMAX_CN_API_KEY`
+- `HERMES_API_KEY`
+- `FEISHU_BOT_WEBHOOK`
 
-### `POST /api/feishu/requirement`
+Risks:
 
-File: `src/app/api/feishu/requirement/route.ts`
+- Event route performs LLM work inline, which can exceed serverless latency budgets.
+- Duplicate job check depends on `hermes_jobs.request_text`, which is not in the audited SQL setup.
+- Error handling intentionally returns HTTP 200 for many failures to avoid Feishu retries; operational errors can be hidden unless logs/receipts are monitored.
 
-Auth:
+## Feishu Bitable Ingest APIs
 
-- No route-level bearer auth found.
-- Uses Supabase service role env variables.
+Routes:
 
-Request:
-
-- JSON payload from Feishu Bitable automation.
-
-Behavior:
-
-- Inserts into `hermes_queue` with `event_type = "new_requirement"`, `payload`, `status = "pending"`.
-
-Response:
-
-- `{ ok: true, queue_id }`
-- `{ ok: false, error }`
-
-### `POST /api/feishu/codex-task`
-
-File: `src/app/api/feishu/codex-task/route.ts`
-
-Auth:
-
-- No route-level bearer auth found.
+- `POST /api/feishu/requirement`
+- `POST /api/feishu/codex-task`
 
 Behavior:
 
-- Inserts into `hermes_queue` with `event_type = "codex_task_ready"`, `payload`, `status = "pending"`.
+- `requirement` decodes request body as UTF-8, logs the first 500 chars, inserts into `hermes_queue` with `event_type = new_requirement`.
+- `codex-task` parses JSON text and inserts into `hermes_queue` with `event_type = codex_task_ready`.
 
-### `POST /api/feishu/decompose-callback`
+Environment variable names used:
 
-File: `src/app/api/feishu/decompose-callback/route.ts`
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
 
-Auth:
+Risks:
 
-- If `FEISHU_API_TOKEN` exists, requires `Authorization: Bearer <token>`.
+- No explicit request authentication was found on these two routes.
+- Raw payload is accepted and inserted into queue without schema validation.
+- These routes feed `hermes_queue`, not directly `hermes_jobs`.
+
+## Feishu Bitable Create Tables API
+
+Route: `POST /api/feishu/create-tables`
+
+Behavior:
+
+- Optional Bearer auth via `FEISHU_API_TOKEN`.
+- Uses `BITABLE_APP_TOKEN`, `FEISHU_APP_ID`, `FEISHU_APP_SECRET`.
+- Creates eight Feishu Bitable tables and fields.
+
+Risk:
+
+- If `FEISHU_API_TOKEN` is missing, auth is disabled by code path.
+- This is a configuration-changing route and should be disabled or strongly protected in production.
+
+## Feishu Decompose Callback API
+
+Route: `POST /api/feishu/decompose-callback`
+
+Behavior:
+
+- Optional Bearer auth via `FEISHU_API_TOKEN`.
+- Reads `tasks` and `parentTaskId`.
+- Gets Feishu tenant access token.
+- Reads Bitable fields and inserts task records.
+- Returns per-task results and debug field names.
+
+Environment variable names used:
+
+- `FEISHU_API_TOKEN`
+- `FEISHU_APP_ID`
+- `FEISHU_APP_SECRET`
+- `BITABLE_APP_TOKEN`
+- `BITABLE_TABLE_ID`
+
+Risks:
+
 - If `FEISHU_API_TOKEN` is missing, auth is disabled.
+- Bitable sync errors can be included in API response; current code does not print secrets, but error text should remain sanitized in V2.
 
-Request:
+## Worker Next API
 
-- `{ tasks: [{ title, status?, assignee? }], parentTaskId? }`
+Route: `src/app/api/worker/next/route.ts`
 
-Behavior:
+Methods:
 
-- Gets Feishu tenant token.
-- Lists Bitable fields.
-- Inserts task records into Bitable.
-- Processes tasks serially.
-- Returns debug field names and per-task results.
+- `GET /api/worker/next`
+- `POST /api/worker/next`
 
-### `POST /api/feishu/create-tables`
+Authentication:
 
-File: `src/app/api/feishu/create-tables/route.ts`
-
-Auth:
-
-- If `FEISHU_API_TOKEN` exists, requires `Authorization: Bearer <token>`.
-- If missing, auth is disabled.
+- `assertWorkerAuthorized()` checks Bearer token when one of these env vars is configured: `WORKER_TOKEN`, `WORKER_API_TOKEN`, `HERMES_WORKER_TOKEN`.
+- If no token env is configured, the route allows access.
 
 Behavior:
 
-- Creates 8 Bitable tables and fields using `BITABLE_APP_TOKEN`, `FEISHU_APP_ID`, and `FEISHU_APP_SECRET`.
+- Selects one `hermes_jobs` row with status in `queued`, `pending`.
+- Orders by `priority` ascending then `created_at` ascending.
+- Updates selected row to `running`.
+- Sets `claimed_by`, `claimed_at`, `expires_at`, progress fields, and `updated_at`.
+- Syncs running status to Feishu Bitable if a record id can be found.
 
-## Other API routes
+Risks:
 
-- `/api/queue/status`: reads `hermes_queue` stats, recent queue rows, and recent `task_results`.
-- `/api/admin/list`: service role fetch of `partner_posts`, optional `status` filter.
-- `/api/partners`: GET approved partner posts; POST creates pending partner post.
-- `/api/reports`: creates report rows.
-- `/api/partners/[id]/moderate`: file path exists in route inventory, but literal path read failed with PowerShell wildcard brackets; not further audited in this pass.
+- Claim is not atomic. Two Workers can select the same row before either update completes.
+- No `expires_at < now()` recovery is applied.
+- Status `queued` may conflict with SQL setup.
+- Query parameter uses `worker_id` in API helper, while Worker sends `worker_name`; if header `x-worker-id` is absent, claim may become `unknown-worker`.
 
-## Not found
+## Worker Progress API
 
-- `/api/worker/heartbeat`: Worker calls this endpoint, but no route file was found.
-- Deployment callback receiver for `.github/workflows/sync-vercel-deployment.yml`: not found.
-- Dedicated auth middleware: not found.
-- Rate limiting for public Feishu routes: not found.
+Route: `POST /api/worker/progress`
+
+Behavior:
+
+- Requires `job_id` or `id`.
+- Normalizes progress and status.
+- Updates `hermes_jobs`.
+- Syncs progress to Feishu Bitable.
+
+Risks:
+
+- Does not verify that the reporting Worker owns the claim.
+- Can move status based only on submitted body.
+
+## Worker Report API
+
+Route: `POST /api/worker/report`
+
+Behavior:
+
+- Requires `job_id` or `id`.
+- Normalizes status to `running`, `queued`, `succeeded`, or `failed`.
+- Terminal statuses set progress to 100 and `completed_at`.
+- Stores `git_commit_sha`, error text, and a `result` object.
+- Syncs final status to Feishu Bitable.
+
+Risks:
+
+- Worker sends `result_text` and `deploy_status`, but route does not explicitly store those fields.
+- Status `succeeded` may conflict with SQL setup.
+- Does not verify claim ownership.
+- Feishu sync is awaited but internally catches errors; this is good for non-blocking behavior, but failures only appear in logs.
+
+## Missing API Routes
+
+- `/api/worker/heartbeat`: Worker calls it, repository route not found.
+- Deployment status callback route for `.github/workflows/sync-vercel-deployment.yml`: not found.
+
+## API Recommendations for V2
+
+1. Add mandatory auth for all Feishu automation and Worker routes.
+2. Introduce atomic job claim RPC or conditional update.
+3. Add `/api/worker/heartbeat` and stale job recovery.
+4. Validate request body schemas.
+5. Normalize status names across SQL, API, Worker, and Feishu.
+6. Add a deployment callback receiver or remove the workflow.

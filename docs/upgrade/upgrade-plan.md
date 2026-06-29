@@ -1,132 +1,148 @@
-# Upgrade plan
+# Upgrade Plan for Hermes Multi-Role Task System V2
 
-This plan starts after phase 0 approval. Do not begin phase 1 without owner approval.
+Audit date: 2026-06-29
 
-## Phase 1: Stabilize schema and state machine
+This plan intentionally stops before Phase 1 implementation. It lists recommended sequencing only.
 
-Goal: make `hermes_jobs` status and fields match actual Worker/API behavior.
+## Phase 0 Exit Criteria
 
-Minimal tasks:
+Before Phase 1 starts:
 
-1. Define canonical job statuses: suggested set `queued`, `claimed`, `running`, `waiting_review`, `succeeded`, `failed`, `cancelled`.
-2. Add or confirm required `hermes_jobs` columns: progress, current step, status message, commit SHA, error text, completed timestamp, heartbeat timestamp, lease expiry, record id.
-3. Add a SQL migration for the canonical status check constraint.
-4. Replace string literals in Worker API with shared constants.
-5. Add tests for allowed transitions.
+- Current architecture audit reviewed.
+- Database state machine decision approved.
+- Worker Git authority and branch policy approved.
+- Feishu route authentication policy approved.
+- No production database migration run from this audit task.
 
-Exit criteria:
+## Phase 1: Canonical Data Model
 
-- API, SQL, Worker, and Feishu sync use one status vocabulary.
-- Existing jobs can be migrated without losing history.
+Goal: define one source of truth for requirements, tasks, subtasks, and execution attempts.
 
-## Phase 2: Atomic job claim and lease recovery
+Recommended work:
 
-Goal: remove duplicate claiming and stuck running jobs.
+1. Decide whether `hermes_queue` remains only an ingest queue or becomes part of job orchestration.
+2. Create a canonical V2 schema:
+   - parent requirement
+   - child tasks
+   - execution attempts
+   - Feishu Bitable mapping
+   - deployment records
+3. Normalize status values across SQL, API, Worker, and Feishu.
+4. Add required runtime fields currently missing from setup SQL.
+5. Add idempotency keys:
+   - Feishu event id
+   - Feishu message id
+   - Bitable record id
+   - normalized task fingerprint
 
-Minimal tasks:
+Acceptance:
 
-1. Create SQL RPC `claim_next_hermes_job(worker_id)` that atomically selects and updates one queued/expired job.
-2. Include attempt increment and lease expiry in the atomic claim.
-3. Update `/api/worker/next` to call the RPC.
-4. Add expired job requeue logic with max attempts.
-5. Add tests for concurrent claims.
+- One documented state machine.
+- Runtime code no longer needs missing-column skip behavior for expected fields.
 
-Exit criteria:
+## Phase 2: Atomic Claim and Lease Recovery
+
+Goal: prevent duplicate execution and recover stuck tasks.
+
+Recommended work:
+
+1. Add SQL RPC or conditional update for claiming the next job.
+2. Return a claim token or lease id.
+3. Require claim ownership on progress/report.
+4. Add lease expiry recovery:
+   - running with expired lease
+   - max attempts
+   - terminal failed state
+5. Add indexes for claim queries.
+
+Acceptance:
 
 - Two Workers cannot claim the same job.
-- Expired jobs are recoverable or marked failed with reason.
+- Stale running jobs are visible and recoverable.
 
-## Phase 3: Heartbeat and Worker health
+## Phase 3: Heartbeat and Worker Health
 
-Goal: make Worker liveness explicit and reliable.
+Goal: make Worker liveness observable.
 
-Minimal tasks:
+Recommended work:
 
-1. Add `/api/worker/heartbeat`.
-2. Store `heartbeat_at`, `worker_name`, and optional `pid` or runtime metadata.
-3. Make heartbeat interval configurable or update docs to fixed value.
-4. Add server-side stale heartbeat detection.
-5. Update Worker report flow to distinguish alive-but-running from stalled.
+1. Add `POST /api/worker/heartbeat`.
+2. Store `heartbeat_at`, `worker_name`, optional PID/version/base commit.
+3. Make heartbeat interval configurable or align docs with fixed 60 seconds.
+4. Show stale heartbeat in job status and Feishu sync.
 
-Exit criteria:
+Acceptance:
 
-- Dashboard can show active Worker and stale jobs.
-- Heartbeat failures produce actionable status.
+- Heartbeat failures have a server-side signal.
+- A killed Worker leaves evidence for recovery.
 
-## Phase 4: Decouple Feishu sync from critical path
+## Phase 4: Feishu Security and Sync Reliability
 
-Goal: avoid Feishu API latency blocking Worker claim/progress/report.
+Goal: make Feishu ingress and Bitable sync safe.
 
-Minimal tasks:
+Recommended work:
 
-1. Add a `feishu_sync_events` table or reuse a queue with event type.
-2. Worker API writes sync events instead of awaiting Feishu API.
-3. Add a sync processor with retries and sanitized errors.
-4. Keep immediate best-effort sync only if bounded by short timeout.
+1. Require auth/signature on all Feishu automation routes.
+2. Disable or strongly gate `/api/feishu/create-tables` in production.
+3. Add durable Feishu sync outbox:
+   - target app/table/record
+   - payload
+   - attempt count
+   - last error
+4. Move long-running Feishu event work to queue-based processing.
 
-Exit criteria:
-
-- Worker API remains responsive when Feishu is slow.
-- Failed Feishu sync is retryable and visible.
-
-## Phase 5: Secure public mutation routes
-
-Goal: make all external mutation endpoints explicitly authenticated.
-
-Minimal tasks:
-
-1. Require `FEISHU_API_TOKEN` or Feishu signature/token validation for `/api/feishu/requirement`.
-2. Require auth for `/api/feishu/codex-task`.
-3. Make `/api/feishu/create-tables` admin-only and disabled in production unless explicitly enabled.
-4. Add rate limiting or idempotency keys for Feishu event and Bitable automation routes.
-
-Exit criteria:
+Acceptance:
 
 - Missing auth config fails closed.
-- Unauthorized mutation requests return 401.
+- Feishu Bitable can be eventually consistent with retry.
 
-## Phase 6: Deployment status writeback
+## Phase 5: Worker Git and Codex Guardrails
 
-Goal: close the GitHub/Vercel status loop.
+Goal: keep Git automation useful but bounded.
 
-Minimal tasks:
+Recommended work:
 
-1. Add authenticated deployment callback route or remove the workflow if no longer needed.
-2. Validate `X-Deploy-Secret`.
-3. Store deployment status by `git_commit_sha`.
-4. Sync deployment URL/status to Bitable via queue.
-5. Add tests for callback payloads.
+1. Require job-level allowed paths.
+2. Reject changes outside allowed paths before commit.
+3. Add sensitive path and sensitive content checks to server-side audit too.
+4. Include Codex version, prompt hash, changed files, and base/head SHA in report.
+5. Keep Codex prohibited from Git operations.
 
-Exit criteria:
+Acceptance:
 
-- Vercel deployment statuses are visible on the corresponding Worker job.
+- Worker can prove exactly what it committed and why.
+- Sensitive files and infrastructure paths require explicit human approval.
 
-## Phase 7: Multi-layer task model
+## Phase 6: Deployment Status Writeback
 
-Goal: support phases, subtasks, dependencies, and review gates.
+Goal: close GitHub/Vercel feedback loop.
 
-Minimal tasks:
+Recommended work:
 
-1. Decide whether `hermes_queue` should feed `hermes_jobs` directly or whether a new parent-child job model is needed.
-2. Add parent job id, phase, dependency, and role fields.
-3. Add smallest scheduling rule: executable only when dependencies succeeded and owner approval not required.
-4. Add Feishu Bitable sync mapping for phase/task hierarchy.
+1. Add authenticated deployment callback route for `.github/workflows/sync-vercel-deployment.yml`, or remove the workflow.
+2. Store deployment status by commit SHA.
+3. Link deployment status to the corresponding job/attempt.
+4. Sync deployment URL/status to Feishu Bitable through the sync outbox.
 
-Exit criteria:
+Acceptance:
 
-- One requirement can produce multiple independently tracked Worker jobs.
+- A pushed commit has visible deploy pending/success/failure state on the job.
 
-## Phase 8: Source health and operational hardening
+## Phase 7: Multi-Role Orchestration
 
-Goal: make the current codebase verifiably buildable and operable.
+Goal: implement Hermes V2 roles after foundation is stable.
 
-Minimal tasks:
+Recommended work:
 
-1. Run syntax checks and TypeScript build in a dedicated code-health task.
-2. Fix mojibake or malformed string literals in source files.
-3. Add CI checks for Worker `node --check`, Worker tests, and route typecheck.
-4. Add centralized external-error sanitizer.
+1. Model roles such as product, design, Codex, test, review, owner approval.
+2. Add dependencies between tasks.
+3. Add approval gates for production-sensitive actions.
+4. Add owner-facing decision records.
 
-Exit criteria:
+Acceptance:
 
-- CI catches syntax, type, Worker safety, and secret leak regressions.
+- V2 can represent one requirement with multiple role-specific tasks and a clear owner approval path.
+
+## Phase 1 Recommendation
+
+Start Phase 1 with database/state-machine design, not UI or Worker feature work. The current highest-risk gap is not missing functionality; it is inconsistent orchestration state.

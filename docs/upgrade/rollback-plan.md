@@ -1,130 +1,116 @@
-# Rollback plan
+# Rollback Plan
 
-## General rules
+Audit date: 2026-06-29
 
-- Roll back one phase at a time.
-- Do not roll back production data by deleting rows unless the owner explicitly approves.
-- Prefer additive migrations with feature flags so rollback can disable new paths while preserving data.
-- Keep Worker production directory backups under the existing backup pattern `C:\city-partner-worker-backups`.
-- Do not print or copy real `.env` values during rollback.
+This is a planning document only. No rollback was performed.
 
-## Phase 1 rollback: schema and state machine
+## General Rollback Rules
 
-Rollback method:
+- Keep V2 changes behind explicit feature flags where possible.
+- Never delete V1 tables during V2 rollout.
+- Add nullable columns first, backfill separately, enforce constraints last.
+- Keep Worker deployment reversible through `infra/windows-worker/deploy-worker.ps1` backups.
+- Keep Feishu Bitable schema changes additive until V2 is accepted.
 
-1. Disable new API code paths that write new statuses.
-2. Restore previous status mapping in API/Worker if no data migration is required.
-3. If SQL constraint changed, apply a rollback migration that accepts both old and new statuses temporarily.
-4. Keep new columns; stop writing them rather than dropping immediately.
+## Phase 1 Rollback: Data Model
 
-Verification:
+If a V2 schema migration causes issues:
 
-- `/api/worker/next` can still claim legacy pending jobs.
-- `/api/worker/report` can still mark failed jobs.
+1. Disable V2 routes or feature flag.
+2. Keep new tables/columns in place but stop writing to them.
+3. Continue using existing `hermes_queue` and `hermes_jobs` behavior.
+4. Revert application code through normal Git/Worker pipeline.
 
-## Phase 2 rollback: atomic claim and recovery
+Do not drop V2 tables immediately unless data privacy or production safety requires it.
 
-Rollback method:
+## Phase 2 Rollback: Atomic Claim
 
-1. Switch `/api/worker/next` back to old select/update implementation.
-2. Keep the SQL RPC in place but unused.
-3. Disable scheduled requeue/reaper job.
+If atomic claim RPC fails:
 
-Verification:
+1. Switch Worker API back to old `/api/worker/next` behavior.
+2. Disable multi-Worker concurrency.
+3. Manually inspect running jobs before requeue.
 
-- Worker can claim one pending job in a single-Worker environment.
-- No job is repeatedly requeued.
+Residual risk:
 
-## Phase 3 rollback: heartbeat
+- Duplicate claim risk returns until atomic claim is restored.
 
-Rollback method:
+## Phase 3 Rollback: Heartbeat
 
-1. Leave heartbeat columns in DB.
+If heartbeat creates false failures:
+
+1. Keep heartbeat storage columns.
 2. Disable stale-heartbeat enforcement.
-3. Make Worker heartbeat failures non-fatal, matching current behavior.
+3. Continue logging heartbeat but do not fail jobs based on it.
+4. Revert Worker heartbeat interval changes if needed.
 
-Verification:
+Residual risk:
 
-- Long-running jobs are not failed only because heartbeat is absent.
-- Worker report still finalizes jobs.
+- Stalled Worker detection becomes manual again.
 
-## Phase 4 rollback: Feishu sync decoupling
+## Phase 4 Rollback: Feishu Auth and Sync
 
-Rollback method:
+If Feishu automation stops working after auth changes:
 
-1. Disable async sync worker or queue consumer.
-2. Re-enable current inline `syncWorkerStatusToFeishu()` calls if needed.
-3. Keep pending sync events for later replay; do not delete them by default.
+1. Confirm Feishu automation headers/secrets with a human operator.
+2. Temporarily disable only the failing route.
+3. Do not open unauthenticated production routes as a permanent fix.
+4. Queue failed Bitable sync records for retry after configuration is corrected.
 
-Verification:
+Residual risk:
 
-- Worker progress/report routes still return success.
-- Feishu sync failures do not block job finalization.
+- Bitable may lag backend truth during rollback.
 
-## Phase 5 rollback: external route auth
+## Phase 5 Rollback: Worker Git Guardrails
 
-Rollback method:
+If new path restrictions block valid tasks:
 
-1. Re-enable previous auth behavior only for a short emergency window.
-2. Prefer adding the missing token/env over disabling auth.
-3. Keep logs of rejected requests for owner review.
+1. Mark affected jobs `waiting_review` or equivalent.
+2. Have a human approve expanded allowed paths.
+3. Avoid disabling sensitive path checks globally.
+4. Re-run only after allowed scope is explicit.
 
-Verification:
+Residual risk:
 
-- Feishu automation can still create legitimate queue rows.
-- Unauthorized requests remain blocked unless owner explicitly approved temporary compatibility mode.
+- Overly broad allowed paths can recreate current production misoperation risk.
 
-## Phase 6 rollback: deployment status writeback
+## Phase 6 Rollback: Deployment Status Writeback
 
-Rollback method:
+If deployment callback is noisy or wrong:
 
 1. Disable `.github/workflows/sync-vercel-deployment.yml` callback step or point it to a no-op endpoint.
-2. Keep existing deployment status columns/events.
-3. Stop Bitable deployment sync if it creates noisy or wrong updates.
+2. Keep deployment records already stored.
+3. Stop Feishu deployment sync.
+4. Continue using GitHub/Vercel native deployment views manually.
 
-Verification:
+Residual risk:
 
-- Vercel deployments continue independently.
-- Worker job completion no longer waits for deployment status.
+- Hermes job status will not reflect deployment state.
 
-## Phase 7 rollback: multi-layer task model
-
-Rollback method:
-
-1. Stop creating child jobs from new requirements.
-2. Continue showing existing child jobs read-only.
-3. Route new requirements back to the single-job model.
-4. Preserve parent-child records for later migration; do not delete them.
-
-Verification:
-
-- New Feishu requirements still create executable work.
-- Existing single-layer Worker jobs remain claimable.
-
-## Phase 8 rollback: source health and hardening
-
-Rollback method:
-
-1. Revert only the code-health changes that caused regression.
-2. Keep CI checks that passed; disable only the failing new check with owner approval.
-3. If Worker deployment changed, use `deploy-worker.ps1` backup restore behavior or manually restore from `C:\city-partner-worker-backups`.
-
-Verification:
-
-- `npm run build` and Worker verification return to the last known good baseline.
-- Production Worker process can start and poll.
-
-## Emergency Worker rollback
+## Worker Deployment Rollback
 
 Use existing deployment design:
 
-1. Stop `CityPartnerCodexWorker` scheduled task.
-2. Stop `node.exe` processes whose command line contains `local_worker.js`.
-3. Restore files from the latest timestamped backup under `C:\city-partner-worker-backups`.
-4. Do not overwrite or print production env file contents.
-5. Start the scheduled task.
-6. Confirm Worker process exists and logs do not contain secret values.
+1. `deploy-worker.ps1` creates timestamped backups under `C:\city-partner-worker-backups`.
+2. If deployment verification fails, the script restores files and restarts the scheduled task.
+3. For manual rollback, restore the previous backup files to `C:\city-partner-worker`.
+4. Do not copy or print production env file contents.
 
-Repository evidence:
+Expected markers:
 
-- `infra/windows-worker/deploy-worker.ps1` already contains backup, restore, process stop, and scheduled task restart logic.
+- Success: `WORKER_DEPLOYMENT_SUCCEEDED`
+- Rollback: `WORKER_DEPLOYMENT_ROLLED_BACK`
+
+## Emergency Stop
+
+If automation behaves unexpectedly:
+
+1. Stop the Windows scheduled task `CityPartnerCodexWorker`.
+2. Disable or rotate Worker API token with human approval.
+3. Disable Feishu automation rules or route traffic at the platform layer.
+4. Pause GitHub deployment status callback workflow if it is causing bad writes.
+5. Preserve logs and job records for audit.
+
+## Review Gate
+
+After this Phase 0 audit, the recommended status is `waiting_review`. Phase 1 should not begin until the owner approves the V2 state model and rollout order.

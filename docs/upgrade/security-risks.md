@@ -1,102 +1,104 @@
-# Security and reliability risks
+# Security and Reliability Risks
 
-## High
+Audit date: 2026-06-29
 
-1. Duplicate Worker claim risk
+## High Priority Risks
 
-- Evidence: `src/app/api/worker/next/route.ts` selects a pending job and then updates it in a separate statement.
-- Impact: two Workers can read the same job before either update completes.
-- Upgrade need: atomic claim via SQL RPC or conditional update with status guard.
+1. Non-atomic task claim
 
-2. Worker heartbeat endpoint missing
+- Evidence: `/api/worker/next` selects one `hermes_jobs` row, then updates it.
+- Impact: two Workers can claim the same task under concurrency.
+- V2 need: atomic claim RPC or conditional update with status/lease predicate.
 
-- Evidence: `infra/windows-worker/local_worker.js` posts to `/api/worker/heartbeat`; no matching route was found under `src/app/api`.
-- Impact: liveness is not stored, heartbeat failures are only logged, and stalled jobs cannot be judged reliably.
-- Upgrade need: implement heartbeat route and DB fields before relying on heartbeat decisions.
+2. Missing heartbeat receiver
 
-3. `hermes_jobs` status mismatch
+- Evidence: `local_worker.js` posts to `/api/worker/heartbeat`; no route exists in `src/app/api/worker`.
+- Impact: Worker liveness is not stored. Stalled jobs cannot be detected reliably.
+- V2 need: heartbeat route, `heartbeat_at`, stale detection, and recovery policy.
 
-- Evidence: SQL allows `pending`, `running`, `awaiting_review`, `completed`, `failed`; Worker code reads `queued` and reports `succeeded`.
-- Impact: live writes can fail check constraints or create inconsistent status semantics if live DB differs from repository SQL.
-- Upgrade need: define one canonical state machine and migrate SQL/API/Worker together.
+3. Status/schema drift
 
-4. Public or optionally unauthenticated Feishu mutation routes
+- Evidence: SQL setup allows `pending/running/awaiting_review/completed/failed`; runtime uses `queued/succeeded` and writes fields missing from audited SQL.
+- Impact: jobs may fail to update, or missing-column fallback may silently skip important state.
+- V2 need: one canonical schema migration.
 
-- Evidence: `/api/feishu/requirement` and `/api/feishu/codex-task` have no explicit bearer auth; `/api/feishu/decompose-callback` and `/api/feishu/create-tables` disable auth when `FEISHU_API_TOKEN` is missing.
-- Impact: unwanted queue inserts or Bitable table mutations if endpoints are exposed without env configured.
-- Upgrade need: make auth mandatory for mutation endpoints.
+4. Public or optionally unauthenticated Feishu routes
 
-5. Production environment operation risk in Worker Git flow
+- Evidence: `/api/feishu/requirement` and `/api/feishu/codex-task` have no auth check; create/callback routes disable auth when `FEISHU_API_TOKEN` is missing.
+- Impact: external callers could enqueue tasks or mutate Bitable if deployment is public and env auth is absent.
+- V2 need: mandatory shared secret/signature verification.
 
-- Evidence: `local_worker.js` can fetch, switch, pull, commit, and push based on env configuration.
-- Impact: wrong `PROJECT_DIR`, `GIT_PUSH_BRANCH`, or `GIT_AUTO_PUSH` can write to unintended branch or repository.
-- Upgrade need: hard allowlist repo path, branch, remote, and task file scope.
+5. Deployment status loop incomplete
 
-## Medium
+- Evidence: GitHub workflow posts deployment status to `DEPLOY_CALLBACK_URL`; no receiver route found.
+- Impact: pushed commits may deploy but job/Bitable status will not reflect real Vercel outcome.
+- V2 need: authenticated deployment callback or remove workflow.
 
-1. Single-layer task model
+## Medium Priority Risks
 
-- Evidence: `docs/setup-hermes-jobs.sql` says one requirement equals one task; `hermes_queue` decomposition exists separately and is not integrated with `hermes_jobs`.
-- Impact: multi-step upgrade work is hard to schedule, retry, or report independently.
-- Upgrade need: parent-child job model or explicit phase/task tables.
+6. Single-layer task model
 
-2. Worker interruption risk
+- Evidence: `docs/setup-hermes-jobs.sql` documents one requirement equals one task. `hermes_queue` decomposition exists separately.
+- Impact: V2 multi-role work cannot represent parent requirement, subtasks, dependencies, approvals, and per-role status cleanly.
+- V2 need: parent-child job model or requirement/task tables.
 
-- Evidence: `expires_at` and `attempts` fields exist in SQL, but no requeue route or scheduled recovery was found.
-- Impact: interrupted Worker can leave jobs stuck in `running`.
-- Upgrade need: reaper job that requeues expired running jobs with attempt limits.
+7. Worker interruption handling is incomplete
 
-3. State machine incomplete
+- Evidence: Worker has hard/idle timeout and rollback, but server lease recovery is missing.
+- Impact: a killed Worker can leave job `running`.
+- V2 need: lease expiry scan and retry/requeue rules.
 
-- Evidence: statuses differ across SQL, API, Worker, and Feishu sync: `pending`, `queued`, `running`, `succeeded`, `completed`, `awaiting_review`, `failed`.
-- Impact: dashboards, Bitable sync, retry rules, and reports can disagree.
-- Upgrade need: central transition table and typed constants shared across code.
+8. Feishu sync is best-effort inline work
 
-4. Feishu sync latency can delay Worker API responses
+- Evidence: `syncWorkerStatusToFeishu()` catches errors and logs them; GitHub Action Bitable callback is non-fatal.
+- Impact: backend truth and Bitable view can diverge.
+- V2 need: durable sync attempts with retry and last error.
 
-- Evidence: Worker routes `await syncWorkerStatusToFeishu(...)`; the sync catches failures but still performs network calls inline.
-- Impact: Feishu API slowness can slow claim/progress/report responses.
-- Upgrade need: enqueue sync events or call sync asynchronously with timeout.
+9. Worker Git automation has high blast radius
 
-5. Deployment status callback receiver missing
+- Evidence: Worker can fetch, switch, pull, commit, and push based on env settings.
+- Impact: a bad task or prompt can still lead to committed changes after Codex exits successfully.
+- V2 need: per-job allowed file scopes, branch policy, and human approval gates for sensitive paths.
 
-- Evidence: `.github/workflows/sync-vercel-deployment.yml` posts to `DEPLOY_CALLBACK_URL` with `X-Deploy-Secret`; no receiving route found.
-- Impact: Vercel deployment status may not be written back to jobs.
-- Upgrade need: add authenticated callback route or remove unused workflow.
+10. Claim/report ownership not enforced
 
-6. Schema drift hidden by skipped missing columns
+- Evidence: progress/report routes require job id but do not validate claim owner or lease token.
+- Impact: one Worker or caller with token can update another Worker's job.
+- V2 need: claim token or worker id ownership check.
 
-- Evidence: `updateHermesJob()` removes missing columns and retries.
-- Impact: deployment may appear successful while progress, commit, or error fields are not stored.
-- Upgrade need: fail loudly for required columns after schema migration is complete.
+## Lower Priority Risks
 
-## Low
+11. Inline LLM in Feishu event route
 
-1. Encoding and syntax health risk
+- Evidence: `POST /api/feishu/event` calls `runAgent()`.
+- Impact: serverless timeout or slow Feishu response.
+- V2 need: enqueue long-running work and immediately acknowledge Feishu.
 
-- Evidence: multiple inspected files show mojibake in comments and string literals in this environment; some captured strings appear unterminated.
-- Impact: build or runtime failures may occur if source files are actually malformed.
-- Upgrade need: run `node --check` or TypeScript build after a controlled code-health phase.
+12. Logs can include operational payload text
 
-2. README drift
+- Evidence: `requirement` route logs first 500 chars of raw payload; Worker logs task content.
+- Impact: user data or task details can appear in logs.
+- V2 need: structured logging with redaction and log-level controls.
 
-- Evidence: Worker README mentions `HEARTBEAT_INTERVAL_MS`, but `local_worker.js` uses a fixed 60-second interval.
-- Impact: operators may believe heartbeat interval is configurable when it is not.
-- Upgrade need: align code and docs.
+13. Env names are spread across modules
 
-3. Secret exposure via logs is partly mitigated but uneven
+- Evidence: Worker auth accepts three token env names; Bitable table env has several aliases.
+- Impact: misconfiguration can disable auth or sync.
+- V2 need: central config validation at startup.
 
-- Evidence: `feishu-worker-sync.ts` sanitizes Feishu sync errors; other routes may return raw Supabase or Feishu error text.
-- Impact: accidental diagnostic leaks are possible if upstream errors include sensitive context.
-- Upgrade need: central error sanitizer for external API failures.
+14. RLS policies in setup docs are broad
 
-## Required risk labels from task
+- Evidence: `hermes_queue` setup allows anon read/insert/update.
+- Impact: if anon access is exposed, queue data can be read or modified.
+- V2 need: service-only writes and minimal read policies.
 
-- Single-layer task limit: present.
-- Duplicate claim risk: present.
-- Worker interruption risk: present.
-- Heartbeat missing or false heartbeat risk: present.
-- Incomplete state machine: present.
-- Feishu sync blocking main flow: present.
-- Secret leakage risk: present as logging/error-surface risk; no real env values were read or output in this audit.
-- Production misoperation risk: present in Worker Git push/deploy scripts if env is wrong.
+## Specific Required Risk Checklist
+
+- Single-layer tasks: present.
+- Duplicate claim: possible.
+- Heartbeat: client exists, server route missing.
+- State machine: inconsistent.
+- Worker interruption: not fully recovered server-side.
+- Feishu sync blocking: mostly non-blocking, but inline Feishu event route still does long work.
+- Secret leakage: no env contents read in this audit; route/log redaction should still be strengthened.
+- Production misoperation: Worker auto-push and Feishu create-table route are high-impact operations requiring stricter gates.
