@@ -22,6 +22,7 @@ import {
   buildProjectDirectorReply,
   buildTaskTreeChangeRecordedReply,
   buildTaskTreeReviewReceivedReply,
+  classifyProjectDirectorDemand,
   getDemandBody,
   isBossApprovalReply,
   isDispatchBatchApprovalReply,
@@ -530,6 +531,33 @@ export async function POST(req: NextRequest) {
       throw new Error(`create feishu receipt failed: ${receiptError.message}`);
     }
     try {
+      const convId = await getOrCreateConversation(
+        supabase,
+        userId,
+        ev.message.chat_id,
+        ev.message.chat_type
+      );
+
+      const demandKind = classifyProjectDirectorDemand(text);
+      if (demandKind === "website_product_request") {
+        const reply = buildProjectDirectorReply(text);
+        await saveDirectReply(supabase, convId, text, reply, ev.message.message_id);
+        const token = await getFeishuToken();
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          demand_type: "website_product_request",
+          state: "waiting_boss_reply",
+        });
+      }
+
       try {
         const duplicateCheck = await findRecentDuplicateFeishuJob(supabase, text);
         if (duplicateCheck.error) {
@@ -573,13 +601,6 @@ export async function POST(req: NextRequest) {
         console.error("[feishu-event] duplicate job check failed:", sanitizeLogText(errorToText(duplicateCheckError)));
         text = normalizeFeishuTaskText(text);
       }
-
-      const convId = await getOrCreateConversation(
-      supabase,
-      userId,
-      ev.message.chat_id,
-      ev.message.chat_type
-    );
 
     // 7. 项目总管确认 / 任务树草案 / 待分发清单流程。这里只写 hermes_messages，不写 hermes_jobs。
     if (isDispatchPlanChangeReply(text)) {

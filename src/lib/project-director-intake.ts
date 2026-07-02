@@ -1,4 +1,9 @@
-const NEW_DEMAND_PREFIX = "新需求：";
+const NEW_DEMAND_PREFIXES = ["新需求：", "新需求:"];
+
+export type ProjectDirectorDemandKind =
+  | "system_upgrade_request"
+  | "website_product_request"
+  | "other_request";
 
 const WEBSITE_PRODUCT_KEYWORDS = [
   "网站",
@@ -111,14 +116,14 @@ function normalizeDemandText(text: string): string {
 }
 
 export function isNewDemandMessage(text: string): boolean {
-  return normalizeDemandText(text).startsWith(NEW_DEMAND_PREFIX);
+  const normalized = normalizeDemandText(text);
+  return NEW_DEMAND_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
 export function getDemandBody(text: string): string {
   const normalized = normalizeDemandText(text);
-  return isNewDemandMessage(normalized)
-    ? normalized.slice(NEW_DEMAND_PREFIX.length).trim()
-    : normalized;
+  const prefix = NEW_DEMAND_PREFIXES.find((item) => normalized.startsWith(item));
+  return prefix ? normalized.slice(prefix.length).trim() : normalized;
 }
 
 export function isSystemUpgradeDemand(text: string): boolean {
@@ -127,9 +132,17 @@ export function isSystemUpgradeDemand(text: string): boolean {
 }
 
 export function isWebsiteProductDemand(text: string): boolean {
-  if (!isNewDemandMessage(text) || isSystemUpgradeDemand(text)) return false;
+  return classifyProjectDirectorDemand(text) === "website_product_request";
+}
+
+export function classifyProjectDirectorDemand(text: string): ProjectDirectorDemandKind {
+  if (!isNewDemandMessage(text)) return "other_request";
+  if (isSystemUpgradeDemand(text)) return "system_upgrade_request";
   const demand = getDemandBody(text);
-  return WEBSITE_PRODUCT_KEYWORDS.some((keyword) => demand.includes(keyword));
+  if (WEBSITE_PRODUCT_KEYWORDS.some((keyword) => demand.includes(keyword))) {
+    return "website_product_request";
+  }
+  return "other_request";
 }
 
 export function isBossApprovalReply(text: string): boolean {
