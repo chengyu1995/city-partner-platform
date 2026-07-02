@@ -62,11 +62,41 @@ const TASK_TREE_REVIEW_PHRASES = [
   "同意任务树",
   "按这个拆",
   "开始分发",
+  "任务树可以",
+  "就按这个任务树",
   "暂停",
+];
+
+const TASK_TREE_APPROVAL_PHRASES = [
+  "批准任务树",
+  "同意任务树",
+  "按这个拆",
+  "开始分发",
+  "任务树可以",
+  "就按这个任务树",
+];
+
+const TASK_TREE_CHANGE_PHRASES = [
+  "先不要做",
+  "增加",
+  "删除",
+  "改成",
 ];
 
 const TASK_TREE_CHANGE_PREFIX = "修改任务树：";
 const TASK_TREE_CHANGE_PREFIX_ASCII = "修改任务树:";
+const TASK_TREE_ADJUST_PREFIX = "调整任务树：";
+const TASK_TREE_ADJUST_PREFIX_ASCII = "调整任务树:";
+
+const DISPATCH_PLAN_CHANGE_PREFIX = "修改分发清单：";
+const DISPATCH_PLAN_CHANGE_PREFIX_ASCII = "修改分发清单:";
+
+const DISPATCH_BATCH_APPROVAL_PHRASES = [
+  "批准分发第 1 批",
+  "批准分发第1批",
+  "同意分发第 1 批",
+  "同意分发第1批",
+];
 
 function normalizeDemandText(text: string): string {
   return text.trim().replace(/\s+/g, " ");
@@ -105,10 +135,38 @@ export function isBossApprovalReply(text: string): boolean {
 export function isTaskTreeReviewReply(text: string): boolean {
   const normalized = normalizeDemandText(text);
   return (
-    normalized.startsWith(TASK_TREE_CHANGE_PREFIX) ||
-    normalized.startsWith(TASK_TREE_CHANGE_PREFIX_ASCII) ||
+    isTaskTreeChangeReply(normalized) ||
     TASK_TREE_REVIEW_PHRASES.some((phrase) => normalized === phrase)
   );
+}
+
+export function isTaskTreeApprovalReply(text: string): boolean {
+  const normalized = normalizeDemandText(text);
+  return TASK_TREE_APPROVAL_PHRASES.some((phrase) => normalized === phrase);
+}
+
+export function isTaskTreeChangeReply(text: string): boolean {
+  const normalized = normalizeDemandText(text);
+  return (
+    normalized.startsWith(TASK_TREE_CHANGE_PREFIX) ||
+    normalized.startsWith(TASK_TREE_CHANGE_PREFIX_ASCII) ||
+    normalized.startsWith(TASK_TREE_ADJUST_PREFIX) ||
+    normalized.startsWith(TASK_TREE_ADJUST_PREFIX_ASCII) ||
+    TASK_TREE_CHANGE_PHRASES.some((phrase) => normalized.startsWith(phrase))
+  );
+}
+
+export function isDispatchPlanChangeReply(text: string): boolean {
+  const normalized = normalizeDemandText(text);
+  return (
+    normalized.startsWith(DISPATCH_PLAN_CHANGE_PREFIX) ||
+    normalized.startsWith(DISPATCH_PLAN_CHANGE_PREFIX_ASCII)
+  );
+}
+
+export function isDispatchBatchApprovalReply(text: string): boolean {
+  const normalized = normalizeDemandText(text);
+  return DISPATCH_BATCH_APPROVAL_PHRASES.some((phrase) => normalized === phrase);
 }
 
 function summarizeDemand(text: string): string {
@@ -148,4 +206,16 @@ export function buildBossApprovedReply(): string {
 
 export function buildTaskTreeReviewReceivedReply(): string {
   return "已收到任务树审核意见。下一阶段将进入任务分发准备。";
+}
+
+export function buildTaskTreeChangeRecordedReply(): string {
+  return "已记录修改意见，下一阶段将重新生成任务树草案。本阶段不会分发任务，也不会写入 Worker 队列。";
+}
+
+export function buildDispatchPlanChangeRecordedReply(): string {
+  return "已记录分发清单修改意见。本阶段不会真正分发任务，也不会创建 Worker 可领取的 queued 任务。";
+}
+
+export function buildDispatchBatchApprovalReceivedReply(): string {
+  return "已收到分发第 1 批的确认。本阶段只完成识别和记录，真正分发将在下一阶段处理。";
 }

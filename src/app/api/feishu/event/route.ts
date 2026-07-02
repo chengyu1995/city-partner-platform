@@ -18,43 +18,37 @@ import { decryptFeishuEvent } from "@/lib/feishu-crypto";
 import { runAgent, AgentMessage } from "@/lib/hermes-agent";
 import {
   buildBossApprovedReply,
+  buildDispatchBatchApprovalReceivedReply,
+  buildDispatchPlanChangeRecordedReply,
   buildProjectDirectorReply,
+  buildTaskTreeChangeRecordedReply,
   buildTaskTreeReviewReceivedReply,
   getDemandBody,
   isBossApprovalReply,
+  isDispatchBatchApprovalReply,
+  isDispatchPlanChangeReply,
+  isTaskTreeApprovalReply,
+  isTaskTreeChangeReply,
   isTaskTreeReviewReply,
   isWebsiteProductDemand,
 } from "@/lib/project-director-intake";
 import {
+  buildDispatchPlanChangeRecord,
+  buildDispatchPlanDraftRecord,
+  buildDispatchPlanSummary,
+  buildProjectDirectorDispatchPlanDraft,
+  buildReviewChangeRecord,
+} from "@/lib/project-director-dispatch-plan";
+import {
   buildProjectDirectorTaskTreeDraft,
   buildTaskTreeDraftRecord,
   buildTaskTreeDraftSummary,
+  type ProjectDirectorTaskTreeDraft,
 } from "@/lib/project-director-task-tree";
 import { findRecentDuplicateFeishuJob, normalizeFeishuTaskText } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-
-interface FeishuEvent {
-  schema: "2.0";
-  header: {
-    event_type: string;
-    app_id: string;
-    tenant_key: string;
-    event_id: string;
-    create_time: string;
-  };
-  event: {
-    sender: { sender_id: { open_id: string; user_id: string; union_id: string } };
-    message: {
-      message_id: string;
-      chat_id: string;
-      chat_type: "p2p" | "group" | string;
-      message_type: "text" | string;
-      content: string; // JSON 字符串: {"text": "..."}
-    };
-  };
-}
 
 function sb(): SupabaseClient | null {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -202,6 +196,63 @@ async function findRecentProjectDirectorDemand(
   return null;
 }
 
+function extractLineValue(content: string, key: string): string {
+  const line = content.split(/\r?\n/).find((item) => item.startsWith(`${key}: `));
+  return line ? line.slice(key.length + 2).trim() : "";
+}
+
+function extractJsonAfterMarker(content: string, marker: string): string | null {
+  const markerIndex = content.indexOf(marker);
+  if (markerIndex < 0) return null;
+  const jsonText = content.slice(markerIndex + marker.length).trim();
+  return jsonText || null;
+}
+
+async function findRecentTaskTreeDraft(
+  supabase: SupabaseClient,
+  convId: string
+): Promise<{
+  originalDemand: string;
+  bossConfirmation: string;
+  draft: ProjectDirectorTaskTreeDraft;
+} | null> {
+  const { data, error } = await supabase
+    .from("hermes_messages")
+    .select("role, content, name, created_at")
+    .eq("conversation_id", convId)
+    .eq("name", "project_director_task_tree_draft")
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  if (error) throw new Error(`load task tree draft failed: ${error.message}`);
+  if (!data) return null;
+
+  for (const message of data) {
+    if (
+      message.role !== "system" ||
+      !message.content.includes("PROJECT_DIRECTOR_TASK_TREE_DRAFT") ||
+      !message.content.includes("state: waiting_task_tree_review")
+    ) {
+      continue;
+    }
+
+    const jsonText = extractJsonAfterMarker(message.content, "json:");
+    if (!jsonText) continue;
+
+    try {
+      return {
+        originalDemand: extractLineValue(message.content, "original_demand"),
+        bossConfirmation: extractLineValue(message.content, "boss_confirmation"),
+        draft: JSON.parse(jsonText) as ProjectDirectorTaskTreeDraft,
+      };
+    } catch (parseError) {
+      console.error("[feishu-event] task tree draft parse failed:", sanitizeLogText(errorToText(parseError)));
+    }
+  }
+
+  return null;
+}
+
 async function saveTaskTreeDraftReply(
   supabase: SupabaseClient,
   convId: string,
@@ -237,6 +288,44 @@ async function saveTaskTreeDraftReply(
     },
   ]);
   if (error) throw new Error(`save task tree draft failed: ${error.message}`);
+}
+
+async function saveSystemRecordedReply(
+  supabase: SupabaseClient,
+  convId: string,
+  userText: string,
+  reply: string,
+  systemRecord: string,
+  systemName: string,
+  feishuMessageId: string
+): Promise<void> {
+  const { error } = await supabase.from("hermes_messages").insert([
+    {
+      conversation_id: convId,
+      role: "user",
+      content: userText,
+      feishu_message_id: feishuMessageId,
+      tool_call_id: null,
+      name: null,
+    },
+    {
+      conversation_id: convId,
+      role: "assistant",
+      content: reply,
+      feishu_message_id: null,
+      tool_call_id: null,
+      name: null,
+    },
+    {
+      conversation_id: convId,
+      role: "system",
+      content: systemRecord,
+      feishu_message_id: null,
+      tool_call_id: null,
+      name: systemName,
+    },
+  ]);
+  if (error) throw new Error(`save project director record failed: ${error.message}`);
 }
 
 async function sendFeishuMessage(
@@ -433,8 +522,116 @@ export async function POST(req: NextRequest) {
       ev.message.chat_type
     );
 
-    // 7. 项目总管确认 / 任务树草案流程。这里只写 hermes_messages，不写 hermes_jobs。
+    // 7. 项目总管确认 / 任务树草案 / 待分发清单流程。这里只写 hermes_messages，不写 hermes_jobs。
+    if (isDispatchPlanChangeReply(text)) {
+      const reply = buildDispatchPlanChangeRecordedReply();
+      await saveSystemRecordedReply(
+        supabase,
+        convId,
+        text,
+        reply,
+        buildDispatchPlanChangeRecord(text),
+        "project_director_dispatch_plan_change",
+        ev.message.message_id
+      );
+      const token = await getFeishuToken();
+      await sendFeishuMessage(
+        token,
+        ev.message.chat_id,
+        ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+        reply
+      );
+      await markReceiptCompleted(supabase, eventId);
+      return NextResponse.json({
+        code: 0,
+        project_director_intake: true,
+        state: "dispatch_plan_change_requested",
+      });
+    }
+
+    if (isDispatchBatchApprovalReply(text)) {
+      const reply = buildDispatchBatchApprovalReceivedReply();
+      await saveDirectReply(supabase, convId, text, reply, ev.message.message_id);
+      const token = await getFeishuToken();
+      await sendFeishuMessage(
+        token,
+        ev.message.chat_id,
+        ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+        reply
+      );
+      await markReceiptCompleted(supabase, eventId);
+      return NextResponse.json({
+        code: 0,
+        project_director_intake: true,
+        state: "dispatch_batch_approval_received_phase_3e_required",
+      });
+    }
+
     if (isTaskTreeReviewReply(text)) {
+      if (isTaskTreeChangeReply(text)) {
+        const reply = buildTaskTreeChangeRecordedReply();
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          buildReviewChangeRecord(text),
+          "project_director_task_tree_review_change",
+          ev.message.message_id
+        );
+        const token = await getFeishuToken();
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "task_tree_change_requested",
+        });
+      }
+
+      if (isTaskTreeApprovalReply(text)) {
+        const recentDraft = await findRecentTaskTreeDraft(supabase, convId);
+        if (recentDraft) {
+          const dispatchPlan = buildProjectDirectorDispatchPlanDraft(recentDraft.draft);
+          const reply = buildDispatchPlanSummary(dispatchPlan);
+          const record = buildDispatchPlanDraftRecord(
+            recentDraft.originalDemand,
+            text,
+            recentDraft.draft,
+            dispatchPlan,
+            reply
+          );
+          await saveSystemRecordedReply(
+            supabase,
+            convId,
+            text,
+            reply,
+            record,
+            "project_director_dispatch_plan_draft",
+            ev.message.message_id
+          );
+          const token = await getFeishuToken();
+          await sendFeishuMessage(
+            token,
+            ev.message.chat_id,
+            ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+            reply
+          );
+          await markReceiptCompleted(supabase, eventId);
+          return NextResponse.json({
+            code: 0,
+            project_director_intake: true,
+            state: "waiting_dispatch_approval",
+            dispatch_plan_draft: true,
+          });
+        }
+      }
+
       const reply = buildTaskTreeReviewReceivedReply();
       await saveDirectReply(supabase, convId, text, reply, ev.message.message_id);
       const token = await getFeishuToken();
@@ -448,7 +645,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({
         code: 0,
         project_director_intake: true,
-        state: "task_tree_review_received",
+        state: "task_tree_review_received_without_recent_draft",
       });
     }
 

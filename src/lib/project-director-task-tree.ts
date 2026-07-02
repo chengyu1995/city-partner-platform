@@ -152,6 +152,26 @@ export function buildProjectDirectorTaskTreeDraft(
                 ["PRODUCT-01-01"],
                 30
               ),
+              task(
+                "PRODUCT-01-03",
+                "输出用户流程",
+                "product_manager",
+                approvedInput,
+                ["docs/product/user-flow.md"],
+                ["覆盖首页、分类、列表、详情和发布入口的主流程", "标明登录预留状态", "列出移动端关键路径"],
+                ["PRODUCT-01-02"],
+                35
+              ),
+              task(
+                "PRODUCT-01-04",
+                "输出验收标准",
+                "product_manager",
+                approvedInput,
+                ["docs/product/acceptance-criteria.md"],
+                ["覆盖页面、交互、移动端和基础构建检查", "明确首版必须交付和暂不交付内容", "能作为测试验收输入"],
+                ["PRODUCT-01-03"],
+                30
+              ),
             ],
           },
         ],
