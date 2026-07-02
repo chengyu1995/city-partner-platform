@@ -1,6 +1,9 @@
 ﻿$ErrorActionPreference = "Stop"
 
-$WorkerDir = "C:\city-partner-worker"
+$WorkerDir = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($WorkerDir)) {
+    $WorkerDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
 $WorkerFile = Join-Path $WorkerDir "local_worker.js"
 $LogDir = Join-Path $WorkerDir "logs"
 $StartupLog = Join-Path $LogDir "scheduled-worker.log"
@@ -27,5 +30,6 @@ Set-Location $WorkerDir
 
 Add-Content $StartupLog "$(Get-Date -Format s) 正在启动 Worker。"
 
-& "C:\Program Files\nodejs\node.exe" ".\local_worker.js" `
+$NodeCommand = Get-Command node -ErrorAction Stop
+& $NodeCommand.Source ".\local_worker.js" `
     *>> $StartupLog
