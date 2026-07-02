@@ -19,9 +19,17 @@ import { runAgent, AgentMessage } from "@/lib/hermes-agent";
 import {
   buildBossApprovedReply,
   buildProjectDirectorReply,
+  buildTaskTreeReviewReceivedReply,
+  getDemandBody,
   isBossApprovalReply,
+  isTaskTreeReviewReply,
   isWebsiteProductDemand,
 } from "@/lib/project-director-intake";
+import {
+  buildProjectDirectorTaskTreeDraft,
+  buildTaskTreeDraftRecord,
+  buildTaskTreeDraftSummary,
+} from "@/lib/project-director-task-tree";
 import { findRecentDuplicateFeishuJob, normalizeFeishuTaskText } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
@@ -162,6 +170,73 @@ async function saveDirectReply(
     },
   ]);
   if (error) throw new Error(`save direct reply failed: ${error.message}`);
+}
+
+async function findRecentProjectDirectorDemand(
+  supabase: SupabaseClient,
+  convId: string
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("hermes_messages")
+    .select("role, content, created_at")
+    .eq("conversation_id", convId)
+    .order("created_at", { ascending: false })
+    .limit(30);
+
+  if (error) throw new Error(`load project director history failed: ${error.message}`);
+  if (!data) return null;
+
+  const history = data.reverse();
+  for (let index = history.length - 1; index >= 0; index--) {
+    const message = history[index];
+    if (message.role !== "assistant" || !message.content.includes("【项目总管确认】")) continue;
+
+    for (let userIndex = index - 1; userIndex >= 0; userIndex--) {
+      const candidate = history[userIndex];
+      if (candidate.role === "user" && isWebsiteProductDemand(candidate.content)) {
+        return getDemandBody(candidate.content);
+      }
+    }
+  }
+
+  return null;
+}
+
+async function saveTaskTreeDraftReply(
+  supabase: SupabaseClient,
+  convId: string,
+  bossConfirmation: string,
+  reply: string,
+  draftRecord: string,
+  feishuMessageId: string
+): Promise<void> {
+  const { error } = await supabase.from("hermes_messages").insert([
+    {
+      conversation_id: convId,
+      role: "user",
+      content: bossConfirmation,
+      feishu_message_id: feishuMessageId,
+      tool_call_id: null,
+      name: null,
+    },
+    {
+      conversation_id: convId,
+      role: "assistant",
+      content: reply,
+      feishu_message_id: null,
+      tool_call_id: null,
+      name: null,
+    },
+    {
+      conversation_id: convId,
+      role: "system",
+      content: draftRecord,
+      feishu_message_id: null,
+      tool_call_id: null,
+      name: "project_director_task_tree_draft",
+    },
+  ]);
+  if (error) throw new Error(`save task tree draft failed: ${error.message}`);
 }
 
 async function sendFeishuMessage(
@@ -358,10 +433,9 @@ export async function POST(req: NextRequest) {
       ev.message.chat_type
     );
 
-    // 7. 加载历史
-    if (isWebsiteProductDemand(text) || isBossApprovalReply(text)) {
-      const approved = isBossApprovalReply(text);
-      const reply = approved ? buildBossApprovedReply() : buildProjectDirectorReply(text);
+    // 7. 项目总管确认 / 任务树草案流程。这里只写 hermes_messages，不写 hermes_jobs。
+    if (isTaskTreeReviewReply(text)) {
+      const reply = buildTaskTreeReviewReceivedReply();
       await saveDirectReply(supabase, convId, text, reply, ev.message.message_id);
       const token = await getFeishuToken();
       await sendFeishuMessage(
@@ -374,7 +448,72 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({
         code: 0,
         project_director_intake: true,
-        state: approved ? "boss_approved" : "waiting_boss_reply",
+        state: "task_tree_review_received",
+      });
+    }
+
+    if (isWebsiteProductDemand(text)) {
+      const reply = buildProjectDirectorReply(text);
+      await saveDirectReply(supabase, convId, text, reply, ev.message.message_id);
+      const token = await getFeishuToken();
+      await sendFeishuMessage(
+        token,
+        ev.message.chat_id,
+        ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+        reply
+      );
+      await markReceiptCompleted(supabase, eventId);
+      return NextResponse.json({
+        code: 0,
+        project_director_intake: true,
+        state: "waiting_boss_reply",
+      });
+    }
+
+    if (isBossApprovalReply(text)) {
+      const originalDemand = await findRecentProjectDirectorDemand(supabase, convId);
+      if (originalDemand) {
+        const draft = buildProjectDirectorTaskTreeDraft(originalDemand, text);
+        const reply = buildTaskTreeDraftSummary(draft);
+        const draftRecord = buildTaskTreeDraftRecord(originalDemand, text, draft, reply);
+        await saveTaskTreeDraftReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          draftRecord,
+          ev.message.message_id
+        );
+        const token = await getFeishuToken();
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "waiting_task_tree_review",
+          task_tree_draft: true,
+        });
+      }
+
+      const reply = buildBossApprovedReply();
+      await saveDirectReply(supabase, convId, text, reply, ev.message.message_id);
+      const token = await getFeishuToken();
+      await sendFeishuMessage(
+        token,
+        ev.message.chat_id,
+        ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+        reply
+      );
+      await markReceiptCompleted(supabase, eventId);
+      return NextResponse.json({
+        code: 0,
+        project_director_intake: true,
+        state: "boss_approved_without_recent_project_director_context",
       });
     }
 

@@ -57,6 +57,17 @@ const APPROVAL_PHRASES = [
   "选B",
 ];
 
+const TASK_TREE_REVIEW_PHRASES = [
+  "批准任务树",
+  "同意任务树",
+  "按这个拆",
+  "开始分发",
+  "暂停",
+];
+
+const TASK_TREE_CHANGE_PREFIX = "修改任务树：";
+const TASK_TREE_CHANGE_PREFIX_ASCII = "修改任务树:";
+
 function normalizeDemandText(text: string): string {
   return text.trim().replace(/\s+/g, " ");
 }
@@ -89,6 +100,15 @@ export function isBossApprovalReply(text: string): boolean {
     return APPROVAL_PHRASES.some((phrase) => normalized === phrase);
   }
   return APPROVAL_PHRASES.some((phrase) => phrase.length > 2 && normalized.includes(phrase));
+}
+
+export function isTaskTreeReviewReply(text: string): boolean {
+  const normalized = normalizeDemandText(text);
+  return (
+    normalized.startsWith(TASK_TREE_CHANGE_PREFIX) ||
+    normalized.startsWith(TASK_TREE_CHANGE_PREFIX_ASCII) ||
+    TASK_TREE_REVIEW_PHRASES.some((phrase) => normalized === phrase)
+  );
 }
 
 function summarizeDemand(text: string): string {
@@ -124,4 +144,8 @@ export function buildProjectDirectorReply(text: string): string {
 
 export function buildBossApprovedReply(): string {
   return "已收到批准，下一阶段将进入任务树拆解。";
+}
+
+export function buildTaskTreeReviewReceivedReply(): string {
+  return "已收到任务树审核意见。下一阶段将进入任务分发准备。";
 }
