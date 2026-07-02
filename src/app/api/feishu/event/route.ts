@@ -16,6 +16,12 @@ import { NextResponse, NextRequest } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { decryptFeishuEvent } from "@/lib/feishu-crypto";
 import { runAgent, AgentMessage } from "@/lib/hermes-agent";
+import {
+  buildBossApprovedReply,
+  buildProjectDirectorReply,
+  isBossApprovalReply,
+  isWebsiteProductDemand,
+} from "@/lib/project-director-intake";
 import { findRecentDuplicateFeishuJob, normalizeFeishuTaskText } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
@@ -132,6 +138,30 @@ async function loadHistory(
     if (m.name) msg.name = m.name;
     return msg;
   });
+}
+
+async function saveDirectReply(
+  supabase: SupabaseClient,
+  convId: string,
+  userText: string,
+  reply: string,
+  feishuMessageId: string
+): Promise<void> {
+  const { error } = await supabase.from("hermes_messages").insert([
+    {
+      conversation_id: convId,
+      role: "user",
+      content: userText,
+      feishu_message_id: feishuMessageId,
+    },
+    {
+      conversation_id: convId,
+      role: "assistant",
+      content: reply,
+      feishu_message_id: null,
+    },
+  ]);
+  if (error) throw new Error(`save direct reply failed: ${error.message}`);
 }
 
 async function sendFeishuMessage(
@@ -329,6 +359,25 @@ export async function POST(req: NextRequest) {
     );
 
     // 7. 加载历史
+    if (isWebsiteProductDemand(text) || isBossApprovalReply(text)) {
+      const approved = isBossApprovalReply(text);
+      const reply = approved ? buildBossApprovedReply() : buildProjectDirectorReply(text);
+      await saveDirectReply(supabase, convId, text, reply, ev.message.message_id);
+      const token = await getFeishuToken();
+      await sendFeishuMessage(
+        token,
+        ev.message.chat_id,
+        ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+        reply
+      );
+      await markReceiptCompleted(supabase, eventId);
+      return NextResponse.json({
+        code: 0,
+        project_director_intake: true,
+        state: approved ? "boss_approved" : "waiting_boss_reply",
+      });
+    }
+
     const history = await loadHistory(supabase, convId);
 
     // 8. 调 Agent

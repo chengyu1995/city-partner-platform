@@ -1,0 +1,127 @@
+const NEW_DEMAND_PREFIX = "新需求：";
+
+const WEBSITE_PRODUCT_KEYWORDS = [
+  "网站",
+  "页面",
+  "首页",
+  "功能",
+  "产品",
+  "登录",
+  "注册",
+  "后台",
+  "CMS",
+  "发布",
+  "同城搭子",
+  "搭子",
+  "列表页",
+  "详情页",
+  "个人中心",
+  "支付",
+  "聊天",
+  "搜索",
+  "筛选",
+  "用户流程",
+  "UI",
+  "前端",
+  "后端",
+  "部署",
+];
+
+const SYSTEM_UPGRADE_KEYWORDS = [
+  "系统升级",
+  "阶段 3",
+  "阶段3",
+  "3A",
+  "3B",
+  "3C",
+  "Worker",
+  "数据库",
+  "SQL",
+  "Supabase",
+  "飞书接口",
+  "Vercel API",
+  "Hermes",
+];
+
+const APPROVAL_PHRASES = [
+  "批准建议",
+  "按你建议来",
+  "就按这个做",
+  "批准",
+  "开始",
+  "可以",
+  "同意",
+  "选 A",
+  "选A",
+  "选 B",
+  "选B",
+];
+
+function normalizeDemandText(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+export function isNewDemandMessage(text: string): boolean {
+  return normalizeDemandText(text).startsWith(NEW_DEMAND_PREFIX);
+}
+
+export function getDemandBody(text: string): string {
+  const normalized = normalizeDemandText(text);
+  return isNewDemandMessage(normalized)
+    ? normalized.slice(NEW_DEMAND_PREFIX.length).trim()
+    : normalized;
+}
+
+export function isSystemUpgradeDemand(text: string): boolean {
+  const demand = getDemandBody(text);
+  return SYSTEM_UPGRADE_KEYWORDS.some((keyword) => demand.includes(keyword));
+}
+
+export function isWebsiteProductDemand(text: string): boolean {
+  if (!isNewDemandMessage(text) || isSystemUpgradeDemand(text)) return false;
+  const demand = getDemandBody(text);
+  return WEBSITE_PRODUCT_KEYWORDS.some((keyword) => demand.includes(keyword));
+}
+
+export function isBossApprovalReply(text: string): boolean {
+  const normalized = normalizeDemandText(text);
+  if (normalized.length <= 12) {
+    return APPROVAL_PHRASES.some((phrase) => normalized === phrase);
+  }
+  return APPROVAL_PHRASES.some((phrase) => phrase.length > 2 && normalized.includes(phrase));
+}
+
+function summarizeDemand(text: string): string {
+  const demand = getDemandBody(text);
+  if (demand.length <= 80) return demand;
+  return `${demand.slice(0, 77)}...`;
+}
+
+export function buildProjectDirectorReply(text: string): string {
+  const summary = summarizeDemand(text);
+  return [
+    "【项目总管确认】",
+    `我理解你的需求：你想做 ${summary}。这属于网站/产品类需求，我会先确认范围，不直接分发给 Codex 执行。`,
+    "",
+    "我的建议：A 先做可上线的 MVP；B 一次做完整平台。推荐 A，因为先把页面和核心流程跑通，风险更低，也更容易验收。",
+    "",
+    "我建议先这样做：",
+    "1. 首页或核心入口页面",
+    "2. 列表页和详情页",
+    "3. 基础发布或报名流程",
+    "4. 移动端优先的 UI 状态",
+    "5. 手工验收清单",
+    "",
+    "关键问题：首版是只做用户能看见的页面和核心流程，还是同时包含后台/支付/聊天等复杂能力？",
+    "",
+    "请回复：",
+    "* 批准建议",
+    "* 选 A",
+    "* 选 B",
+    "* 或补充你的要求",
+  ].join("\n");
+}
+
+export function buildBossApprovedReply(): string {
+  return "已收到批准，下一阶段将进入任务树拆解。";
+}
