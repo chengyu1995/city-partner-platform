@@ -137,7 +137,10 @@ const GIT_REMOTE_NAME =
   String(process.env.GIT_REMOTE_NAME || "origin").trim();
 
 const GIT_PUSH_BRANCH =
-  String(process.env.GIT_PUSH_BRANCH || "").trim();
+  String(process.env.GIT_PUSH_BRANCH || "master").trim();
+
+const REQUIRED_GIT_PUSH_REMOTE = "origin";
+const REQUIRED_GIT_PUSH_BRANCH = "master";
 
 function runCommand(command, args, cwd = PROJECT_DIR) {
   return new Promise((resolve, reject) => {
@@ -178,6 +181,13 @@ function runCommand(command, args, cwd = PROJECT_DIR) {
 
 async function runGit(args) {
   return runCommand("git", args, PROJECT_DIR);
+}
+
+function sanitizeGitErrorMessage(message) {
+  return String(message || "")
+    .replace(/https:\/\/[^@\s]+@/gi, "https://<redacted>@")
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "<redacted>")
+    .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, "<redacted>");
 }
 
 async function readGitStatusEntries() {
@@ -374,64 +384,84 @@ async function pushGitTask(commitSha) {
     };
   }
 
+  if (GIT_REMOTE_NAME !== REQUIRED_GIT_PUSH_REMOTE) {
+    throw new Error(
+      `Git 自动推送被拒绝：GIT_REMOTE_NAME 必须是 ${REQUIRED_GIT_PUSH_REMOTE}`
+    );
+  }
+
+  if (GIT_PUSH_BRANCH !== REQUIRED_GIT_PUSH_BRANCH) {
+    throw new Error(
+      `Git 自动推送被拒绝：GIT_PUSH_BRANCH 必须是 ${REQUIRED_GIT_PUSH_BRANCH}`
+    );
+  }
+
+  await runGit(["rev-parse", "--verify", "HEAD"]);
+
+  if (!commitSha) {
+    throw new Error("Git 自动推送被拒绝：最近提交不存在");
+  }
+
+  const currentCommit = await runGit(["rev-parse", "HEAD"]);
+
+  if (currentCommit.stdout !== commitSha) {
+    throw new Error(
+      "Git 自动推送被拒绝：待推送提交不是当前 HEAD"
+    );
+  }
+
+  const branchResult = await runGit(["branch", "--show-current"]);
+
+  if (branchResult.stdout !== REQUIRED_GIT_PUSH_BRANCH) {
+    throw new Error(
+      `Git 自动推送被拒绝：当前分支必须是 ${REQUIRED_GIT_PUSH_BRANCH}`
+    );
+  }
+
+  const status = await runGit(["status", "--porcelain"]);
+
+  if (status.stdout) {
+    throw new Error(
+      "Git 自动推送被拒绝：工作区不干净，禁止推送"
+    );
+  }
+
   const remoteResult = await runGit([
     "remote",
     "get-url",
-    GIT_REMOTE_NAME,
+    REQUIRED_GIT_PUSH_REMOTE,
   ]);
 
   if (!remoteResult.stdout) {
     throw new Error(
-      `Git 远程仓库不存在：${GIT_REMOTE_NAME}`
+      `Git 远程仓库不存在：${REQUIRED_GIT_PUSH_REMOTE}`
     );
-  }
-
-  let branch = GIT_PUSH_BRANCH;
-
-  if (!branch) {
-    const branchResult = await runGit([
-      "branch",
-      "--show-current",
-    ]);
-
-    branch = branchResult.stdout;
-  }
-
-  if (!branch) {
-    throw new Error("无法确定 Git 推送分支");
   }
 
   try {
-    await runGit([
-      "push",
-      GIT_REMOTE_NAME,
-      `HEAD:${branch}`,
-    ]);
-  } catch (firstPushError) {
-    console.warn(
-      `Git 首次推送失败，正在同步 ${GIT_REMOTE_NAME}/${branch} 后重试：`,
-      firstPushError instanceof Error
-        ? firstPushError.message
-        : firstPushError
+    await runGit(["push", "origin", "master"]);
+  } catch (pushError) {
+    throw new Error(
+      [
+        "Git 自动推送失败：git push origin master 未成功",
+        "请确认本机 GitHub 凭据已配置且有仓库写权限；不要把 token 或密钥写入仓库或日志。",
+        sanitizeGitErrorMessage(
+          pushError instanceof Error ? pushError.message : String(pushError)
+        ),
+      ]
+        .filter(Boolean)
+        .join("\n")
     );
-
-    await runGit(["pull", "--rebase", GIT_REMOTE_NAME, branch]);
-
-    await runGit([
-      "push",
-      GIT_REMOTE_NAME,
-      `HEAD:${branch}`,
-    ]);
   }
 
   console.log(
-    `Git 推送成功：${GIT_REMOTE_NAME}/${branch}`
+    `Git 推送成功：${REQUIRED_GIT_PUSH_REMOTE}/${REQUIRED_GIT_PUSH_BRANCH}`
   );
 
   return {
     pushed: true,
-    remote: GIT_REMOTE_NAME,
-    branch,
+    remote: REQUIRED_GIT_PUSH_REMOTE,
+    branch: REQUIRED_GIT_PUSH_BRANCH,
     commitSha,
   };
 }
