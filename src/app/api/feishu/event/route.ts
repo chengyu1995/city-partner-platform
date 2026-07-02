@@ -18,7 +18,6 @@ import { decryptFeishuEvent } from "@/lib/feishu-crypto";
 import { runAgent, AgentMessage } from "@/lib/hermes-agent";
 import {
   buildBossApprovedReply,
-  buildDispatchBatchApprovalReceivedReply,
   buildDispatchPlanChangeRecordedReply,
   buildProjectDirectorReply,
   buildTaskTreeChangeRecordedReply,
@@ -38,7 +37,17 @@ import {
   buildDispatchPlanSummary,
   buildProjectDirectorDispatchPlanDraft,
   buildReviewChangeRecord,
+  type ProjectDirectorDispatchPlanDraft,
 } from "@/lib/project-director-dispatch-plan";
+import {
+  buildBatch01DispatchedRecord,
+  buildBatch01DispatchedReply,
+  buildBatch01ProductPlanningJobs,
+  hasBatch01DispatchRecord,
+  hasExistingBatch01Jobs,
+  insertBatch01ProductPlanningJobs,
+  PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD_NAME,
+} from "@/lib/project-director-job-builder";
 import {
   buildProjectDirectorTaskTreeDraft,
   buildTaskTreeDraftRecord,
@@ -208,6 +217,19 @@ function extractJsonAfterMarker(content: string, marker: string): string | null 
   return jsonText || null;
 }
 
+function extractJsonBetweenMarkers(
+  content: string,
+  startMarker: string,
+  endMarker: string
+): string | null {
+  const startIndex = content.indexOf(startMarker);
+  if (startIndex < 0) return null;
+  const jsonStart = startIndex + startMarker.length;
+  const endIndex = content.indexOf(endMarker, jsonStart);
+  const jsonText = (endIndex < 0 ? content.slice(jsonStart) : content.slice(jsonStart, endIndex)).trim();
+  return jsonText || null;
+}
+
 async function findRecentTaskTreeDraft(
   supabase: SupabaseClient,
   convId: string
@@ -247,6 +269,43 @@ async function findRecentTaskTreeDraft(
       };
     } catch (parseError) {
       console.error("[feishu-event] task tree draft parse failed:", sanitizeLogText(errorToText(parseError)));
+    }
+  }
+
+  return null;
+}
+
+async function findRecentDispatchPlanDraft(
+  supabase: SupabaseClient,
+  convId: string
+): Promise<ProjectDirectorDispatchPlanDraft | null> {
+  const { data, error } = await supabase
+    .from("hermes_messages")
+    .select("role, content, name, created_at")
+    .eq("conversation_id", convId)
+    .eq("name", "project_director_dispatch_plan_draft")
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  if (error) throw new Error(`load dispatch plan draft failed: ${error.message}`);
+  if (!data) return null;
+
+  for (const message of data) {
+    if (
+      message.role !== "system" ||
+      !message.content.includes("PROJECT_DIRECTOR_DISPATCH_PLAN_DRAFT") ||
+      !message.content.includes("state: waiting_dispatch_approval")
+    ) {
+      continue;
+    }
+
+    const jsonText = extractJsonBetweenMarkers(message.content, "dispatch_plan_json:", "summary:");
+    if (!jsonText) continue;
+
+    try {
+      return JSON.parse(jsonText) as ProjectDirectorDispatchPlanDraft;
+    } catch (parseError) {
+      console.error("[feishu-event] dispatch plan draft parse failed:", sanitizeLogText(errorToText(parseError)));
     }
   }
 
@@ -550,21 +609,187 @@ export async function POST(req: NextRequest) {
     }
 
     if (isDispatchBatchApprovalReply(text)) {
-      const reply = buildDispatchBatchApprovalReceivedReply();
-      await saveDirectReply(supabase, convId, text, reply, ev.message.message_id);
       const token = await getFeishuToken();
-      await sendFeishuMessage(
-        token,
-        ev.message.chat_id,
-        ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
-        reply
-      );
-      await markReceiptCompleted(supabase, eventId);
-      return NextResponse.json({
-        code: 0,
-        project_director_intake: true,
-        state: "dispatch_batch_approval_received_phase_3e_required",
-      });
+      const alreadyDispatched = await hasBatch01DispatchRecord(supabase, convId);
+      if (alreadyDispatched) {
+        const reply = "第 1 批产品规划任务已经分发过，不会重复创建。";
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          [
+            "PROJECT_DIRECTOR_DISPATCH_BATCH_DUPLICATE",
+            "state: duplicate_dispatch_skipped",
+            "batch_code: BATCH-01",
+            "note: existing dispatched record found in hermes_messages.",
+          ].join("\n"),
+          "project_director_dispatch_batch_duplicate",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "dispatch_batch_duplicate_skipped",
+        });
+      }
+
+      const dispatchPlan = await findRecentDispatchPlanDraft(supabase, convId);
+      if (!dispatchPlan) {
+        const reply = "未找到待分发清单，请先完成任务树审核。";
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          [
+            "PROJECT_DIRECTOR_DISPATCH_BATCH_BLOCKED",
+            "state: waiting_dispatch_plan_missing",
+            "batch_code: BATCH-01",
+            "reason: no recent waiting_dispatch_approval dispatch plan was found.",
+          ].join("\n"),
+          "project_director_dispatch_batch_blocked",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "waiting_dispatch_plan_missing",
+        });
+      }
+
+      const buildResult = buildBatch01ProductPlanningJobs(dispatchPlan);
+      if (buildResult.tasks.length === 0) {
+        const reply = "第 1 批产品规划任务为空，无法分发。";
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          [
+            "PROJECT_DIRECTOR_DISPATCH_BATCH_BLOCKED",
+            "state: batch_01_empty",
+            "batch_code: BATCH-01",
+            "reason: no allowed product planning document task was found.",
+          ].join("\n"),
+          "project_director_dispatch_batch_blocked",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "batch_01_empty",
+        });
+      }
+
+      const existingJobs = await hasExistingBatch01Jobs(supabase, buildResult.tasks);
+      if (existingJobs) {
+        const reply = "第 1 批产品规划任务已经分发过，不会重复创建。";
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          [
+            "PROJECT_DIRECTOR_DISPATCH_BATCH_DUPLICATE",
+            "state: duplicate_dispatch_skipped",
+            "batch_code: BATCH-01",
+            "note: existing queued/running project_director hermes_jobs row found.",
+          ].join("\n"),
+          "project_director_dispatch_batch_duplicate",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "dispatch_batch_duplicate_skipped",
+        });
+      }
+
+      try {
+        const insertResult = await insertBatch01ProductPlanningJobs(supabase, buildResult);
+        const reply = buildBatch01DispatchedReply(insertResult.insertedCount);
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          buildBatch01DispatchedRecord(dispatchPlan, buildResult.tasks, insertResult.skippedColumns),
+          PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD_NAME,
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "waiting_review",
+          dispatched_batch: "BATCH-01",
+          inserted_jobs: insertResult.insertedCount,
+        });
+      } catch (dispatchError) {
+        const errorSummary = sanitizeLogText(errorToText(dispatchError)).slice(0, 300);
+        const reply = `第 1 批产品规划任务分发失败：${errorSummary}`;
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          [
+            "PROJECT_DIRECTOR_DISPATCH_BATCH_FAILED",
+            "state: dispatch_failed",
+            "batch_code: BATCH-01",
+            `error: ${errorSummary}`,
+          ].join("\n"),
+          "project_director_dispatch_batch_failed",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "dispatch_failed",
+        });
+      }
     }
 
     if (isTaskTreeReviewReply(text)) {

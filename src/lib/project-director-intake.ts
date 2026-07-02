@@ -94,6 +94,14 @@ const DISPATCH_PLAN_CHANGE_PREFIX_ASCII = "修改分发清单:";
 const DISPATCH_BATCH_APPROVAL_PHRASES = [
   "批准分发第 1 批",
   "批准分发第1批",
+  "批准第 1 批",
+  "批准第1批",
+  "开始第 1 批",
+  "开始第1批",
+  "分发第 1 批",
+  "分发第1批",
+  "先做产品规划",
+  "开始产品规划",
   "同意分发第 1 批",
   "同意分发第1批",
 ];
@@ -217,5 +225,5 @@ export function buildDispatchPlanChangeRecordedReply(): string {
 }
 
 export function buildDispatchBatchApprovalReceivedReply(): string {
-  return "已收到分发第 1 批的确认。本阶段只完成识别和记录，真正分发将在下一阶段处理。";
+  return "已收到分发第 1 批的确认。";
 }
