@@ -253,6 +253,39 @@ export function buildBossApprovedReply(): string {
   return "已收到批准，下一阶段将进入任务树草案。";
 }
 
+export function buildProjectDirectorScopeUpdateReply(updateText: string): string {
+  const normalized = normalizeDemandText(updateText);
+  const summary = normalized.length <= 120 ? normalized : `${normalized.slice(0, 117)}...`;
+
+  return [
+    "【项目总管确认】",
+    "已收到补充需求，我会把它合并到当前待确认范围里。",
+    "",
+    `补充内容：${summary}`,
+    "",
+    "当前仍处于确认阶段，不会分发任务，也不会写入 Worker 队列。",
+    "",
+    "请继续回复：",
+    "* 批准建议",
+    "* 选 A",
+    "* 选 B",
+    "* 或继续补充要求",
+  ].join("\n");
+}
+
+export function buildProjectDirectorScopeUpdateRecord(
+  originalDemand: string,
+  updateText: string
+): string {
+  return [
+    "PROJECT_DIRECTOR_SCOPE_UPDATE",
+    "state: waiting_boss_reply",
+    `original_demand: ${originalDemand}`,
+    `scope_update: ${normalizeDemandText(updateText)}`,
+    "note: recorded only; no hermes_jobs queued task is created before boss approval.",
+  ].join("\n");
+}
+
 export function buildTaskTreeReviewReceivedReply(): string {
   return "已收到任务树审核意见。下一阶段将进入任务分发准备。";
 }

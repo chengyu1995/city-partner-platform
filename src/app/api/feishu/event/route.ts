@@ -19,6 +19,8 @@ import { runAgent, AgentMessage } from "@/lib/hermes-agent";
 import {
   buildBossApprovedReply,
   buildDispatchPlanChangeRecordedReply,
+  buildProjectDirectorScopeUpdateRecord,
+  buildProjectDirectorScopeUpdateReply,
   buildProjectDirectorReply,
   buildTaskTreeChangeRecordedReply,
   buildTaskTreeReviewReceivedReply,
@@ -200,6 +202,52 @@ async function findRecentProjectDirectorDemand(
       if (candidate.role === "user" && isWebsiteProductDemand(candidate.content)) {
         return getDemandBody(candidate.content);
       }
+    }
+  }
+
+  return null;
+}
+
+async function findPendingProjectDirectorConfirmation(
+  supabase: SupabaseClient,
+  convId: string
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("hermes_messages")
+    .select("role, content, name, created_at")
+    .eq("conversation_id", convId)
+    .order("created_at", { ascending: false })
+    .limit(40);
+
+  if (error) throw new Error(`load project director pending confirmation failed: ${error.message}`);
+  if (!data) return null;
+
+  const history = data.reverse();
+  for (let index = history.length - 1; index >= 0; index--) {
+    const message = history[index];
+    const content = typeof message.content === "string" ? message.content : "";
+    const name = typeof message.name === "string" ? message.name : "";
+
+    if (
+      content.includes("PROJECT_DIRECTOR_TASK_TREE_DRAFT") ||
+      content.includes("PROJECT_DIRECTOR_DISPATCH_PLAN_DRAFT") ||
+      content.includes("PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD")
+    ) {
+      return null;
+    }
+
+    if (name === "project_director_scope_update" && content.includes("state: waiting_boss_reply")) {
+      return extractLineValue(content, "original_demand") || null;
+    }
+
+    if (message.role === "assistant" && content.includes("【项目总管确认】")) {
+      for (let userIndex = index - 1; userIndex >= 0; userIndex--) {
+        const candidate = history[userIndex];
+        if (candidate.role === "user" && isWebsiteProductDemand(candidate.content)) {
+          return getDemandBody(candidate.content);
+        }
+      }
+      return null;
     }
   }
 
@@ -961,6 +1009,34 @@ export async function POST(req: NextRequest) {
         code: 0,
         project_director_intake: true,
         state: "boss_approved_without_recent_project_director_context",
+      });
+    }
+
+    const pendingProjectDirectorDemand = await findPendingProjectDirectorConfirmation(supabase, convId);
+    if (pendingProjectDirectorDemand) {
+      const reply = buildProjectDirectorScopeUpdateReply(text);
+      await saveSystemRecordedReply(
+        supabase,
+        convId,
+        text,
+        reply,
+        buildProjectDirectorScopeUpdateRecord(pendingProjectDirectorDemand, text),
+        "project_director_scope_update",
+        ev.message.message_id
+      );
+      const token = await getFeishuToken();
+      await sendFeishuMessage(
+        token,
+        ev.message.chat_id,
+        ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+        reply
+      );
+      await markReceiptCompleted(supabase, eventId);
+      return NextResponse.json({
+        code: 0,
+        project_director_intake: true,
+        state: "waiting_boss_reply",
+        scope_update_recorded: true,
       });
     }
 
