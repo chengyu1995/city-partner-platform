@@ -429,11 +429,15 @@ async function getFeishuToken(): Promise<string> {
 
 export async function POST(req: NextRequest) {
   try {
-    // 1. 飞书 URL 验证 (challenge) - 可能加密 or 公开
+    // 1. 飞书 URL 验证 (challenge) - 明文 challenge 必须最快返回。
     const bodyText = await req.text();
     let body: any;
     try { body = JSON.parse(bodyText); }
     catch { return NextResponse.json({ code: 400, msg: "invalid json" }, { status: 400 }); }
+
+    if (body?.type === "url_verification" && typeof body.challenge === "string") {
+      return NextResponse.json({ challenge: body.challenge });
+    }
 
     // URL 验证 (encrypt key + verification token)
     const FEISHU_ENCRYPT_KEY = process.env.FEISHU_ENCRYPT_KEY || "";

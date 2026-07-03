@@ -192,12 +192,40 @@ export function isDispatchBatchApprovalReply(text: string): boolean {
 
 function summarizeDemand(text: string): string {
   const demand = getDemandBody(text);
+  if (demand === "做同城搭子网站首页") return "你想先做同城搭子网站首页";
   if (demand.length <= 80) return demand;
   return `${demand.slice(0, 77)}...`;
 }
 
 export function buildProjectDirectorReply(text: string): string {
   const summary = summarizeDemand(text);
+  if (summary === "你想先做同城搭子网站首页") {
+    return [
+      "【项目总管确认】",
+      "我理解你的需求：",
+      "你想先做同城搭子网站首页。",
+      "",
+      "我的建议：",
+      "建议先做 MVP 首页，不要一开始做完整复杂平台。先让首页能清楚展示平台定位、搭子分类、找搭子入口和发布入口。",
+      "",
+      "我建议先这样做：",
+      "1. 首页核心展示",
+      "2. 搭子分类入口",
+      "3. 搭子列表入口",
+      "4. 发布入口预留",
+      "5. 移动端适配",
+      "",
+      "关键问题：",
+      "你希望首页首版更偏“找搭子列表”，还是更偏“发布搭子入口”？",
+      "",
+      "请回复：",
+      "- 批准建议",
+      "- 选 A：找搭子列表优先",
+      "- 选 B：发布搭子入口优先",
+      "- 补充要求：你的要求",
+    ].join("\n");
+  }
+
   return [
     "【项目总管确认】",
     `我理解你的需求：你想做 ${summary}。这属于网站/产品类需求，我会先确认范围，不直接分发给 Codex 执行。`,
@@ -222,7 +250,7 @@ export function buildProjectDirectorReply(text: string): string {
 }
 
 export function buildBossApprovedReply(): string {
-  return "已收到批准，下一阶段将进入任务树拆解。";
+  return "已收到批准，下一阶段将进入任务树草案。";
 }
 
 export function buildTaskTreeReviewReceivedReply(): string {
