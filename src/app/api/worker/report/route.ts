@@ -2,10 +2,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
+  assertWorkerOwnsJob,
   clampProgress,
   findHermesJob,
   getBitableRecordId,
+  getWorkerIdFromBody,
   getWorkerSupabase,
+  isTerminalWorkerStatus,
   normalizeWorkerStatus,
   parseJsonBody,
   responseFromMaybe,
@@ -22,7 +25,11 @@ interface WorkerReportBody {
   progress_percent?: number;
   current_step?: string;
   status_message?: string;
+  worker_id?: string;
+  worker_name?: string;
   git_commit_sha?: string;
+  deploy_status?: string | null;
+  result_text?: string;
   error_text?: string;
   error?: string;
   output?: string;
@@ -45,6 +52,8 @@ function buildResult(body: WorkerReportBody): Record<string, unknown> {
     test_passed: body.test_passed ?? null,
     duration_ms: body.duration_ms ?? null,
     git_commit_sha: body.git_commit_sha ?? null,
+    deploy_status: body.deploy_status ?? null,
+    result_text: body.result_text ?? null,
   };
 }
 
@@ -68,10 +77,30 @@ export async function POST(req: NextRequest) {
   const now = new Date().toISOString();
   const progressPercent = terminal ? 100 : clampProgress(body.progress_percent, 0);
   const errorText = body.error_text ?? body.error ?? null;
-  const { data: existingJob } = await findHermesJob(supabase, jobId);
+  const { data: existingJob, error: findError } = await findHermesJob(supabase, jobId);
+  if (findError) {
+    return NextResponse.json({ ok: false, error: findError.message ?? "job lookup failed" }, { status: 500 });
+  }
+  if (!existingJob) {
+    return NextResponse.json({ ok: false, error: "job not found" }, { status: 404 });
+  }
+
+  const workerId = getWorkerIdFromBody(body);
+  const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
+  if (ownershipError) return ownershipError;
+
+  if (isTerminalWorkerStatus(existingJob.status)) {
+    return NextResponse.json({
+      ok: true,
+      job: existingJob,
+      idempotent: true,
+      skipped: "terminal_job_report_ignored",
+    });
+  }
 
   const { data, error, skippedColumns } = await updateHermesJob(supabase, jobId, {
     status: workerStatus,
+    claimed_by: workerId,
     progress_percent: progressPercent,
     current_step:
       body.current_step ??

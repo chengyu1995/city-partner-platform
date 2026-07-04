@@ -1,15 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
   assertWorkerOwnsJob,
-  clampProgress,
   findHermesJob,
-  getBitableRecordId,
   getWorkerIdFromBody,
+  getWorkerIdFromRequest,
   getWorkerSupabase,
   isTerminalWorkerStatus,
-  normalizeWorkerStatus,
   parseJsonBody,
   responseFromMaybe,
   updateHermesJob,
@@ -18,25 +15,19 @@ import {
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-interface WorkerProgressBody {
+interface WorkerHeartbeatBody {
   id?: string;
   job_id?: string;
-  status?: string;
-  progress_percent?: number;
-  current_step?: string;
-  status_message?: string;
   worker_id?: string;
   worker_name?: string;
-  bitable_record_id?: string;
-  feishu_record_id?: string;
-  record_id?: string;
+  status_message?: string;
 }
 
 export async function POST(req: NextRequest) {
   const unauthorized = assertWorkerAuthorized(req);
   if (unauthorized) return unauthorized;
 
-  const body = await parseJsonBody<WorkerProgressBody>(req);
+  const body = await parseJsonBody<WorkerHeartbeatBody>(req);
   if (responseFromMaybe(body)) return body;
 
   const jobId = body.job_id ?? body.id;
@@ -47,11 +38,6 @@ export async function POST(req: NextRequest) {
   const supabase = await getWorkerSupabase();
   if (responseFromMaybe(supabase)) return supabase;
 
-  const now = new Date().toISOString();
-  const progressPercent = clampProgress(body.progress_percent, 0);
-  const workerStatus = normalizeWorkerStatus(body.status);
-  const currentStep =
-    body.current_step ?? (workerStatus === "queued" ? "等待 Worker 领取" : "执行中");
   const { data: existingJob, error: findError } = await findHermesJob(supabase, jobId);
   if (findError) {
     return NextResponse.json({ ok: false, error: findError.message ?? "job lookup failed" }, { status: 500 });
@@ -69,40 +55,38 @@ export async function POST(req: NextRequest) {
       ok: true,
       job: existingJob,
       idempotent: true,
-      skipped: "terminal_job_progress_ignored",
+      skipped: "terminal_job_heartbeat_ignored",
     });
   }
 
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
   const { data, error, skippedColumns } = await updateHermesJob(supabase, jobId, {
-    status: body.status ?? "running",
+    status: "running",
     claimed_by: workerId,
-    progress_percent: workerStatus === "queued" ? 0 : progressPercent,
-    current_step: currentStep,
-    status_message: body.status_message ?? null,
+    heartbeat_at: now,
+    expires_at: expiresAt,
+    status_message: body.status_message ?? "Worker 心跳正常",
     updated_at: now,
   });
 
   if (error) {
-    return NextResponse.json({ ok: false, error: error.message ?? "update failed" }, { status: 500 });
+    return NextResponse.json({ ok: false, error: error.message ?? "heartbeat update failed" }, { status: 500 });
   }
   if (skippedColumns.length > 0) {
-    console.log(`[worker/progress] skipped missing hermes_jobs columns: ${skippedColumns.join(", ")}`);
+    console.log(`[worker/heartbeat] skipped missing hermes_jobs columns: ${skippedColumns.join(", ")}`);
   }
 
-  const recordId = getBitableRecordId(body, data, existingJob);
-  await syncWorkerStatusToFeishu({
-    recordId,
-    status: workerStatus === "queued" ? "queued" : "running",
-    stage: "execution",
-    progressPercent: workerStatus === "queued" ? 0 : progressPercent,
-    currentStep,
-    statusMessage: body.status_message ?? null,
-    updatedAt: now,
-  });
-
-  return NextResponse.json({ ok: true, job: data, feishu_sync: recordId ? "attempted" : "skipped_no_record_id" });
+  return NextResponse.json({ ok: true, job: data });
 }
 
-export async function GET() {
-  return NextResponse.json({ ok: true, route: "worker-progress" });
+export async function GET(req: NextRequest) {
+  const unauthorized = assertWorkerAuthorized(req);
+  if (unauthorized) return unauthorized;
+
+  return NextResponse.json({
+    ok: true,
+    route: "worker-heartbeat",
+    worker_id: getWorkerIdFromRequest(req),
+  });
 }

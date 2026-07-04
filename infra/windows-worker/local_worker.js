@@ -83,6 +83,8 @@ async function request(path, options = {}) {
     headers: {
       Authorization: `Bearer ${WORKER_AUTH}`,
       "Content-Type": "application/json",
+      "X-Worker-Id": WORKER_NAME,
+      "X-Worker-Name": WORKER_NAME,
       ...(options.headers || {}),
     },
   });
@@ -95,6 +97,8 @@ async function sendHeartbeat(jobId) {
     method: "POST",
     body: JSON.stringify({
       job_id: jobId,
+      worker_id: WORKER_NAME,
+      worker_name: WORKER_NAME,
     }),
   });
 
@@ -835,6 +839,7 @@ async function updateProgress(
       method: "POST",
       body: JSON.stringify({
         job_id: jobId,
+        worker_id: WORKER_NAME,
         worker_name: WORKER_NAME,
         progress_percent: progressPercent,
         current_step: currentStep,
@@ -870,12 +875,16 @@ async function report(jobId, status, payload, extra = {}) {
     status === "succeeded"
       ? {
           job_id: jobId,
+          worker_id: WORKER_NAME,
+          worker_name: WORKER_NAME,
           status,
           result_text: payload,
           ...extra,
         }
       : {
           job_id: jobId,
+          worker_id: WORKER_NAME,
+          worker_name: WORKER_NAME,
           status,
           error_text: payload,
           ...extra,
@@ -901,7 +910,7 @@ async function pollOnce() {
   }
 
   const response = await request(
-    `/api/worker/next?worker_name=${encodeURIComponent(WORKER_NAME)}`
+    `/api/worker/next?worker_id=${encodeURIComponent(WORKER_NAME)}`
   );
 
   if (response.status === 204) {

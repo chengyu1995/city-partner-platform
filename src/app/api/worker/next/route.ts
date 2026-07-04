@@ -2,18 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
+  claimHermesJob,
   getBitableRecordId,
+  getWorkerIdFromRequest,
   getWorkerSupabase,
   responseFromMaybe,
-  updateHermesJob,
 } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-
-function getWorkerId(req: NextRequest): string {
-  return req.headers.get("x-worker-id") ?? req.nextUrl.searchParams.get("worker_id") ?? "unknown-worker";
-}
 
 async function handleNext(req: NextRequest) {
   const unauthorized = assertWorkerAuthorized(req);
@@ -40,9 +37,10 @@ async function handleNext(req: NextRequest) {
 
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-  const { data: claimedJob, error: updateError, skippedColumns } = await updateHermesJob(supabase, job.id, {
+  const workerId = getWorkerIdFromRequest(req);
+  const { data: claimedJob, error: updateError, skippedColumns } = await claimHermesJob(supabase, job.id, workerId, {
     status: "running",
-    claimed_by: getWorkerId(req),
+    claimed_by: workerId,
     claimed_at: now,
     expires_at: expiresAt,
     progress_percent: 0,
@@ -53,6 +51,9 @@ async function handleNext(req: NextRequest) {
 
   if (updateError) {
     return NextResponse.json({ ok: false, error: updateError.message ?? "claim failed" }, { status: 500 });
+  }
+  if (!claimedJob) {
+    return NextResponse.json({ ok: true, job: null, skipped: "already_claimed_or_not_runnable" });
   }
   if (skippedColumns.length > 0) {
     console.log(`[worker/next] skipped missing hermes_jobs columns: ${skippedColumns.join(", ")}`);

@@ -31,6 +31,68 @@ const RECORD_ID_KEYS = [
   "recordId",
 ];
 
+const TERMINAL_WORKER_STATUSES = new Set(["succeeded", "failed"]);
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function isSafePostgrestFilterValue(value: string): boolean {
+  return /^[A-Za-z0-9._:@-]+$/.test(value);
+}
+
+export function getWorkerIdFromRequest(req: NextRequest): string {
+  return (
+    readString(req.headers.get("x-worker-id")) ??
+    readString(req.headers.get("x-worker-name")) ??
+    readString(req.nextUrl.searchParams.get("worker_id")) ??
+    readString(req.nextUrl.searchParams.get("worker_name")) ??
+    "unknown-worker"
+  );
+}
+
+export function getWorkerIdFromBody(body: {
+  worker_id?: unknown;
+  worker_name?: unknown;
+  workerId?: unknown;
+  workerName?: unknown;
+}): string {
+  return (
+    readString(body.worker_id) ??
+    readString(body.worker_name) ??
+    readString(body.workerId) ??
+    readString(body.workerName) ??
+    "unknown-worker"
+  );
+}
+
+export function getClaimedBy(job: JobRecord | null | undefined): string | null {
+  if (!job) return null;
+  return readString(job.claimed_by);
+}
+
+export function isTerminalWorkerStatus(value: unknown): boolean {
+  return TERMINAL_WORKER_STATUSES.has(String(value || ""));
+}
+
+export function assertWorkerOwnsJob(
+  job: JobRecord | null,
+  workerId: string
+): NextResponse | null {
+  const claimedBy = getClaimedBy(job);
+  if (!claimedBy || claimedBy === workerId) return null;
+
+  return NextResponse.json(
+    {
+      ok: false,
+      error: "worker does not own this job",
+      claimed_by: claimedBy,
+      worker_id: workerId,
+    },
+    { status: 409 }
+  );
+}
+
 export function assertWorkerAuthorized(req: NextRequest): NextResponse | null {
   const expected =
     process.env.WORKER_TOKEN?.trim() ??
@@ -156,6 +218,46 @@ export async function updateHermesJob(
   return {
     data: null,
     error: { message: "too many missing columns while updating hermes_jobs" },
+    skippedColumns,
+  };
+}
+
+export async function claimHermesJob(
+  supabase: SupabaseClient,
+  jobId: string,
+  workerId: string,
+  fields: JobRecord
+): Promise<{ data: JobRecord | null; error: SupabaseWriteError | null; skippedColumns: string[] }> {
+  const claimedFields = { ...fields };
+  const skippedColumns: string[] = [];
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    let query = supabase
+      .from("hermes_jobs")
+      .update(claimedFields)
+      .eq("id", jobId)
+      .in("status", ["queued", "pending"]);
+
+    query = isSafePostgrestFilterValue(workerId)
+      ? query.or(`claimed_by.is.null,claimed_by.eq.${workerId}`)
+      : query.is("claimed_by", null);
+
+    const { data, error } = await query.select("*").maybeSingle();
+
+    if (!error) return { data: (data as JobRecord | null) ?? null, error: null, skippedColumns };
+    if (!isMissingColumnError(error)) return { data: null, error, skippedColumns };
+
+    const missingColumn = extractMissingColumn(error);
+    if (!missingColumn || !(missingColumn in claimedFields)) {
+      return { data: null, error, skippedColumns };
+    }
+    skippedColumns.push(missingColumn);
+    delete claimedFields[missingColumn];
+  }
+
+  return {
+    data: null,
+    error: { message: "too many missing columns while claiming hermes_jobs" },
     skippedColumns,
   };
 }
