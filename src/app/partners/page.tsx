@@ -1,6 +1,6 @@
 "use client";
 
-import { useSyncExternalStore } from "react";
+import { Suspense, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import {
@@ -60,7 +60,24 @@ function hrefWith(params: { city?: string; category?: string }) {
   return text ? `/partners?${text}` : "/partners";
 }
 
-export default function PartnersPage() {
+function PartnersPageFallback() {
+  return (
+    <main className="min-h-screen bg-[#f8faf7] px-4 py-6 text-slate-950 sm:px-6 lg:px-8">
+      <section className="mx-auto max-w-6xl">
+        <div className="rounded-3xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+          <p className="text-sm font-black uppercase tracking-[0.25em] text-emerald-600">
+            Partners
+          </p>
+          <h1 className="mt-4 text-4xl font-black tracking-tight sm:text-5xl">
+            Loading partners
+          </h1>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function PartnersPageContent() {
   const searchParams = useSearchParams();
   const selectedCity = searchParams.get("city") ?? "全部";
   const selectedCategory = searchParams.get("category") ?? "全部";
@@ -296,5 +313,13 @@ export default function PartnersPage() {
         </section>
       </section>
     </main>
+  );
+}
+
+export default function PartnersPage() {
+  return (
+    <Suspense fallback={<PartnersPageFallback />}>
+      <PartnersPageContent />
+    </Suspense>
   );
 }
