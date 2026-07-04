@@ -401,6 +401,7 @@ function formatPreviewReport(reportResult) {
     ...(routeLines.length ? routeLines : ["- 未执行"]),
     "静态检查：",
     ...(checkLines.length ? checkLines : ["- 未执行"]),
+    reportResult.reportWriteError ? `warning: 诊断报告写入失败：${reportResult.reportWriteError}` : "",
     reportResult.warning ? `warning: ${reportResult.error || "本地预览诊断失败"}` : "",
   ].join("\n");
 }
@@ -639,6 +640,7 @@ function killProcessTree(pid, reason) {
       {
         windowsHide: true,
         maxBuffer: 1024 * 1024,
+        env: sanitizeWindowsEnv(process.env),
       },
       (error, stdout, stderr) => {
         const message = [

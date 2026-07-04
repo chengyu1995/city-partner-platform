@@ -60,6 +60,18 @@ function sanitizeWindowsEnv(env = process.env) {
   return sanitized;
 }
 
+function writeJsonReportSafe(filePath, payload) {
+  try {
+    fs.mkdirSync(path.dirname(filePath), {
+      recursive: true,
+    });
+    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8");
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
 function resolveProjectDir(projectDir) {
   const resolved = path.resolve(projectDir || process.env.PROJECT_DIR || process.cwd());
 
@@ -415,10 +427,6 @@ async function recoverLocalPreview(projectDir, options = {}) {
   await restoreGeneratedEnvFiles(root);
 
   const logDir = path.join(__dirname, "logs");
-  fs.mkdirSync(logDir, {
-    recursive: true,
-  });
-
   const routeFiles = await checkRouteFiles(root, options.routeFiles);
   const staticChecks = [
     await runStaticCheck(root, "eslint", "npm.cmd", ["run", "lint"]),
@@ -438,11 +446,16 @@ async function recoverLocalPreview(projectDir, options = {}) {
   };
   report.warning = !report.ok;
 
-  fs.writeFileSync(
+  const reportWriteError = writeJsonReportSafe(
     path.join(logDir, "local-preview-recovery-report.json"),
-    JSON.stringify(report, null, 2),
-    "utf8"
+    report
   );
+
+  if (reportWriteError) {
+    report.ok = false;
+    report.warning = true;
+    report.reportWriteError = reportWriteError;
+  }
 
   return report;
 }
