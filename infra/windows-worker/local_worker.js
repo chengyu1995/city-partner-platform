@@ -72,6 +72,7 @@ function assertRequiredEnv() {
 
 let stopping = false;
 let working = false;
+let currentAttemptId = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -92,11 +93,12 @@ async function request(path, options = {}) {
   return response;
 }
 
-async function sendHeartbeat(jobId) {
+async function sendHeartbeat(jobId, attemptId = null) {
   const response = await request("/api/worker/heartbeat", {
     method: "POST",
     body: JSON.stringify({
       job_id: jobId,
+      attempt_id: attemptId,
       worker_id: WORKER_NAME,
       worker_name: WORKER_NAME,
     }),
@@ -110,7 +112,7 @@ async function sendHeartbeat(jobId) {
   }
 }
 
-function startHeartbeat(jobId) {
+function startHeartbeat(jobId, attemptId = null) {
   let stopped = false;
 
   const send = async () => {
@@ -119,7 +121,7 @@ function startHeartbeat(jobId) {
     }
 
     try {
-      await sendHeartbeat(jobId);
+      await sendHeartbeat(jobId, attemptId);
     } catch (error) {
       console.error(
         `任务 ${jobId} 心跳失败：`,
@@ -832,13 +834,15 @@ async function updateProgress(
   jobId,
   progressPercent,
   currentStep,
-  statusMessage = ""
+  statusMessage = "",
+  attemptId = null
 ) {
   try {
     const response = await request("/api/worker/progress", {
       method: "POST",
       body: JSON.stringify({
         job_id: jobId,
+        attempt_id: attemptId || currentAttemptId,
         worker_id: WORKER_NAME,
         worker_name: WORKER_NAME,
         progress_percent: progressPercent,
@@ -871,10 +875,12 @@ async function updateProgress(
 }
 
 async function report(jobId, status, payload, extra = {}) {
+  const attemptId = extra.attempt_id || currentAttemptId || null;
   const body =
     status === "succeeded"
       ? {
           job_id: jobId,
+          attempt_id: attemptId,
           worker_id: WORKER_NAME,
           worker_name: WORKER_NAME,
           status,
@@ -883,6 +889,7 @@ async function report(jobId, status, payload, extra = {}) {
         }
       : {
           job_id: jobId,
+          attempt_id: attemptId,
           worker_id: WORKER_NAME,
           worker_name: WORKER_NAME,
           status,
@@ -925,14 +932,17 @@ async function pollOnce() {
 
   const payload = JSON.parse(text);
   const job = payload.job;
+  const attemptId = payload.attempt_id || job?.attempt_id || job?.active_attempt_id || job?.payload?.attempt_id || null;
 
   if (!job || !job.id) {
     return;
   }
 
   working = true;
+  currentAttemptId = attemptId;
 
   console.log(`领取任务： ${job.id}`);
+  console.log(`执行尝试： ${attemptId || "legacy-no-attempt-id"}`);
 
   await updateProgress(
     job.id,
@@ -942,7 +952,7 @@ async function pollOnce() {
   );
   console.log(`任务内容：${job.request_text}`);
 
-  const stopHeartbeat = startHeartbeat(job.id);
+  const stopHeartbeat = startHeartbeat(job.id, attemptId);
   let gitCheckpoint = null;
 
   try {
@@ -1087,6 +1097,7 @@ async function pollOnce() {
       "succeeded",
       finalResult,
       {
+        attempt_id: attemptId,
         git_commit_sha:
           gitResult.commitSha || null,
         deploy_status:
@@ -1126,11 +1137,13 @@ async function pollOnce() {
       job.id,
       "failed",
       `${
-        error instanceof Error ? error.message : String(error)
-      }${rollbackMessage}`
+      error instanceof Error ? error.message : String(error)
+      }${rollbackMessage}`,
+      { attempt_id: attemptId }
     );
   } finally {
     stopHeartbeat();
+    currentAttemptId = null;
     working = false;
   }
 }

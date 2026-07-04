@@ -2,9 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
+  assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
+  buildAttemptPayload,
   clampProgress,
   findHermesJob,
+  getAttemptIdFromBody,
   getBitableRecordId,
   getWorkerIdFromBody,
   getWorkerSupabase,
@@ -21,6 +24,7 @@ export const runtime = "nodejs";
 interface WorkerProgressBody {
   id?: string;
   job_id?: string;
+  attempt_id?: string;
   status?: string;
   progress_percent?: number;
   current_step?: string;
@@ -50,8 +54,7 @@ export async function POST(req: NextRequest) {
   const now = new Date().toISOString();
   const progressPercent = clampProgress(body.progress_percent, 0);
   const workerStatus = normalizeWorkerStatus(body.status);
-  const currentStep =
-    body.current_step ?? (workerStatus === "queued" ? "等待 Worker 领取" : "执行中");
+  const currentStep = body.current_step ?? (workerStatus === "queued" ? "waiting_worker_claim" : "running");
   const { data: existingJob, error: findError } = await findHermesJob(supabase, jobId);
   if (findError) {
     return NextResponse.json({ ok: false, error: findError.message ?? "job lookup failed" }, { status: 500 });
@@ -63,6 +66,10 @@ export async function POST(req: NextRequest) {
   const workerId = getWorkerIdFromBody(body);
   const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
   if (ownershipError) return ownershipError;
+
+  const attemptId = getAttemptIdFromBody(body);
+  const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
+  if (attemptError) return attemptError;
 
   if (isTerminalWorkerStatus(existingJob.status)) {
     return NextResponse.json({
@@ -79,6 +86,19 @@ export async function POST(req: NextRequest) {
     progress_percent: workerStatus === "queued" ? 0 : progressPercent,
     current_step: currentStep,
     status_message: body.status_message ?? null,
+    ...(attemptId
+      ? {
+          attempt_id: attemptId,
+          active_attempt_id: attemptId,
+          payload: buildAttemptPayload(existingJob, {
+            attempt_id: attemptId,
+            job_id: jobId,
+            worker_id: workerId,
+            status: workerStatus,
+            updated_at: now,
+          }),
+        }
+      : {}),
     updated_at: now,
   });
 
@@ -100,7 +120,12 @@ export async function POST(req: NextRequest) {
     updatedAt: now,
   });
 
-  return NextResponse.json({ ok: true, job: data, feishu_sync: recordId ? "attempted" : "skipped_no_record_id" });
+  return NextResponse.json({
+    ok: true,
+    job: data,
+    attempt_id: attemptId,
+    feishu_sync: recordId ? "attempted" : "skipped_no_record_id",
+  });
 }
 
 export async function GET() {

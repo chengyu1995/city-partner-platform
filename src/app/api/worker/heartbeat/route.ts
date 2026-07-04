@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   assertWorkerAuthorized,
+  assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
+  buildAttemptPayload,
   findHermesJob,
+  getAttemptIdFromBody,
   getWorkerIdFromBody,
   getWorkerIdFromRequest,
   getWorkerSupabase,
@@ -20,6 +23,7 @@ interface WorkerHeartbeatBody {
   job_id?: string;
   worker_id?: string;
   worker_name?: string;
+  attempt_id?: string;
   status_message?: string;
 }
 
@@ -50,6 +54,10 @@ export async function POST(req: NextRequest) {
   const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
   if (ownershipError) return ownershipError;
 
+  const attemptId = getAttemptIdFromBody(body);
+  const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
+  if (attemptError) return attemptError;
+
   if (isTerminalWorkerStatus(existingJob.status)) {
     return NextResponse.json({
       ok: true,
@@ -66,7 +74,21 @@ export async function POST(req: NextRequest) {
     claimed_by: workerId,
     heartbeat_at: now,
     expires_at: expiresAt,
-    status_message: body.status_message ?? "Worker 心跳正常",
+    status_message: body.status_message ?? "Worker heartbeat ok",
+    ...(attemptId
+      ? {
+          attempt_id: attemptId,
+          active_attempt_id: attemptId,
+          payload: buildAttemptPayload(existingJob, {
+            attempt_id: attemptId,
+            job_id: jobId,
+            worker_id: workerId,
+            status: "running",
+            heartbeat_at: now,
+            updated_at: now,
+          }),
+        }
+      : {}),
     updated_at: now,
   });
 
@@ -77,7 +99,7 @@ export async function POST(req: NextRequest) {
     console.log(`[worker/heartbeat] skipped missing hermes_jobs columns: ${skippedColumns.join(", ")}`);
   }
 
-  return NextResponse.json({ ok: true, job: data });
+  return NextResponse.json({ ok: true, job: data, attempt_id: attemptId });
 }
 
 export async function GET(req: NextRequest) {

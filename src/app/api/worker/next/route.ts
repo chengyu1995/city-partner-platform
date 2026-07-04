@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
+  buildAttemptPayload,
   claimHermesJob,
+  createWorkerAttemptId,
   getBitableRecordId,
   getWorkerIdFromRequest,
   getWorkerSupabase,
@@ -38,19 +40,38 @@ async function handleNext(req: NextRequest) {
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
   const workerId = getWorkerIdFromRequest(req);
-  const { data: claimedJob, error: updateError, skippedColumns } = await claimHermesJob(supabase, job.id, workerId, {
-    status: "running",
-    claimed_by: workerId,
-    claimed_at: now,
-    expires_at: expiresAt,
-    progress_percent: 0,
-    current_step: "等待 Worker 领取",
-    status_message: "Worker 已领取任务",
-    updated_at: now,
-  });
+  const attemptId = createWorkerAttemptId(job.id, workerId);
+  const { data: claimedJob, error: updateError, skippedColumns } = await claimHermesJob(
+    supabase,
+    job.id,
+    workerId,
+    {
+      status: "running",
+      claimed_by: workerId,
+      claimed_at: now,
+      attempt_id: attemptId,
+      active_attempt_id: attemptId,
+      expires_at: expiresAt,
+      progress_percent: 0,
+      current_step: "waiting_worker_claim",
+      status_message: "Worker claimed job",
+      payload: buildAttemptPayload(job, {
+        attempt_id: attemptId,
+        job_id: job.id,
+        worker_id: workerId,
+        status: "running",
+        started_at: now,
+        updated_at: now,
+      }),
+      updated_at: now,
+    }
+  );
 
   if (updateError) {
-    return NextResponse.json({ ok: false, error: updateError.message ?? "claim failed" }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: updateError.message ?? "claim failed" },
+      { status: 500 }
+    );
   }
   if (!claimedJob) {
     return NextResponse.json({ ok: true, job: null, skipped: "already_claimed_or_not_runnable" });
@@ -65,12 +86,17 @@ async function handleNext(req: NextRequest) {
     status: "running",
     stage: "execution",
     progressPercent: 0,
-    currentStep: "等待 Worker 领取",
-    statusMessage: "Worker 已领取任务",
+    currentStep: "waiting_worker_claim",
+    statusMessage: "Worker claimed job",
     updatedAt: now,
   });
 
-  return NextResponse.json({ ok: true, job: claimedJob ?? job, feishu_sync: recordId ? "attempted" : "skipped_no_record_id" });
+  return NextResponse.json({
+    ok: true,
+    job: claimedJob,
+    attempt_id: attemptId,
+    feishu_sync: recordId ? "attempted" : "skipped_no_record_id",
+  });
 }
 
 export async function GET(req: NextRequest) {

@@ -103,6 +103,7 @@ const SYSTEM_ALLOWED_FILES = [
   "infra/windows-worker/local_worker.js",
   "docs/upgrade/batch-15-agent-dispatcher.md",
   "docs/upgrade/batch-15-task-tree-design.md",
+  "docs/upgrade/batch-16-boss-console-attempt-contract.md",
   "docs/ops/agent-dispatch-architecture.md",
   "docs/ops/project-director-upgrade-roadmap.md",
   "docs/product/batch-15-agent-dispatcher-notes.md",
@@ -281,6 +282,87 @@ function buildSystemUpgradeTasks(originalDemand: string): ProjectDirectorSubtask
     "本阶段性质：系统升级，不开发网站业务页面。",
     "冻结业务页面：app/page.tsx、app/post/page.tsx、app/partners/page.tsx、src/app/page.tsx、src/app/post/page.tsx、src/app/partners/page.tsx。",
   ];
+
+  if (/BATCH-16|Attempt|attempt|老板控制台|控制台命令|总管命令|多 Agent/i.test(originalDemand)) {
+    return [
+      task({
+        task_code: "BATCH-16-CONSOLE-01",
+        task_title: "建立飞书老板控制台命令",
+        role: "backend_developer",
+        task_type: "system_upgrade",
+        stage: "BACKEND",
+        input: baseInput,
+        allowed_files: [
+          "src/lib/project-director-console.ts",
+          "src/app/api/feishu/event/route.ts",
+        ],
+        acceptance_criteria: [
+          "支持帮助、状态、暂停、恢复、批准执行命令",
+          "暂停状态阻止新 Agent 分发但不中断运行中的 Worker",
+          "控制台回复不暴露 SQL、PowerShell、堆栈或密钥",
+        ],
+        estimated_minutes: 50,
+      }),
+      task({
+        task_code: "BATCH-16-ATTEMPT-01",
+        task_title: "建立 Worker attempt_id 契约",
+        role: "backend_developer",
+        task_type: "backend_development",
+        stage: "BACKEND",
+        input: baseInput,
+        allowed_files: [
+          "src/lib/worker-jobs.ts",
+          "src/app/api/worker/next/route.ts",
+          "src/app/api/worker/heartbeat/route.ts",
+          "src/app/api/worker/progress/route.ts",
+          "src/app/api/worker/report/route.ts",
+        ],
+        acceptance_criteria: [
+          "领取任务时生成 attempt_id",
+          "heartbeat、progress、report 接收并校验 attempt_id",
+          "错误 Worker 或错误 attempt 的上报被拒绝",
+          "同一 attempt 的重复终态上报幂等",
+        ],
+        dependency_keys: ["BATCH-16-CONSOLE-01"],
+        estimated_minutes: 70,
+      }),
+      task({
+        task_code: "BATCH-16-WORKER-01",
+        task_title: "让 Windows Worker 传递 attempt_id",
+        role: "operations_engineer",
+        task_type: "system_upgrade",
+        stage: "OPS",
+        input: baseInput,
+        allowed_files: ["infra/windows-worker/local_worker.js"],
+        acceptance_criteria: [
+          "Worker 从领取响应读取 attempt_id",
+          "Worker 后续进度、心跳、最终报告都带 attempt_id",
+          "不改变 Codex 禁止 git/dev server/browser 的外层规则",
+        ],
+        dependency_keys: ["BATCH-16-ATTEMPT-01"],
+        estimated_minutes: 45,
+      }),
+      task({
+        task_code: "BATCH-16-DOCS-01",
+        task_title: "记录 BATCH-16 操作契约和验证方式",
+        role: "project_director",
+        task_type: "system_upgrade",
+        stage: "REPORT",
+        input: baseInput,
+        allowed_files: [
+          "docs/upgrade/batch-16-boss-console-attempt-contract.md",
+          "docs/upgrade/batch-15-to-19-roadmap.md",
+        ],
+        acceptance_criteria: [
+          "记录飞书老板控制台命令",
+          "记录 attempt_id payload 契约",
+          "记录静态验证方式且不要求启动 dev server",
+        ],
+        dependency_keys: ["BATCH-16-WORKER-01"],
+        estimated_minutes: 30,
+      }),
+    ];
+  }
 
   return [
     task({

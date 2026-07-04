@@ -19,18 +19,20 @@ Acceptance:
 - Expired jobs can be retried or failed according to policy.
 - Ownership remains visible through `claimed_by`.
 
-## BATCH-16: Attempt Model and Worker Contract
+## BATCH-16: Feishu Boss Console, Attempt Model, and Worker Contract
 
-Goal: move from job-only reporting to attempt-aware reporting.
+Goal: let the boss control the project director and multi Agent dispatcher from Feishu, and move from job-only reporting to attempt-aware reporting.
 
 Deliverables:
 
+- Feishu boss console commands for help, status, pause, resume, and approved execution.
 - Attempt ID contract for claim, heartbeat, progress, and report.
 - Worker payload schema for `attempt_id`, `job_id`, `worker_id`, status, progress, result, and error fields.
 - Compatibility notes for existing `hermes_jobs`.
 
 Acceptance:
 
+- Boss can use Feishu commands to inspect and control project director dispatch.
 - Every execution has a durable attempt identity.
 - Duplicate terminal reports for the same attempt are idempotent.
 - Reports from the wrong Worker are rejected.
@@ -84,4 +86,3 @@ Acceptance:
 - Operators can diagnose queued, running, stale, failed, and completed jobs.
 - Static verification commands are documented and pass or produce actionable warnings.
 - A human owner explicitly approves lifting the business-development freeze.
-

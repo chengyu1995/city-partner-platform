@@ -37,6 +37,10 @@ function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+function readRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
 function isSafePostgrestFilterValue(value: string): boolean {
   return /^[A-Za-z0-9._:@-]+$/.test(value);
 }
@@ -66,9 +70,60 @@ export function getWorkerIdFromBody(body: {
   );
 }
 
+export function getAttemptIdFromBody(body: {
+  attempt_id?: unknown;
+  attemptId?: unknown;
+}): string | null {
+  return readString(body.attempt_id) ?? readString(body.attemptId);
+}
+
+export function createWorkerAttemptId(jobId: string, workerId: string, now = Date.now()): string {
+  const safeJob = jobId.replace(/[^A-Za-z0-9._:-]/g, "_");
+  const safeWorker = workerId.replace(/[^A-Za-z0-9._:-]/g, "_");
+  return `${safeJob}:${safeWorker}:${now.toString(36)}`;
+}
+
 export function getClaimedBy(job: JobRecord | null | undefined): string | null {
   if (!job) return null;
   return readString(job.claimed_by);
+}
+
+export function getActiveAttemptId(job: JobRecord | null | undefined): string | null {
+  if (!job) return null;
+  const payload = readRecord(job.payload);
+  const result = readRecord(job.result);
+  const activeAttempt = readRecord(payload?.active_attempt);
+
+  return (
+    readString(job.active_attempt_id) ??
+    readString(job.attempt_id) ??
+    readString(activeAttempt?.attempt_id) ??
+    readString(payload?.attempt_id) ??
+    readString(result?.attempt_id)
+  );
+}
+
+export function buildAttemptPayload(
+  job: JobRecord | null | undefined,
+  attempt: {
+    attempt_id: string;
+    job_id: string;
+    worker_id: string;
+    status: string;
+    started_at?: string;
+    heartbeat_at?: string;
+    updated_at: string;
+  }
+): Record<string, unknown> {
+  const payload = readRecord(job?.payload) ?? {};
+  return {
+    ...payload,
+    attempt_id: attempt.attempt_id,
+    active_attempt: {
+      ...(readRecord(payload.active_attempt) ?? {}),
+      ...attempt,
+    },
+  };
 }
 
 export function isTerminalWorkerStatus(value: unknown): boolean {
@@ -88,6 +143,24 @@ export function assertWorkerOwnsJob(
       error: "worker does not own this job",
       claimed_by: claimedBy,
       worker_id: workerId,
+    },
+    { status: 409 }
+  );
+}
+
+export function assertWorkerAttemptMatchesJob(
+  job: JobRecord | null,
+  attemptId: string | null
+): NextResponse | null {
+  const activeAttemptId = getActiveAttemptId(job);
+  if (!activeAttemptId || !attemptId || activeAttemptId === attemptId) return null;
+
+  return NextResponse.json(
+    {
+      ok: false,
+      error: "attempt_id does not match active job attempt",
+      active_attempt_id: activeAttemptId,
+      attempt_id: attemptId,
     },
     { status: 409 }
   );

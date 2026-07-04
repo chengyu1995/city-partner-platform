@@ -2,9 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
+  assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
   clampProgress,
   findHermesJob,
+  getAttemptIdFromBody,
   getBitableRecordId,
   getWorkerIdFromBody,
   getWorkerSupabase,
@@ -21,6 +23,7 @@ export const runtime = "nodejs";
 interface WorkerReportBody {
   id?: string;
   job_id?: string;
+  attempt_id?: string;
   status?: string;
   progress_percent?: number;
   current_step?: string;
@@ -45,6 +48,8 @@ interface WorkerReportBody {
 
 function buildResult(body: WorkerReportBody): Record<string, unknown> {
   return {
+    attempt_id: body.attempt_id ?? null,
+    worker_id: body.worker_id ?? body.worker_name ?? null,
     output: body.output ?? null,
     pr_url: body.pr_url ?? null,
     files_changed: body.files_changed ?? null,
@@ -89,10 +94,15 @@ export async function POST(req: NextRequest) {
   const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
   if (ownershipError) return ownershipError;
 
+  const attemptId = getAttemptIdFromBody(body);
+  const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
+  if (attemptError) return attemptError;
+
   if (isTerminalWorkerStatus(existingJob.status)) {
     return NextResponse.json({
       ok: true,
       job: existingJob,
+      attempt_id: attemptId,
       idempotent: true,
       skipped: "terminal_job_report_ignored",
     });
@@ -101,14 +111,16 @@ export async function POST(req: NextRequest) {
   const { data, error, skippedColumns } = await updateHermesJob(supabase, jobId, {
     status: workerStatus,
     claimed_by: workerId,
+    attempt_id: attemptId,
+    active_attempt_id: attemptId,
     progress_percent: progressPercent,
     current_step:
       body.current_step ??
-      (workerStatus === "succeeded" ? "已完成" : workerStatus === "failed" ? "失败" : null),
+      (workerStatus === "succeeded" ? "completed" : workerStatus === "failed" ? "failed" : null),
     status_message: body.status_message ?? null,
     git_commit_sha: body.git_commit_sha ?? null,
     error_text: workerStatus === "failed" ? errorText : null,
-    result: buildResult(body),
+    result: buildResult({ ...body, attempt_id: attemptId ?? body.attempt_id }),
     completed_at: terminal ? now : null,
     updated_at: now,
   });
@@ -128,7 +140,7 @@ export async function POST(req: NextRequest) {
     progressPercent,
     currentStep:
       body.current_step ??
-      (workerStatus === "succeeded" ? "已完成" : workerStatus === "failed" ? "失败" : null),
+      (workerStatus === "succeeded" ? "completed" : workerStatus === "failed" ? "failed" : null),
     statusMessage: body.status_message ?? null,
     gitCommitSha: body.git_commit_sha ?? null,
     errorText: workerStatus === "failed" ? errorText : "",
@@ -136,7 +148,12 @@ export async function POST(req: NextRequest) {
     updatedAt: now,
   });
 
-  return NextResponse.json({ ok: true, job: data, feishu_sync: recordId ? "attempted" : "skipped_no_record_id" });
+  return NextResponse.json({
+    ok: true,
+    job: data,
+    attempt_id: attemptId,
+    feishu_sync: recordId ? "attempted" : "skipped_no_record_id",
+  });
 }
 
 export async function GET() {

@@ -17,6 +17,11 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { decryptFeishuEvent } from "@/lib/feishu-crypto";
 import { runAgent, AgentMessage } from "@/lib/hermes-agent";
 import {
+  buildProjectDirectorConsoleAction,
+  isProjectDirectorDispatchPaused,
+  parseProjectDirectorConsoleCommand,
+} from "@/lib/project-director-console";
+import {
   buildBossApprovedReply,
   buildDispatchPlanChangeRecordedReply,
   buildProjectDirectorScopeUpdateRecord,
@@ -654,6 +659,38 @@ export async function POST(req: NextRequest) {
         ev.message.chat_type
       );
 
+      const consoleCommand = parseProjectDirectorConsoleCommand(text);
+      if (consoleCommand && consoleCommand !== "approve_execution") {
+        const action = await buildProjectDirectorConsoleAction(supabase, text);
+        if (action) {
+          await saveSystemRecordedReply(
+            supabase,
+            convId,
+            text,
+            action.reply,
+            action.record,
+            "project_director_console",
+            ev.message.message_id
+          );
+          const token = await getFeishuToken();
+          await sendFeishuMessage(
+            token,
+            ev.message.chat_id,
+            ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+            action.reply
+          );
+          await markReceiptCompleted(supabase, eventId);
+          return NextResponse.json({
+            code: 0,
+            project_director_console: true,
+            command: action.command,
+          });
+        }
+      }
+      if (consoleCommand === "approve_execution") {
+        text = "批准执行";
+      }
+
       if (isAcceptanceFeedbackMessage(text)) {
         const feedbackText = getAcceptanceFeedbackBody(text);
         const alreadyQueued = await hasRecentAcceptanceFeedbackJob(supabase, feedbackText);
@@ -834,6 +871,35 @@ export async function POST(req: NextRequest) {
 
     if (isApprovedExecutionReply(text)) {
       const token = await getFeishuToken();
+      const dispatchPaused = await isProjectDirectorDispatchPaused(supabase, convId);
+      if (dispatchPaused) {
+        const reply = "项目总管当前处于暂停分发状态。请先在飞书发送：总管 恢复，然后再发送：总管 批准执行。";
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          [
+            "PROJECT_DIRECTOR_APPROVED_EXECUTION_BLOCKED",
+            "state: paused_by_boss_console",
+            "reason: agent dispatch is paused by project director console.",
+          ].join("\n"),
+          "project_director_approved_execution_blocked",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_console: true,
+          state: "approved_execution_blocked_paused",
+        });
+      }
       const recentDraft = await findRecentTaskTreeDraft(supabase, convId);
       if (!recentDraft) {
         const reply = "未找到可执行的任务树计划，请先发送新需求并完成项目总管规划。";
