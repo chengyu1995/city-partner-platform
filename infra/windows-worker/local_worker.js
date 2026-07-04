@@ -1220,3 +1220,11 @@ function safeReportArray(value) {
   if (value == null) return [];
   return [value];
 }
+
+
+function safeReportJoin(value, separator = "\n") {
+  // SAFE_REPORT_JOIN_FOR_UNDEFINED_VALUES
+  if (Array.isArray(value)) return value.join(separator);
+  if (value == null) return "";
+  return String(value);
+}
