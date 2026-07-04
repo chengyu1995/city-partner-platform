@@ -1,203 +1,148 @@
-/**
- * 发布搭子需求页面 —— 年轻化 UI
- * 移动端优先 + 大色块分类卡片 + Emoji 图标
- */
-"use client";
+﻿import Link from "next/link";
 
-import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
-import Link from "next/link";
-import { PARTNER_CATEGORIES, type PartnerCategory, type NewPartnerPost, type PartnerPostFormErrors } from "@/types/db";
+const categories = [
+  "饭搭子",
+  "运动搭子",
+  "学习搭子",
+  "出游搭子",
+  "K歌搭子",
+  "旅游搭子",
+  "摩友搭子",
+  "钓友搭子",
+];
 
-export default function PostPartnerPage() {
-  const router = useRouter();
-  const [isPending, startTransition] = useTransition();
-  const [errors, setErrors] = useState<PartnerPostFormErrors>({});
-  const [submitError, setSubmitError] = useState<string | null>(null);
-
-  const [form, setForm] = useState<Partial<NewPartnerPost>>({
-    category: undefined,
-    city: "",
-    title: "",
-    description: "",
-    contact: "",
-    host_name: "",
-    starts_at: "",
-  });
-
-  function update<K extends keyof NewPartnerPost>(key: K, value: NewPartnerPost[K]) {
-    setForm((f) => ({ ...f, [key]: value }));
-    if (errors[key]) setErrors((e) => ({ ...e, [key]: undefined }));
-  }
-
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setSubmitError(null);
-    setErrors({});
-
-    const res = await fetch("/api/partners", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify(form),
-    });
-    const data = await res.json();
-    if (!data.ok) {
-      if (data.fieldErrors) setErrors(data.fieldErrors);
-      else setSubmitError(data.error || "提交失败");
-      return;
-    }
-    startTransition(() => router.push(`/partners/${data.id}`));
-  }
-
+export default function PostPage() {
   return (
-    <div className="min-h-screen bg-gradient-to-br from-violet-50 via-white to-amber-50">
-      <div className="mx-auto max-w-2xl px-4 py-6 sm:py-12">
-        {/* Header */}
-        <div className="mb-8 text-center sm:mb-10">
-          <div className="inline-flex items-center rounded-full bg-gradient-to-r from-violet-500 to-pink-500 px-4 py-1 text-xs font-medium text-white shadow-md">
-            ✨ 同城搭子 · 发布你的需求
-          </div>
-          <h1 className="mt-4 text-3xl font-extrabold tracking-tight text-slate-900 sm:text-4xl">
-            找搭子 · 就现在
-          </h1>
-          <p className="mt-2 text-sm text-slate-600 sm:text-base">
-            填好下面 6 项，几秒钟就能发出你的搭子帖
-          </p>
-        </div>
+    <main className="min-h-screen bg-[#f8faf7] px-4 py-6 text-slate-950 sm:px-6 lg:px-8">
+      <section className="mx-auto max-w-5xl">
+        <header className="mb-8 flex items-center justify-between gap-4 border-b border-slate-200 pb-5">
+          <Link href="/" className="text-xl font-black tracking-tight">
+            同城搭子
+          </Link>
 
-        <form onSubmit={onSubmit} className="space-y-6">
-          {/* 1. 分类（卡片大色块） */}
-          <div>
-            <label className="mb-3 block text-sm font-bold text-slate-800">
-              1️⃣ 你想找什么搭子？
-            </label>
-            <div className="grid grid-cols-3 gap-3 sm:grid-cols-5">
-              {PARTNER_CATEGORIES.map((c) => {
-                const active = form.category === c.key;
-                return (
-                  <button
-                    key={c.key}
-                    type="button"
-                    onClick={() => update("category", c.key)}
-                    className={[
-                      "group relative flex flex-col items-center justify-center gap-1 rounded-2xl px-3 py-4 text-sm font-bold transition-all",
-                      "active:scale-95 hover:-translate-y-0.5",
-                      active
-                        ? `bg-gradient-to-br ${c.color} text-white shadow-lg ring-2 ring-offset-2 ring-violet-400`
-                        : "bg-white text-slate-700 shadow-sm hover:shadow-md ring-1 ring-slate-200",
-                    ].join(" ")}
-                  >
-                    <span className="text-2xl">{c.emoji}</span>
-                    <span>{c.key}</span>
-                  </button>
-                );
-              })}
-            </div>
-            {errors.category && <p className="mt-2 text-xs text-red-600">{errors.category}</p>}
-          </div>
-
-          {/* 2. 城市 + 时间 */}
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <div>
-              <label className="mb-2 block text-sm font-bold text-slate-800">2️⃣ 你的城市</label>
-              <input
-                type="text"
-                value={form.city ?? ""}
-                onChange={(e) => update("city", e.target.value)}
-                placeholder="北京 / 上海 / 杭州..."
-                className="w-full rounded-xl border-0 bg-white px-4 py-3 text-base shadow-sm ring-1 ring-slate-200 focus:ring-2 focus:ring-violet-500"
-              />
-              {errors.city && <p className="mt-1 text-xs text-red-600">{errors.city}</p>}
-            </div>
-            <div>
-              <label className="mb-2 block text-sm font-bold text-slate-800">
-                预计见面时间 <span className="text-xs font-normal text-slate-400">(可选)</span>
-              </label>
-              <input
-                type="datetime-local"
-                value={form.starts_at ?? ""}
-                onChange={(e) => update("starts_at", e.target.value || null)}
-                className="w-full rounded-xl border-0 bg-white px-4 py-3 text-base shadow-sm ring-1 ring-slate-200 focus:ring-2 focus:ring-violet-500"
-              />
-            </div>
-          </div>
-
-          {/* 3. 标题 */}
-          <div>
-            <label className="mb-2 block text-sm font-bold text-slate-800">3️⃣ 标题（让人一眼看懂）</label>
-            <input
-              type="text"
-              value={form.title ?? ""}
-              onChange={(e) => update("title", e.target.value)}
-              placeholder="例：周末去阿那亚看海"
-              maxLength={80}
-              className="w-full rounded-xl border-0 bg-white px-4 py-3 text-base shadow-sm ring-1 ring-slate-200 focus:ring-2 focus:ring-violet-500"
-            />
-            {errors.title && <p className="mt-1 text-xs text-red-600">{errors.title}</p>}
-          </div>
-
-          {/* 4. 描述 */}
-          <div>
-            <label className="mb-2 block text-sm font-bold text-slate-800">4️⃣ 详细描述（让人知道怎么约）</label>
-            <textarea
-              value={form.description ?? ""}
-              onChange={(e) => update("description", e.target.value)}
-              placeholder="说清楚：和谁、几个人、什么时间、在哪集合、需要带什么..."
-              rows={4}
-              maxLength={500}
-              className="w-full resize-none rounded-xl border-0 bg-white px-4 py-3 text-base shadow-sm ring-1 ring-slate-200 focus:ring-2 focus:ring-violet-500"
-            />
-            <p className="mt-1 text-right text-xs text-slate-400">{(form.description ?? "").length} / 500</p>
-            {errors.description && <p className="mt-1 text-xs text-red-600">{errors.description}</p>}
-          </div>
-
-          {/* 5. 联系方式 + 昵称 */}
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <div>
-              <label className="mb-2 block text-sm font-bold text-slate-800">5️⃣ 联系方式</label>
-              <input
-                type="text"
-                value={form.contact ?? ""}
-                onChange={(e) => update("contact", e.target.value)}
-                placeholder="微信号 / 手机号 / 飞书..."
-                className="w-full rounded-xl border-0 bg-white px-4 py-3 text-base shadow-sm ring-1 ring-slate-200 focus:ring-2 focus:ring-violet-500"
-              />
-              {errors.contact && <p className="mt-1 text-xs text-red-600">{errors.contact}</p>}
-            </div>
-            <div>
-              <label className="mb-2 block text-sm font-bold text-slate-800">6️⃣ 你的昵称</label>
-              <input
-                type="text"
-                value={form.host_name ?? ""}
-                onChange={(e) => update("host_name", e.target.value)}
-                placeholder="让大家怎么称呼你"
-                className="w-full rounded-xl border-0 bg-white px-4 py-3 text-base shadow-sm ring-1 ring-slate-200 focus:ring-2 focus:ring-violet-500"
-              />
-              {errors.host_name && <p className="mt-1 text-xs text-red-600">{errors.host_name}</p>}
-            </div>
-          </div>
-
-          {/* 提交 */}
-          <div className="space-y-3 pt-4">
-            <button
-              type="submit"
-              disabled={isPending}
-              className="w-full rounded-2xl bg-gradient-to-r from-violet-500 to-pink-500 px-6 py-4 text-lg font-bold text-white shadow-lg transition-all hover:shadow-xl active:scale-95 disabled:opacity-50"
-            >
-              {isPending ? "发布中..." : "🚀 立即发布"}
-            </button>
-            {submitError && (
-              <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{submitError}</p>
-            )}
-            <Link
-              href="/partners"
-              className="block text-center text-sm text-slate-500 underline-offset-2 hover:underline"
-            >
-              先看看大家发了啥
+          <nav className="flex items-center gap-3 text-sm font-bold text-slate-600">
+            <Link href="/" className="hover:text-slate-950">
+              首页
             </Link>
-          </div>
-        </form>
-      </div>
-    </div>
+            <Link href="/partners" className="hover:text-slate-950">
+              找搭子
+            </Link>
+          </nav>
+        </header>
+
+        <div className="grid gap-6 lg:grid-cols-[0.9fr_1.1fr] lg:items-start">
+          <aside className="rounded-3xl bg-slate-950 p-6 text-white shadow-sm">
+            <p className="text-sm font-black uppercase tracking-[0.25em] text-emerald-300">
+              Publish
+            </p>
+
+            <h1 className="mt-4 text-4xl font-black leading-tight tracking-tight sm:text-5xl">
+              发布一个同城搭子需求
+            </h1>
+
+            <p className="mt-4 text-sm leading-7 text-slate-200">
+              写清楚城市、时间、想找什么搭子和大概计划。当前是 MVP 前端演示，提交后不会真正保存。
+            </p>
+
+            <div className="mt-6 rounded-2xl bg-white/10 p-4 text-sm leading-6 text-slate-100">
+              <p className="font-black">安全提醒</p>
+              <ul className="mt-3 space-y-2">
+                <li>不要提前转账。</li>
+                <li>首次见面选择公共场所。</li>
+                <li>不要泄露身份证、银行卡、家庭住址等隐私。</li>
+              </ul>
+            </div>
+          </aside>
+
+          <section className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200 sm:p-6">
+            <div className="mb-6">
+              <h2 className="text-2xl font-black">填写搭子需求</h2>
+              <p className="mt-2 text-sm leading-6 text-slate-600">
+                当前页面只做前端展示，不会写入 Supabase，也不会创建执行任务。
+              </p>
+            </div>
+
+            <form className="grid gap-4">
+              <label className="grid gap-2">
+                <span className="text-sm font-bold text-slate-700">城市</span>
+                <input
+                  className="min-h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm outline-none focus:border-emerald-400 focus:bg-white"
+                  placeholder="例如：广州、深圳、上海"
+                />
+              </label>
+
+              <label className="grid gap-2">
+                <span className="text-sm font-bold text-slate-700">搭子分类</span>
+                <select className="min-h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm outline-none focus:border-emerald-400 focus:bg-white">
+                  {categories.map((category) => (
+                    <option key={category}>{category}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="grid gap-2">
+                <span className="text-sm font-bold text-slate-700">标题</span>
+                <input
+                  className="min-h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm outline-none focus:border-emerald-400 focus:bg-white"
+                  placeholder="例如：周末一起探店吃饭"
+                />
+              </label>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <label className="grid gap-2">
+                  <span className="text-sm font-bold text-slate-700">活动时间</span>
+                  <input
+                    className="min-h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm outline-none focus:border-emerald-400 focus:bg-white"
+                    placeholder="例如：本周六晚上"
+                  />
+                </label>
+
+                <label className="grid gap-2">
+                  <span className="text-sm font-bold text-slate-700">期望人数</span>
+                  <input
+                    className="min-h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm outline-none focus:border-emerald-400 focus:bg-white"
+                    placeholder="例如：2-4 人"
+                  />
+                </label>
+              </div>
+
+              <label className="grid gap-2">
+                <span className="text-sm font-bold text-slate-700">详细说明</span>
+                <textarea
+                  className="min-h-32 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm outline-none focus:border-emerald-400 focus:bg-white"
+                  placeholder="写清楚活动内容、集合地点、注意事项等。"
+                />
+              </label>
+
+              <label className="grid gap-2">
+                <span className="text-sm font-bold text-slate-700">联系方式或备注</span>
+                <input
+                  className="min-h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm outline-none focus:border-emerald-400 focus:bg-white"
+                  placeholder="当前演示不建议填写真实隐私信息"
+                />
+              </label>
+
+              <div className="rounded-2xl bg-amber-50 p-4 text-sm leading-6 text-amber-900">
+                当前为 MVP 前端演示。点击按钮只表示生成发布预览，正式保存功能将在后续接入。
+              </div>
+
+              <button
+                type="button"
+                className="min-h-12 rounded-2xl bg-emerald-500 px-5 text-sm font-black text-white shadow-sm transition hover:bg-emerald-600"
+              >
+                已生成发布预览，下一步接入真实保存
+              </button>
+
+              <Link
+                href="/partners"
+                className="inline-flex min-h-12 items-center justify-center rounded-2xl bg-slate-950 px-5 text-sm font-black text-white transition hover:bg-slate-800"
+              >
+                返回找搭子
+              </Link>
+            </form>
+          </section>
+        </div>
+      </section>
+    </main>
   );
 }
