@@ -2,6 +2,12 @@
 
 import { FormEvent, useState } from "react";
 import Link from "next/link";
+import {
+  createLocalPostDraft,
+  saveLocalPostDraft,
+  type LocalPostDraft,
+  type LocalPostDraftInput,
+} from "@/lib/local-drafts";
 
 const categories = [
   "饭搭子",
@@ -14,24 +20,14 @@ const categories = [
   "钓友搭子",
 ];
 
-type PostDraft = {
-  city: string;
-  category: string;
-  title: string;
-  activityTime: string;
-  expectedPeople: string;
-  description: string;
-  contactNote: string;
-};
+type DraftErrors = Partial<Record<keyof Pick<LocalPostDraftInput, "city" | "category" | "title" | "description">, string>>;
 
-type DraftErrors = Partial<Record<keyof Pick<PostDraft, "city" | "category" | "title" | "description">, string>>;
-
-function getFormValue(formData: FormData, key: keyof PostDraft) {
+function getFormValue(formData: FormData, key: keyof LocalPostDraftInput) {
   const value = formData.get(key);
   return typeof value === "string" ? value.trim() : "";
 }
 
-function validateDraft(draft: PostDraft) {
+function validateDraft(draft: LocalPostDraftInput) {
   const errors: DraftErrors = {};
 
   if (!draft.city) errors.city = "请填写城市。";
@@ -43,14 +39,15 @@ function validateDraft(draft: PostDraft) {
 }
 
 export default function PostPage() {
-  const [draft, setDraft] = useState<PostDraft | null>(null);
+  const [draft, setDraft] = useState<LocalPostDraft | null>(null);
   const [errors, setErrors] = useState<DraftErrors>({});
+  const [saveState, setSaveState] = useState<"idle" | "saved" | "unavailable">("idle");
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     const formData = new FormData(event.currentTarget);
-    const nextDraft: PostDraft = {
+    const nextInput: LocalPostDraftInput = {
       city: getFormValue(formData, "city"),
       category: getFormValue(formData, "category"),
       title: getFormValue(formData, "title"),
@@ -59,12 +56,16 @@ export default function PostPage() {
       description: getFormValue(formData, "description"),
       contactNote: getFormValue(formData, "contactNote"),
     };
-    const nextErrors = validateDraft(nextDraft);
+    const nextErrors = validateDraft(nextInput);
 
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length > 0) return;
 
+    const nextDraft = createLocalPostDraft(nextInput);
+    const saved = saveLocalPostDraft(nextDraft);
+
     setDraft(nextDraft);
+    setSaveState(saved ? "saved" : "unavailable");
   }
 
   const hasErrors = Object.keys(errors).length > 0;
@@ -104,15 +105,15 @@ export default function PostPage() {
             </h1>
 
             <p className="mt-4 text-sm leading-7 text-slate-200">
-              写清楚城市、时间、想找什么搭子和大概计划。当前是 MVP 前端演示，提交后只会在页面内生成草稿预览。
+              写清楚城市、时间、想找什么搭子和大概计划。当前是 MVP 前端演示，提交后会保存为本机草稿并生成预览。
             </p>
 
             <div className="mt-6 rounded-2xl bg-white/10 p-4 text-sm leading-6 text-slate-100">
-              <p className="font-black">安全提醒</p>
+              <p className="font-black">安全提示</p>
               <ul className="mt-3 space-y-2">
                 <li>线下见面选择公共场所。</li>
-                <li>不要提前转账。</li>
-                <li>不要泄露身份证、银行卡、住址等隐私。</li>
+                <li>不提前转账。</li>
+                <li>不泄露身份证、银行卡、住址等隐私。</li>
               </ul>
             </div>
           </aside>
@@ -223,14 +224,14 @@ export default function PostPage() {
               </label>
 
               <div className="rounded-2xl bg-amber-50 p-4 text-sm leading-6 text-amber-900">
-                当前为 MVP 前端演示。点击按钮只生成页面内草稿预览，正式审核和保存功能将在后续接入。
+                这是本机草稿，仅用于 MVP 预览。正式审核和保存功能将在后续接入，刷新或换设备可能看不到该草稿。
               </div>
 
               <button
                 type="submit"
                 className="min-h-12 rounded-2xl bg-emerald-500 px-5 text-sm font-black text-white shadow-sm transition hover:bg-emerald-600"
               >
-                {draft ? "继续修改草稿" : "生成本地草稿"}
+                {draft ? "继续保存本地草稿" : "生成本地草稿"}
               </button>
 
               {draft ? (
@@ -238,12 +239,34 @@ export default function PostPage() {
                   className="rounded-3xl bg-emerald-50 p-5 text-slate-900 ring-1 ring-emerald-100"
                   aria-live="polite"
                 >
-                  <p className="text-sm font-black text-emerald-700">
-                    发布需求已生成草稿，等待后续接入审核/保存功能
-                  </p>
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <p className="text-sm font-black text-emerald-700">
+                        {saveState === "saved"
+                          ? "本机草稿已保存，可去搭子列表查看待审核预览"
+                          : "已生成页面内预览，但当前浏览器无法写入本地草稿"}
+                      </p>
+                      <p className="mt-2 text-sm leading-6 text-emerald-900">
+                        这不是正式发布。正式审核和保存功能将在后续接入，刷新或换设备可能看不到该草稿。
+                      </p>
+                    </div>
+                    <Link
+                      href="/partners"
+                      className="inline-flex min-h-11 shrink-0 items-center justify-center rounded-2xl bg-slate-950 px-5 text-sm font-black text-white hover:bg-slate-800"
+                    >
+                      去找搭子列表查看
+                    </Link>
+                  </div>
+
                   <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-emerald-100">
                     <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-black text-amber-800">
+                        本地草稿
+                      </span>
                       <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-700">
+                        待审核
+                      </span>
+                      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-600">
                         {draft.category}
                       </span>
                       <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-600">

@@ -1,11 +1,14 @@
-﻿import Link from "next/link";
+"use client";
 
-type PageProps = {
-  searchParams?: Promise<{
-    city?: string;
-    category?: string;
-  }>;
-};
+import { useSyncExternalStore } from "react";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
+import {
+  clearLocalPostDrafts,
+  getLocalPostDraftsServerSnapshot,
+  getLocalPostDraftsSnapshot,
+  subscribeLocalPostDrafts,
+} from "@/lib/local-drafts";
 
 const partners = [
   {
@@ -56,10 +59,15 @@ function hrefWith(params: { city?: string; category?: string }) {
   return text ? `/partners?${text}` : "/partners";
 }
 
-export default async function PartnersPage({ searchParams }: PageProps) {
-  const params = await searchParams;
-  const selectedCity = params?.city ?? "全部";
-  const selectedCategory = params?.category ?? "全部";
+export default function PartnersPage() {
+  const searchParams = useSearchParams();
+  const selectedCity = searchParams.get("city") ?? "全部";
+  const selectedCategory = searchParams.get("category") ?? "全部";
+  const localDrafts = useSyncExternalStore(
+    subscribeLocalPostDrafts,
+    getLocalPostDraftsSnapshot,
+    getLocalPostDraftsServerSnapshot,
+  );
 
   const filteredPartners = partners.filter((partner) => {
     const cityOk = selectedCity === "全部" || partner.city === selectedCity;
@@ -67,19 +75,28 @@ export default async function PartnersPage({ searchParams }: PageProps) {
     return cityOk && categoryOk;
   });
 
+  const filteredDrafts = localDrafts.filter((draft) => {
+    const cityOk = selectedCity === "全部" || draft.city === selectedCity;
+    const categoryOk = selectedCategory === "全部" || draft.category === selectedCategory;
+    return cityOk && categoryOk;
+  });
+
   return (
     <main className="min-h-screen bg-[#f8faf7] px-4 py-6 text-slate-950 sm:px-6 lg:px-8">
       <section className="mx-auto max-w-6xl">
-        <header className="mb-8 flex items-center justify-between border-b border-slate-200 pb-5">
+        <header className="mb-8 flex flex-col gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-center sm:justify-between">
           <Link href="/" className="text-xl font-black">
             同城搭子
           </Link>
 
-          <nav className="flex items-center gap-4 text-sm font-bold text-slate-600">
-            <Link href="/" className="hover:text-slate-950">
+          <nav className="flex flex-wrap items-center gap-3 text-sm font-bold text-slate-600">
+            <Link href="/" className="inline-flex min-h-11 items-center hover:text-slate-950">
               首页
             </Link>
-            <Link href="/post" className="rounded-full bg-slate-950 px-4 py-2 text-white hover:bg-slate-800">
+            <Link
+              href="/post"
+              className="inline-flex min-h-11 items-center rounded-full bg-slate-950 px-4 text-white hover:bg-slate-800"
+            >
               发布需求
             </Link>
           </nav>
@@ -149,6 +166,79 @@ export default async function PartnersPage({ searchParams }: PageProps) {
           </div>
         </section>
 
+        {localDrafts.length > 0 ? (
+          <section className="mt-6 rounded-3xl bg-amber-50 p-5 shadow-sm ring-1 ring-amber-100 sm:p-6">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <p className="text-sm font-black uppercase tracking-[0.2em] text-amber-700">
+                  Local Preview
+                </p>
+                <h2 className="mt-2 text-2xl font-black">我的本地草稿 / 待审核预览</h2>
+                <p className="mt-2 text-sm leading-6 text-amber-900">
+                  这是本机草稿，仅用于 MVP 预览。正式审核和保存功能将在后续接入，刷新或换设备可能看不到该草稿。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={clearLocalPostDrafts}
+                className="inline-flex min-h-11 shrink-0 items-center justify-center rounded-2xl bg-white px-5 text-sm font-black text-amber-900 shadow-sm ring-1 ring-amber-200 hover:bg-amber-100"
+              >
+                清空本地草稿
+              </button>
+            </div>
+
+            {filteredDrafts.length > 0 ? (
+              <div className="mt-5 grid gap-4 md:grid-cols-2">
+                {filteredDrafts.map((draft) => (
+                  <article
+                    key={draft.id}
+                    className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-amber-200"
+                  >
+                    <div className="flex flex-wrap gap-2">
+                      <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-black text-amber-800">
+                        本地草稿
+                      </span>
+                      <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-700">
+                        待审核
+                      </span>
+                      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-black text-slate-600">
+                        暂未正式发布
+                      </span>
+                    </div>
+                    <div className="mt-4 flex flex-wrap gap-2 text-xs font-bold text-slate-500">
+                      <span>{draft.city}</span>
+                      <span>{draft.category}</span>
+                      <span>{new Date(draft.createdAt).toLocaleDateString("zh-CN")}</span>
+                    </div>
+                    <h3 className="mt-3 text-2xl font-black">{draft.title}</h3>
+                    <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-slate-600">
+                      {draft.description}
+                    </p>
+                    <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2">
+                      <div>
+                        <dt className="font-bold text-slate-500">活动时间</dt>
+                        <dd className="mt-1 font-semibold">{draft.activityTime || "未填写"}</dd>
+                      </div>
+                      <div>
+                        <dt className="font-bold text-slate-500">期望人数</dt>
+                        <dd className="mt-1 font-semibold">{draft.expectedPeople || "未填写"}</dd>
+                      </div>
+                      <div className="sm:col-span-2">
+                        <dt className="font-bold text-slate-500">联系方式或备注</dt>
+                        <dd className="mt-1 font-semibold">{draft.contactNote || "未填写"}</dd>
+                      </div>
+                    </dl>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="mt-5 rounded-2xl bg-white p-4 text-sm leading-6 text-slate-600 ring-1 ring-amber-100">
+                当前城市和分类下没有本地草稿。清除筛选后可以查看本机保存的全部草稿。
+              </div>
+            )}
+          </section>
+        ) : null}
+
         <section className="mt-6 grid gap-4 md:grid-cols-2">
           {filteredPartners.length > 0 ? (
             filteredPartners.map((partner) => (
@@ -197,7 +287,7 @@ export default async function PartnersPage({ searchParams }: PageProps) {
         <section className="mt-8 rounded-3xl bg-slate-950 p-6 text-white">
           <h2 className="text-2xl font-black">安全提示</h2>
           <ul className="mt-4 grid gap-3 text-sm leading-6 text-slate-200 md:grid-cols-3">
-            <li>线下见面建议选择公共场所。</li>
+            <li>线下见面选择公共场所。</li>
             <li>不要提前转账，不要轻信陌生人借钱。</li>
             <li>不要泄露身份证、银行卡、家庭住址等隐私。</li>
           </ul>
