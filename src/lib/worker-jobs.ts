@@ -261,12 +261,15 @@ export function assertWorkerAttemptMatchesJob(
   attemptId: string | null
 ): NextResponse | null {
   const activeAttemptId = getActiveAttemptId(job);
-  if (!activeAttemptId || !attemptId || activeAttemptId === attemptId) return null;
+  if (!activeAttemptId) return null;
+  if (attemptId === activeAttemptId) return null;
 
   return NextResponse.json(
     {
       ok: false,
-      error: "attempt_id does not match active job attempt",
+      error: attemptId
+        ? "attempt_id does not match active job attempt"
+        : "attempt_id is required for active job attempt",
       active_attempt_id: activeAttemptId,
       attempt_id: attemptId,
     },
