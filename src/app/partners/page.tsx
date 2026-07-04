@@ -108,6 +108,14 @@ function partnersHref(next: { city?: string; category?: string }) {
   return query ? `/partners?${query}` : "/partners";
 }
 
+function categoryHref(category: PartnerCategory) {
+  return partnersHref({ category });
+}
+
+function cityHref(city: string) {
+  return partnersHref({ city });
+}
+
 export default async function PartnersPage({ searchParams }: PartnersPageProps) {
   const params = await searchParams;
   const selectedCity = firstValue(params.city)?.trim();
@@ -162,7 +170,7 @@ export default async function PartnersPage({ searchParams }: PartnersPageProps) 
 
       <section className="mx-auto max-w-6xl px-4 pb-4 sm:px-6 lg:px-8">
         <div className="grid gap-4 lg:grid-cols-[0.95fr_1.05fr]">
-          <form action="/partners" className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200/80">
+          <form action="/partners" method="get" className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200/80">
             <p className="text-sm font-bold text-emerald-700">搜索 / 筛选</p>
             <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_1fr_auto]">
               <label className="block">
@@ -202,7 +210,7 @@ export default async function PartnersPage({ searchParams }: PartnersPageProps) 
             <p className="text-sm font-bold text-emerald-700">城市筛选入口</p>
             <div className="mt-4 flex gap-2 overflow-x-auto pb-1">
               <Link
-                href={partnersHref({ category: selectedCategory })}
+                href="/partners"
                 className={`inline-flex min-h-11 shrink-0 items-center rounded-full px-4 text-sm font-bold transition ${
                   selectedCity ? "bg-slate-100 text-slate-700 hover:bg-slate-200" : "bg-slate-950 text-white"
                 }`}
@@ -212,7 +220,7 @@ export default async function PartnersPage({ searchParams }: PartnersPageProps) 
               {CITIES.map((city) => (
                 <Link
                   key={city}
-                  href={partnersHref({ city, category: selectedCategory })}
+                  href={cityHref(city)}
                   className={`inline-flex min-h-11 shrink-0 items-center rounded-full px-4 text-sm font-bold transition ${
                     selectedCity === city
                       ? "bg-emerald-500 text-white"
@@ -238,11 +246,21 @@ export default async function PartnersPage({ searchParams }: PartnersPageProps) 
               {filteredPartners.length} 条结果
             </span>
           </div>
-          <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+          <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            <Link
+              href="/partners"
+              className={`min-h-14 rounded-2xl px-4 py-3 text-center text-sm font-black transition ${
+                selectedCategory
+                  ? "bg-slate-50 text-slate-700 ring-1 ring-slate-100 hover:bg-white hover:shadow-sm"
+                  : "bg-slate-950 text-white shadow-md"
+              }`}
+            >
+              全部分类
+            </Link>
             {CATEGORIES.map((category) => (
               <Link
                 key={category}
-                href={partnersHref({ city: selectedCity, category })}
+                href={categoryHref(category)}
                 className={`min-h-14 rounded-2xl px-4 py-3 text-center text-sm font-black transition ${
                   selectedCategory === category
                     ? "bg-slate-950 text-white shadow-md"

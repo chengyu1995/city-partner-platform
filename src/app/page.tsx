@@ -11,6 +11,10 @@ const CATEGORY_COPY: Record<PartnerCategory, { title: string; desc: string }> = 
   钓友: { title: "钓友搭子", desc: "野钓、路亚、装备交流" },
 };
 
+function categoryHref(category: PartnerCategory) {
+  return `/partners?category=${encodeURIComponent(CATEGORY_COPY[category].title)}`;
+}
+
 const MOCK_PARTNER_POSTS = [
   {
     id: "travel-weekend-hangzhou",
@@ -63,16 +67,22 @@ export default function Home() {
           </Link>
           <div className="flex items-center gap-2">
             <Link
-              href="/partners?city=杭州"
-              className="hidden min-h-11 items-center rounded-full bg-slate-100 px-4 text-sm font-semibold text-slate-700 sm:inline-flex"
+              href="/partners"
+              className="inline-flex min-h-11 items-center rounded-full bg-slate-100 px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-200 sm:px-4"
             >
-              杭州
+              分类
+            </Link>
+            <Link
+              href="/partners"
+              className="inline-flex min-h-11 items-center rounded-full bg-slate-100 px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-200 sm:px-4"
+            >
+              推荐
             </Link>
             <Link
               href="/post"
-              className="inline-flex min-h-11 items-center rounded-full bg-slate-950 px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800"
+              className="inline-flex min-h-11 items-center rounded-full bg-slate-950 px-3 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800 sm:px-4"
             >
-              发布搭子
+              发布需求
             </Link>
           </div>
         </nav>
@@ -126,16 +136,16 @@ export default function Home() {
                 href="/post"
                 className="inline-flex min-h-12 items-center justify-center rounded-2xl bg-white px-6 text-base font-bold text-slate-800 shadow-sm ring-1 ring-slate-200 transition hover:bg-slate-50"
               >
-                发布搭子
+                发布需求
               </Link>
             </div>
             <div className="mt-4 flex gap-2 overflow-x-auto pb-1 lg:hidden">
               {PARTNER_CATEGORIES.map((category) => (
-                <Link
-                  key={category.key}
-                  href={`/partners?category=${encodeURIComponent(category.key)}`}
-                  className="inline-flex min-h-11 shrink-0 items-center gap-2 rounded-full bg-white px-4 text-sm font-semibold text-slate-700 shadow-sm ring-1 ring-slate-200"
-                >
+                  <Link
+                    key={category.key}
+                    href={categoryHref(category.key)}
+                    className="inline-flex min-h-11 shrink-0 items-center gap-2 rounded-full bg-white px-4 text-sm font-semibold text-slate-700 shadow-sm ring-1 ring-slate-200"
+                  >
                   <span aria-hidden>{category.emoji}</span>
                   <span>{category.key}</span>
                 </Link>
@@ -159,7 +169,7 @@ export default function Home() {
                 return (
                   <Link
                     key={post.id}
-                    href={`/partners?category=${encodeURIComponent(post.category)}&city=${encodeURIComponent(post.city)}`}
+                    href={`${categoryHref(post.category)}&city=${encodeURIComponent(post.city)}`}
                     className="block rounded-2xl bg-slate-50 p-4 ring-1 ring-slate-100 transition hover:-translate-y-0.5 hover:bg-white hover:shadow-md"
                   >
                     <div className="flex gap-3">
@@ -221,7 +231,7 @@ export default function Home() {
             return (
               <Link
                 key={category.key}
-                href={`/partners?category=${encodeURIComponent(category.key)}`}
+                href={categoryHref(category.key)}
                 className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200/80 transition hover:-translate-y-1 hover:shadow-md"
               >
                 <div
@@ -264,7 +274,7 @@ export default function Home() {
               href="/post"
               className="inline-flex min-h-12 items-center justify-center rounded-2xl bg-slate-950 px-6 text-base font-bold text-white transition hover:bg-slate-800"
             >
-              我要发布搭子
+              我要发布需求
             </Link>
           </div>
         </div>
