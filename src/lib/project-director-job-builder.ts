@@ -22,10 +22,21 @@ export interface DispatchJobInsertResult {
   skippedColumns: string[];
 }
 
+export interface AcceptanceFeedbackJobInput {
+  feedbackText: string;
+  rawMessageText: string;
+  feishuMessageId: string;
+  feishuEventId: string;
+  feishuChatId: string;
+  feishuUserId: string;
+}
+
 export const PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD_NAME = "project_director_dispatch_batch";
 export const PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD_MARKER =
   "PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD";
 export const PROJECT_DIRECTOR_BATCH_01 = "BATCH-01";
+export const PROJECT_DIRECTOR_BATCH_12 = "BATCH-12";
+export const PROJECT_DIRECTOR_ACCEPTANCE_FEEDBACK_JOB_TYPE = "acceptance_feedback";
 
 const ALLOWED_BATCH_01_ROLES = new Set(["product_manager", "project_director"]);
 const ALLOWED_OUTPUT_PREFIXES = ["docs/product/", "docs/upgrade/"];
@@ -156,6 +167,75 @@ function buildJobRow(
   };
 }
 
+function buildAcceptanceFeedbackRequestText(input: AcceptanceFeedbackJobInput): string {
+  const feedback =
+    input.feedbackText.trim().replace(/\s+/g, " ") ||
+    input.rawMessageText.trim().replace(/\s+/g, " ");
+  return [
+    "[Project Director Acceptance Feedback]",
+    "Batch: BATCH-12",
+    "Goal: diagnose the boss acceptance feedback, make the smallest safe fix, verify locally, and report the result.",
+    "",
+    "Acceptance feedback:",
+    feedback,
+    "",
+    "Execution rules:",
+    "1. Only modify files required to address this feedback.",
+    "2. Do not modify .env, package.json, SQL, Supabase schema, Worker git automation, or production deployment settings.",
+    "3. Do not send bulk Feishu messages.",
+    "4. If the feedback requires product scope decisions, secrets, database schema changes, or production deployment, stop and report the blocker.",
+    "5. Run focused verification plus lint/typecheck/build when feasible.",
+    "6. Report changed files, verification result, residual risk, and whether boss acceptance is still needed.",
+  ].join("\n");
+}
+
+function buildAcceptanceFeedbackJobRow(input: AcceptanceFeedbackJobInput): JobRecord {
+  const feedback =
+    input.feedbackText.trim().replace(/\s+/g, " ") ||
+    input.rawMessageText.trim().replace(/\s+/g, " ");
+  const requestText = buildAcceptanceFeedbackRequestText(input);
+  const title = `BATCH-12 acceptance feedback: ${feedback.slice(0, 80)}`;
+
+  return {
+    source: "project_director",
+    job_type: PROJECT_DIRECTOR_ACCEPTANCE_FEEDBACK_JOB_TYPE,
+    job_id: `${PROJECT_DIRECTOR_BATCH_12}-${Date.now()}`,
+    title,
+    description: requestText,
+    priority: 5,
+    acceptance: "Address the acceptance feedback, verify the fix, and return the changed files plus validation result.",
+    branch: null,
+    executor: "local_codex",
+    repo: "city-partner-platform",
+    prompt: requestText,
+    request_text: requestText,
+    status: "queued",
+    plan_status: "approved",
+    workflow_stage: "execution",
+    claimed_by: null,
+    claimed_at: null,
+    started_at: null,
+    parent_task_id: null,
+    project_id: "city-partner-platform",
+    task_code: PROJECT_DIRECTOR_BATCH_12,
+    dispatch_batch: PROJECT_DIRECTOR_BATCH_12,
+    feishu_message_id: input.feishuMessageId || null,
+    feishu_event_id: input.feishuEventId || null,
+    feishu_chat_id: input.feishuChatId || null,
+    feishu_user_id: input.feishuUserId || null,
+    payload: {
+      batch_code: PROJECT_DIRECTOR_BATCH_12,
+      route: "project_director_acceptance_feedback",
+      feedback_text: feedback,
+      raw_message_text: input.rawMessageText,
+      feishu_message_id: input.feishuMessageId,
+      feishu_event_id: input.feishuEventId,
+      feishu_chat_id: input.feishuChatId,
+      feishu_user_id: input.feishuUserId,
+    },
+  };
+}
+
 export function buildBatch01ProductPlanningJobs(
   plan: ProjectDirectorDispatchPlanDraft
 ): DispatchJobBuildResult {
@@ -267,6 +347,107 @@ export async function insertBatch01ProductPlanningJobs(
   }
 
   throw new Error("insert hermes_jobs failed: too many missing columns");
+}
+
+export async function hasRecentAcceptanceFeedbackJob(
+  supabase: SupabaseClient,
+  feedbackText: string,
+  now = Date.now()
+): Promise<boolean> {
+  const normalized = feedbackText.trim().replace(/\s+/g, " ");
+  if (!normalized) return false;
+
+  const createdAfter = new Date(now - 30 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .select("id, payload, request_text, created_at")
+    .eq("source", "project_director")
+    .in("status", ["queued", "pending", "running"])
+    .gte("created_at", createdAfter)
+    .contains("payload", {
+      batch_code: PROJECT_DIRECTOR_BATCH_12,
+      feedback_text: normalized,
+    })
+    .limit(1)
+    .maybeSingle();
+
+  if (!error) return Boolean(data);
+  if (!isMissingColumnError(error)) {
+    throw new Error(`check acceptance feedback job failed: ${error.message}`);
+  }
+
+  const fallback = await supabase
+    .from("hermes_jobs")
+    .select("id, request_text, created_at")
+    .eq("source", "project_director")
+    .in("status", ["queued", "pending", "running"])
+    .gte("created_at", createdAfter)
+    .ilike("request_text", `%${normalized.slice(0, 120)}%`)
+    .limit(1)
+    .maybeSingle();
+
+  if (fallback.error) {
+    if (isMissingColumnError(fallback.error)) return false;
+    throw new Error(`check acceptance feedback job failed: ${fallback.error.message}`);
+  }
+  return Boolean(fallback.data);
+}
+
+export async function insertAcceptanceFeedbackJob(
+  supabase: SupabaseClient,
+  input: AcceptanceFeedbackJobInput
+): Promise<DispatchJobInsertResult> {
+  let rows = [buildAcceptanceFeedbackJobRow(input)];
+  const skippedColumns: string[] = [];
+
+  for (let attempt = 0; attempt < 16; attempt++) {
+    const { error } = await supabase.from("hermes_jobs").insert(rows);
+    if (!error) return { insertedCount: rows.length, skippedColumns };
+    if (!isMissingColumnError(error)) throw new Error(`insert acceptance feedback job failed: ${error.message}`);
+
+    const missingColumn = extractMissingColumn(error);
+    if (!missingColumn || !rows.some((row) => missingColumn in row)) {
+      throw new Error(`insert acceptance feedback job failed: ${error.message}`);
+    }
+
+    skippedColumns.push(missingColumn);
+    rows = rows.map((row) => {
+      const next = { ...row };
+      delete next[missingColumn];
+      return next;
+    });
+  }
+
+  throw new Error("insert acceptance feedback job failed: too many missing columns");
+}
+
+export function buildAcceptanceFeedbackQueuedReply(insertedCount: number): string {
+  return [
+    "【项目总管：验收反馈已入队】",
+    `已创建 ${insertedCount} 个 BATCH-12 修复任务。`,
+    "",
+    "我会让 Worker 先诊断反馈、执行最小范围修复并验证。",
+    "完成后会回报修改文件、验证结果和是否仍需老板验收。",
+  ].join("\n");
+}
+
+export function buildAcceptanceFeedbackDuplicateReply(): string {
+  return "【项目总管】检测到相同验收反馈已在处理中，本次不会重复入队。";
+}
+
+export function buildAcceptanceFeedbackQueuedRecord(
+  input: AcceptanceFeedbackJobInput,
+  skippedColumns: string[]
+): string {
+  return [
+    "PROJECT_DIRECTOR_ACCEPTANCE_FEEDBACK_QUEUED",
+    "state: queued",
+    `batch_code: ${PROJECT_DIRECTOR_BATCH_12}`,
+    `feedback: ${input.feedbackText.trim() || input.rawMessageText.trim()}`,
+    `feishu_message_id: ${input.feishuMessageId || "none"}`,
+    `skipped_hermes_jobs_columns: ${skippedColumns.join(", ") || "none"}`,
+    "note: boss acceptance feedback was routed directly to project director worker queue.",
+  ].join("\n");
 }
 
 export function buildBatch01DispatchedReply(taskCount: number): string {

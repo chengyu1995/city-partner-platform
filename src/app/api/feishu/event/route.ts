@@ -25,7 +25,9 @@ import {
   buildTaskTreeChangeRecordedReply,
   buildTaskTreeReviewReceivedReply,
   classifyProjectDirectorDemand,
+  getAcceptanceFeedbackBody,
   getDemandBody,
+  isAcceptanceFeedbackMessage,
   isBossApprovalReply,
   isDispatchBatchApprovalReply,
   isDispatchPlanChangeReply,
@@ -46,8 +48,13 @@ import {
   buildBatch01DispatchedRecord,
   buildBatch01DispatchedReply,
   buildBatch01ProductPlanningJobs,
+  buildAcceptanceFeedbackDuplicateReply,
+  buildAcceptanceFeedbackQueuedRecord,
+  buildAcceptanceFeedbackQueuedReply,
   hasBatch01DispatchRecord,
   hasExistingBatch01Jobs,
+  hasRecentAcceptanceFeedbackJob,
+  insertAcceptanceFeedbackJob,
   insertBatch01ProductPlanningJobs,
   PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD_NAME,
 } from "@/lib/project-director-job-builder";
@@ -589,6 +596,77 @@ export async function POST(req: NextRequest) {
         ev.message.chat_id,
         ev.message.chat_type
       );
+
+      if (isAcceptanceFeedbackMessage(text)) {
+        const feedbackText = getAcceptanceFeedbackBody(text);
+        const alreadyQueued = await hasRecentAcceptanceFeedbackJob(supabase, feedbackText);
+        const token = await getFeishuToken();
+
+        if (alreadyQueued) {
+          const reply = buildAcceptanceFeedbackDuplicateReply();
+          await saveSystemRecordedReply(
+            supabase,
+            convId,
+            text,
+            reply,
+            [
+              "PROJECT_DIRECTOR_ACCEPTANCE_FEEDBACK_DUPLICATE",
+              "state: duplicate_skipped",
+              "batch_code: BATCH-12",
+              `feedback: ${feedbackText}`,
+              "note: a recent queued/running acceptance feedback job already exists.",
+            ].join("\n"),
+            "project_director_acceptance_feedback_duplicate",
+            ev.message.message_id
+          );
+          await sendFeishuMessage(
+            token,
+            ev.message.chat_id,
+            ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+            reply
+          );
+          await markReceiptCompleted(supabase, eventId);
+          return NextResponse.json({
+            code: 0,
+            project_director_intake: true,
+            state: "acceptance_feedback_duplicate_skipped",
+          });
+        }
+
+        const jobInput = {
+          feedbackText,
+          rawMessageText: text,
+          feishuMessageId: ev.message.message_id,
+          feishuEventId: eventId,
+          feishuChatId: ev.message.chat_id,
+          feishuUserId: userId,
+        };
+        const insertResult = await insertAcceptanceFeedbackJob(supabase, jobInput);
+        const reply = buildAcceptanceFeedbackQueuedReply(insertResult.insertedCount);
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          buildAcceptanceFeedbackQueuedRecord(jobInput, insertResult.skippedColumns),
+          "project_director_acceptance_feedback",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "acceptance_feedback_queued",
+          dispatched_batch: "BATCH-12",
+          inserted_jobs: insertResult.insertedCount,
+        });
+      }
 
       const demandKind = classifyProjectDirectorDemand(text);
       if (demandKind === "website_product_request") {

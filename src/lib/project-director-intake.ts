@@ -1,5 +1,14 @@
 const NEW_DEMAND_PREFIXES = ["新需求：", "新需求:"];
 
+const ACCEPTANCE_FEEDBACK_PREFIXES = [
+  "验收反馈：",
+  "验收反馈:",
+  "验收问题：",
+  "验收问题:",
+  "反馈：",
+  "反馈:",
+];
+
 export type ProjectDirectorDemandKind =
   | "system_upgrade_request"
   | "website_product_request"
@@ -123,6 +132,17 @@ export function isNewDemandMessage(text: string): boolean {
 export function getDemandBody(text: string): string {
   const normalized = normalizeDemandText(text);
   const prefix = NEW_DEMAND_PREFIXES.find((item) => normalized.startsWith(item));
+  return prefix ? normalized.slice(prefix.length).trim() : normalized;
+}
+
+export function isAcceptanceFeedbackMessage(text: string): boolean {
+  const normalized = normalizeDemandText(text);
+  return ACCEPTANCE_FEEDBACK_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+
+export function getAcceptanceFeedbackBody(text: string): string {
+  const normalized = normalizeDemandText(text);
+  const prefix = ACCEPTANCE_FEEDBACK_PREFIXES.find((item) => normalized.startsWith(item));
   return prefix ? normalized.slice(prefix.length).trim() : normalized;
 }
 
