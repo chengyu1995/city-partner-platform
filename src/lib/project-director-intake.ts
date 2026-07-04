@@ -14,6 +14,17 @@ export type ProjectDirectorDemandKind =
   | "website_product_request"
   | "other_request";
 
+export type ProjectDirectorRequestType =
+  | "system_upgrade"
+  | "product_planning"
+  | "ui_design"
+  | "interaction_design"
+  | "frontend_development"
+  | "backend_development"
+  | "testing_acceptance"
+  | "operations_release"
+  | "acceptance_feedback";
+
 const WEBSITE_PRODUCT_KEYWORDS = [
   "网站",
   "页面",
@@ -179,6 +190,21 @@ export function classifyProjectDirectorDemand(text: string): ProjectDirectorDema
     return "website_product_request";
   }
   return "other_request";
+}
+
+export function classifyProjectDirectorRequestType(text: string): ProjectDirectorRequestType {
+  const demand = getDemandBody(text);
+  if (/验收|反馈|bug|修复/i.test(demand)) return "acceptance_feedback";
+  if (/发布|部署|生产|Vercel|上线|release|deploy/i.test(demand)) return "operations_release";
+  if (isSystemUpgradeDemand(text)) return "system_upgrade";
+  if (/UI|视觉|样式|设计|配色|组件/i.test(demand)) return "ui_design";
+  if (/交互|流程|状态|表单|路径|用户旅程/i.test(demand)) return "interaction_design";
+  if (/后端|API|接口|数据|Supabase|RLS/i.test(demand)) return "backend_development";
+  if (/测试|验收|检查|lint|typecheck|build/i.test(demand)) return "testing_acceptance";
+  if (/前端|页面|组件|首页|列表|详情|登录|注册|个人主页/i.test(demand)) {
+    return "frontend_development";
+  }
+  return "product_planning";
 }
 
 export function isBossApprovalReply(text: string): boolean {

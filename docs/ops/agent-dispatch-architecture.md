@@ -16,6 +16,14 @@
 - `agent_dispatch`: concrete Agent execution tasks.
 - `feishu_feedback`: feedback and acceptance routes when available.
 
+## Queue Strategy
+
+- Planning stage writes one project director planning job only.
+- Approved execution writes one job per concrete Agent task.
+- The worker reads `request_text` as the canonical task prompt.
+- `source`, `workflow_stage`, and `plan_status` use existing compatible strings.
+- Missing optional columns are removed from the insert payload and retried.
+
 ## Backward Compatibility
 
 No database migration is required. The job builder first writes rich rows, then removes missing optional columns reported by Supabase and retries.
@@ -24,3 +32,8 @@ No database migration is required. The job builder first writes rich rows, then 
 
 The boss sees only the demand understanding, Agent subtasks, execution order, approval items, automatic items, and next reply options. Internal logs, SQL, shell commands, stack traces, and secrets are not included.
 
+## Worker Guard
+
+The Windows Worker wraps Agent tasks with a guard that forbids Codex from committing, pushing,
+starting a dev server, opening a browser, or modifying files outside the task scope. Local preview
+smoke is disabled by default for system-upgrade jobs; static validation remains the accepted path.

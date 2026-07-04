@@ -14,6 +14,8 @@
 - Generate dispatch plans with dependency order and approval gates.
 - Queue planning and approved execution tasks without database schema changes.
 - Keep Worker request claiming backward compatible.
+- Freeze business page development while system-upgrade dispatcher work is active.
+- Default Worker preview smoke to off so BATCH-15 uses static diagnostics instead of local dev preview.
 
 ## Later Batches
 
@@ -21,4 +23,3 @@
 - Add thread-level dependency completion checks.
 - Add dashboard visibility for task trees.
 - Add human approval UI for high-risk tasks.
-

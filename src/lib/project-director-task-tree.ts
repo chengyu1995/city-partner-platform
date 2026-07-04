@@ -10,6 +10,7 @@ export type ProjectDirectorDemandCategory =
   | "system_upgrade"
   | "product_planning"
   | "ui_design"
+  | "interaction_design"
   | "frontend_development"
   | "backend_development"
   | "testing_acceptance"
@@ -147,6 +148,7 @@ function detectDemandCategory(originalDemand: string): ProjectDirectorDemandCate
     return "system_upgrade";
   }
   if (/UI|视觉|样式|设计/i.test(originalDemand)) return "ui_design";
+  if (/交互|流程|状态|表单|路径|用户旅程/i.test(originalDemand)) return "interaction_design";
   if (/后端|API|接口|数据/i.test(originalDemand)) return "backend_development";
   if (/测试|验收|检查/i.test(originalDemand)) return "testing_acceptance";
   if (/前端|页面|组件|首页|列表|详情|登录|注册/i.test(originalDemand)) {
@@ -493,10 +495,279 @@ function buildProductTasks(originalDemand: string): ProjectDirectorSubtask[] {
   ];
 }
 
+function buildFrontendTasks(originalDemand: string): ProjectDirectorSubtask[] {
+  const baseInput = [
+    `老板原始需求：${originalDemand}`,
+    "业务开发仍需先由项目总管拆范围；只允许在 approved_execution 后修改 allowed_files。",
+  ];
+
+  return [
+    task({
+      task_code: "FRONTEND-DIAGNOSE-01",
+      task_title: "确认前端修改范围和页面冻结边界",
+      role: "project_director",
+      task_type: "frontend_development",
+      stage: "INTAKE",
+      input: baseInput,
+      allowed_files: ["docs/product/frontend-implementation-scope.md"],
+      acceptance_criteria: [
+        "识别需求是否触碰冻结业务页面",
+        "列出前端可改文件和 forbidden_files",
+        "需要老板批准后才能进入代码修改",
+      ],
+      can_auto_execute: false,
+      risk_level: "medium",
+    }),
+    task({
+      task_code: "FRONTEND-IMPLEMENT-01",
+      task_title: "按批准范围实施前端修改",
+      role: "frontend_developer",
+      task_type: "frontend_development",
+      stage: "FRONTEND",
+      input: baseInput,
+      allowed_files: ["docs/product/frontend-implementation-scope.md"],
+      acceptance_criteria: [
+        "只修改 allowed_files",
+        "不修改 BATCH-15 冻结业务页面",
+        "静态验证 TypeScript/ESLint 通过或记录 warning",
+      ],
+      dependency_keys: ["FRONTEND-DIAGNOSE-01"],
+      can_auto_execute: false,
+      risk_level: "medium",
+    }),
+    task({
+      task_code: "FRONTEND-TEST-01",
+      task_title: "前端变更静态验收",
+      role: "testing_engineer",
+      task_type: "testing_acceptance",
+      stage: "TEST",
+      input: baseInput,
+      allowed_files: ["docs/product/frontend-acceptance.md"],
+      acceptance_criteria: [
+        "检查移动端影响范围",
+        "检查冻结页面未被误改",
+        "汇总验证结果和残余风险",
+      ],
+      dependency_keys: ["FRONTEND-IMPLEMENT-01"],
+    }),
+  ];
+}
+
+function buildBackendTasks(originalDemand: string): ProjectDirectorSubtask[] {
+  const baseInput = [
+    `老板原始需求：${originalDemand}`,
+    "后端任务不得修改数据库结构、不得执行 SQL、不得修改 .env。",
+  ];
+
+  return [
+    task({
+      task_code: "BACKEND-DIAGNOSE-01",
+      task_title: "确认后端接口和数据边界",
+      role: "project_director",
+      task_type: "backend_development",
+      stage: "INTAKE",
+      input: baseInput,
+      allowed_files: ["docs/ops/backend-scope.md"],
+      acceptance_criteria: [
+        "识别是否涉及数据库结构、密钥或生产配置",
+        "涉及高风险边界时 requires_boss_approval 必须为 true",
+        "不依赖不存在的数据库列",
+      ],
+      can_auto_execute: false,
+      risk_level: "medium",
+    }),
+    task({
+      task_code: "BACKEND-IMPLEMENT-01",
+      task_title: "按批准范围实施后端修改",
+      role: "backend_developer",
+      task_type: "backend_development",
+      stage: "BACKEND",
+      input: baseInput,
+      allowed_files: ["src/app/api/**", "src/lib/**", "docs/ops/**"],
+      acceptance_criteria: [
+        "保持 mock/真实 Supabase 双轨兼容",
+        "不修改 src/lib/env.ts fallback 逻辑",
+        "缺少可选字段时降级兼容，不让任务失败",
+      ],
+      dependency_keys: ["BACKEND-DIAGNOSE-01"],
+      can_auto_execute: false,
+      risk_level: "medium",
+    }),
+    task({
+      task_code: "BACKEND-TEST-01",
+      task_title: "后端变更静态验收",
+      role: "testing_engineer",
+      task_type: "testing_acceptance",
+      stage: "TEST",
+      input: baseInput,
+      allowed_files: ["docs/ops/backend-acceptance.md"],
+      acceptance_criteria: ["TypeScript/ESLint 通过或记录 warning", "确认未执行 SQL", "确认未修改 .env"],
+      dependency_keys: ["BACKEND-IMPLEMENT-01"],
+    }),
+  ];
+}
+
+function buildDesignTasks(
+  originalDemand: string,
+  category: "ui_design" | "interaction_design"
+): ProjectDirectorSubtask[] {
+  const isInteraction = category === "interaction_design";
+  const baseInput = [
+    `老板原始需求：${originalDemand}`,
+    "设计类任务只输出方案和验收条件，不直接改业务页面。",
+  ];
+
+  return [
+    task({
+      task_code: isInteraction ? "IXD-PLAN-01" : "UI-PLAN-01",
+      task_title: isInteraction ? "输出交互流程和状态设计" : "输出视觉规范和组件状态设计",
+      role: isInteraction ? "interaction_designer" : "ui_designer",
+      task_type: category,
+      stage: "DESIGN",
+      input: baseInput,
+      allowed_files: [
+        isInteraction ? "docs/product/interaction-flow.md" : "docs/product/mobile-visual-spec.md",
+      ],
+      acceptance_criteria: isInteraction
+        ? ["覆盖主流程、异常状态和验收路径", "标注依赖和后续前端范围", "不修改业务页面"]
+        : ["覆盖 375px/768px 移动端规格", "定义卡片、按钮、头像、标签状态", "不修改业务页面"],
+    }),
+    task({
+      task_code: isInteraction ? "IXD-TEST-01" : "UI-TEST-01",
+      task_title: "设计方案可验收性检查",
+      role: "testing_engineer",
+      task_type: "testing_acceptance",
+      stage: "TEST",
+      input: baseInput,
+      allowed_files: ["docs/product/design-acceptance.md"],
+      acceptance_criteria: ["确认设计产物可拆成后续开发任务", "列出仍需老板确认的问题"],
+      dependency_keys: [isInteraction ? "IXD-PLAN-01" : "UI-PLAN-01"],
+    }),
+  ];
+}
+
+function buildTestingTasks(originalDemand: string): ProjectDirectorSubtask[] {
+  const baseInput = [`老板原始需求：${originalDemand}`, "测试验收任务只做静态验证和验收报告。"];
+
+  return [
+    task({
+      task_code: "TEST-PLAN-01",
+      task_title: "制定测试验收清单",
+      role: "testing_engineer",
+      task_type: "testing_acceptance",
+      stage: "TEST",
+      input: baseInput,
+      allowed_files: ["docs/product/acceptance-criteria.md", "docs/ops/test-report.md"],
+      acceptance_criteria: [
+        "覆盖 TypeScript、ESLint、build 和文件范围检查",
+        "确认没有业务冻结页面修改",
+        "记录 warning 不阻塞任务完成",
+      ],
+    }),
+  ];
+}
+
+function buildOperationsTasks(originalDemand: string): ProjectDirectorSubtask[] {
+  const baseInput = [
+    `老板原始需求：${originalDemand}`,
+    "发布、部署、生产环境、密钥和删除数据相关任务必须老板批准。",
+  ];
+
+  return [
+    task({
+      task_code: "OPS-APPROVAL-01",
+      task_title: "发布/部署风险确认",
+      role: "operations_engineer",
+      task_type: "operations_release",
+      stage: "OPS",
+      input: baseInput,
+      allowed_files: ["docs/ops/release-checklist.md", "docs/upgrade/rollback-plan.md"],
+      acceptance_criteria: [
+        "列出发布影响、回滚方式和需要老板批准的动作",
+        "不修改生产环境变量",
+        "不部署 production",
+      ],
+      can_auto_execute: false,
+      risk_level: "high",
+    }),
+  ];
+}
+
+function buildAcceptanceFeedbackTasks(originalDemand: string): ProjectDirectorSubtask[] {
+  const baseInput = [
+    `老板验收反馈：${originalDemand}`,
+    "修 Bug 和验收反馈必须先由 project_director 诊断，再决定派给开发或测试。",
+  ];
+
+  return [
+    task({
+      task_code: "FEEDBACK-DIAGNOSE-01",
+      task_title: "诊断验收反馈并确定责任 Agent",
+      role: "project_director",
+      task_type: "bug_diagnosis",
+      stage: "INTAKE",
+      input: baseInput,
+      allowed_files: ["docs/ops/feedback-diagnosis.md"],
+      acceptance_criteria: [
+        "判断反馈属于产品、前端、后端、测试还是运维",
+        "列出最小修复范围",
+        "涉及数据库、密钥、生产部署或删除数据时必须要求老板批准",
+      ],
+    }),
+    task({
+      task_code: "FEEDBACK-FIX-01",
+      task_title: "按诊断结果执行最小修复",
+      role: "frontend_developer",
+      task_type: "acceptance_feedback",
+      stage: "FRONTEND",
+      input: baseInput,
+      allowed_files: ["docs/ops/feedback-diagnosis.md"],
+      acceptance_criteria: [
+        "只修改诊断中批准的 allowed_files",
+        "不扩大业务范围",
+        "保留现有 Worker 领取任务流程",
+      ],
+      dependency_keys: ["FEEDBACK-DIAGNOSE-01"],
+      can_auto_execute: false,
+      risk_level: "medium",
+    }),
+    task({
+      task_code: "FEEDBACK-VERIFY-01",
+      task_title: "复测验收反馈",
+      role: "testing_engineer",
+      task_type: "testing_acceptance",
+      stage: "TEST",
+      input: baseInput,
+      allowed_files: ["docs/ops/feedback-test-report.md"],
+      acceptance_criteria: ["复测原反馈", "确认没有误改冻结业务页面", "输出残余风险"],
+      dependency_keys: ["FEEDBACK-FIX-01"],
+    }),
+  ];
+}
+
 function buildTasksForDemand(originalDemand: string): ProjectDirectorSubtask[] {
   const category = detectDemandCategory(originalDemand);
-  if (category === "system_upgrade") return buildSystemUpgradeTasks(originalDemand);
-  return buildProductTasks(originalDemand);
+  switch (category) {
+    case "system_upgrade":
+      return buildSystemUpgradeTasks(originalDemand);
+    case "frontend_development":
+      return buildFrontendTasks(originalDemand);
+    case "backend_development":
+      return buildBackendTasks(originalDemand);
+    case "ui_design":
+      return buildDesignTasks(originalDemand, "ui_design");
+    case "interaction_design":
+      return buildDesignTasks(originalDemand, "interaction_design");
+    case "testing_acceptance":
+      return buildTestingTasks(originalDemand);
+    case "operations_release":
+      return buildOperationsTasks(originalDemand);
+    case "acceptance_feedback":
+      return buildAcceptanceFeedbackTasks(originalDemand);
+    case "product_planning":
+    default:
+      return buildProductTasks(originalDemand);
+  }
 }
 
 export function buildProjectDirectorTaskTreeDraft(

@@ -30,7 +30,7 @@ const CODEX_IDLE_TIMEOUT_MS = Number(process.env.CODEX_IDLE_TIMEOUT_MS || 60000)
 const CODEX_PROGRESS_HEARTBEAT_INTERVAL_MS = 30 * 1000;
 const CODEX_EXE = process.env.CODEX_EXE || "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe";
 const WORKER_PREVIEW_SMOKE =
-  String(process.env.WORKER_PREVIEW_SMOKE || "true").toLowerCase() === "true";
+  String(process.env.WORKER_PREVIEW_SMOKE || "false").toLowerCase() === "true";
 
 function repairKnownDroppedFirstCharPath(filePath) {
   const value = String(filePath || "").trim();
