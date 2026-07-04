@@ -41,7 +41,7 @@ function validateDraft(draft: LocalPostDraftInput) {
 export default function PostPage() {
   const [draft, setDraft] = useState<LocalPostDraft | null>(null);
   const [errors, setErrors] = useState<DraftErrors>({});
-  const [saveState, setSaveState] = useState<"idle" | "saved" | "unavailable">("idle");
+  const [saveState, setSaveState] = useState<"idle" | "saved" | "duplicate" | "unavailable">("idle");
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -62,10 +62,10 @@ export default function PostPage() {
     if (Object.keys(nextErrors).length > 0) return;
 
     const nextDraft = createLocalPostDraft(nextInput);
-    const saved = saveLocalPostDraft(nextDraft);
+    const saveResult = saveLocalPostDraft(nextDraft);
 
-    setDraft(nextDraft);
-    setSaveState(saved ? "saved" : "unavailable");
+    setDraft(saveResult.draft);
+    setSaveState(saveResult.status);
   }
 
   const hasErrors = Object.keys(errors).length > 0;
@@ -243,19 +243,34 @@ export default function PostPage() {
                     <div>
                       <p className="text-sm font-black text-emerald-700">
                         {saveState === "saved"
-                          ? "本机草稿已保存，可去搭子列表查看待审核预览"
-                          : "已生成页面内预览，但当前浏览器无法写入本地草稿"}
+                          ? "已生成本地草稿，可前往搭子列表预览。"
+                          : saveState === "duplicate"
+                            ? "这条需求已经在本地草稿中，不需要重复提交。"
+                            : "已生成页面内预览，但当前浏览器无法写入本地草稿"}
                       </p>
                       <p className="mt-2 text-sm leading-6 text-emerald-900">
                         这不是正式发布。正式审核和保存功能将在后续接入，刷新或换设备可能看不到该草稿。
                       </p>
                     </div>
-                    <Link
-                      href="/partners"
-                      className="inline-flex min-h-11 shrink-0 items-center justify-center rounded-2xl bg-slate-950 px-5 text-sm font-black text-white hover:bg-slate-800"
-                    >
-                      去找搭子列表查看
-                    </Link>
+                    <div className="flex shrink-0 flex-wrap gap-3">
+                      <Link
+                        href="/partners"
+                        className="inline-flex min-h-11 items-center justify-center rounded-2xl bg-slate-950 px-5 text-sm font-black text-white hover:bg-slate-800"
+                      >
+                        查看搭子列表
+                      </Link>
+                      <button
+                        type="reset"
+                        onClick={() => {
+                          setDraft(null);
+                          setErrors({});
+                          setSaveState("idle");
+                        }}
+                        className="inline-flex min-h-11 items-center justify-center rounded-2xl bg-white px-5 text-sm font-black text-slate-950 shadow-sm ring-1 ring-emerald-200 hover:bg-emerald-100"
+                      >
+                        继续发布新需求
+                      </button>
+                    </div>
                   </div>
 
                   <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-emerald-100">

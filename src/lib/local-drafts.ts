@@ -17,6 +17,11 @@ export type LocalPostDraft = {
 
 export type LocalPostDraftInput = Omit<LocalPostDraft, "id" | "status" | "createdAt">;
 
+export type SaveLocalPostDraftResult =
+  | { status: "saved"; draft: LocalPostDraft }
+  | { status: "duplicate"; draft: LocalPostDraft }
+  | { status: "unavailable"; draft: LocalPostDraft };
+
 const LOCAL_DRAFTS_EVENT = "city-partner-local-drafts-change";
 const EMPTY_DRAFTS: LocalPostDraft[] = [];
 let cachedRawDrafts: string | null = null;
@@ -57,6 +62,26 @@ function createDraftId() {
   return `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function normalizeDraftField(value: string) {
+  return value.trim();
+}
+
+function getDraftDedupeKey(draft: Pick<LocalPostDraft, "city" | "category" | "title" | "description">) {
+  return [
+    normalizeDraftField(draft.city),
+    normalizeDraftField(draft.category),
+    normalizeDraftField(draft.title),
+    normalizeDraftField(draft.description),
+  ].join("\u001f");
+}
+
+function isSameLocalPostDraft(
+  left: Pick<LocalPostDraft, "city" | "category" | "title" | "description">,
+  right: Pick<LocalPostDraft, "city" | "category" | "title" | "description">,
+) {
+  return getDraftDedupeKey(left) === getDraftDedupeKey(right);
+}
+
 export function createLocalPostDraft(input: LocalPostDraftInput): LocalPostDraft {
   return {
     ...input,
@@ -64,6 +89,20 @@ export function createLocalPostDraft(input: LocalPostDraftInput): LocalPostDraft
     status: "pending_review",
     createdAt: new Date().toISOString(),
   };
+}
+
+export function dedupeLocalPostDrafts(drafts: LocalPostDraft[]): LocalPostDraft[] {
+  const seen = new Set<string>();
+  const nextDrafts: LocalPostDraft[] = [];
+
+  for (const draft of drafts) {
+    const key = getDraftDedupeKey(draft);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    nextDrafts.push(draft);
+  }
+
+  return nextDrafts;
 }
 
 export function readLocalPostDrafts(): LocalPostDraft[] {
@@ -87,24 +126,30 @@ export function readLocalPostDrafts(): LocalPostDraft[] {
     }
 
     cachedRawDrafts = raw;
-    cachedDrafts = parsed.filter(isLocalPostDraft);
+    cachedDrafts = dedupeLocalPostDrafts(parsed.filter(isLocalPostDraft));
     return cachedDrafts;
   } catch {
     return EMPTY_DRAFTS;
   }
 }
 
-export function saveLocalPostDraft(draft: LocalPostDraft) {
-  if (!canUseLocalStorage()) return false;
+export function saveLocalPostDraft(draft: LocalPostDraft): SaveLocalPostDraftResult {
+  if (!canUseLocalStorage()) return { status: "unavailable", draft };
 
   try {
     const drafts = readLocalPostDrafts();
+    const duplicateDraft = drafts.find((item) => isSameLocalPostDraft(item, draft));
+
+    if (duplicateDraft) {
+      return { status: "duplicate", draft: duplicateDraft };
+    }
+
     const nextDrafts = [draft, ...drafts.filter((item) => item.id !== draft.id)];
     window.localStorage.setItem(LOCAL_DRAFTS_STORAGE_KEY, JSON.stringify(nextDrafts));
     emitLocalDraftsChange();
-    return true;
+    return { status: "saved", draft };
   } catch {
-    return false;
+    return { status: "unavailable", draft };
   }
 }
 

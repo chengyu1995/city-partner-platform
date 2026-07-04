@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import {
   clearLocalPostDrafts,
+  dedupeLocalPostDrafts,
   getLocalPostDraftsServerSnapshot,
   getLocalPostDraftsSnapshot,
   subscribeLocalPostDrafts,
@@ -63,11 +64,12 @@ export default function PartnersPage() {
   const searchParams = useSearchParams();
   const selectedCity = searchParams.get("city") ?? "全部";
   const selectedCategory = searchParams.get("category") ?? "全部";
-  const localDrafts = useSyncExternalStore(
+  const localDraftsSnapshot = useSyncExternalStore(
     subscribeLocalPostDrafts,
     getLocalPostDraftsSnapshot,
     getLocalPostDraftsServerSnapshot,
   );
+  const localDrafts = dedupeLocalPostDrafts(localDraftsSnapshot);
 
   const filteredPartners = partners.filter((partner) => {
     const cityOk = selectedCity === "全部" || partner.city === selectedCity;
