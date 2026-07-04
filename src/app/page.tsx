@@ -53,7 +53,7 @@ function getCategoryMeta(category: PartnerCategory) {
 export default function Home() {
   return (
     <main className="min-h-screen bg-[#f8faf7] text-slate-900">
-      <section className="mx-auto flex min-h-[92vh] max-w-6xl flex-col px-4 pb-6 pt-5 sm:px-6 lg:px-8">
+      <section className="mx-auto flex max-w-6xl flex-col px-4 pb-6 pt-5 sm:px-6 lg:min-h-[92vh] lg:px-8">
         <nav className="flex items-center justify-between rounded-full bg-white/90 px-4 py-3 shadow-sm ring-1 ring-slate-200/70">
           <Link href="/" className="flex min-h-11 items-center gap-2 font-bold text-slate-950">
             <span className="flex h-9 w-9 items-center justify-center rounded-full bg-emerald-500 text-base text-white">
@@ -128,6 +128,18 @@ export default function Home() {
               >
                 发布搭子
               </Link>
+            </div>
+            <div className="mt-4 flex gap-2 overflow-x-auto pb-1 lg:hidden">
+              {PARTNER_CATEGORIES.map((category) => (
+                <Link
+                  key={category.key}
+                  href={`/partners?category=${encodeURIComponent(category.key)}`}
+                  className="inline-flex min-h-11 shrink-0 items-center gap-2 rounded-full bg-white px-4 text-sm font-semibold text-slate-700 shadow-sm ring-1 ring-slate-200"
+                >
+                  <span aria-hidden>{category.emoji}</span>
+                  <span>{category.key}</span>
+                </Link>
+              ))}
             </div>
           </div>
 
