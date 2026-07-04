@@ -4,6 +4,7 @@ import {
   assertWorkerAuthorized,
   assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
+  buildProjectDirectorWorkerReport,
   clampProgress,
   findHermesJob,
   getAttemptIdFromBody,
@@ -98,11 +99,26 @@ export async function POST(req: NextRequest) {
   const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
   if (attemptError) return attemptError;
 
+  const projectDirectorReport = buildProjectDirectorWorkerReport({
+    job: existingJob,
+    workerId,
+    attemptId,
+    status: workerStatus,
+    resultText: body.result_text,
+    output: body.output,
+    filesChanged: body.files_changed,
+    gitCommitSha: body.git_commit_sha,
+    buildPassed: body.build_passed,
+    testPassed: body.test_passed,
+    errorText,
+  });
+
   if (isTerminalWorkerStatus(existingJob.status)) {
     return NextResponse.json({
       ok: true,
       job: existingJob,
       attempt_id: attemptId,
+      project_director_report: projectDirectorReport,
       idempotent: true,
       skipped: "terminal_job_report_ignored",
     });
@@ -120,7 +136,11 @@ export async function POST(req: NextRequest) {
     status_message: body.status_message ?? null,
     git_commit_sha: body.git_commit_sha ?? null,
     error_text: workerStatus === "failed" ? errorText : null,
-    result: buildResult({ ...body, attempt_id: attemptId ?? body.attempt_id }),
+    result: {
+      ...buildResult({ ...body, attempt_id: attemptId ?? body.attempt_id }),
+      project_director_report: projectDirectorReport.data,
+      project_director_report_text: projectDirectorReport.text,
+    },
     completed_at: terminal ? now : null,
     updated_at: now,
   });
@@ -152,6 +172,7 @@ export async function POST(req: NextRequest) {
     ok: true,
     job: data,
     attempt_id: attemptId,
+    project_director_report: projectDirectorReport,
     feishu_sync: recordId ? "attempted" : "skipped_no_record_id",
   });
 }

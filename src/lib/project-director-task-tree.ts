@@ -49,6 +49,16 @@ export interface ProjectDirectorSubtask {
   execution_mode: ProjectDirectorExecutionMode;
 }
 
+export interface ProjectDirectorTaskPlanItem {
+  order: number;
+  task_key: string;
+  title: string;
+  execution_order: number;
+  risk_note: string;
+  requires_boss_approval: boolean;
+  status: "waiting_approval" | "queued" | "running" | "completed" | "failed";
+}
+
 export interface ProjectDirectorTaskGroup {
   code: string;
   title: string;
@@ -63,6 +73,13 @@ export interface ProjectDirectorStage {
 }
 
 export interface ProjectDirectorTaskTreeDraft {
+  boss_request_id: string;
+  plan_id: string;
+  original_demand: string;
+  director_understanding: string;
+  execution_tasks: ProjectDirectorTaskPlanItem[];
+  requires_boss_approval: boolean;
+  current_status: "waiting_boss_approval" | "approved_execution" | "completed" | "failed";
   project_goal: string;
   task_tree_id: string;
   execution_mode: ProjectDirectorExecutionMode;
@@ -140,6 +157,33 @@ function createTaskTreeId(originalDemand: string): string {
     hash = (hash * 31 + originalDemand.charCodeAt(index)) >>> 0;
   }
   return `task-tree-${hash.toString(16).padStart(8, "0")}`;
+}
+
+function createBossRequestId(originalDemand: string): string {
+  return createTaskTreeId(`boss:${originalDemand}`).replace("task-tree", "boss-request");
+}
+
+function buildRiskNote(taskItem: ProjectDirectorSubtask): string {
+  if (taskItem.risk_level === "critical") return "critical risk; stop for boss approval before dispatch.";
+  if (taskItem.risk_level === "high") return "high risk; requires boss approval before dispatch.";
+  if (taskItem.requires_boss_approval) return "approval boundary detected; do not dispatch before boss approval.";
+  if (taskItem.allowed_files.length === 0) return "no explicit editable file scope; keep planning only.";
+  return "low operational risk if limited to allowed files and static validation.";
+}
+
+function buildExecutionTasks(
+  tasks: ProjectDirectorSubtask[],
+  executionMode: ProjectDirectorExecutionMode
+): ProjectDirectorTaskPlanItem[] {
+  return tasks.map((taskItem, index) => ({
+    order: index + 1,
+    task_key: taskItem.task_key,
+    title: taskItem.task_title,
+    execution_order: index + 1,
+    risk_note: buildRiskNote(taskItem),
+    requires_boss_approval: taskItem.requires_boss_approval,
+    status: executionMode === "approved_execution" ? "queued" : "waiting_approval",
+  }));
 }
 
 function detectDemandCategory(originalDemand: string): ProjectDirectorDemandCategory {
@@ -277,6 +321,108 @@ function groupByStage(tasks: ProjectDirectorSubtask[]): ProjectDirectorStage[] {
 }
 
 function buildSystemUpgradeTasks(originalDemand: string): ProjectDirectorSubtask[] {
+  if (/BATCH-17|老板验收|老板批准|批准执行|需求识别|任务分发|闭环|boss_request_id|plan_id/i.test(originalDemand)) {
+    const batch17Input = [
+      `Boss original demand: ${originalDemand}`,
+      "Scope: system orchestration upgrade only; do not build city-partner business pages.",
+      "Approval gate: no executable Worker/Codex job may be queued before boss approval.",
+    ];
+
+    return [
+      task({
+        task_code: "BATCH-17-INTAKE-01",
+        task_title: "Recognize boss demand and keep it in project director planning",
+        role: "project_director",
+        task_type: "system_upgrade",
+        stage: "INTAKE",
+        input: batch17Input,
+        allowed_files: [
+          "src/app/api/feishu/event/route.ts",
+          "src/lib/project-director-task-tree.ts",
+        ],
+        acceptance_criteria: [
+          "New boss demands are recorded as waiting project-director plans.",
+          "No executable Worker/Codex job is queued before boss approval.",
+          "Boss receives a clear plan with approve and pause commands.",
+        ],
+        risk_level: "medium",
+      }),
+      task({
+        task_code: "BATCH-17-PLAN-01",
+        task_title: "Expand task tree records for approval traceability",
+        role: "project_director",
+        task_type: "system_upgrade",
+        stage: "PRODUCT",
+        input: batch17Input,
+        allowed_files: [
+          "src/lib/project-director-task-tree.ts",
+          "docs/upgrade/batch-17-project-director-loop.md",
+        ],
+        acceptance_criteria: [
+          "Plan records original demand, director understanding, execution tasks, order, risks, approval requirement, and status.",
+          "Plan records boss_request_id and plan_id.",
+          "Docs include local simulated boss-demand validation.",
+        ],
+        dependency_keys: ["BATCH-17-INTAKE-01"],
+      }),
+      task({
+        task_code: "BATCH-17-DISPATCH-01",
+        task_title: "Dispatch approved tasks with boss request and plan correlation",
+        role: "backend_developer",
+        task_type: "backend_development",
+        stage: "BACKEND",
+        input: batch17Input,
+        allowed_files: [
+          "src/app/api/feishu/event/route.ts",
+          "src/app/api/worker/next/route.ts",
+          "src/lib/worker-jobs.ts",
+        ],
+        acceptance_criteria: [
+          "Approved dispatch request_text includes boss_request_id, plan_id, and attempt_id contract.",
+          "Worker next response returns attempt_id without removing BATCH-16 attempt protection.",
+          "Paused dispatch blocks approved execution.",
+        ],
+        dependency_keys: ["BATCH-17-PLAN-01"],
+        risk_level: "medium",
+      }),
+      task({
+        task_code: "BATCH-17-REPORT-01",
+        task_title: "Return worker completion as project director acceptance report",
+        role: "backend_developer",
+        task_type: "backend_development",
+        stage: "BACKEND",
+        input: batch17Input,
+        allowed_files: [
+          "src/app/api/worker/report/route.ts",
+          "src/lib/worker-jobs.ts",
+          "src/lib/project-director-console.ts",
+        ],
+        acceptance_criteria: [
+          "Worker completion report includes what changed, files, validation, commit hash, boss confirmation need, and next step.",
+          "Status command shows pause state, recent boss demand, recent plan, running task, last completed task, failure reason, and heartbeat when available.",
+          "Wrong attempt_id reports are still rejected.",
+        ],
+        dependency_keys: ["BATCH-17-DISPATCH-01"],
+        risk_level: "medium",
+      }),
+      task({
+        task_code: "BATCH-17-DOCS-01",
+        task_title: "Document BATCH-17 project director loop",
+        role: "project_director",
+        task_type: "system_upgrade",
+        stage: "REPORT",
+        input: batch17Input,
+        allowed_files: ["docs/upgrade/batch-17-project-director-loop.md"],
+        acceptance_criteria: [
+          "Document approval gate, dispatch metadata, report format, and static validation.",
+          "Document that no Supabase schema change is required.",
+          "Document attempt_id contract verification.",
+        ],
+        dependency_keys: ["BATCH-17-REPORT-01"],
+      }),
+    ];
+  }
+
   const baseInput = [
     `老板原始需求：${originalDemand}`,
     "本阶段性质：系统升级，不开发网站业务页面。",
@@ -882,6 +1028,14 @@ export function buildProjectDirectorTaskTreeDraft(
       : "把老板需求拆成可审核、可分批执行的 MVP 任务树，先规划再执行。";
 
   return {
+    boss_request_id: createBossRequestId(originalDemand),
+    plan_id: taskTreeId,
+    original_demand: originalDemand,
+    director_understanding: projectGoal,
+    execution_tasks: buildExecutionTasks(childTasks, executionMode),
+    requires_boss_approval: childTasks.some((taskItem) => taskItem.requires_boss_approval),
+    current_status:
+      executionMode === "approved_execution" ? "approved_execution" : "waiting_boss_approval",
     project_goal: projectGoal,
     task_tree_id: taskTreeId,
     execution_mode: executionMode,
@@ -905,8 +1059,38 @@ export function buildProjectDirectorTaskTreeDraft(
 export function buildTaskTreeDraftSummary(draft: ProjectDirectorTaskTreeDraft): string {
   const autoTasks = draft.child_tasks.filter((taskItem) => !taskItem.requires_boss_approval);
   const approvalTasks = draft.child_tasks.filter((taskItem) => taskItem.requires_boss_approval);
+  const batch17ApprovalSummary = [
+    "[Project Director: waiting for boss approval]",
+    `boss_request_id: ${draft.boss_request_id}`,
+    `plan_id: ${draft.plan_id}`,
+    `status: ${draft.current_status}`,
+    `original_demand: ${draft.original_demand}`,
+    `director_understanding: ${draft.director_understanding}`,
+    "",
+    "Prepared tasks:",
+    ...draft.execution_tasks.map(
+      (taskItem) =>
+        `${taskItem.execution_order}. ${taskItem.task_key} - ${taskItem.title}; risk=${taskItem.risk_note}; approval=${taskItem.requires_boss_approval ? "yes" : "no"}; status=${taskItem.status}`
+    ),
+    "",
+    "Possible modified files/modules:",
+    ...Array.from(new Set(draft.child_tasks.flatMap((taskItem) => taskItem.allowed_files))).map(
+      (file) => `- ${file}`
+    ),
+    "",
+    "Why this split:",
+    "- Intake and planning stay with project director first.",
+    "- Implementation tasks are separated by file boundary, risk, and verification owner.",
+    "- Worker/Codex dispatch is blocked until the boss sends: 总管 批准执行.",
+    "",
+    "Boss commands:",
+    "- 总管 批准执行: dispatch approved Worker/Codex tasks.",
+    "- 总管 暂停: block dispatch.",
+    "",
+  ];
 
   return [
+    ...batch17ApprovalSummary,
     "【项目总管：任务树草案】",
     `需求理解：${draft.project_goal}`,
     `任务树编号：${draft.task_tree_id}`,
@@ -945,6 +1129,11 @@ export function buildTaskTreeDraftRecord(
     "PROJECT_DIRECTOR_TASK_TREE_DRAFT",
     "state: waiting_execution_approval",
     `original_demand: ${originalDemand}`,
+    `boss_request_id: ${draft.boss_request_id}`,
+    `plan_id: ${draft.plan_id}`,
+    `director_understanding: ${draft.director_understanding}`,
+    `requires_boss_approval: ${draft.requires_boss_approval ? "true" : "false"}`,
+    `current_status: ${draft.current_status}`,
     `boss_confirmation: ${bossConfirmation}`,
     `execution_mode: ${draft.execution_mode}`,
     "summary:",

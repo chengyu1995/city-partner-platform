@@ -6,6 +6,7 @@ import {
   claimHermesJob,
   createWorkerAttemptId,
   getBitableRecordId,
+  getProjectDirectorJobCorrelation,
   getWorkerIdFromRequest,
   getWorkerSupabase,
   responseFromMaybe,
@@ -81,6 +82,7 @@ async function handleNext(req: NextRequest) {
   }
 
   const recordId = getBitableRecordId(claimedJob, job);
+  const projectDirector = getProjectDirectorJobCorrelation(claimedJob);
   await syncWorkerStatusToFeishu({
     recordId,
     status: "running",
@@ -95,6 +97,12 @@ async function handleNext(req: NextRequest) {
     ok: true,
     job: claimedJob,
     attempt_id: attemptId,
+    project_director: {
+      ...projectDirector,
+      attempt_id: attemptId,
+      attempt_contract:
+        "echo this attempt_id in heartbeat, progress, and report; mismatches are rejected",
+    },
     feishu_sync: recordId ? "attempted" : "skipped_no_record_id",
   });
 }

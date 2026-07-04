@@ -50,6 +50,66 @@ function formatCounts(counts: Record<string, number>): string {
   return entries.map(([status, count]) => `- ${status}: ${count}`).join("\n");
 }
 
+function readLineValue(content: string, key: string): string {
+  const line = content.split(/\r?\n/).find((item) => item.startsWith(`${key}: `));
+  return line ? line.slice(key.length + 2).trim() : "";
+}
+
+function oneLine(value: unknown, fallback = "none"): string {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (!normalized) return fallback;
+  return normalized.length > 140 ? `${normalized.slice(0, 137)}...` : normalized;
+}
+
+async function loadLatestSystemRecord(
+  supabase: SupabaseClient,
+  convId: string | undefined,
+  marker: string
+): Promise<string> {
+  if (!convId) return "";
+  const { data, error } = await supabase
+    .from("hermes_messages")
+    .select("content, created_at")
+    .eq("conversation_id", convId)
+    .eq("role", "system")
+    .ilike("content", `%${marker}%`)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error || !data || typeof data.content !== "string") return "";
+  return data.content;
+}
+
+async function loadLatestJobSummary(
+  supabase: SupabaseClient,
+  statuses: string[]
+): Promise<string> {
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .select("job_id, title, status, claimed_by, updated_at, error_text, status_message, payload")
+    .in("source", ["project_director", "agent_dispatch"])
+    .in("status", statuses)
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error || !data) return "none";
+  const payload =
+    data.payload && typeof data.payload === "object" ? (data.payload as Record<string, unknown>) : {};
+  return [
+    `job=${oneLine(data.job_id)}`,
+    `title=${oneLine(data.title)}`,
+    `status=${oneLine(data.status)}`,
+    `worker=${oneLine(data.claimed_by)}`,
+    `updated=${oneLine(data.updated_at)}`,
+    `heartbeat=${oneLine(payload.heartbeat_at ?? payload.updated_at)}`,
+    `message=${oneLine(data.status_message)}`,
+    `error=${oneLine(data.error_text)}`,
+  ].join("; ");
+}
+
 async function loadQueueCounts(supabase: SupabaseClient): Promise<Record<string, number>> {
   const { data, error } = await supabase
     .from("hermes_jobs")
@@ -69,7 +129,8 @@ async function loadQueueCounts(supabase: SupabaseClient): Promise<Record<string,
 
 export async function buildProjectDirectorConsoleAction(
   supabase: SupabaseClient,
-  text: string
+  text: string,
+  convId?: string
 ): Promise<ProjectDirectorConsoleAction | null> {
   const command = parseProjectDirectorConsoleCommand(text);
   if (!command) return null;
@@ -93,9 +154,39 @@ export async function buildProjectDirectorConsoleAction(
 
   if (command === "status") {
     const counts = await loadQueueCounts(supabase);
+    const paused = convId ? await isProjectDirectorDispatchPaused(supabase, convId) : false;
+    const recentPlan = await loadLatestSystemRecord(
+      supabase,
+      convId,
+      "PROJECT_DIRECTOR_TASK_TREE_DRAFT"
+    );
+    const recentDispatch = await loadLatestSystemRecord(
+      supabase,
+      convId,
+      "PROJECT_DIRECTOR_APPROVED_EXECUTION_DISPATCHED"
+    );
+    const runningTask = await loadLatestJobSummary(supabase, ["running"]);
+    const completedTask = await loadLatestJobSummary(supabase, ["succeeded"]);
+    const failedTask = await loadLatestJobSummary(supabase, ["failed"]);
+    const recentDemand =
+      readLineValue(recentPlan, "original_demand") ||
+      readLineValue(recentDispatch, "original_demand") ||
+      "none";
+    const recentPlanId =
+      readLineValue(recentPlan, "plan_id") ||
+      readLineValue(recentPlan, "task_tree_id") ||
+      "none";
     return {
       command,
       reply: [
+        "[Project Director Status]",
+        `paused: ${paused ? "yes" : "no"}`,
+        `recent_boss_request: ${oneLine(recentDemand)}`,
+        `recent_plan: ${oneLine(recentPlanId)}`,
+        `current_running_task: ${runningTask}`,
+        `last_completed_task: ${completedTask}`,
+        `last_failure: ${failedTask}`,
+        "",
         "[项目总管状态]",
         "队列统计：",
         formatCounts(counts),
@@ -106,6 +197,12 @@ export async function buildProjectDirectorConsoleAction(
         "PROJECT_DIRECTOR_CONSOLE",
         "command: status",
         "state: replied",
+        `agent_dispatch_paused: ${paused ? "true" : "false"}`,
+        `recent_boss_request: ${recentDemand}`,
+        `recent_plan: ${recentPlanId}`,
+        `current_running_task: ${runningTask}`,
+        `last_completed_task: ${completedTask}`,
+        `last_failure: ${failedTask}`,
         `counts: ${JSON.stringify(counts)}`,
       ].join("\n"),
     };

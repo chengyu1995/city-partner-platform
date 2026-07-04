@@ -59,16 +59,13 @@ import {
   buildAcceptanceFeedbackDuplicateReply,
   buildAcceptanceFeedbackQueuedRecord,
   buildAcceptanceFeedbackQueuedReply,
-  buildProjectDirectorPlanningRequestText,
   hasExistingAgentDispatchJobs,
   hasBatch01DispatchRecord,
   hasExistingBatch01Jobs,
-  hasExistingPlanningJob,
   hasRecentAcceptanceFeedbackJob,
   insertApprovedAgentDispatchJobs,
   insertAcceptanceFeedbackJob,
   insertBatch01ProductPlanningJobs,
-  insertProjectDirectorPlanningJob,
   PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD_NAME,
 } from "@/lib/project-director-job-builder";
 import {
@@ -427,34 +424,15 @@ async function savePlanningTaskTreeReply(
   reply: string,
   draftRecord: string,
   draft: ProjectDirectorTaskTreeDraft,
-  feishuMessageId: string,
-  feishuEventId: string,
-  feishuChatId: string,
-  feishuUserId: string
+  feishuMessageId: string
 ): Promise<void> {
-  const planningRequestText = buildProjectDirectorPlanningRequestText({
-    originalDemand,
-    taskTreeId: draft.task_tree_id,
-    summary: reply,
-  });
-  let planningInsertNote = "planning_job: skipped_duplicate";
-
-  const alreadyQueued = await hasExistingPlanningJob(supabase, draft.task_tree_id);
-  if (!alreadyQueued) {
-    const insertResult = await insertProjectDirectorPlanningJob(supabase, {
-      originalDemand,
-      taskTreeId: draft.task_tree_id,
-      requestText: planningRequestText,
-      feishuMessageId,
-      feishuEventId,
-      feishuChatId,
-      feishuUserId,
-    });
-    planningInsertNote = [
-      `planning_job: inserted_${insertResult.insertedCount}`,
-      `skipped_hermes_jobs_columns: ${insertResult.skippedColumns.join(", ") || "none"}`,
-    ].join("\n");
-  }
+  const planningInsertNote = [
+    "planning_job: not_inserted_before_boss_approval",
+    `boss_request_id: ${draft.boss_request_id}`,
+    `plan_id: ${draft.plan_id}`,
+    `original_demand: ${originalDemand}`,
+    "note: BATCH-17 keeps planning in hermes_messages only until 总管 批准执行.",
+  ].join("\n");
 
   await saveSystemRecordedReply(
     supabase,
@@ -542,6 +520,34 @@ async function getFeishuToken(): Promise<string> {
   const data = (await res.json()) as { tenant_access_token?: string; code: number };
   if (data.code !== 0 || !data.tenant_access_token) throw new Error("feishu token fail");
   return data.tenant_access_token;
+}
+
+function attachProjectDirectorDispatchMetadata(
+  buildResult: {
+    requestTexts: string[];
+    tasks: Array<{ task_key?: string; task_code?: string }>;
+  },
+  input: {
+    bossRequestId: string;
+    planId: string;
+    originalDemand: string;
+  }
+): void {
+  buildResult.requestTexts = buildResult.requestTexts.map((requestText, index) => {
+    const taskKey =
+      buildResult.tasks[index]?.task_key ?? buildResult.tasks[index]?.task_code ?? `task-${index + 1}`;
+    return [
+      "[Project Director Dispatch Metadata]",
+      `boss_request_id: ${input.bossRequestId}`,
+      `plan_id: ${input.planId}`,
+      `task_key: ${taskKey}`,
+      "attempt_id: assigned_on_worker_claim",
+      "attempt_contract: Worker must echo the attempt_id returned by /api/worker/next in heartbeat/progress/report; mismatched attempt_id is rejected.",
+      `original_demand: ${input.originalDemand}`,
+      "",
+      requestText,
+    ].join("\n");
+  });
 }
 
 export async function POST(req: NextRequest) {
@@ -661,7 +667,7 @@ export async function POST(req: NextRequest) {
 
       const consoleCommand = parseProjectDirectorConsoleCommand(text);
       if (consoleCommand && consoleCommand !== "approve_execution") {
-        const action = await buildProjectDirectorConsoleAction(supabase, text);
+        const action = await buildProjectDirectorConsoleAction(supabase, text, convId);
         if (action) {
           await saveSystemRecordedReply(
             supabase,
@@ -776,10 +782,7 @@ export async function POST(req: NextRequest) {
           reply,
           draftRecord,
           draft,
-          ev.message.message_id,
-          eventId,
-          ev.message.chat_id,
-          userId
+          ev.message.message_id
         );
         const token = await getFeishuToken();
         await sendFeishuMessage(
@@ -937,6 +940,11 @@ export async function POST(req: NextRequest) {
       );
       const dispatchPlan = buildProjectDirectorDispatchPlanDraft(approvedTree, "approved_execution");
       const buildResult = buildApprovedAgentDispatchJobs(dispatchPlan);
+      attachProjectDirectorDispatchMetadata(buildResult, {
+        bossRequestId: approvedTree.boss_request_id,
+        planId: approvedTree.plan_id,
+        originalDemand: recentDraft.originalDemand,
+      });
       const alreadyDispatched = await hasExistingAgentDispatchJobs(supabase, buildResult.tasks);
       if (alreadyDispatched) {
         const reply = "该任务树的 Agent 执行任务已经分发过，本次不会重复创建。";
@@ -969,6 +977,8 @@ export async function POST(req: NextRequest) {
 
       const insertResult = await insertApprovedAgentDispatchJobs(supabase, buildResult);
       const reply = [
+        `[Project Director Dispatch] boss_request_id=${approvedTree.boss_request_id}`,
+        `[Project Director Dispatch] plan_id=${approvedTree.plan_id}`,
         "【项目总管：已批准执行】",
         `已创建 ${insertResult.insertedCount} 个 Agent 执行任务。`,
         "",
@@ -996,6 +1006,10 @@ export async function POST(req: NextRequest) {
         [
           record,
           "PROJECT_DIRECTOR_APPROVED_EXECUTION_DISPATCHED",
+          `boss_request_id: ${approvedTree.boss_request_id}`,
+          `plan_id: ${approvedTree.plan_id}`,
+          `original_demand: ${recentDraft.originalDemand}`,
+          "attempt_id_contract: assigned_on_worker_claim_and_required_on_report",
           `inserted_jobs: ${insertResult.insertedCount}`,
           `skipped_hermes_jobs_columns: ${insertResult.skippedColumns.join(", ") || "none"}`,
         ].join("\n"),

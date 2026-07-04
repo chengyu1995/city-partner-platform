@@ -103,6 +103,114 @@ export function getActiveAttemptId(job: JobRecord | null | undefined): string | 
   );
 }
 
+function readLineValue(content: string, key: string): string | null {
+  const line = content.split(/\r?\n/).find((item) => item.startsWith(`${key}: `));
+  return line ? line.slice(key.length + 2).trim() || null : null;
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+export function getProjectDirectorJobCorrelation(job: JobRecord | null | undefined): {
+  boss_request_id: string | null;
+  plan_id: string | null;
+  task_key: string | null;
+  original_demand: string | null;
+} {
+  const payload = readRecord(job?.payload);
+  const requestText = readString(job?.request_text) ?? readString(job?.prompt) ?? "";
+
+  return {
+    boss_request_id:
+      readString(payload?.boss_request_id) ?? readLineValue(requestText, "boss_request_id"),
+    plan_id:
+      readString(payload?.plan_id) ??
+      readString(payload?.task_tree_id) ??
+      readLineValue(requestText, "plan_id"),
+    task_key:
+      readString(payload?.task_key) ??
+      readString(job?.task_code) ??
+      readLineValue(requestText, "task_key"),
+    original_demand:
+      readString(payload?.original_demand) ?? readLineValue(requestText, "original_demand"),
+  };
+}
+
+export function buildProjectDirectorWorkerReport(input: {
+  job: JobRecord | null;
+  workerId: string;
+  attemptId: string | null;
+  status: "queued" | "running" | "succeeded" | "failed";
+  resultText?: string | null;
+  output?: string | null;
+  filesChanged?: string[];
+  gitCommitSha?: string | null;
+  buildPassed?: boolean | null;
+  testPassed?: boolean | null;
+  errorText?: string | null;
+}): { text: string; data: Record<string, unknown> } {
+  const correlation = getProjectDirectorJobCorrelation(input.job);
+  const filesChanged =
+    input.filesChanged && input.filesChanged.length > 0
+      ? input.filesChanged
+      : readStringArray(readRecord(input.job?.result)?.files_changed);
+  const validation = [
+    `build=${input.buildPassed === undefined || input.buildPassed === null ? "unknown" : input.buildPassed ? "passed" : "failed"}`,
+    `test=${input.testPassed === undefined || input.testPassed === null ? "unknown" : input.testPassed ? "passed" : "failed"}`,
+  ];
+  const needsBossConfirmation = input.status === "succeeded";
+  const summary =
+    input.resultText?.trim() ||
+    input.output?.trim() ||
+    (input.status === "failed" ? input.errorText?.trim() : "") ||
+    "Worker did not provide a detailed result.";
+
+  const data = {
+    boss_request_id: correlation.boss_request_id,
+    plan_id: correlation.plan_id,
+    task_key: correlation.task_key,
+    original_demand: correlation.original_demand,
+    worker_id: input.workerId,
+    attempt_id: input.attemptId,
+    status: input.status,
+    what_changed: summary,
+    files_changed: filesChanged,
+    validation_result: validation,
+    commit_hash: input.gitCommitSha ?? null,
+    needs_boss_confirmation: needsBossConfirmation,
+    next_step: needsBossConfirmation
+      ? "Boss should review the changed files and validation result, then confirm acceptance or send acceptance feedback."
+      : "Project director should inspect the failure reason and decide whether to retry or revise the plan.",
+    error: input.errorText ?? null,
+  };
+
+  const text = [
+    "[Project Director Worker Report]",
+    `boss_request_id: ${correlation.boss_request_id ?? "unknown"}`,
+    `plan_id: ${correlation.plan_id ?? "unknown"}`,
+    `task_key: ${correlation.task_key ?? "unknown"}`,
+    `attempt_id: ${input.attemptId ?? "missing"}`,
+    `worker_id: ${input.workerId}`,
+    `status: ${input.status}`,
+    "",
+    "What changed:",
+    summary,
+    "",
+    "Changed files:",
+    ...(filesChanged.length ? filesChanged.map((file) => `- ${file}`) : ["- none reported"]),
+    "",
+    "Validation:",
+    ...validation.map((item) => `- ${item}`),
+    "",
+    `Commit hash: ${input.gitCommitSha || "not reported"}`,
+    `Needs boss confirmation: ${needsBossConfirmation ? "yes" : "no"}`,
+    `Next step: ${data.next_step}`,
+  ].join("\n");
+
+  return { text, data };
+}
+
 export function buildAttemptPayload(
   job: JobRecord | null | undefined,
   attempt: {
