@@ -57,9 +57,11 @@ Static diagnostics:
 
 When static preview diagnostics fail, Worker records a warning and continues to commit/report flow. Local preview recovery failure must not mark the whole job as failed.
 
+The `recover-preview` CLI follows the same policy: failed static diagnostics are reported as warning output with exit code `0`. The command is a diagnostic artifact producer, not a job gate.
+
 ## Windows PATH Handling
 
-All Worker child processes normalize environment variables before spawn/exec. On Windows, `Path` and `PATH` are the same key for process creation, so Worker keeps one path entry to avoid:
+All Worker child processes normalize environment variables before spawn/exec. On Windows, `Path` and `PATH` are the same key for process creation, so Worker emits only one canonical `Path` entry to avoid:
 
 ```text
 spawn EINVAL

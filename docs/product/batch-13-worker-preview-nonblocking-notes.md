@@ -24,11 +24,11 @@ Page validation is static-only:
 
 ## Failure Policy
 
-Local preview recovery is diagnostic only. If static diagnostics fail or the recovery helper throws, Worker logs a warning and continues the task flow. The job should fail only for the actual Codex/task/Git failure path, not because local preview could not start.
+Local preview recovery is diagnostic only. If static diagnostics fail or the recovery helper throws, Worker logs a warning and continues the task flow. The `recover-preview` CLI also exits `0` for warning-only static diagnostic failures. The job should fail only for the actual Codex/task/Git failure path, not because local preview could not start.
 
 ## Windows PATH Fix
 
-Worker child processes normalize environment variables before `execFile` or `spawn`. Only one case variant of the Windows path key is passed to child processes, avoiding `Path` / `PATH` dictionary collisions and `spawn EINVAL`.
+Worker child processes normalize environment variables before `execFile` or `spawn`. Only one canonical `Path` key is passed to child processes, avoiding `Path` / `PATH` dictionary collisions and `spawn EINVAL`.
 
 ## Cleanup Policy
 

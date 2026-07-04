@@ -33,17 +33,17 @@ const STATIC_PREVIEW_ROUTE_FILES = [
 
 function sanitizeWindowsEnv(env = process.env) {
   const sanitized = {};
-  let pathKey = null;
   let pathValue = null;
+  let fallbackPathValue = null;
 
   for (const [key, value] of Object.entries(env)) {
     if (key.toLowerCase() === "path") {
-      if (pathKey === null || key === "Path") {
-        pathKey = key;
+      if (key === "Path" && value) {
+        pathValue = value;
       }
 
-      if (value) {
-        pathValue = value;
+      if (fallbackPathValue === null && value) {
+        fallbackPathValue = value;
       }
       continue;
     }
@@ -51,8 +51,10 @@ function sanitizeWindowsEnv(env = process.env) {
     sanitized[key] = value;
   }
 
-  if (pathValue !== null) {
-    sanitized[pathKey || "Path"] = pathValue;
+  const resolvedPathValue = pathValue || fallbackPathValue;
+
+  if (resolvedPathValue !== null) {
+    sanitized.Path = resolvedPathValue;
   }
 
   return sanitized;
@@ -434,6 +436,7 @@ async function recoverLocalPreview(projectDir, options = {}) {
     skippedBrowser: true,
     ok: routeFiles.every((item) => item.ok) && staticChecks.every((item) => item.ok),
   };
+  report.warning = !report.ok;
 
   fs.writeFileSync(
     path.join(logDir, "local-preview-recovery-report.json"),
@@ -494,7 +497,10 @@ async function runCli() {
   if (command === "recover-preview") {
     const result = await recoverLocalPreview(projectDir);
     process.stdout.write(JSON.stringify(result, null, 2));
-    process.exitCode = result.ok ? 0 : 1;
+    if (!result.ok) {
+      console.warn("\n[worker] local preview static diagnostics produced warnings; continuing");
+    }
+    process.exitCode = 0;
     return;
   }
 

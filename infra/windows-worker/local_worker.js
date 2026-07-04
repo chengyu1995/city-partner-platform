@@ -316,6 +316,7 @@ const CODEX_GIT_OPERATION_GUARD = [
   "不允许执行 cmd start /b npm run dev。",
   "如果需要验证页面，只做静态验证：文件是否存在、TypeScript/ESLint 是否通过、路由文件是否存在。",
   "不启动浏览器，不启动本地 dev server。",
+  "本地预览恢复或静态诊断失败只能记录 warning，不能把任务标记 failed。",
   "不允许执行 git add。",
   "不允许执行 git commit。",
   "不允许执行 git push。",
