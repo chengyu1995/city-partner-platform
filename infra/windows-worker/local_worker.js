@@ -973,7 +973,7 @@ async function pollOnce() {
         "正在使用 next dev --webpack 执行 /、/post、/partners smoke test"
       );
 
-      previewReport = await recoverLocalPreview(PROJECT_DIR);
+      previewReport = await safeRecoverLocalPreview(PROJECT_DIR);
     }
 
     await updateProgress(
@@ -1171,3 +1171,21 @@ module.exports = {
 
 
 
+
+
+async function safeRecoverLocalPreview(...args) {
+  // SAFE_RECOVER_LOCAL_PREVIEW_NON_BLOCKING
+  try {
+    return await recoverLocalPreview(...args);
+  } catch (err) {
+    const message = err && (err.message || String(err));
+    console.warn("[worker] local preview recovery failed but task will continue:", message);
+    return {
+      ok: false,
+      warning: true,
+      skipped: true,
+      error: message,
+      note: "本地预览恢复失败，但不阻断项目总管任务；继续执行代码诊断、修复、验证和回报。"
+    };
+  }
+}
