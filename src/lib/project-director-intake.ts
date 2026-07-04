@@ -120,6 +120,17 @@ const DISPATCH_BATCH_APPROVAL_PHRASES = [
   "同意分发第1批",
 ];
 
+const APPROVED_EXECUTION_PHRASES = [
+  "批准执行",
+  "同意执行",
+  "按计划执行",
+  "开始执行",
+  "批准全部执行",
+];
+
+const PLAN_CHANGE_PREFIX = "修改计划：";
+const PLAN_CHANGE_PREFIX_ASCII = "修改计划:";
+
 function normalizeDemandText(text: string): string {
   return text.trim().replace(/\s+/g, " ");
 }
@@ -149,6 +160,11 @@ export function getAcceptanceFeedbackBody(text: string): string {
 export function isSystemUpgradeDemand(text: string): boolean {
   const demand = getDemandBody(text);
   return SYSTEM_UPGRADE_KEYWORDS.some((keyword) => demand.includes(keyword));
+}
+
+export function isProjectDirectorDemand(text: string): boolean {
+  const kind = classifyProjectDirectorDemand(text);
+  return kind === "system_upgrade_request" || kind === "website_product_request";
 }
 
 export function isWebsiteProductDemand(text: string): boolean {
@@ -207,7 +223,25 @@ export function isDispatchPlanChangeReply(text: string): boolean {
 
 export function isDispatchBatchApprovalReply(text: string): boolean {
   const normalized = normalizeDemandText(text);
-  return DISPATCH_BATCH_APPROVAL_PHRASES.some((phrase) => normalized === phrase);
+  return (
+    DISPATCH_BATCH_APPROVAL_PHRASES.some((phrase) => normalized === phrase) ||
+    isApprovedExecutionReply(normalized)
+  );
+}
+
+export function isApprovedExecutionReply(text: string): boolean {
+  const normalized = normalizeDemandText(text);
+  return APPROVED_EXECUTION_PHRASES.some((phrase) => normalized === phrase);
+}
+
+export function isPlanChangeReply(text: string): boolean {
+  const normalized = normalizeDemandText(text);
+  return (
+    normalized.startsWith(PLAN_CHANGE_PREFIX) ||
+    normalized.startsWith(PLAN_CHANGE_PREFIX_ASCII) ||
+    isDispatchPlanChangeReply(normalized) ||
+    isTaskTreeChangeReply(normalized)
+  );
 }
 
 function summarizeDemand(text: string): string {
@@ -219,6 +253,22 @@ function summarizeDemand(text: string): string {
 
 export function buildProjectDirectorReply(text: string): string {
   const summary = summarizeDemand(text);
+  if (isSystemUpgradeDemand(text)) {
+    return [
+      "【项目总管确认】",
+      `需求理解：${summary}`,
+      "",
+      "这属于系统升级需求，不是网站业务开发。我会先生成多 Agent 任务树和调度计划，并继续冻结首页、/post、/partners、登录、注册、个人主页等业务页面。",
+      "",
+      "规划阶段只会创建 1 个项目总管规划任务；只有你回复“批准执行”后，才会创建具体 Agent 执行任务。",
+      "",
+      "下一步老板只需回复：",
+      "- 批准建议",
+      "- 修改计划：{你的要求}",
+      "- 暂停",
+    ].join("\n");
+  }
+
   if (summary === "你想先做同城搭子网站首页") {
     return [
       "【项目总管确认】",
@@ -265,6 +315,7 @@ export function buildProjectDirectorReply(text: string): string {
     "* 批准建议",
     "* 选 A",
     "* 选 B",
+    "* 修改计划：{你的要求}",
     "* 或补充你的要求",
   ].join("\n");
 }

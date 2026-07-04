@@ -22,6 +22,16 @@ export interface DispatchJobInsertResult {
   skippedColumns: string[];
 }
 
+export interface ProjectDirectorPlanningJobInput {
+  originalDemand: string;
+  taskTreeId: string;
+  requestText: string;
+  feishuMessageId: string;
+  feishuEventId: string;
+  feishuChatId: string;
+  feishuUserId: string;
+}
+
 export interface AcceptanceFeedbackJobInput {
   feedbackText: string;
   rawMessageText: string;
@@ -36,7 +46,10 @@ export const PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD_MARKER =
   "PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD";
 export const PROJECT_DIRECTOR_BATCH_01 = "BATCH-01";
 export const PROJECT_DIRECTOR_BATCH_12 = "BATCH-12";
+export const PROJECT_DIRECTOR_BATCH_15 = "BATCH-15";
 export const PROJECT_DIRECTOR_ACCEPTANCE_FEEDBACK_JOB_TYPE = "acceptance_feedback";
+export const PROJECT_DIRECTOR_PLANNING_JOB_TYPE = "project_director_planning";
+export const PROJECT_DIRECTOR_AGENT_DISPATCH_JOB_TYPE = "agent_dispatch";
 
 const ALLOWED_BATCH_01_ROLES = new Set(["product_manager", "project_director"]);
 const ALLOWED_OUTPUT_PREFIXES = ["docs/product/", "docs/upgrade/"];
@@ -167,6 +180,157 @@ function buildJobRow(
   };
 }
 
+function buildProjectDirectorPlanningJobRow(input: ProjectDirectorPlanningJobInput): JobRecord {
+  return {
+    source: "project_director",
+    job_type: PROJECT_DIRECTOR_PLANNING_JOB_TYPE,
+    job_id: input.taskTreeId,
+    title: `Project director planning: ${input.originalDemand.slice(0, 80)}`,
+    description: input.requestText,
+    priority: 20,
+    acceptance: "Generate or record the project director task tree and wait for boss approval before execution.",
+    branch: null,
+    executor: "project_director",
+    repo: "city-partner-platform",
+    prompt: input.requestText,
+    request_text: input.requestText,
+    status: "queued",
+    plan_status: "planning_only",
+    workflow_stage: "planning",
+    claimed_by: null,
+    claimed_at: null,
+    started_at: null,
+    parent_task_id: null,
+    project_id: "city-partner-platform",
+    task_code: input.taskTreeId,
+    dispatch_batch: PROJECT_DIRECTOR_BATCH_15,
+    feishu_message_id: input.feishuMessageId || null,
+    feishu_event_id: input.feishuEventId || null,
+    feishu_chat_id: input.feishuChatId || null,
+    feishu_user_id: input.feishuUserId || null,
+    payload: {
+      batch_code: PROJECT_DIRECTOR_BATCH_15,
+      route: "project_director_planning",
+      original_demand: input.originalDemand,
+      task_tree_id: input.taskTreeId,
+      execution_mode: "planning_only",
+    },
+  };
+}
+
+function buildAgentDispatchRequestText(
+  projectTitle: string,
+  task: ProjectDirectorDispatchTask
+): string {
+  return [
+    "【项目总管 Agent 执行任务】",
+    `项目：${projectTitle}`,
+    `任务树批次：${task.dispatch_batch}`,
+    `任务编号：${task.task_key}`,
+    `执行角色：${task.agent_role}`,
+    `任务类型：${task.task_type}`,
+    `任务阶段：${task.stage}`,
+    `任务标题：${task.task_title}`,
+    "",
+    "输入：",
+    cleanLines(task.input),
+    "",
+    "依赖任务：",
+    cleanLines(task.dependency_keys),
+    "",
+    "允许修改文件：",
+    cleanLines(task.allowed_files),
+    "",
+    "禁止修改文件：",
+    cleanLines(task.forbidden_files),
+    "",
+    "验收条件：",
+    cleanLines(task.acceptance_criteria),
+    "",
+    "执行模式：approved_execution",
+    "执行限制：",
+    "1. 只允许修改 allowed_files 中列出的文件。",
+    "2. 不允许修改业务冻结页面，除非本任务 allowed_files 明确列出且老板已批准。",
+    "3. 不允许修改数据库结构、执行 SQL、修改 .env 或输出密钥。",
+    "4. 不允许启动 dev server 或浏览器。",
+    "5. 完成后只回报修改文件、验证结果、残余风险和是否需要老板继续验收。",
+  ].join("\n");
+}
+
+function buildAgentDispatchJobRow(
+  projectTitle: string,
+  task: ProjectDirectorDispatchTask,
+  requestText: string
+): JobRecord {
+  return {
+    source: "agent_dispatch",
+    job_type: PROJECT_DIRECTOR_AGENT_DISPATCH_JOB_TYPE,
+    job_id: task.task_key,
+    title: task.task_title,
+    description: requestText,
+    priority: task.requires_boss_approval ? 30 : 15,
+    acceptance: task.acceptance_criteria.join("\n"),
+    branch: null,
+    executor: task.agent_role,
+    repo: "city-partner-platform",
+    prompt: requestText,
+    request_text: requestText,
+    status: "queued",
+    plan_status: "approved",
+    workflow_stage: "execution",
+    claimed_by: null,
+    claimed_at: null,
+    started_at: null,
+    parent_task_id: null,
+    project_id: projectTitle,
+    task_code: task.task_key,
+    dispatch_batch: task.dispatch_batch,
+    payload: {
+      project_title: projectTitle,
+      batch_code: task.dispatch_batch,
+      role: task.agent_role,
+      task_type: task.task_type,
+      task_key: task.task_key,
+      task_title: task.task_title,
+      dependency_keys: task.dependency_keys,
+      allowed_files: task.allowed_files,
+      forbidden_files: task.forbidden_files,
+      acceptance_criteria: task.acceptance_criteria,
+      requires_boss_approval: task.requires_boss_approval,
+      execution_mode: "approved_execution",
+    },
+  };
+}
+
+async function insertRowsWithMissingColumnFallback(
+  supabase: SupabaseClient,
+  rowsInput: JobRecord[],
+  failureLabel: string
+): Promise<DispatchJobInsertResult> {
+  let rows = rowsInput;
+  const skippedColumns: string[] = [];
+
+  for (let attempt = 0; attempt < 16; attempt++) {
+    const { error } = await supabase.from("hermes_jobs").insert(rows);
+    if (!error) return { insertedCount: rows.length, skippedColumns };
+    if (!isMissingColumnError(error)) throw new Error(`${failureLabel}: ${error.message}`);
+
+    const missingColumn = extractMissingColumn(error);
+    if (!missingColumn || !rows.some((row) => missingColumn in row)) {
+      throw new Error(`${failureLabel}: ${error.message}`);
+    }
+
+    skippedColumns.push(missingColumn);
+    rows = rows.map((row) => {
+      const next = { ...row };
+      delete next[missingColumn];
+      return next;
+    });
+  }
+
+  throw new Error(`${failureLabel}: too many missing columns`);
+}
+
 function buildAcceptanceFeedbackRequestText(input: AcceptanceFeedbackJobInput): string {
   const feedback =
     input.feedbackText.trim().replace(/\s+/g, " ") ||
@@ -254,6 +418,149 @@ export function buildBatch01ProductPlanningJobs(
     tasks,
     requestTexts,
   };
+}
+
+export function buildProjectDirectorPlanningRequestText(input: {
+  originalDemand: string;
+  taskTreeId: string;
+  summary: string;
+}): string {
+  return [
+    "【项目总管规划任务】",
+    "执行角色：project_director",
+    "执行模式：planning_only",
+    `任务树编号：${input.taskTreeId}`,
+    "",
+    "老板原始需求：",
+    input.originalDemand,
+    "",
+    "规划摘要：",
+    input.summary,
+    "",
+    "执行限制：",
+    "1. 本任务只记录规划，不创建具体 Agent 执行任务。",
+    "2. 子任务必须等老板回复“批准执行”后才能入队。",
+    "3. 不允许修改业务页面、数据库结构、.env 或生产环境。",
+  ].join("\n");
+}
+
+export async function hasExistingPlanningJob(
+  supabase: SupabaseClient,
+  taskTreeId: string
+): Promise<boolean> {
+  const marker = `任务树编号：${taskTreeId}`;
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .select("id, request_text")
+    .eq("source", "project_director")
+    .in("status", ["queued", "pending", "running"])
+    .ilike("request_text", `%${marker}%`)
+    .limit(1)
+    .maybeSingle();
+
+  if (!error) return Boolean(data);
+  if (!isMissingColumnError(error)) {
+    throw new Error(`check project director planning job failed: ${error.message}`);
+  }
+
+  const fallback = await supabase
+    .from("hermes_jobs")
+    .select("id, job_id")
+    .eq("source", "project_director")
+    .in("status", ["queued", "pending", "running"])
+    .eq("job_id", taskTreeId)
+    .limit(1)
+    .maybeSingle();
+
+  if (fallback.error) {
+    if (isMissingColumnError(fallback.error)) return false;
+    throw new Error(`check project director planning job failed: ${fallback.error.message}`);
+  }
+
+  return Boolean(fallback.data);
+}
+
+export async function insertProjectDirectorPlanningJob(
+  supabase: SupabaseClient,
+  input: ProjectDirectorPlanningJobInput
+): Promise<DispatchJobInsertResult> {
+  return insertRowsWithMissingColumnFallback(
+    supabase,
+    [buildProjectDirectorPlanningJobRow(input)],
+    "insert project director planning job failed"
+  );
+}
+
+export function buildApprovedAgentDispatchJobs(
+  plan: ProjectDirectorDispatchPlanDraft
+): DispatchJobBuildResult {
+  const tasks = plan.dispatch_plan.batches
+    .flatMap((batch) => batch.tasks)
+    .filter((task) => !task.requires_boss_approval || task.execution_mode === "approved_execution");
+  const requestTexts = tasks.map((task) =>
+    buildAgentDispatchRequestText(plan.project.title, task)
+  );
+
+  return {
+    projectTitle: plan.project.title,
+    tasks,
+    requestTexts,
+  };
+}
+
+export async function hasExistingAgentDispatchJobs(
+  supabase: SupabaseClient,
+  tasks: ProjectDirectorDispatchTask[]
+): Promise<boolean> {
+  for (const task of tasks) {
+    const marker = `任务编号：${task.task_key}`;
+    const { data, error } = await supabase
+      .from("hermes_jobs")
+      .select("id, request_text")
+      .eq("source", "agent_dispatch")
+      .in("status", ["queued", "pending", "running"])
+      .ilike("request_text", `%${marker}%`)
+      .limit(1)
+      .maybeSingle();
+
+    if (!error && data) return true;
+    if (!error) continue;
+    if (!isMissingColumnError(error)) {
+      throw new Error(`check existing agent dispatch jobs failed: ${error.message}`);
+    }
+
+    const fallback = await supabase
+      .from("hermes_jobs")
+      .select("id, job_id")
+      .eq("source", "agent_dispatch")
+      .in("status", ["queued", "pending", "running"])
+      .eq("job_id", task.task_key)
+      .limit(1)
+      .maybeSingle();
+
+    if (fallback.error) {
+      if (isMissingColumnError(fallback.error)) continue;
+      throw new Error(`check existing agent dispatch jobs failed: ${fallback.error.message}`);
+    }
+    if (fallback.data) return true;
+  }
+
+  return false;
+}
+
+export async function insertApprovedAgentDispatchJobs(
+  supabase: SupabaseClient,
+  buildResult: DispatchJobBuildResult
+): Promise<DispatchJobInsertResult> {
+  const rows = buildResult.tasks.map((task, index) =>
+    buildAgentDispatchJobRow(buildResult.projectTitle, task, buildResult.requestTexts[index])
+  );
+
+  return insertRowsWithMissingColumnFallback(
+    supabase,
+    rows,
+    "insert approved agent dispatch jobs failed"
+  );
 }
 
 export async function hasBatch01DispatchRecord(

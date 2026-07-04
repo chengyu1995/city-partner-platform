@@ -28,9 +28,11 @@ import {
   getAcceptanceFeedbackBody,
   getDemandBody,
   isAcceptanceFeedbackMessage,
+  isApprovedExecutionReply,
   isBossApprovalReply,
   isDispatchBatchApprovalReply,
   isDispatchPlanChangeReply,
+  isProjectDirectorDemand,
   isTaskTreeApprovalReply,
   isTaskTreeChangeReply,
   isTaskTreeReviewReply,
@@ -48,14 +50,20 @@ import {
   buildBatch01DispatchedRecord,
   buildBatch01DispatchedReply,
   buildBatch01ProductPlanningJobs,
+  buildApprovedAgentDispatchJobs,
   buildAcceptanceFeedbackDuplicateReply,
   buildAcceptanceFeedbackQueuedRecord,
   buildAcceptanceFeedbackQueuedReply,
+  buildProjectDirectorPlanningRequestText,
+  hasExistingAgentDispatchJobs,
   hasBatch01DispatchRecord,
   hasExistingBatch01Jobs,
+  hasExistingPlanningJob,
   hasRecentAcceptanceFeedbackJob,
+  insertApprovedAgentDispatchJobs,
   insertAcceptanceFeedbackJob,
   insertBatch01ProductPlanningJobs,
+  insertProjectDirectorPlanningJob,
   PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD_NAME,
 } from "@/lib/project-director-job-builder";
 import {
@@ -206,7 +214,7 @@ async function findRecentProjectDirectorDemand(
 
     for (let userIndex = index - 1; userIndex >= 0; userIndex--) {
       const candidate = history[userIndex];
-      if (candidate.role === "user" && isWebsiteProductDemand(candidate.content)) {
+      if (candidate.role === "user" && isProjectDirectorDemand(candidate.content)) {
         return getDemandBody(candidate.content);
       }
     }
@@ -250,7 +258,7 @@ async function findPendingProjectDirectorConfirmation(
     if (message.role === "assistant" && content.includes("【项目总管确认】")) {
       for (let userIndex = index - 1; userIndex >= 0; userIndex--) {
         const candidate = history[userIndex];
-        if (candidate.role === "user" && isWebsiteProductDemand(candidate.content)) {
+        if (candidate.role === "user" && isProjectDirectorDemand(candidate.content)) {
           return getDemandBody(candidate.content);
         }
       }
@@ -309,7 +317,8 @@ async function findRecentTaskTreeDraft(
     if (
       message.role !== "system" ||
       !message.content.includes("PROJECT_DIRECTOR_TASK_TREE_DRAFT") ||
-      !message.content.includes("state: waiting_task_tree_review")
+      (!message.content.includes("state: waiting_task_tree_review") &&
+        !message.content.includes("state: waiting_execution_approval"))
     ) {
       continue;
     }
@@ -403,6 +412,54 @@ async function saveTaskTreeDraftReply(
     },
   ]);
   if (error) throw new Error(`save task tree draft failed: ${error.message}`);
+}
+
+async function savePlanningTaskTreeReply(
+  supabase: SupabaseClient,
+  convId: string,
+  originalDemand: string,
+  userText: string,
+  reply: string,
+  draftRecord: string,
+  draft: ProjectDirectorTaskTreeDraft,
+  feishuMessageId: string,
+  feishuEventId: string,
+  feishuChatId: string,
+  feishuUserId: string
+): Promise<void> {
+  const planningRequestText = buildProjectDirectorPlanningRequestText({
+    originalDemand,
+    taskTreeId: draft.task_tree_id,
+    summary: reply,
+  });
+  let planningInsertNote = "planning_job: skipped_duplicate";
+
+  const alreadyQueued = await hasExistingPlanningJob(supabase, draft.task_tree_id);
+  if (!alreadyQueued) {
+    const insertResult = await insertProjectDirectorPlanningJob(supabase, {
+      originalDemand,
+      taskTreeId: draft.task_tree_id,
+      requestText: planningRequestText,
+      feishuMessageId,
+      feishuEventId,
+      feishuChatId,
+      feishuUserId,
+    });
+    planningInsertNote = [
+      `planning_job: inserted_${insertResult.insertedCount}`,
+      `skipped_hermes_jobs_columns: ${insertResult.skippedColumns.join(", ") || "none"}`,
+    ].join("\n");
+  }
+
+  await saveSystemRecordedReply(
+    supabase,
+    convId,
+    userText,
+    reply,
+    [draftRecord, planningInsertNote].join("\n"),
+    "project_director_task_tree_draft",
+    feishuMessageId
+  );
 }
 
 async function saveSystemRecordedReply(
@@ -669,9 +726,24 @@ export async function POST(req: NextRequest) {
       }
 
       const demandKind = classifyProjectDirectorDemand(text);
-      if (demandKind === "website_product_request") {
-        const reply = buildProjectDirectorReply(text);
-        await saveDirectReply(supabase, convId, text, reply, ev.message.message_id);
+      if (demandKind === "website_product_request" || demandKind === "system_upgrade_request") {
+        const originalDemand = getDemandBody(text);
+        const draft = buildProjectDirectorTaskTreeDraft(originalDemand, "规划阶段", "planning_only");
+        const reply = buildTaskTreeDraftSummary(draft);
+        const draftRecord = buildTaskTreeDraftRecord(originalDemand, "规划阶段", draft, reply);
+        await savePlanningTaskTreeReply(
+          supabase,
+          convId,
+          originalDemand,
+          text,
+          reply,
+          draftRecord,
+          draft,
+          ev.message.message_id,
+          eventId,
+          ev.message.chat_id,
+          userId
+        );
         const token = await getFeishuToken();
         await sendFeishuMessage(
           token,
@@ -683,8 +755,9 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({
           code: 0,
           project_director_intake: true,
-          demand_type: "website_product_request",
-          state: "waiting_boss_reply",
+          demand_type: demandKind,
+          state: "waiting_execution_approval",
+          execution_mode: "planning_only",
         });
       }
 
@@ -756,6 +829,125 @@ export async function POST(req: NextRequest) {
         code: 0,
         project_director_intake: true,
         state: "dispatch_plan_change_requested",
+      });
+    }
+
+    if (isApprovedExecutionReply(text)) {
+      const token = await getFeishuToken();
+      const recentDraft = await findRecentTaskTreeDraft(supabase, convId);
+      if (!recentDraft) {
+        const reply = "未找到可执行的任务树计划，请先发送新需求并完成项目总管规划。";
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          [
+            "PROJECT_DIRECTOR_APPROVED_EXECUTION_BLOCKED",
+            "state: waiting_task_tree_missing",
+            "reason: no recent project director task tree draft was found.",
+          ].join("\n"),
+          "project_director_approved_execution_blocked",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "waiting_task_tree_missing",
+        });
+      }
+
+      const approvedTree = buildProjectDirectorTaskTreeDraft(
+        recentDraft.originalDemand,
+        text,
+        "approved_execution"
+      );
+      const dispatchPlan = buildProjectDirectorDispatchPlanDraft(approvedTree, "approved_execution");
+      const buildResult = buildApprovedAgentDispatchJobs(dispatchPlan);
+      const alreadyDispatched = await hasExistingAgentDispatchJobs(supabase, buildResult.tasks);
+      if (alreadyDispatched) {
+        const reply = "该任务树的 Agent 执行任务已经分发过，本次不会重复创建。";
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          [
+            "PROJECT_DIRECTOR_APPROVED_EXECUTION_DUPLICATE",
+            "state: duplicate_dispatch_skipped",
+            `task_tree_id: ${approvedTree.task_tree_id}`,
+          ].join("\n"),
+          "project_director_approved_execution_duplicate",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "approved_execution_duplicate_skipped",
+        });
+      }
+
+      const insertResult = await insertApprovedAgentDispatchJobs(supabase, buildResult);
+      const reply = [
+        "【项目总管：已批准执行】",
+        `已创建 ${insertResult.insertedCount} 个 Agent 执行任务。`,
+        "",
+        "执行顺序：",
+        ...dispatchPlan.dispatch_plan.batches
+          .filter((batch) => batch.tasks.length > 0)
+          .map((batch, index) => `${index + 1}. ${batch.title}：${batch.tasks.length} 个任务`),
+        "",
+        "说明：具体任务已写入 Worker 兼容队列，子任务内容存放在 hermes_jobs.request_text。",
+        "完成后项目总管会汇总修改文件、验证结果和是否仍需老板验收。",
+      ].join("\n");
+      const summary = buildDispatchPlanSummary(dispatchPlan);
+      const record = buildDispatchPlanDraftRecord(
+        recentDraft.originalDemand,
+        text,
+        approvedTree,
+        dispatchPlan,
+        summary
+      );
+      await saveSystemRecordedReply(
+        supabase,
+        convId,
+        text,
+        reply,
+        [
+          record,
+          "PROJECT_DIRECTOR_APPROVED_EXECUTION_DISPATCHED",
+          `inserted_jobs: ${insertResult.insertedCount}`,
+          `skipped_hermes_jobs_columns: ${insertResult.skippedColumns.join(", ") || "none"}`,
+        ].join("\n"),
+        "project_director_approved_execution",
+        ev.message.message_id
+      );
+      await sendFeishuMessage(
+        token,
+        ev.message.chat_id,
+        ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+        reply
+      );
+      await markReceiptCompleted(supabase, eventId);
+      return NextResponse.json({
+        code: 0,
+        project_director_intake: true,
+        state: "approved_execution_dispatched",
+        inserted_jobs: insertResult.insertedCount,
       });
     }
 
