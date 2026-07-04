@@ -6,6 +6,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $WorkerDir = Split-Path -Parent $PSCommandPath
 $WorkerFile = Join-Path $WorkerDir "local_worker.js"
+$HealthcheckFile = Join-Path $WorkerDir "worker-healthcheck.ps1"
 $LogDir = Join-Path $WorkerDir "logs"
 $StartupLog = Join-Path $LogDir "scheduled-worker.log"
 
@@ -14,6 +15,12 @@ New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 if (-not (Test-Path $WorkerFile)) {
   Add-Content $StartupLog "$(Get-Date -Format s) 找不到 local_worker.js：$WorkerFile"
   throw "找不到 local_worker.js：$WorkerFile"
+}
+
+if (Test-Path $HealthcheckFile) {
+  Add-Content $StartupLog "$(Get-Date -Format s) 正在执行 Worker 启动前自检"
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $HealthcheckFile -StopExistingWorker
+  Add-Content $StartupLog "$(Get-Date -Format s) Worker 启动前自检完成"
 }
 
 $existing = Get-CimInstance Win32_Process |

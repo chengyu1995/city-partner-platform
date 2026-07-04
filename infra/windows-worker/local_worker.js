@@ -11,6 +11,11 @@ const {
   validateCommittablePaths,
   validateStagedPaths,
 } = require("./git-safety");
+const {
+  classifyLocalError,
+  recoverLocalPreview,
+  runPreflight,
+} = require("./worker-recovery");
 
 const WORKER_API_URL = String(process.env.WORKER_API_URL || "").replace(/\/+$/, "");
 const WORKER_AUTH_ENV_KEY = "WORKER_" + "TOKEN";
@@ -22,6 +27,8 @@ const CODEX_TIMEOUT_MS = Number(process.env.CODEX_TIMEOUT_MS || 900000);
 const CODEX_IDLE_TIMEOUT_MS = Number(process.env.CODEX_IDLE_TIMEOUT_MS || 60000);
 const CODEX_PROGRESS_HEARTBEAT_INTERVAL_MS = 30 * 1000;
 const CODEX_EXE = process.env.CODEX_EXE || "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe";
+const WORKER_PREVIEW_SMOKE =
+  String(process.env.WORKER_PREVIEW_SMOKE || "true").toLowerCase() === "true";
 
 function repairKnownDroppedFirstCharPath(filePath) {
   const value = String(filePath || "").trim();
@@ -246,7 +253,7 @@ async function stageTaskPaths(paths) {
   return stagedPaths;
 }
 
-async function prepareGitTask(job) {
+async function prepareGitTask() {
   if (!GIT_AUTO_COMMIT) {
     return {
       enabled: false,
@@ -328,6 +335,101 @@ function buildWorkerGuardedPrompt(requestText) {
 
 function buildCodexPrompt(job) {
   return buildWorkerGuardedPrompt(job?.request_text || "");
+}
+
+function buildCodexRepairPrompt(job, error, attempt) {
+  const errorText = error instanceof Error ? error.message : String(error);
+  const category = classifyLocalError(errorText);
+  const taskText = String(job?.request_text || "").trim();
+  const mode =
+    attempt === 2
+      ? "第 1 次失败：请先诊断错误类型，优先安全修复缓存、路由、语法、端口或依赖引用问题，然后再次验证。"
+      : "第 2 次失败：请执行最小化修复，只改最小必要文件，不扩大范围。";
+
+  return buildWorkerGuardedPrompt(
+    [
+      "【项目总管自动重试】",
+      mode,
+      `自动分类：${category}`,
+      "错误摘要（已截断，不包含密钥）：",
+      errorText.slice(-4000),
+      "",
+      "【原始任务】",
+      taskText,
+    ].join("\n")
+  );
+}
+
+function formatPreflightResult(result) {
+  return [
+    `停止残留进程：${result.stoppedProcesses.length}`,
+    `清理缓存：${result.removedCaches.join(", ") || "无"}`,
+    `还原生成文件：${result.restoredEnvFiles.join(", ") || "无"}`,
+    `清理已知生成文件：${result.cleanedGeneratedPaths.join(", ") || "无"}`,
+    `Git 状态：${result.gitStatusShort.length ? result.gitStatusShort.join("; ") : "clean"}`,
+  ].join("\n");
+}
+
+function formatPreviewReport(reportResult) {
+  if (!reportResult) {
+    return "本地预览恢复：未执行";
+  }
+
+  const smokeLines = reportResult.smoke.map((item) => {
+    const status = item.status === null ? "ERR" : item.status;
+    return `- ${item.path}: ${status} ${item.ok ? "OK" : "FAIL"}`;
+  });
+
+  return [
+    `本地预览恢复：${reportResult.ok ? "通过" : "未通过"}`,
+    `预览地址：${reportResult.baseUrl}`,
+    `缓存清理：${reportResult.removedCaches.join(", ") || "无"}`,
+    "Smoke test：",
+    ...(smokeLines.length ? smokeLines : ["- 未执行"]),
+  ].join("\n");
+}
+
+async function runCodexWithRetries(job) {
+  const prompts = [
+    () => buildCodexPrompt(job),
+    (error) => buildCodexRepairPrompt(job, error, 2),
+    (error) => buildCodexRepairPrompt(job, error, 3),
+  ];
+  const failures = [];
+
+  for (let index = 0; index < prompts.length; index += 1) {
+    try {
+      if (index > 0) {
+        await updateProgress(
+          job.id,
+          index === 1 ? 45 : 55,
+          index === 1 ? "Codex 自动重试" : "Codex 最小化修复",
+          index === 1
+            ? "第 1 次执行失败，正在携带错误摘要重试"
+            : "第 2 次执行失败，正在执行最小化修复"
+        );
+      }
+
+      return await runCodex(prompts[index](failures[failures.length - 1]), job);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+
+  const summary = failures
+    .map((error, index) => {
+      const message = error instanceof Error ? error.message : String(error);
+      return `第 ${index + 1} 次失败：${classifyLocalError(message)} - ${message.slice(-1200)}`;
+    })
+    .join("\n\n");
+
+  throw new Error(
+    [
+      "项目总管连续自动修复失败，已停止继续尝试。",
+      "需要老板二选一决策：A. 允许扩大修改范围继续修；B. 保持当前状态，人工指定优先修哪个问题。",
+      summary,
+    ].join("\n\n")
+  );
 }
 
 async function commitGitTask(job) {
@@ -815,16 +917,32 @@ async function pollOnce() {
   try {
     await updateProgress(
       job.id,
+      10,
+      "Worker 启动前自检",
+      "正在停止残留进程、清理缓存并检查 Git 状态"
+    );
+
+    const preflightResult = await runPreflight(PROJECT_DIR);
+
+    await updateProgress(
+      job.id,
       15,
+      "Worker 自检完成",
+      formatPreflightResult(preflightResult)
+    );
+
+    await updateProgress(
+      job.id,
+      20,
       "同步 Git",
       "正在同步 Git 仓库"
     );
 
-    gitCheckpoint = await prepareGitTask(job);
+    gitCheckpoint = await prepareGitTask();
 
     await updateProgress(
       job.id,
-      25,
+      30,
       "Git 同步完成",
       "本地分支已与远程分支同步"
     );
@@ -836,7 +954,7 @@ async function pollOnce() {
       "正在启动 Codex"
     );
 
-    const result = await runCodex(buildCodexPrompt(job), job);
+    const result = await runCodexWithRetries(job);
 
     await updateProgress(
       job.id,
@@ -844,6 +962,19 @@ async function pollOnce() {
       "Codex 执行完成",
       "Codex 已完成代码修改"
     );
+
+    let previewReport = null;
+
+    if (WORKER_PREVIEW_SMOKE) {
+      await updateProgress(
+        job.id,
+        70,
+        "恢复本地预览",
+        "正在使用 next dev --webpack 执行 /、/post、/partners smoke test"
+      );
+
+      previewReport = await recoverLocalPreview(PROJECT_DIR);
+    }
 
     await updateProgress(
       job.id,
@@ -892,6 +1023,8 @@ async function pollOnce() {
 
     const finalResult = [
       result,
+      "",
+      formatPreviewReport(previewReport),
       "",
       "Git 自动备份：",
       gitResult.committed
