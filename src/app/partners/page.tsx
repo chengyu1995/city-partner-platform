@@ -1,346 +1,303 @@
-import Link from "next/link";
+﻿import Link from "next/link";
 
-const CATEGORIES = ["旅游搭子", "K 歌搭子", "学习搭子", "摩友搭子", "钓友搭子"] as const;
-const CITIES = ["广州", "深圳", "杭州", "上海", "北京", "成都"] as const;
+type SearchParams = Record<string, string | string[] | undefined>;
 
-type PartnerCategory = (typeof CATEGORIES)[number];
+const categories = [
+  "饭搭子",
+  "运动搭子",
+  "学习搭子",
+  "出游搭子",
+  "K歌搭子",
+  "旅游搭子",
+  "摩友搭子",
+  "钓友搭子",
+];
 
-type PartnerPost = {
-  id: string;
-  title: string;
-  city: string;
-  category: PartnerCategory;
-  activeText: string;
-  description: string;
-  hostName: string;
-  slots: string;
-};
+const cities = ["广州", "深圳", "上海", "北京", "杭州"];
 
-type PartnersPageProps = {
-  searchParams: Promise<{
-    city?: string | string[];
-    category?: string | string[];
-  }>;
-};
-
-const MOCK_PARTNERS: PartnerPost[] = [
+const partnerPosts = [
   {
-    id: "guangzhou-weekend-travel",
-    title: "周末广州老城区 Citywalk，找 2 位拍照搭子",
+    title: "周末一起探店吃饭",
+    category: "饭搭子",
     city: "广州",
-    category: "旅游搭子",
-    activeText: "本周六 14:00",
-    description: "路线从东山口到永庆坊，节奏轻松，想边走边拍照，晚饭可一起 AA。",
-    hostName: "阿宁",
-    slots: "还差 2 人",
+    time: "本周六 18:30",
+    people: "还差 1 人",
+    desc: "找 1-2 位附近朋友，周末一起吃饭聊天，轻松认识新朋友。",
   },
   {
-    id: "guangzhou-karaoke-night",
-    title: "天河周五 K 歌局，粤语歌和流行歌都可",
-    city: "广州",
-    category: "K 歌搭子",
-    activeText: "周五 20:00",
-    description: "已有 3 人，想再找 2-3 位一起唱，接受新手，费用 AA。",
-    hostName: "小宇",
-    slots: "还差 3 人",
-  },
-  {
-    id: "shenzhen-study-sunday",
-    title: "南山咖啡店自习 3 小时，互相监督不摸鱼",
+    title: "下班后一起运动",
+    category: "运动搭子",
     city: "深圳",
+    time: "工作日 20:00",
+    people: "还差 2 人",
+    desc: "慢跑、羽毛球都可以，不卷强度，主要是互相督促。",
+  },
+  {
+    title: "晚上自习搭子",
     category: "学习搭子",
-    activeText: "周日 10:00",
-    description: "适合备考、读书、写代码，安静为主，中途可以一起吃午饭。",
-    hostName: "Mia",
-    slots: "还差 1 人",
-  },
-  {
-    id: "hangzhou-motorcycle-route",
-    title: "杭州周边短途骑行，新手友好不压弯",
-    city: "杭州",
-    category: "摩友搭子",
-    activeText: "48 小时内活跃",
-    description: "计划走临安方向，白天出发傍晚返回，安全骑行，拒绝危险驾驶。",
-    hostName: "川野",
-    slots: "还差 2 人",
-  },
-  {
-    id: "shanghai-fishing-morning",
-    title: "浦东清晨路亚，找同频钓友交流装备",
     city: "上海",
-    category: "钓友搭子",
-    activeText: "明早 06:30",
-    description: "自带装备，地点公开水域，主要交流经验，不做商业组织。",
-    hostName: "老周",
-    slots: "还差 1 人",
+    time: "今晚 19:30",
+    people: "还差 1 人",
+    desc: "适合备考、写作业、学编程，互相监督不摸鱼。",
   },
   {
-    id: "beijing-travel-museum",
-    title: "北京看展搭子，先逛美术馆再喝咖啡",
-    city: "北京",
-    category: "旅游搭子",
-    activeText: "本周日 15:00",
-    description: "想找对展览感兴趣的朋友一起看展，行程半天，不赶时间。",
-    hostName: "青柠",
-    slots: "还差 2 人",
+    title: "周末城市轻旅行",
+    category: "出游搭子",
+    city: "杭州",
+    time: "本周日 10:00",
+    people: "还差 3 人",
+    desc: "附近短途出游，拍照、逛街、吃饭都可以。",
+  },
+  {
+    title: "K歌搭子约一场",
+    category: "K歌搭子",
+    city: "广州",
+    time: "周五 21:00",
+    people: "还差 2 人",
+    desc: "喜欢流行歌、粤语歌都可以，轻松唱歌不尴尬。",
+  },
+  {
+    title: "周末钓鱼搭子",
+    category: "钓友搭子",
+    city: "深圳",
+    time: "周六 08:00",
+    people: "还差 1 人",
+    desc: "新手友好，注意安全，线下见面先确认地点。",
   },
 ];
 
-function firstValue(value: string | string[] | undefined) {
+function getParam(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function normalizeCategory(value: string | undefined): PartnerCategory | undefined {
-  if (!value) return undefined;
+function partnersHref(params: { category?: string; city?: string }) {
+  const query = new URLSearchParams();
 
-  const trimmed = value.trim();
-  const directMatch = CATEGORIES.find((category) => category === trimmed);
-  if (directMatch) return directMatch;
+  if (params.category) {
+    query.set("category", params.category);
+  }
 
-  return CATEGORIES.find((category) => category.replace("搭子", "").replace(" ", "") === trimmed.replace(" ", ""));
+  if (params.city) {
+    query.set("city", params.city);
+  }
+
+  const text = query.toString();
+  return text ? `/partners?${text}` : "/partners";
 }
 
-function partnersHref(next: { city?: string; category?: string }) {
-  const params = new URLSearchParams();
-  if (next.city) params.set("city", next.city);
-  if (next.category) params.set("category", next.category);
-  const query = params.toString();
-  return query ? `/partners?${query}` : "/partners";
-}
+export default async function PartnersPage({
+  searchParams,
+}: {
+  searchParams?: SearchParams | Promise<SearchParams>;
+}) {
+  const params = searchParams ? await searchParams : {};
+  const selectedCategory = getParam(params.category) ?? "";
+  const selectedCity = getParam(params.city) ?? "";
 
-function categoryHref(category: PartnerCategory) {
-  return partnersHref({ category });
-}
+  const filteredPartners = partnerPosts.filter((item) => {
+    const categoryMatched = selectedCategory
+      ? item.category === selectedCategory
+      : true;
 
-function cityHref(city: string) {
-  return partnersHref({ city });
-}
+    const cityMatched = selectedCity ? item.city === selectedCity : true;
 
-export default async function PartnersPage({ searchParams }: PartnersPageProps) {
-  const params = await searchParams;
-  const selectedCity = firstValue(params.city)?.trim();
-  const selectedCategory = normalizeCategory(firstValue(params.category));
-
-  const filteredPartners = MOCK_PARTNERS.filter((partner) => {
-    const cityMatched = selectedCity ? partner.city === selectedCity : true;
-    const categoryMatched = selectedCategory ? partner.category === selectedCategory : true;
-    return cityMatched && categoryMatched;
+    return categoryMatched && cityMatched;
   });
 
   return (
-    <main className="min-h-screen bg-[#f8faf7] text-slate-900">
-      <section className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
-        <div className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200/80 sm:p-8">
-          <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
-            <div>
-              <Link href="/" className="text-sm font-bold text-emerald-700 hover:text-emerald-800">
-                同城搭子
-              </Link>
-              <h1 className="mt-3 text-3xl font-black leading-tight tracking-normal text-slate-950 sm:text-4xl">
-                找同城搭子
-              </h1>
-              <p className="mt-3 max-w-2xl text-base leading-7 text-slate-600">
-                按城市和兴趣快速筛选旅游、K 歌、学习、骑行、钓鱼搭子，先从轻量浏览开始。
-              </p>
-            </div>
+    <main className="min-h-screen bg-[#f8faf7] px-4 py-6 text-slate-950 sm:px-6 lg:px-8">
+      <section className="mx-auto max-w-6xl">
+        <header className="mb-8 flex items-center justify-between gap-4 border-b border-slate-200 pb-5">
+          <Link href="/" className="text-xl font-black tracking-tight">
+            同城搭子
+          </Link>
 
-            <div className="flex flex-wrap gap-2">
-              {selectedCity && (
-                <span className="inline-flex min-h-10 items-center rounded-full bg-emerald-50 px-4 text-sm font-bold text-emerald-700 ring-1 ring-emerald-100">
-                  城市：{selectedCity}
-                </span>
-              )}
-              {selectedCategory && (
-                <span className="inline-flex min-h-10 items-center rounded-full bg-sky-50 px-4 text-sm font-bold text-sky-700 ring-1 ring-sky-100">
-                  分类：{selectedCategory}
-                </span>
-              )}
-              {(selectedCity || selectedCategory) && (
-                <Link
-                  href="/partners"
-                  className="inline-flex min-h-10 items-center rounded-full bg-slate-100 px-4 text-sm font-bold text-slate-700 transition hover:bg-slate-200"
-                >
-                  清除筛选
-                </Link>
-              )}
-            </div>
-          </div>
-        </div>
-      </section>
+          <nav className="flex items-center gap-3 text-sm font-bold text-slate-600">
+            <Link href="/" className="hover:text-slate-950">
+              首页
+            </Link>
+            <Link href="/partners" className="text-slate-950">
+              找搭子
+            </Link>
+            <Link
+              href="/post"
+              className="rounded-full bg-slate-950 px-4 py-2 text-white hover:bg-slate-800"
+            >
+              发布需求
+            </Link>
+          </nav>
+        </header>
 
-      <section className="mx-auto max-w-6xl px-4 pb-4 sm:px-6 lg:px-8">
-        <div className="grid gap-4 lg:grid-cols-[0.95fr_1.05fr]">
-          <form action="/partners" method="get" className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200/80">
-            <p className="text-sm font-bold text-emerald-700">搜索 / 筛选</p>
-            <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_1fr_auto]">
-              <label className="block">
-                <span className="text-sm font-semibold text-slate-700">城市</span>
-                <input
-                  name="city"
-                  defaultValue={selectedCity ?? ""}
-                  placeholder="例如：广州"
-                  className="mt-2 min-h-12 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 text-base outline-none transition focus:border-emerald-300 focus:bg-white focus:ring-4 focus:ring-emerald-100"
-                />
-              </label>
-              <label className="block">
-                <span className="text-sm font-semibold text-slate-700">分类</span>
-                <select
-                  name="category"
-                  defaultValue={selectedCategory ?? ""}
-                  className="mt-2 min-h-12 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 text-base outline-none transition focus:border-emerald-300 focus:bg-white focus:ring-4 focus:ring-emerald-100"
-                >
-                  <option value="">全部分类</option>
-                  {CATEGORIES.map((category) => (
-                    <option key={category} value={category}>
-                      {category}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button
-                type="submit"
-                className="min-h-12 self-end rounded-2xl bg-slate-950 px-6 text-base font-bold text-white transition hover:bg-slate-800"
-              >
-                筛选
-              </button>
-            </div>
-          </form>
+        <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr] lg:items-end">
+          <div className="rounded-3xl bg-white p-6 shadow-sm ring-1 ring-slate-200 sm:p-8">
+            <p className="mb-3 text-sm font-black uppercase tracking-[0.25em] text-emerald-600">
+              Partner List
+            </p>
 
-          <div className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200/80">
-            <p className="text-sm font-bold text-emerald-700">城市筛选入口</p>
-            <div className="mt-4 flex gap-2 overflow-x-auto pb-1">
+            <h1 className="text-4xl font-black leading-tight tracking-tight sm:text-6xl">
+              找附近正在发起的邀约
+            </h1>
+
+            <p className="mt-4 max-w-2xl text-base leading-7 text-slate-600">
+              按城市和兴趣筛选同城搭子。先线上确认需求，线下见面注意安全。
+            </p>
+
+            <div className="mt-6 flex flex-wrap gap-3">
               <Link
                 href="/partners"
-                className={`inline-flex min-h-11 shrink-0 items-center rounded-full px-4 text-sm font-bold transition ${
-                  selectedCity ? "bg-slate-100 text-slate-700 hover:bg-slate-200" : "bg-slate-950 text-white"
-                }`}
+                className="rounded-full bg-slate-950 px-5 py-3 text-sm font-bold text-white"
               >
-                全部城市
+                全部邀约
               </Link>
-              {CITIES.map((city) => (
+
+              <Link
+                href="/post"
+                className="rounded-full bg-white px-5 py-3 text-sm font-bold text-slate-800 shadow-sm ring-1 ring-slate-200"
+              >
+                发布我的需求
+              </Link>
+            </div>
+          </div>
+
+          <aside className="rounded-3xl bg-emerald-50 p-6 ring-1 ring-emerald-100">
+            <p className="text-sm font-bold text-emerald-700">当前筛选</p>
+            <p className="mt-3 text-2xl font-black">
+              {selectedCity || "全部城市"} / {selectedCategory || "全部分类"}
+            </p>
+            <p className="mt-3 text-sm leading-6 text-emerald-900">
+              共找到 {filteredPartners.length} 个匹配邀约。
+            </p>
+          </aside>
+        </div>
+
+        <section className="mt-8 rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <h2 className="text-lg font-black">按分类找搭子</h2>
+            <Link href="/partners" className="text-sm font-bold text-slate-500">
+              清除筛选
+            </Link>
+          </div>
+
+          <div className="flex gap-3 overflow-x-auto pb-2">
+            {categories.map((category) => {
+              const active = selectedCategory === category;
+
+              return (
+                <Link
+                  key={category}
+                  href={partnersHref({ category, city: selectedCity })}
+                  className={`min-h-11 shrink-0 rounded-full px-4 py-3 text-sm font-bold transition ${
+                    active
+                      ? "bg-slate-950 text-white shadow-md"
+                      : "bg-slate-50 text-slate-700 ring-1 ring-slate-200 hover:bg-white"
+                  }`}
+                >
+                  {category}
+                </Link>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="mt-6 rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+          <h2 className="mb-4 text-lg font-black">按城市筛选</h2>
+
+          <div className="flex gap-3 overflow-x-auto pb-2">
+            {cities.map((city) => {
+              const active = selectedCity === city;
+
+              return (
                 <Link
                   key={city}
-                  href={cityHref(city)}
-                  className={`inline-flex min-h-11 shrink-0 items-center rounded-full px-4 text-sm font-bold transition ${
-                    selectedCity === city
-                      ? "bg-emerald-500 text-white"
-                      : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                  href={partnersHref({ city, category: selectedCategory })}
+                  className={`min-h-11 shrink-0 rounded-full px-4 py-3 text-sm font-bold transition ${
+                    active
+                      ? "bg-emerald-500 text-white shadow-md"
+                      : "bg-slate-50 text-slate-700 ring-1 ring-slate-200 hover:bg-white"
                   }`}
                 >
                   {city}
                 </Link>
-              ))}
-            </div>
+              );
+            })}
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section className="mx-auto max-w-6xl px-4 py-4 sm:px-6 lg:px-8">
-        <div className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200/80">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-sm font-bold text-emerald-700">分类筛选入口</p>
-              <h2 className="mt-1 text-2xl font-black text-slate-950">按兴趣找搭子</h2>
-            </div>
-            <span className="hidden rounded-full bg-slate-100 px-4 py-2 text-sm font-bold text-slate-600 sm:inline-flex">
-              {filteredPartners.length} 条结果
-            </span>
-          </div>
-          <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-            <Link
-              href="/partners"
-              className={`min-h-14 rounded-2xl px-4 py-3 text-center text-sm font-black transition ${
-                selectedCategory
-                  ? "bg-slate-50 text-slate-700 ring-1 ring-slate-100 hover:bg-white hover:shadow-sm"
-                  : "bg-slate-950 text-white shadow-md"
-              }`}
-            >
-              全部分类
-            </Link>
-            {CATEGORIES.map((category) => (
-              <Link
-                key={category}
-                href={categoryHref(category)}
-                className={`min-h-14 rounded-2xl px-4 py-3 text-center text-sm font-black transition ${
-                  selectedCategory === category
-                    ? "bg-slate-950 text-white shadow-md"
-                    : "bg-slate-50 text-slate-700 ring-1 ring-slate-100 hover:bg-white hover:shadow-sm"
-                }`}
-              >
-                {category}
-              </Link>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      <section className="mx-auto max-w-6xl px-4 py-4 sm:px-6 lg:px-8">
-        <div className="mb-4 flex items-end justify-between gap-4">
-          <div>
-            <p className="text-sm font-bold text-emerald-700">搭子卡片列表</p>
-            <h2 className="mt-1 text-2xl font-black text-slate-950">正在找人的搭子需求</h2>
-          </div>
-          <span className="rounded-full bg-white px-4 py-2 text-sm font-bold text-slate-600 shadow-sm ring-1 ring-slate-200/80">
-            {filteredPartners.length} 条
-          </span>
-        </div>
-
-        {filteredPartners.length > 0 ? (
-          <div className="grid gap-4 md:grid-cols-2">
-            {filteredPartners.map((partner) => (
+        <section className="mt-8 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {filteredPartners.length > 0 ? (
+            filteredPartners.map((partner) => (
               <article
-                key={partner.id}
-                className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200/80 transition hover:-translate-y-0.5 hover:shadow-md"
+                key={`${partner.title}-${partner.city}`}
+                className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-200 transition hover:-translate-y-0.5 hover:shadow-md"
               >
-                <div className="flex flex-wrap items-center gap-2 text-sm font-bold">
-                  <span className="rounded-full bg-emerald-50 px-3 py-1 text-emerald-700">{partner.city}</span>
-                  <span className="rounded-full bg-sky-50 px-3 py-1 text-sky-700">{partner.category}</span>
-                  <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600">{partner.activeText}</span>
+                <div className="mb-4 flex flex-wrap gap-2 text-xs font-black">
+                  <span className="rounded-full bg-emerald-50 px-3 py-1 text-emerald-700">
+                    {partner.category}
+                  </span>
+                  <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600">
+                    {partner.city}
+                  </span>
+                  <span className="rounded-full bg-orange-50 px-3 py-1 text-orange-700">
+                    {partner.people}
+                  </span>
                 </div>
-                <h3 className="mt-4 text-xl font-black leading-7 text-slate-950">{partner.title}</h3>
-                <p className="mt-3 text-sm leading-6 text-slate-600">{partner.description}</p>
-                <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4">
-                  <div>
-                    <p className="text-sm font-bold text-slate-900">发起人：{partner.hostName}</p>
-                    <p className="mt-1 text-sm text-slate-500">{partner.slots}</p>
-                  </div>
+
+                <h3 className="text-2xl font-black tracking-tight">
+                  {partner.title}
+                </h3>
+
+                <p className="mt-2 text-sm font-bold text-slate-500">
+                  {partner.time}
+                </p>
+
+                <p className="mt-4 text-sm leading-6 text-slate-600">
+                  {partner.desc}
+                </p>
+
+                <div className="mt-5 flex gap-3">
                   <Link
-                    href={partnersHref({ city: partner.city, category: partner.category })}
-                    className="inline-flex min-h-11 items-center justify-center rounded-2xl bg-emerald-500 px-5 text-sm font-bold text-white transition hover:bg-emerald-600"
+                    href={partnersHref({
+                      category: partner.category,
+                      city: partner.city,
+                    })}
+                    className="inline-flex min-h-11 items-center justify-center rounded-2xl bg-emerald-500 px-4 text-sm font-bold text-white hover:bg-emerald-600"
                   >
-                    想一起
+                    查看同类
+                  </Link>
+
+                  <Link
+                    href="/post"
+                    className="inline-flex min-h-11 items-center justify-center rounded-2xl bg-slate-950 px-4 text-sm font-bold text-white hover:bg-slate-800"
+                  >
+                    我也发布
                   </Link>
                 </div>
               </article>
-            ))}
-          </div>
-        ) : (
-          <div className="rounded-3xl bg-white p-8 text-center shadow-sm ring-1 ring-slate-200/80">
-            <p className="text-2xl font-black text-slate-950">暂时没有符合条件的搭子</p>
-            <p className="mx-auto mt-3 max-w-xl text-sm leading-6 text-slate-500">
-              可以换一个城市或分类看看。后续接入发布页和真实数据后，这里会展示更多同城需求。
-            </p>
-            <Link
-              href="/partners"
-              className="mt-5 inline-flex min-h-11 items-center rounded-2xl bg-slate-950 px-5 text-sm font-bold text-white transition hover:bg-slate-800"
-            >
-              查看全部搭子
-            </Link>
-          </div>
-        )}
-      </section>
+            ))
+          ) : (
+            <div className="rounded-3xl bg-white p-8 shadow-sm ring-1 ring-slate-200 md:col-span-2 lg:col-span-3">
+              <h3 className="text-2xl font-black">暂时没有匹配的搭子</h3>
+              <p className="mt-3 text-sm leading-6 text-slate-600">
+                可以换个城市或分类，也可以先发布自己的搭子需求。
+              </p>
+              <Link
+                href="/post"
+                className="mt-5 inline-flex min-h-11 items-center rounded-2xl bg-slate-950 px-5 text-sm font-bold text-white"
+              >
+                发布需求
+              </Link>
+            </div>
+          )}
+        </section>
 
-      <section className="mx-auto max-w-6xl px-4 pb-12 pt-4 sm:px-6 lg:px-8">
-        <div className="rounded-3xl bg-slate-950 p-5 text-white shadow-sm sm:p-6">
-          <p className="text-sm font-bold text-emerald-300">安全提示</p>
-          <div className="mt-4 grid gap-3 sm:grid-cols-3">
-            {["线下见面注意安全", "不提前转账", "首次见面建议选择公共场所"].map((tip) => (
-              <div key={tip} className="rounded-2xl bg-white/10 p-4 text-sm font-bold leading-6 ring-1 ring-white/10">
-                {tip}
-              </div>
-            ))}
-          </div>
-        </div>
+        <section className="mt-8 rounded-3xl bg-slate-950 p-6 text-white">
+          <h2 className="text-xl font-black">安全提示</h2>
+          <ul className="mt-4 grid gap-3 text-sm leading-6 text-slate-200 md:grid-cols-3">
+            <li>线下见面建议选择公共场所。</li>
+            <li>不要提前转账，不要轻信陌生人借钱。</li>
+            <li>首次见面把行程告诉朋友或家人。</li>
+          </ul>
+        </section>
       </section>
     </main>
   );
