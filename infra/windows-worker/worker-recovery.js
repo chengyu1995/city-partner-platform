@@ -1,8 +1,7 @@
 const fs = require("fs");
 const path = require("path");
-const { execFile, spawn } = require("child_process");
+const { execFile } = require("child_process");
 
-const DEFAULT_SMOKE_PATHS = ["/", "/post", "/partners"];
 const NEXT_ENV_CONTENT = [
   '/// <reference types="next" />',
   '/// <reference types="next/image-types/global" />',
@@ -25,6 +24,39 @@ const GENERATED_FILE_PATHS = new Set([
   "ext-env.d.ts",
   "tsconfig.tsbuildinfo",
 ]);
+
+const STATIC_PREVIEW_ROUTE_FILES = [
+  "src/app/page.tsx",
+  "src/app/post/page.tsx",
+  "src/app/partners/page.tsx",
+];
+
+function sanitizeWindowsEnv(env = process.env) {
+  const sanitized = {};
+  let pathKey = null;
+  let pathValue = null;
+
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toLowerCase() === "path") {
+      if (pathKey === null || key === "Path") {
+        pathKey = key;
+      }
+
+      if (value) {
+        pathValue = value;
+      }
+      continue;
+    }
+
+    sanitized[key] = value;
+  }
+
+  if (pathValue !== null) {
+    sanitized[pathKey || "Path"] = pathValue;
+  }
+
+  return sanitized;
+}
 
 function resolveProjectDir(projectDir) {
   const resolved = path.resolve(projectDir || process.env.PROJECT_DIR || process.cwd());
@@ -60,13 +92,13 @@ function runCommand(command, args, options = {}) {
         cwd: options.cwd || process.cwd(),
         windowsHide: true,
         maxBuffer: options.maxBuffer || 20 * 1024 * 1024,
-        env: options.env || process.env,
+        env: sanitizeWindowsEnv(options.env || process.env),
       },
       (error, stdout, stderr) => {
         const result = {
           stdout: String(stdout || "").trim(),
           stderr: String(stderr || "").trim(),
-          code: error && typeof error.code === "number" ? error.code : 0,
+          code: error ? (typeof error.code === "number" ? error.code : 1) : 0,
         };
 
         if (error && !options.allowFailure) {
@@ -191,26 +223,44 @@ async function cleanBuildCaches(projectDir) {
   return removed;
 }
 
+async function cleanGitStatusPaths(projectDir, entries, options = {}) {
+  const paths = uniqueSorted(entries.map((entry) => entry.path));
+  const trackedPaths = uniqueSorted(
+    entries
+      .filter((entry) => entry.status !== "??")
+      .map((entry) => entry.path)
+  );
+  const untrackedPaths = uniqueSorted(
+    entries
+      .filter((entry) => entry.status === "??")
+      .map((entry) => entry.path)
+  );
+
+  if (trackedPaths.length > 0) {
+    await runGit(projectDir, ["restore", "--staged", "--worktree", "--", ...trackedPaths]);
+  }
+
+  for (const filePath of untrackedPaths) {
+    if (options.useGitClean === true) {
+      await runGit(projectDir, ["clean", "-f", "--", filePath], {
+        allowFailure: true,
+      });
+    } else {
+      await removePathSafe(projectDir, filePath);
+    }
+  }
+
+  return {
+    paths,
+    trackedPaths,
+    untrackedPaths,
+  };
+}
+
 async function cleanKnownGeneratedGitChanges(projectDir, entries) {
-  const generatedPaths = uniqueSorted(entries.map((entry) => entry.path).filter(isGeneratedPath));
-  const trackedGeneratedPaths = generatedPaths.filter((filePath) => {
-    const entry = entries.find((candidate) => candidate.path === filePath);
-    return entry && entry.status !== "??";
-  });
-  const untrackedGeneratedPaths = generatedPaths.filter((filePath) => {
-    const entry = entries.find((candidate) => candidate.path === filePath);
-    return entry && entry.status === "??";
-  });
-
-  if (trackedGeneratedPaths.length > 0) {
-    await runGit(projectDir, ["restore", "--staged", "--worktree", "--", ...trackedGeneratedPaths]);
-  }
-
-  for (const filePath of untrackedGeneratedPaths) {
-    await removePathSafe(projectDir, filePath);
-  }
-
-  return generatedPaths;
+  const generatedEntries = entries.filter((entry) => isGeneratedPath(entry.path));
+  const result = await cleanGitStatusPaths(projectDir, generatedEntries);
+  return result.paths;
 }
 
 function sanitizeProcessList(processes) {
@@ -313,7 +363,7 @@ async function runPreflight(projectDir, options = {}) {
     const error = new Error(
       [
         "发现未确认业务修改，项目总管已停止执行。",
-        "请老板选择：A. 继续保留这些修改并重新派单；B. 先由 Worker 自动备份后再执行。",
+        "请选择：A. 保留这些修改并重新派单；B. 先由 Worker 自动备份后再执行。",
         "文件清单：",
         ...unknownEntries.map((entry) => `- ${entry.line}`),
       ].join("\n")
@@ -332,77 +382,28 @@ async function runPreflight(projectDir, options = {}) {
   };
 }
 
-async function isPortOpen(port) {
-  const script = [
-    `$connection = Get-NetTCPConnection -LocalPort ${Number(port)} -State Listen -ErrorAction SilentlyContinue`,
-    "if ($connection) { exit 0 }",
-    "exit 1",
-  ].join("\n");
-  const result = await runCommand("powershell.exe", [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-Command",
-    script,
-  ], {
+async function checkRouteFiles(projectDir, routes = STATIC_PREVIEW_ROUTE_FILES) {
+  return routes.map((routePath) => ({
+    path: normalizeGitPath(routePath),
+    ok: fs.existsSync(path.join(projectDir, routePath)),
+  }));
+}
+
+async function runStaticCheck(projectDir, label, command, args) {
+  const result = await runCommand(command, args, {
+    cwd: projectDir,
     allowFailure: true,
+    maxBuffer: 30 * 1024 * 1024,
   });
 
-  return result.code === 0;
-}
-
-async function waitForHttp(url, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let lastError = "";
-
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(url);
-      if (response.status < 500) {
-        return {
-          ok: true,
-          status: response.status,
-        };
-      }
-      lastError = `HTTP ${response.status}`;
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-
   return {
-    ok: false,
-    error: lastError || "等待本地预览超时",
+    label,
+    command: [command, ...args].join(" "),
+    ok: result.code === 0,
+    code: result.code,
+    stdout: result.stdout.slice(-4000),
+    stderr: result.stderr.slice(-4000),
   };
-}
-
-async function runSmokeTests(baseUrl, paths = DEFAULT_SMOKE_PATHS) {
-  const results = [];
-
-  for (const smokePath of paths) {
-    const url = `${baseUrl}${smokePath}`;
-    try {
-      const response = await fetch(url, {
-        redirect: "manual",
-      });
-      results.push({
-        path: smokePath,
-        status: response.status,
-        ok: response.status >= 200 && response.status < 500,
-      });
-    } catch (error) {
-      results.push({
-        path: smokePath,
-        status: null,
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
-  return results;
 }
 
 async function recoverLocalPreview(projectDir, options = {}) {
@@ -411,40 +412,27 @@ async function recoverLocalPreview(projectDir, options = {}) {
   const removedCaches = await cleanBuildCaches(root);
   await restoreGeneratedEnvFiles(root);
 
-  const requestedPort = Number(options.port || 3000);
-  const port = (await isPortOpen(requestedPort)) ? requestedPort + 1 : requestedPort;
   const logDir = path.join(__dirname, "logs");
   fs.mkdirSync(logDir, {
     recursive: true,
   });
 
-  const previewLog = path.join(logDir, "local-preview-recovery.log");
-  const out = fs.openSync(previewLog, "a");
-  const child = spawn("npx.cmd", ["next", "dev", "--webpack", "-p", String(port)], {
-    cwd: root,
-    windowsHide: true,
-    stdio: ["ignore", out, out],
-    env: {
-      ...process.env,
-      NO_COLOR: "1",
-    },
-  });
-
-  const baseUrl = `http://127.0.0.1:${port}`;
-  const readiness = await waitForHttp(`${baseUrl}/`, Number(options.timeoutMs || 60000));
-  const smoke = readiness.ok ? await runSmokeTests(baseUrl) : [];
-
-  await killProcessTree(child.pid);
-  fs.closeSync(out);
+  const routeFiles = await checkRouteFiles(root, options.routeFiles);
+  const staticChecks = [
+    await runStaticCheck(root, "eslint", "npm.cmd", ["run", "lint"]),
+    await runStaticCheck(root, "typecheck", "npx.cmd", ["tsc", "--noEmit"]),
+  ];
 
   const report = {
-    baseUrl,
-    port,
+    mode: "static-only",
+    baseUrl: null,
+    port: null,
     removedCaches,
-    readiness,
-    smoke,
-    logFile: previewLog,
-    ok: readiness.ok && smoke.every((item) => item.ok),
+    routeFiles,
+    staticChecks,
+    skippedDevServer: true,
+    skippedBrowser: true,
+    ok: routeFiles.every((item) => item.ok) && staticChecks.every((item) => item.ok),
   };
 
   fs.writeFileSync(
@@ -463,7 +451,7 @@ function classifyLocalError(errorText) {
     return "turbopack-cache";
   }
 
-  if (text.includes("eaddrinuse") || text.includes("port") && text.includes("3000")) {
+  if (text.includes("eaddrinuse") || (text.includes("port") && text.includes("3000"))) {
     return "port-conflict";
   }
 
@@ -481,6 +469,10 @@ function classifyLocalError(errorText) {
 
   if (text.includes("module not found") || text.includes("cannot find module")) {
     return "dependency-or-import";
+  }
+
+  if (text.includes("spawn einval") || text.includes("key in dictionary")) {
+    return "windows-env-path-conflict";
   }
 
   return "unknown";
@@ -519,8 +511,10 @@ if (require.main === module) {
 module.exports = {
   classifyLocalError,
   cleanBuildCaches,
+  cleanGitStatusPaths,
   recoverLocalPreview,
   restoreGeneratedEnvFiles,
   runPreflight,
+  sanitizeWindowsEnv,
   stopResidualProcesses,
 };

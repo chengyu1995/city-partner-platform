@@ -1,58 +1,83 @@
 # Worker Self-Healing
 
-Windows Worker 的自恢复入口：
+Windows Worker self-healing entry points:
 
 - `infra/windows-worker/worker-recovery.js`
 - `infra/windows-worker/worker-healthcheck.ps1`
 - `infra/windows-worker/start-worker.ps1`
 
-## 启动前自检
+## Preflight
 
-`start-worker.ps1` 会先调用：
+`start-worker.ps1` runs the health check before starting the scheduled worker:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File infra/windows-worker/worker-healthcheck.ps1 -StopExistingWorker
 ```
 
-自检动作：
+Preflight actions:
 
-- 停止残留 Worker、Next dev、Turbopack、Codex 进程。
-- 清理 `.next`、`.turbo`、`node_modules/.cache`。
-- 还原 Next 自动生成类型文件。
-- 检查 `git status --short`。
-- 自动清理已知生成文件。
-- 遇到未知业务修改时停止。
+- Stop residual Worker, `next dev`, `next-server`, Turbopack, `npm run dev`, and Codex processes.
+- Clean `.next`, `.turbo`, and `node_modules/.cache`.
+- Restore generated Next type files.
+- Check `git status --short`.
+- Clean known generated changes only.
+- Stop when unknown business changes exist.
 
-## Codex 自动重试
+## Codex Retry
 
-`local_worker.js` 执行 Codex 时有三段：
+`local_worker.js` runs Codex in three attempts:
 
-1. 正常执行原始需求。
-2. 第 1 次失败后，携带错误摘要和自动分类重新执行。
-3. 第 2 次失败后，执行最小化修复提示词。
+1. Execute the original task.
+2. On first failure, retry with a local error summary and automatic category.
+3. On second failure, retry with a minimum-change repair prompt.
 
-仍失败时才向老板回报，并给二选一决策，不要求老板手动查日志。
+If all attempts fail, Worker reports the failure and asks for a human decision instead of looping forever.
 
-## 本地预览恢复
+## Local Preview Policy
 
-恢复流程由 `worker-recovery.js recover-preview` 执行：
+Codex must not start local preview servers during Worker tasks.
 
-1. 停止旧 dev 服务。
-2. 清理缓存。
-3. 优先执行 `npx next dev --webpack -p 3000`。
-4. 如果 3000 被占用，自动切到 3001。
-5. 访问 `/`、`/post`、`/partners` 做 smoke test。
-6. 写入 `infra/windows-worker/logs/local-preview-recovery-report.json`。
+Forbidden commands and flows:
 
-手动执行：
+- `npm run dev`
+- `next dev`
+- `npx next dev`
+- `Start-Process` for a dev server
+- `cmd start /b npm run dev`
+- Browser-based preview verification
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File infra/windows-worker/worker-healthcheck.ps1 -RecoverPreview
+`worker-recovery.js recover-preview` is now static-only. It does not start `next dev`, does not open a browser, and does not wait for HTTP readiness.
+
+Static diagnostics:
+
+- Confirm route files exist for `/`, `/post`, and `/partners`.
+- Run `npm run lint`.
+- Run `npx tsc --noEmit`.
+- Write `infra/windows-worker/logs/local-preview-recovery-report.json`.
+
+When static preview diagnostics fail, Worker records a warning and continues to commit/report flow. Local preview recovery failure must not mark the whole job as failed.
+
+## Windows PATH Handling
+
+All Worker child processes normalize environment variables before spawn/exec. On Windows, `Path` and `PATH` are the same key for process creation, so Worker keeps one path entry to avoid:
+
+```text
+spawn EINVAL
+Item has already been added. Key in dictionary: 'Path' Key being added: 'PATH'
 ```
 
-## 错误分类
+## Temporary File Cleanup
 
-Worker 会把错误摘要归类为：
+Worker cleanup distinguishes Git status classes:
+
+- Tracked files are restored with `git restore`.
+- Untracked generated or temporary files are removed directly or with targeted `git clean -f -- <path>`.
+
+Worker must not use broad destructive cleanup such as `git reset --hard` or unrestricted `git clean`.
+
+## Error Categories
+
+Worker classifies local errors into:
 
 - `turbopack-cache`
 - `port-conflict`
@@ -60,6 +85,7 @@ Worker 会把错误摘要归类为：
 - `route-404`
 - `code-syntax`
 - `dependency-or-import`
+- `windows-env-path-conflict`
 - `unknown`
 
-分类只用于自动选择修复提示词和老板回报摘要，不会输出密钥或完整堆栈。
+The category is used only for repair prompts and summaries. Worker must not print secrets or full sensitive logs.

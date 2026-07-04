@@ -100,6 +100,14 @@ function getTrackedStatusPaths(entries) {
   );
 }
 
+function getUntrackedStatusPaths(entries) {
+  return uniqueSortedPaths(
+    entries
+      .filter((entry) => entry.status === "??")
+      .flatMap((entry) => entry.paths || [])
+  );
+}
+
 function comparePathSets(expectedPaths, actualPaths) {
   const expected = uniqueSortedPaths(expectedPaths);
   const actual = uniqueSortedPaths(actualPaths);
@@ -327,6 +335,7 @@ module.exports = {
   formatStatusList,
   getStatusPaths,
   getTrackedStatusPaths,
+  getUntrackedStatusPaths,
   isSensitivePath,
   normalizeGitPath,
   parseGitStatusPorcelain,

@@ -6,6 +6,7 @@ const {
   assertCleanStatusEntries,
   getStatusPaths,
   getTrackedStatusPaths,
+  getUntrackedStatusPaths,
   parseGitStatusPorcelain,
   uniqueSortedPaths,
   validateCommittablePaths,
@@ -15,6 +16,7 @@ const {
   classifyLocalError,
   recoverLocalPreview,
   runPreflight,
+  sanitizeWindowsEnv,
 } = require("./worker-recovery");
 
 const WORKER_API_URL = String(process.env.WORKER_API_URL || "").replace(/\/+$/, "");
@@ -158,7 +160,7 @@ function runCommand(command, args, cwd = PROJECT_DIR) {
         cwd,
         windowsHide: true,
         maxBuffer: 20 * 1024 * 1024,
-        env: process.env,
+        env: sanitizeWindowsEnv(process.env),
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -306,6 +308,14 @@ const CODEX_GIT_OPERATION_GUARD = [
   "【Windows Worker 强制规则】",
   "Codex 只负责修改文件和汇报结果，Git 提交和推送由外层 Worker 自动完成。",
   "只允许修改任务要求的文件。",
+  "不允许阻塞式启动本地预览。",
+  "不允许执行 npm run dev。",
+  "不允许执行 next dev。",
+  "不允许执行 npx next dev。",
+  "不允许使用 Start-Process 启动 dev server。",
+  "不允许执行 cmd start /b npm run dev。",
+  "如果需要验证页面，只做静态验证：文件是否存在、TypeScript/ESLint 是否通过、路由文件是否存在。",
+  "不启动浏览器，不启动本地 dev server。",
   "不允许执行 git add。",
   "不允许执行 git commit。",
   "不允许执行 git push。",
@@ -372,20 +382,25 @@ function formatPreflightResult(result) {
 
 function formatPreviewReport(reportResult) {
   if (!reportResult) {
-    return "本地预览恢复：未执行";
+    return "本地预览诊断：未执行";
   }
 
-  const smokeLines = safeReportArray(reportResult.smoke).map((item) => {
-    const status = item.status === null ? "ERR" : item.status;
-    return `- ${item.path}: ${status} ${item.ok ? "OK" : "FAIL"}`;
+  const routeLines = safeReportArray(reportResult.routeFiles).map((item) => {
+    return `- ${item.path}: ${item.ok ? "OK" : "MISSING"}`;
+  });
+  const checkLines = safeReportArray(reportResult.staticChecks).map((item) => {
+    return `- ${item.label}: exit ${item.code} ${item.ok ? "OK" : "FAIL"}`;
   });
 
   return [
-    `本地预览恢复：${reportResult.ok ? "通过" : "未通过"}`,
-    `预览地址：${reportResult.baseUrl}`,
+    `本地预览诊断：${reportResult.ok ? "通过" : "warning"}`,
+    "模式：static-only（未启动 dev server / 浏览器）",
     `缓存清理：${reportResult.removedCaches.join(", ") || "无"}`,
-    "Smoke test：",
-    ...(smokeLines.length ? smokeLines : ["- 未执行"]),
+    "路由文件：",
+    ...(routeLines.length ? routeLines : ["- 未执行"]),
+    "静态检查：",
+    ...(checkLines.length ? checkLines : ["- 未执行"]),
+    reportResult.warning ? `warning: ${reportResult.error || "本地预览诊断失败"}` : "",
   ].join("\n");
 }
 
@@ -581,10 +596,10 @@ async function rollbackGitTask(checkpoint) {
   }
 
   const entries = await readGitStatusEntries();
-  const changedPaths = getStatusPaths(entries).map(repairKnownDroppedFirstCharPath);
   const trackedPaths = getTrackedStatusPaths(entries).map(repairKnownDroppedFirstCharPath);
+  const untrackedPaths = getUntrackedStatusPaths(entries).map(repairKnownDroppedFirstCharPath);
 
-  await unstagePaths(changedPaths);
+  await unstagePaths(trackedPaths);
 
   if (trackedPaths.length > 0) {
     await runGit([
@@ -596,6 +611,10 @@ async function rollbackGitTask(checkpoint) {
       "--",
       ...trackedPaths,
     ]);
+  }
+
+  if (untrackedPaths.length > 0) {
+    await runGit(["clean", "-f", "--", ...untrackedPaths]);
   }
 
   console.log(`Git 已回滚到：${checkpoint.baseCommit}`);
@@ -693,7 +712,7 @@ function runCodex(prompt, job) {
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
         env: {
-          ...process.env,
+          ...sanitizeWindowsEnv(process.env),
           CI: "1",
           NO_COLOR: "1",
         },
@@ -969,8 +988,8 @@ async function pollOnce() {
       await updateProgress(
         job.id,
         70,
-        "恢复本地预览",
-        "正在使用 next dev --webpack 执行 /、/post、/partners smoke test"
+        "静态预览诊断",
+        "正在检查路由文件、ESLint 和 TypeScript；不会启动 dev server 或浏览器"
       );
 
       previewReport = await safeRecoverLocalPreview(PROJECT_DIR);
@@ -1179,13 +1198,16 @@ async function safeRecoverLocalPreview(...args) {
     return await recoverLocalPreview(...args);
   } catch (err) {
     const message = err && (err.message || String(err));
-    console.warn("[worker] local preview recovery failed but task will continue:", message);
+    console.warn("[worker] local preview diagnostic failed but task will continue:", message);
     return {
       ok: false,
       warning: true,
       skipped: true,
       error: message,
-      note: "本地预览恢复失败，但不阻断项目总管任务；继续执行代码诊断、修复、验证和回报。"
+      removedCaches: [],
+      routeFiles: [],
+      staticChecks: [],
+      note: "本地预览静态诊断失败，但不阻断项目总管任务；继续执行代码诊断、修复、验证和回报。"
     };
   }
 }
