@@ -375,7 +375,7 @@ function formatPreviewReport(reportResult) {
     return "本地预览恢复：未执行";
   }
 
-  const smokeLines = reportResult.smoke.map((item) => {
+  const smokeLines = safeReportArray(reportResult.smoke).map((item) => {
     const status = item.status === null ? "ERR" : item.status;
     return `- ${item.path}: ${status} ${item.ok ? "OK" : "FAIL"}`;
   });
@@ -1188,4 +1188,12 @@ async function safeRecoverLocalPreview(...args) {
       note: "本地预览恢复失败，但不阻断项目总管任务；继续执行代码诊断、修复、验证和回报。"
     };
   }
+}
+
+
+function safeReportArray(value) {
+  // SAFE_REPORT_ARRAY_FOR_FORMAT_PREVIEW_REPORT
+  if (Array.isArray(value)) return value;
+  if (value == null) return [];
+  return [value];
 }
