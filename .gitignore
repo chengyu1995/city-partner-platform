@@ -65,3 +65,11 @@ vendor/
 vendor/
 /.npm-empty*/
 .npm-empty*/
+
+# Local worker / Codex temporary files
+.codex-next-dev-*.log
+codex-next-dev*.log
+.codex-node-perm-test/
+dev-error.log
+.next/
+.turbo/
