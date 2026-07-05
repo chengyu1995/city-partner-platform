@@ -1,43 +1,7 @@
 import Link from "next/link";
+import { mockPartnerPosts, partnerCategories, partnerCities } from "@/lib/mock-partners";
 
-const cities = ["惠州", "广州", "深圳", "上海"];
-
-const categories = [
-  { name: "饭搭子", desc: "约饭、探店、下班吃点好的" },
-  { name: "运动搭子", desc: "跑步、羽毛球、健身、球类" },
-  { name: "学习搭子", desc: "自习、备考、读书、技能学习" },
-  { name: "出游搭子", desc: "周边游、城市散步、短途旅行" },
-  { name: "K 歌搭子", desc: "KTV、清吧唱歌、练歌" },
-  { name: "摩友搭子", desc: "骑行、路线、短途摩旅" },
-  { name: "钓友搭子", desc: "野钓、黑坑、周末钓鱼" },
-];
-
-const previewPosts = [
-  {
-    title: "周六下午找羽毛球搭子",
-    city: "深圳",
-    category: "运动搭子",
-    startsAt: "周六 15:00",
-    location: "南山科技园附近球馆",
-    capacity: "2-4 人",
-  },
-  {
-    title: "下班后一起吃潮汕牛肉火锅",
-    city: "广州",
-    category: "饭搭子",
-    startsAt: "周五 19:30",
-    location: "体育西路",
-    capacity: "3 人",
-  },
-  {
-    title: "周末惠州西湖 Citywalk",
-    city: "惠州",
-    category: "出游搭子",
-    startsAt: "周日 10:00",
-    location: "惠州西湖东门",
-    capacity: "2-5 人",
-  },
-];
+const previewPosts = mockPartnerPosts.slice(0, 3);
 
 function partnerHref(city?: string, category?: string) {
   const params = new URLSearchParams();
@@ -122,7 +86,7 @@ export default function Home() {
           </div>
 
           <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-            {cities.map((city) => (
+            {partnerCities.map((city) => (
               <Link
                 key={city}
                 href={partnerHref(city)}
@@ -141,7 +105,7 @@ export default function Home() {
           </div>
 
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            {categories.map((category) => (
+            {partnerCategories.map((category) => (
               <Link
                 key={category.name}
                 href={partnerHref(undefined, category.name)}

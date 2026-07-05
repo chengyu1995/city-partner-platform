@@ -11,93 +11,21 @@ import {
   subscribeLocalPostDrafts,
   type LocalPostDraft,
 } from "@/lib/local-drafts";
-
-const cities = ["全部", "惠州", "广州", "深圳", "上海"];
-const categories = ["全部", "饭搭子", "运动搭子", "学习搭子", "出游搭子", "K 歌搭子", "摩友搭子", "钓友搭子"];
-
-const examplePartners: LocalPostDraft[] = [
-  {
-    id: "example-1",
-    city: "惠州",
-    category: "出游搭子",
-    title: "周末惠州西湖 Citywalk",
-    startsAt: "周日 10:00",
-    endsAt: "周日 16:00",
-    location: "惠州西湖东门集合",
-    capacity: "2-5 人",
-    description: "轻松散步拍照，中午附近吃饭，节奏慢一点。",
-    targetPeople: "喜欢走路拍照，新手友好",
-    budgetNote: "AA，预计人均 80 元内",
-    notes: "遇到下雨就改期",
-    hostName: "阿城",
-    contactType: "微信",
-    contactValue: "",
-    status: "pending_review",
-    createdAt: "2026-07-05T10:00:00.000Z",
-  },
-  {
-    id: "example-2",
-    city: "广州",
-    category: "饭搭子",
-    title: "下班后一起吃潮汕牛肉火锅",
-    startsAt: "周五 19:30",
-    endsAt: "",
-    location: "体育西路附近",
-    capacity: "3 人",
-    description: "想找附近下班后的饭搭子，吃完可以顺路散步。",
-    targetPeople: "不赶时间，能接受 AA",
-    budgetNote: "AA，约 100 元/人",
-    notes: "不拼酒",
-    hostName: "小林",
-    contactType: "微信",
-    contactValue: "",
-    status: "pending_review",
-    createdAt: "2026-07-05T11:00:00.000Z",
-  },
-  {
-    id: "example-3",
-    city: "深圳",
-    category: "运动搭子",
-    title: "周六下午找羽毛球搭子",
-    startsAt: "周六 15:00",
-    endsAt: "周六 17:00",
-    location: "南山科技园附近球馆",
-    capacity: "2-4 人",
-    description: "休闲局，不卷水平，主要动一动出汗。",
-    targetPeople: "能打基础回合即可",
-    budgetNote: "场地费 AA",
-    notes: "请自带球拍",
-    hostName: "Leo",
-    contactType: "手机号",
-    contactValue: "",
-    status: "pending_review",
-    createdAt: "2026-07-05T12:00:00.000Z",
-  },
-  {
-    id: "example-4",
-    city: "上海",
-    category: "学习搭子",
-    title: "晚上自习搭子，互相监督",
-    startsAt: "工作日 19:30",
-    endsAt: "工作日 22:00",
-    location: "徐家汇附近自习室",
-    capacity: "2 人",
-    description: "备考和技能学习都可以，安静学习，结束简单复盘。",
-    targetPeople: "想稳定学习的人",
-    budgetNote: "自习室费用自理",
-    notes: "不闲聊打扰",
-    hostName: "Mia",
-    contactType: "其他方式",
-    contactValue: "",
-    status: "pending_review",
-    createdAt: "2026-07-05T13:00:00.000Z",
-  },
-];
+import { mockPartnerPosts, partnerCategories, partnerCities, partnerStatusText } from "@/lib/mock-partners";
 
 const statusText: Record<LocalPostDraft["status"], string> = {
   draft: "草稿",
-  pending_review: "待审核",
+  pending_review: partnerStatusText.pending_review,
 };
+
+const cities = ["全部", ...partnerCities];
+const categories = ["全部", ...partnerCategories.map((category) => category.name)];
+
+const examplePartners: LocalPostDraft[] = mockPartnerPosts.map((post) => ({
+  ...post,
+  contactType: "",
+  contactValue: "",
+}));
 
 function hrefWith(params: { city?: string; category?: string }) {
   const query = new URLSearchParams();
