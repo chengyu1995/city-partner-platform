@@ -25,6 +25,8 @@ export type ProjectDirectorRequestType =
   | "operations_release"
   | "acceptance_feedback";
 
+export type ProjectDirectorPlanningChoice = "homepage_mvp" | "complete_mvp_plan";
+
 const WEBSITE_PRODUCT_KEYWORDS = [
   "网站",
   "页面",
@@ -142,8 +144,43 @@ const APPROVED_EXECUTION_PHRASES = [
 const PLAN_CHANGE_PREFIX = "修改计划：";
 const PLAN_CHANGE_PREFIX_ASCII = "修改计划:";
 
+const PLANNING_CHOICE_A_PATTERNS = [
+  /^选\s*A[。.!！]?$/i,
+  /^选择\s*A[。.!！]?$/i,
+  /^按\s*A\s*做[。.!！]?$/i,
+  /先做首页\s*MVP/i,
+];
+
+const PLANNING_CHOICE_B_PATTERNS = [
+  /^选\s*B[。.!！]?$/i,
+  /^选择\s*B[。.!！]?$/i,
+  /^按\s*B\s*做[。.!！]?$/i,
+  /先做完整产品规划/i,
+  /完整产品规划/i,
+];
+
 function normalizeDemandText(text: string): string {
   return text.trim().replace(/\s+/g, " ");
+}
+
+export function parseProjectDirectorPlanningChoice(
+  text: string
+): ProjectDirectorPlanningChoice | null {
+  const normalized = normalizeDemandText(text);
+  if (PLANNING_CHOICE_A_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    return "homepage_mvp";
+  }
+  if (PLANNING_CHOICE_B_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    return "complete_mvp_plan";
+  }
+  if (normalized === "批准建议") {
+    return "complete_mvp_plan";
+  }
+  return null;
+}
+
+export function isProjectDirectorPlanningChoiceReply(text: string): boolean {
+  return parseProjectDirectorPlanningChoice(text) !== null;
 }
 
 export function isNewDemandMessage(text: string): boolean {
@@ -264,10 +301,198 @@ export function isPlanChangeReply(text: string): boolean {
   const normalized = normalizeDemandText(text);
   return (
     normalized.startsWith(PLAN_CHANGE_PREFIX) ||
-    normalized.startsWith(PLAN_CHANGE_PREFIX_ASCII) ||
-    isDispatchPlanChangeReply(normalized) ||
-    isTaskTreeChangeReply(normalized)
+    normalized.startsWith(PLAN_CHANGE_PREFIX_ASCII)
   );
+}
+
+export function getPlanChangeReplyBody(text: string): string {
+  const normalized = normalizeDemandText(text);
+  if (normalized.startsWith(PLAN_CHANGE_PREFIX)) {
+    return normalized.slice(PLAN_CHANGE_PREFIX.length).trim();
+  }
+  if (normalized.startsWith(PLAN_CHANGE_PREFIX_ASCII)) {
+    return normalized.slice(PLAN_CHANGE_PREFIX_ASCII.length).trim();
+  }
+  return normalized;
+}
+
+export function buildPlanningChoiceOriginalDemand(
+  choice: ProjectDirectorPlanningChoice,
+  previousDemand?: string | null
+): string {
+  const fallback =
+    choice === "homepage_mvp"
+      ? "启动同城搭子网站 MVP 第一阶段：首页 MVP 规划"
+      : "启动同城搭子网站 MVP 第一阶段：完整产品规划";
+  return previousDemand?.trim() || fallback;
+}
+
+export function buildProjectDirectorPlanningChoiceReply(
+  choice: ProjectDirectorPlanningChoice,
+  originalDemand: string
+): string {
+  if (choice === "homepage_mvp") {
+    return [
+      "【项目总管：已选择 A，首页 MVP 规划】",
+      `关联需求：${originalDemand}`,
+      "",
+      "首页目标",
+      "- 用一个移动端优先的首页说明“同城搭子”是什么，并让用户能快速进入找搭子、发布搭子和筛选浏览。",
+      "- 首页只输出规划，不写代码；必须等老板回复“总管 批准执行”后才进入 Worker/Codex。",
+      "",
+      "首页模块",
+      "1. 顶部定位区：平台定位、城市生活氛围、主要行动入口。",
+      "2. 搭子分类区：旅游、K 歌、学习、摩友、钓友等首批兴趣入口。",
+      "3. 推荐搭子模块：展示少量示例搭子卡片，强调时间、地点、人数、标签和发起人。",
+      "4. 发布搭子入口：突出“发布我的搭子需求”，但首版可先接到现有发布入口或规划占位。",
+      "5. 筛选入口：城市、兴趣、时间三个轻量筛选维度。",
+      "",
+      "信息架构",
+      "- 首页 -> 分类/筛选 -> 推荐搭子列表 -> 搭子详情。",
+      "- 首页 -> 发布入口 -> 发布搭子表单。",
+      "- 首页 -> 登录/个人状态预留。",
+      "",
+      "交互入口",
+      "- 找搭子：进入列表或推荐模块。",
+      "- 发布搭子：进入发布流程。",
+      "- 筛选：打开轻量筛选条件。",
+      "",
+      "多 Agent 分工",
+      "- 项目总管：冻结范围、拆批次、控制批准门禁。",
+      "- 产品经理：补齐首页模块、优先级和验收口径。",
+      "- UI 设计师：移动端首页视觉规范。",
+      "- 交互设计师：首页入口和筛选流程。",
+      "- 前端工程师：仅在批准后按允许文件实现。",
+      "- 测试工程师：375px/768px、入口可达性、静态检查。",
+      "",
+      "执行批次",
+      "1. 首页产品结构确认。",
+      "2. 首页 UI/交互方案。",
+      "3. 老板批准后再进入首页实现。",
+      "4. 静态验证和验收回报。",
+      "",
+      "需要老板确认的问题",
+      "- 首页首屏更强调“找搭子”还是“发布搭子”？",
+      "- 首批分类是否固定为旅游/K 歌/学习/摩友/钓友？",
+      "- 推荐搭子卡片使用 mock 示例还是已有数据入口？",
+      "",
+      "下一步可回复：修改计划：xxx / 总管 批准执行 / 总管 暂停",
+    ].join("\n");
+  }
+
+  return [
+    "【项目总管：已选择 B，完整 MVP 第一阶段规划】",
+    `关联需求：${originalDemand}`,
+    "",
+    "产品目标",
+    "- 用最小可上线范围验证同城兴趣搭子的核心闭环：发现搭子、查看详情、发布需求、形成后续联系意向。",
+    "- 第一阶段只做规划输出，不写业务页面代码，不进入 Worker/Codex 执行队列。",
+    "",
+    "目标用户",
+    "- 20-35 岁同城兴趣社交用户。",
+    "- 有短期活动需求的人：旅游、K 歌、学习、自习、骑行、钓鱼等。",
+    "- 希望低压力寻找同伴，但不想进入复杂社交关系的人。",
+    "",
+    "用户角色",
+    "- 浏览者：查看搭子分类、推荐和详情。",
+    "- 发布者：发布自己的搭子需求。",
+    "- 参与者：通过详情页了解并表达参与意向。",
+    "- 运营/老板：验收 MVP 范围、决定是否进入下一批开发。",
+    "",
+    "页面结构",
+    "1. 首页：定位、分类、推荐搭子、发布入口、筛选入口。",
+    "2. 搭子列表页：按分类/城市/时间筛选。",
+    "3. 搭子详情页：活动信息、发起人、人数、时间地点、参与入口。",
+    "4. 发布搭子页：标题、分类、时间、地点、人数、说明。",
+    "5. 登录/注册/个人主页：第一阶段仅保留必要入口和状态，不扩大范围。",
+    "",
+    "核心流程",
+    "- 找搭子：进入首页 -> 选择分类/筛选 -> 查看列表 -> 查看详情 -> 表达意向。",
+    "- 发搭子：进入首页发布入口 -> 填写需求 -> 提交 -> 返回详情或列表可见。",
+    "- 验收：老板按页面、流程、移动端、静态检查逐项验收。",
+    "",
+    "功能优先级",
+    "- P0：首页、列表、详情、发布入口、移动端可用、mock/Supabase 双轨不破坏。",
+    "- P1：筛选体验、推荐搭子卡片、用户状态预留。",
+    "- P2：聊天、支付、复杂推荐、后台运营、多城市运营，本阶段不做。",
+    "",
+    "多 Agent 分工",
+    "- 项目总管：确认范围、任务树、批准门禁、风险控制。",
+    "- 产品经理：PRD、页面结构、优先级、验收标准。",
+    "- UI 设计师：移动端视觉规范和组件状态。",
+    "- 交互设计师：找搭子/发搭子/筛选流程。",
+    "- 前端工程师：老板批准后实现允许范围内页面。",
+    "- 后端工程师：老板批准后确认数据入口，不改数据库结构。",
+    "- 测试工程师：lint/typecheck/build、移动端静态验收、F12 console 检查口径。",
+    "- 运维工程师：仅记录预览/部署注意事项，不触发生产部署。",
+    "",
+    "执行批次",
+    "1. BATCH-01：产品规划文档和验收口径。",
+    "2. BATCH-02：UI/交互方案。",
+    "3. BATCH-03：老板批准后实现首页与核心入口。",
+    "4. BATCH-04：列表/详情/发布流程补齐。",
+    "5. BATCH-05：静态验证、移动端检查、验收报告。",
+    "",
+    "验收标准",
+    "- 页面结构覆盖首页、列表、详情、发布入口。",
+    "- P0 流程能从首页走到详情和发布。",
+    "- 移动端 375px/768px 不溢出，触摸目标可用。",
+    "- TypeScript、ESLint、build 按 Worker 规则验证或记录 warning。",
+    "- 未经老板批准不创建 Worker/Codex 执行任务。",
+    "",
+    "风险点",
+    "- 范围膨胀到聊天/支付/后台会拖慢 MVP。",
+    "- 数据库结构和 env 属于高风险边界，本阶段不改。",
+    "- 云端飞书网关如果未同步 choice routing，仍可能重复 A/B，需要按文档同步。",
+    "",
+    "需要老板确认的问题",
+    "- 第一阶段是否只覆盖旅游/K 歌/学习/摩友/钓友五类？",
+    "- 发布后是否必须立刻在列表可见，还是先允许 mock 展示？",
+    "- 登录是否作为 P0 强依赖，还是先做入口预留？",
+    "",
+    "下一步可回复：修改计划：xxx / 总管 批准执行 / 总管 暂停",
+  ].join("\n");
+}
+
+export function buildProjectDirectorPlanningChoiceRecord(input: {
+  choice: ProjectDirectorPlanningChoice;
+  originalDemand: string;
+  bossReply: string;
+  planId: string;
+}): string {
+  return [
+    "PROJECT_DIRECTOR_PLANNING_CHOICE",
+    "state: waiting_execution_approval",
+    `choice: ${input.choice}`,
+    `plan_id: ${input.planId}`,
+    `original_demand: ${input.originalDemand}`,
+    `boss_reply: ${normalizeDemandText(input.bossReply)}`,
+    "routing: handled_before_website_product_request",
+    "worker_jobs_created: no",
+    "note: choice replies must not trigger another A/B confirmation.",
+  ].join("\n");
+}
+
+export function buildProjectDirectorPlanChangeReply(changeText: string): string {
+  const body = getPlanChangeReplyBody(changeText);
+  const summary = body.length <= 160 ? body : `${body.slice(0, 157)}...`;
+  return [
+    "【项目总管：已记录修改计划】",
+    `修改内容：${summary || "未填写具体内容"}`,
+    "",
+    "当前仍处于规划确认阶段，不会分发任务，也不会创建 Worker/Codex 执行任务。",
+    "下一步可回复：选 A / 选 B / 总管 批准执行 / 总管 暂停",
+  ].join("\n");
+}
+
+export function buildProjectDirectorPlanChangeRecord(changeText: string): string {
+  return [
+    "PROJECT_DIRECTOR_PLAN_CHANGE",
+    "state: waiting_boss_reply",
+    `change: ${getPlanChangeReplyBody(changeText)}`,
+    "routing: handled_before_website_product_request",
+    "worker_jobs_created: no",
+  ].join("\n");
 }
 
 function summarizeDemand(text: string): string {

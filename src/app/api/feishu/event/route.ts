@@ -27,6 +27,11 @@ import {
   buildProjectDirectorScopeUpdateRecord,
   buildProjectDirectorScopeUpdateReply,
   buildProjectDirectorReply,
+  buildProjectDirectorPlanChangeRecord,
+  buildProjectDirectorPlanChangeReply,
+  buildProjectDirectorPlanningChoiceRecord,
+  buildProjectDirectorPlanningChoiceReply,
+  buildPlanningChoiceOriginalDemand,
   buildTaskTreeChangeRecordedReply,
   buildTaskTreeReviewReceivedReply,
   classifyProjectDirectorDemand,
@@ -37,7 +42,9 @@ import {
   isBossApprovalReply,
   isDispatchBatchApprovalReply,
   isDispatchPlanChangeReply,
+  isPlanChangeReply,
   isProjectDirectorDemand,
+  parseProjectDirectorPlanningChoice,
   isTaskTreeApprovalReply,
   isTaskTreeChangeReply,
   isTaskTreeReviewReply,
@@ -765,6 +772,82 @@ export async function POST(req: NextRequest) {
           state: "acceptance_feedback_queued",
           dispatched_batch: "BATCH-12",
           inserted_jobs: insertResult.insertedCount,
+        });
+      }
+
+      if (isPlanChangeReply(text)) {
+        const reply = buildProjectDirectorPlanChangeReply(text);
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          buildProjectDirectorPlanChangeRecord(text),
+          "project_director_plan_change",
+          ev.message.message_id
+        );
+        const token = await getFeishuToken();
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "plan_change_recorded",
+          execution_mode: "planning_only",
+        });
+      }
+
+      const planningChoice = parseProjectDirectorPlanningChoice(text);
+      if (planningChoice) {
+        const pendingDemand = await findPendingProjectDirectorConfirmation(supabase, convId);
+        const recentDemand = pendingDemand
+          ? null
+          : await findRecentProjectDirectorDemand(supabase, convId);
+        const originalDemand = buildPlanningChoiceOriginalDemand(
+          planningChoice,
+          pendingDemand || recentDemand
+        );
+        const draft = buildProjectDirectorTaskTreeDraft(originalDemand, text, "planning_only");
+        const reply = buildProjectDirectorPlanningChoiceReply(planningChoice, originalDemand);
+        const draftRecord = [
+          buildTaskTreeDraftRecord(originalDemand, text, draft, reply),
+          buildProjectDirectorPlanningChoiceRecord({
+            choice: planningChoice,
+            originalDemand,
+            bossReply: text,
+            planId: draft.plan_id,
+          }),
+        ].join("\n");
+        await savePlanningTaskTreeReply(
+          supabase,
+          convId,
+          originalDemand,
+          text,
+          reply,
+          draftRecord,
+          draft,
+          ev.message.message_id
+        );
+        const token = await getFeishuToken();
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "planning_choice_recorded",
+          choice: planningChoice,
+          execution_mode: "planning_only",
+          worker_jobs_created: false,
         });
       }
 
