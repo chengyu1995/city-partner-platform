@@ -4,7 +4,7 @@
 
 ## 目标
 
-Worker/Codex 任务进入 `succeeded` 或 `failed` 终态后，飞书必须收到完整项目总管报告，不能只回报一行状态。
+Worker/Codex 任务进入 `succeeded` 或 `failed` 终态后，飞书必须收到完整项目总管报告，不能只回报一行状态。报告字段缺失时必须用占位值，不能要求老板再查 PowerShell、SQL、Git 或日志。
 
 ## 飞书完成报告模板
 
@@ -54,30 +54,30 @@ GitHub 推送状态：<状态或 未提供>
 
 ## 字段兜底
 
-- `job_id`、需求、修改文件、验证结果、commit SHA 是必保留字段。
+- 必须保留：任务编号、状态、需求、修改文件、验证结果、commit SHA。
 - 字段缺失时统一使用 `未提供`、`未生成` 或 `不适用`，不能省略字段。
-- 飞书消息过长时可以截断摘要，但必须保留任务编号、状态、修改文件、验证结果、commit SHA。
-- 报告生成会脱敏 token、app secret、service key、Bearer token 等敏感文本。
+- 飞书消息过长时可以截断摘要和列表，但必须保留任务编号、状态、修改文件、验证结果、commit SHA。
+- 报告生成会脱敏 token、app secret、service key、Bearer token、Worker token、Supabase service key 等敏感文本。
 
-## 云端同步说明
-
-本次仓库内同步点：
+## 仓库内同步点
 
 - `infra/windows-worker/local_worker.js`：终态上报补充 `project_name`、`project_dir`、`files_changed`、`validation_results`、`github_push_status`、`git_commit_sha`。
-- `src/app/api/worker/report/route.ts`：终态飞书 `status_message` 改为完整项目总管报告。
-- `src/lib/worker-jobs.ts`：统一生成 BATCH-27 报告文本和结构化数据。
+- `src/app/api/worker/report/route.ts`：终态任务把完整项目总管报告写入飞书状态消息，并在幂等重复上报时返回已保存报告。
+- `src/lib/worker-jobs.ts`：统一生成 BATCH-27 报告文本和结构化数据，负责占位、截断、安全边界和脱敏。
+
+## 腾讯云 worker_api.js 同步步骤
 
 如果腾讯云端存在独立 `worker_api.js`，需要同步同等逻辑：
 
 1. 终态 report payload 保留 `job_id`、`attempt_id`、需求、修改文件、验证结果、commit SHA。
-2. succeeded/failed 都调用同一个最终报告模板。
-3. 飞书写入字段使用完整报告文本，不只写 `succeeded` 或 `failed`。
-4. 保留 attempt_id 校验和幂等保护：已终态任务重复 report 只返回已有结果，不重复覆盖。
+2. `succeeded` 和 `failed` 都调用同一个最终报告模板。
+3. 飞书写入字段使用完整报告文本，不能只写 `succeeded` 或 `failed`。
+4. 保留 attempt_id 校验和幂等保护：已终态任务重复 report 只能返回已有结果，不能覆盖最终状态。
 5. 输出日志必须脱敏，不打印 token、app_secret、service key、`.env` 内容。
 
-云端验证方法：
+腾讯云验证方法：
 
-- 构造 succeeded report，确认飞书包含任务编号、需求、修改文件、验证结果、commit SHA。
-- 构造 failed report，确认飞书包含同样字段和失败原因。
-- 使用错误 attempt_id 重放 report，确认被拒绝或不覆盖当前任务。
-- 对同一终态任务重复 report，确认幂等，不重复改写最终状态。
+- 构造 `succeeded` report，确认飞书包含任务编号、需求、修改文件、验证结果、commit SHA。
+- 构造 `failed` report，确认飞书包含同样字段和失败原因。
+- 使用错误 `attempt_id` 重放 report，确认被拒绝或不覆盖当前任务。
+- 对同一个终态任务重复 report，确认幂等且不重复改写最终状态。

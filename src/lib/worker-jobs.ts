@@ -108,7 +108,19 @@ function readLineValue(content: string, key: string): string | null {
 }
 
 function readStringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  if (Array.isArray(value)) {
+    return value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  if (typeof value === "string" && value.trim()) {
+    return value
+      .split(/\r?\n|,/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
 }
 
 function placeholder(value: string | null | undefined): string {
@@ -119,7 +131,9 @@ function sanitizeReportText(value: unknown): string {
   return String(value ?? "")
     .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
     .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
+    .replace(/\b(sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b/g, "[redacted]")
     .replace(/\b(sb_secret|service_role|app_secret|tenant_access_token|access_token|refresh_token|api_key|password)\b\s*[:=]\s*['"]?[^'"\s,}]+/gi, "$1=[redacted]")
+    .replace(/\b(WORKER_TOKEN|WORKER_API_TOKEN|HERMES_WORKER_TOKEN|FEISHU_APP_SECRET|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_JWT_SECRET)\b\s*[:=]\s*['"]?[^'"\s,}]+/gi, "$1=[redacted]")
     .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]");
 }
 
@@ -217,8 +231,8 @@ export function buildProjectDirectorWorkerReport(input: {
   projectDir?: string | null;
   resultText?: string | null;
   output?: string | null;
-  filesChanged?: string[];
-  validationResults?: string[];
+  filesChanged?: unknown;
+  validationResults?: unknown;
   gitCommitSha?: string | null;
   githubPushStatus?: string | null;
   deployStatus?: string | null;
@@ -227,12 +241,14 @@ export function buildProjectDirectorWorkerReport(input: {
   errorText?: string | null;
 }): { text: string; data: Record<string, unknown> } {
   const correlation = getProjectDirectorJobCorrelation(input.job);
+  const submittedFilesChanged = readStringArray(input.filesChanged);
   const filesChanged =
-    input.filesChanged && input.filesChanged.length > 0
-      ? input.filesChanged
+    submittedFilesChanged.length > 0
+      ? submittedFilesChanged
       : readStringArray(readRecord(input.job?.result)?.files_changed);
+  const submittedValidationResults = readStringArray(input.validationResults);
   const validation = [
-    ...(input.validationResults && input.validationResults.length > 0 ? input.validationResults : []),
+    ...(submittedValidationResults.length > 0 ? submittedValidationResults : []),
     `build=${input.buildPassed === undefined || input.buildPassed === null ? "未提供" : input.buildPassed ? "通过" : "失败"}`,
     `test=${input.testPassed === undefined || input.testPassed === null ? "未提供" : input.testPassed ? "通过" : "失败"}`,
   ];
@@ -256,7 +272,7 @@ export function buildProjectDirectorWorkerReport(input: {
         : `Codex 任务状态：${input.status}`;
   const gitCommitSha = input.gitCommitSha ?? readString(input.job?.git_commit_sha);
   const githubPushStatus = input.githubPushStatus ?? "未提供";
-  const completionItems = extractCompletionItems(summary);
+  const completionItems = input.status === "failed" ? [] : extractCompletionItems(summary);
   const safetyBoundary = buildSafetyBoundary(filesChanged, input.deployStatus);
 
   const data = {

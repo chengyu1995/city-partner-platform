@@ -71,6 +71,25 @@ function buildResult(body: WorkerReportBody): Record<string, unknown> {
   };
 }
 
+function readRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function getStoredProjectDirectorReport(job: Record<string, unknown>) {
+  const result = readRecord(job.result);
+  const storedText = typeof result?.project_director_report_text === "string"
+    ? result.project_director_report_text
+    : null;
+  const storedData = readRecord(result?.project_director_report);
+
+  return storedText
+    ? {
+        text: storedText,
+        data: storedData ?? {},
+      }
+    : null;
+}
+
 export async function POST(req: NextRequest) {
   const unauthorized = assertWorkerAuthorized(req);
   if (unauthorized) return unauthorized;
@@ -127,11 +146,14 @@ export async function POST(req: NextRequest) {
   });
 
   if (isTerminalWorkerStatus(existingJob.status)) {
+    const storedProjectDirectorReport =
+      getStoredProjectDirectorReport(existingJob) ?? projectDirectorReport;
+
     return NextResponse.json({
       ok: true,
       job: existingJob,
       attempt_id: attemptId,
-      project_director_report: projectDirectorReport,
+      project_director_report: storedProjectDirectorReport,
       idempotent: true,
       skipped: "terminal_job_report_ignored",
     });
@@ -146,7 +168,7 @@ export async function POST(req: NextRequest) {
     current_step:
       body.current_step ??
       (workerStatus === "succeeded" ? "completed" : workerStatus === "failed" ? "failed" : null),
-    status_message: body.status_message ?? null,
+    status_message: terminal ? projectDirectorReport.text : body.status_message ?? null,
     git_commit_sha: body.git_commit_sha ?? null,
     error_text: workerStatus === "failed" ? errorText : null,
     result: {
