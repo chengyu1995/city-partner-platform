@@ -44,8 +44,20 @@ smoke is disabled by default for system-upgrade jobs; static validation remains 
 BATCH-19 marks the upgrade complete. The dispatcher can be used for real 同城搭子网站 product
 planning, but execution remains approval-gated:
 
-- `新需求：状态`, `新需求：查看计划`, and `新需求：帮助` are boss-facing control commands.
+- `新需求：状态`, `新需求：查看计划`, `新需求：帮助`, `新需求：系统自检`, and `新需求：Agent 状态/看板` are boss-facing control commands.
 - `新需求：我要做一个 xxx 功能` enters planning first.
 - `总管 批准执行` is required before Worker/Codex tasks are created.
 - `总管 暂停` blocks new dispatch.
 - `验收反馈：xxx` is routed back to the project director for diagnosis and follow-up.
+
+## BATCH-20 Console Priority
+
+Boss console commands are parsed in `src/app/api/feishu/event/route.ts` before demand
+classification and before duplicate Worker job checks. The only exception is `总管 批准执行`,
+which is normalized to the existing approval phrase and continues through the guarded approval
+path:
+
+- paused dispatch blocks approval.
+- missing task tree blocks approval.
+- previously dispatched task trees are not duplicated.
+- dispatched Worker prompts include the attempt contract.

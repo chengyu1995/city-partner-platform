@@ -34,3 +34,14 @@ system-upgrade freeze mode. It is now in formal project director mode:
 - Boss approval is still required before Worker/Codex dispatch.
 - High-risk actions still require explicit boss confirmation.
 - Stashed or isolated business-page changes stay frozen unless the boss explicitly approves recovery.
+
+## BATCH-20 Production Hardening
+
+BATCH-20 completes the last operational hardening step before formal website planning:
+
+- Boss console short commands are recognized before ordinary website demand routing.
+- `新需求：系统自检` and `总管 系统自检` return a read-only operational health summary.
+- `新需求：Agent 状态/看板` and `总管 Agent 状态/看板` return the static 8-Agent dashboard.
+- Git `main/master` alignment is documented; recommended production branch is `main`.
+- MVP stage 1 starts only with a planning-only template and waits for `总管 批准执行`.
+- BATCH-20 still does not begin business page development.
