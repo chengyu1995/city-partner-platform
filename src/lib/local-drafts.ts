@@ -7,10 +7,17 @@ export type LocalPostDraft = {
   city: string;
   category: string;
   title: string;
-  activityTime: string;
-  expectedPeople: string;
+  startsAt: string;
+  endsAt: string;
+  location: string;
+  capacity: string;
   description: string;
-  contactNote: string;
+  targetPeople: string;
+  budgetNote: string;
+  notes: string;
+  hostName: string;
+  contactType: string;
+  contactValue: string;
   status: LocalPostDraftStatus;
   createdAt: string;
 };
@@ -40,10 +47,17 @@ function isLocalPostDraft(value: unknown): value is LocalPostDraft {
     typeof draft.city === "string" &&
     typeof draft.category === "string" &&
     typeof draft.title === "string" &&
-    typeof draft.activityTime === "string" &&
-    typeof draft.expectedPeople === "string" &&
+    typeof draft.startsAt === "string" &&
+    typeof draft.endsAt === "string" &&
+    typeof draft.location === "string" &&
+    typeof draft.capacity === "string" &&
     typeof draft.description === "string" &&
-    typeof draft.contactNote === "string" &&
+    typeof draft.targetPeople === "string" &&
+    typeof draft.budgetNote === "string" &&
+    typeof draft.notes === "string" &&
+    typeof draft.hostName === "string" &&
+    typeof draft.contactType === "string" &&
+    typeof draft.contactValue === "string" &&
     (draft.status === "draft" || draft.status === "pending_review") &&
     typeof draft.createdAt === "string"
   );
@@ -66,27 +80,31 @@ function normalizeDraftField(value: string) {
   return value.trim();
 }
 
-function getDraftDedupeKey(draft: Pick<LocalPostDraft, "city" | "category" | "title" | "description">) {
+function getDraftDedupeKey(
+  draft: Pick<LocalPostDraft, "city" | "category" | "title" | "startsAt" | "location" | "description">,
+) {
   return [
     normalizeDraftField(draft.city),
     normalizeDraftField(draft.category),
     normalizeDraftField(draft.title),
+    normalizeDraftField(draft.startsAt),
+    normalizeDraftField(draft.location),
     normalizeDraftField(draft.description),
   ].join("\u001f");
 }
 
 function isSameLocalPostDraft(
-  left: Pick<LocalPostDraft, "city" | "category" | "title" | "description">,
-  right: Pick<LocalPostDraft, "city" | "category" | "title" | "description">,
+  left: Pick<LocalPostDraft, "city" | "category" | "title" | "startsAt" | "location" | "description">,
+  right: Pick<LocalPostDraft, "city" | "category" | "title" | "startsAt" | "location" | "description">,
 ) {
   return getDraftDedupeKey(left) === getDraftDedupeKey(right);
 }
 
-export function createLocalPostDraft(input: LocalPostDraftInput): LocalPostDraft {
+export function createLocalPostDraft(input: LocalPostDraftInput, status: LocalPostDraftStatus): LocalPostDraft {
   return {
     ...input,
     id: createDraftId(),
-    status: "pending_review",
+    status,
     createdAt: new Date().toISOString(),
   };
 }
