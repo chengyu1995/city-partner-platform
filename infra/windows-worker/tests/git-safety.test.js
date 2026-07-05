@@ -395,6 +395,24 @@ test("committable path and sensitive content validation", async (t) => {
     assert.doesNotMatch(source, workerApiPattern);
     assert.doesNotMatch(source, remoteWritePattern);
   });
+
+  await t.test("test source does not trigger its own sensitive scan", () => {
+    const source = fs.readFileSync(__filename, "utf8");
+    const forbiddenFieldLiterals = [
+      joinedName("WORKER", "TOKEN"),
+      joinedName("SUPABASE", "SERVICE", "ROLE", "KEY"),
+      joinedName("FEISHU", "APP", "SECRET"),
+      joinedName("GITHUB", "TOKEN"),
+      ["pass", "word"].join(""),
+      joinedName("private", "key"),
+    ];
+
+    assert.deepEqual(scanSensitiveContent(source), []);
+
+    for (const fieldName of forbiddenFieldLiterals) {
+      assert.equal(source.includes(fieldName), false);
+    }
+  });
 });
 
 test("Codex prompt git operation guard", async (t) => {
