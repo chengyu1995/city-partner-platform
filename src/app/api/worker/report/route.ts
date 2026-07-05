@@ -38,7 +38,11 @@ interface WorkerReportBody {
   error?: string;
   output?: string;
   pr_url?: string;
+  project_name?: string;
+  project_dir?: string;
   files_changed?: string[];
+  validation_results?: string[];
+  github_push_status?: string;
   build_passed?: boolean;
   test_passed?: boolean;
   duration_ms?: number;
@@ -53,11 +57,15 @@ function buildResult(body: WorkerReportBody): Record<string, unknown> {
     worker_id: body.worker_id ?? body.worker_name ?? null,
     output: body.output ?? null,
     pr_url: body.pr_url ?? null,
+    project_name: body.project_name ?? null,
+    project_dir: body.project_dir ?? null,
     files_changed: body.files_changed ?? null,
+    validation_results: body.validation_results ?? null,
     build_passed: body.build_passed ?? null,
     test_passed: body.test_passed ?? null,
     duration_ms: body.duration_ms ?? null,
     git_commit_sha: body.git_commit_sha ?? null,
+    github_push_status: body.github_push_status ?? null,
     deploy_status: body.deploy_status ?? null,
     result_text: body.result_text ?? null,
   };
@@ -104,10 +112,15 @@ export async function POST(req: NextRequest) {
     workerId,
     attemptId,
     status: workerStatus,
+    projectName: body.project_name,
+    projectDir: body.project_dir,
     resultText: body.result_text,
     output: body.output,
     filesChanged: body.files_changed,
+    validationResults: body.validation_results,
     gitCommitSha: body.git_commit_sha,
+    githubPushStatus: body.github_push_status,
+    deployStatus: body.deploy_status,
     buildPassed: body.build_passed,
     testPassed: body.test_passed,
     errorText,
@@ -161,9 +174,9 @@ export async function POST(req: NextRequest) {
     currentStep:
       body.current_step ??
       (workerStatus === "succeeded" ? "completed" : workerStatus === "failed" ? "failed" : null),
-    statusMessage: body.status_message ?? null,
+    statusMessage: terminal ? projectDirectorReport.text : body.status_message ?? null,
     gitCommitSha: body.git_commit_sha ?? null,
-    errorText: workerStatus === "failed" ? errorText : "",
+    errorText: workerStatus === "failed" ? projectDirectorReport.text : "",
     completedAt: terminal ? now : null,
     updatedAt: now,
   });

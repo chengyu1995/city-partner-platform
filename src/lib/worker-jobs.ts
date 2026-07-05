@@ -32,7 +32,6 @@ const RECORD_ID_KEYS = [
 ];
 
 const TERMINAL_WORKER_STATUSES = new Set(["succeeded", "failed"]);
-
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
@@ -112,6 +111,78 @@ function readStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
+function placeholder(value: string | null | undefined): string {
+  return value && value.trim() ? value.trim() : "未提供";
+}
+
+function sanitizeReportText(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
+    .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
+    .replace(/\b(sb_secret|service_role|app_secret|tenant_access_token|access_token|refresh_token|api_key|password)\b\s*[:=]\s*['"]?[^'"\s,}]+/gi, "$1=[redacted]")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]");
+}
+
+function truncateText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 40)}\n...[已截断，保留关键字段]`;
+}
+
+function listLines(items: string[], emptyText: string, maxItems = 40): string[] {
+  if (!items.length) return [`- ${emptyText}`];
+  const visibleItems = items.slice(0, maxItems).map((item) => `- ${sanitizeReportText(item)}`);
+  if (items.length > maxItems) {
+    visibleItems.push(`- ...已截断 ${items.length - maxItems} 项`);
+  }
+  return visibleItems;
+}
+
+function numberedLines(items: string[], emptyText: string, maxItems = 5): string[] {
+  if (!items.length) return [`1. ${emptyText}`];
+  const visibleItems = items.slice(0, maxItems).map((item, index) => `${index + 1}. ${sanitizeReportText(item)}`);
+  if (items.length > maxItems) {
+    visibleItems.push(`${maxItems + 1}. ...已截断 ${items.length - maxItems} 项`);
+  }
+  return visibleItems;
+}
+
+function pathMatchesAny(path: string, prefixes: string[]): boolean {
+  const normalized = path.replace(/\\/g, "/");
+  return prefixes.some((prefix) => normalized === prefix || normalized.startsWith(prefix));
+}
+
+function hasEnvChange(filesChanged: string[]): boolean {
+  return filesChanged.some((file) => {
+    const normalized = file.replace(/\\/g, "/");
+    return /(^|\/)\.env(\.|$)/.test(normalized) || normalized.endsWith(".env");
+  });
+}
+
+function buildSafetyBoundary(filesChanged: string[], deployStatus?: string | null): string[] {
+  const businessPageChanged = filesChanged.some((file) =>
+    pathMatchesAny(file, ["src/app/page.tsx", "src/app/partners", "src/app/post"])
+  );
+  const databaseChanged = filesChanged.some((file) =>
+    pathMatchesAny(file, ["docs/setup-supabase.sql", "docs/setup-hermes-jobs.sql", "docs/setup-hermes-v2-schema.sql", "supabase"])
+  );
+
+  return [
+    `是否修改业务页面：首页//partners//post：${businessPageChanged ? "是" : "否"}`,
+    `是否修改数据库：${databaseChanged ? "是" : "否"}`,
+    `是否修改 .env：${hasEnvChange(filesChanged) ? "是" : "否"}`,
+    `是否部署：${deployStatus ? deployStatus : "否"}`,
+    "是否启动 dev server：否",
+  ];
+}
+
+function extractCompletionItems(summary: string): string[] {
+  return summary
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^[-*\d.\s]+/, "").trim())
+    .filter(Boolean)
+    .slice(0, 5);
+}
+
 export function getProjectDirectorJobCorrelation(job: JobRecord | null | undefined): {
   boss_request_id: string | null;
   plan_id: string | null;
@@ -142,10 +213,15 @@ export function buildProjectDirectorWorkerReport(input: {
   workerId: string;
   attemptId: string | null;
   status: "queued" | "running" | "succeeded" | "failed";
+  projectName?: string | null;
+  projectDir?: string | null;
   resultText?: string | null;
   output?: string | null;
   filesChanged?: string[];
+  validationResults?: string[];
   gitCommitSha?: string | null;
+  githubPushStatus?: string | null;
+  deployStatus?: string | null;
   buildPassed?: boolean | null;
   testPassed?: boolean | null;
   errorText?: string | null;
@@ -156,57 +232,94 @@ export function buildProjectDirectorWorkerReport(input: {
       ? input.filesChanged
       : readStringArray(readRecord(input.job?.result)?.files_changed);
   const validation = [
-    `build=${input.buildPassed === undefined || input.buildPassed === null ? "unknown" : input.buildPassed ? "passed" : "failed"}`,
-    `test=${input.testPassed === undefined || input.testPassed === null ? "unknown" : input.testPassed ? "passed" : "failed"}`,
+    ...(input.validationResults && input.validationResults.length > 0 ? input.validationResults : []),
+    `build=${input.buildPassed === undefined || input.buildPassed === null ? "未提供" : input.buildPassed ? "通过" : "失败"}`,
+    `test=${input.testPassed === undefined || input.testPassed === null ? "未提供" : input.testPassed ? "通过" : "失败"}`,
   ];
   const needsBossConfirmation = input.status === "succeeded";
   const summary =
     input.resultText?.trim() ||
     input.output?.trim() ||
     (input.status === "failed" ? input.errorText?.trim() : "") ||
-    "Worker did not provide a detailed result.";
+    "未提供";
+  const demand =
+    correlation.original_demand ??
+    readString(input.job?.request_text) ??
+    readString(input.job?.prompt) ??
+    null;
+  const jobId = readString(input.job?.id) ?? readString(input.job?.job_id);
+  const statusTitle =
+    input.status === "succeeded"
+      ? "✅ Codex 任务执行成功"
+      : input.status === "failed"
+        ? "❌ Codex 任务执行失败"
+        : `Codex 任务状态：${input.status}`;
+  const gitCommitSha = input.gitCommitSha ?? readString(input.job?.git_commit_sha);
+  const githubPushStatus = input.githubPushStatus ?? "未提供";
+  const completionItems = extractCompletionItems(summary);
+  const safetyBoundary = buildSafetyBoundary(filesChanged, input.deployStatus);
 
   const data = {
+    job_id: jobId,
     boss_request_id: correlation.boss_request_id,
     plan_id: correlation.plan_id,
     task_key: correlation.task_key,
-    original_demand: correlation.original_demand,
+    original_demand: demand,
+    project_name: input.projectName ?? "同城搭子网站",
+    project_dir: input.projectDir ?? "未提供",
     worker_id: input.workerId,
     attempt_id: input.attemptId,
     status: input.status,
-    what_changed: summary,
+    status_title: statusTitle,
+    what_changed: sanitizeReportText(summary),
     files_changed: filesChanged,
     validation_result: validation,
-    commit_hash: input.gitCommitSha ?? null,
+    commit_hash: gitCommitSha ?? null,
+    github_push_status: githubPushStatus,
+    safety_boundary: safetyBoundary,
     needs_boss_confirmation: needsBossConfirmation,
     next_step: needsBossConfirmation
-      ? "Boss should review the changed files and validation result, then confirm acceptance or send acceptance feedback."
-      : "Project director should inspect the failure reason and decide whether to retry or revise the plan.",
-    error: input.errorText ?? null,
+      ? "可以进入下一批次；如本批次影响关键链路，请老板验收后再继续。"
+      : "需要老板查看失败原因后决定是否重试、扩大修改范围或调整需求。",
+    error: input.errorText ? sanitizeReportText(input.errorText) : null,
   };
 
-  const text = [
-    "[Project Director Worker Report]",
-    `boss_request_id: ${correlation.boss_request_id ?? "unknown"}`,
-    `plan_id: ${correlation.plan_id ?? "unknown"}`,
-    `task_key: ${correlation.task_key ?? "unknown"}`,
-    `attempt_id: ${input.attemptId ?? "missing"}`,
-    `worker_id: ${input.workerId}`,
-    `status: ${input.status}`,
+  const requiredHeader = [
+    statusTitle,
+    `任务编号：${placeholder(jobId)}`,
+    `job_id：${placeholder(jobId)}`,
+    `attempt_id：${placeholder(input.attemptId)}`,
+    `需求：${placeholder(truncateText(sanitizeReportText(demand), 800))}`,
+    `项目名称：${placeholder(input.projectName ?? "同城搭子网站")}`,
+    `项目目录：${placeholder(input.projectDir)}`,
     "",
-    "What changed:",
-    summary,
+    "本阶段性质：",
+    "系统升级阶段 BATCH-27：统一 Worker 完成后飞书项目总管报告模板",
     "",
-    "Changed files:",
-    ...(filesChanged.length ? filesChanged.map((file) => `- ${file}`) : ["- none reported"]),
+    "执行结果摘要：",
+    truncateText(sanitizeReportText(summary), 1200),
     "",
-    "Validation:",
-    ...validation.map((item) => `- ${item}`),
+    "修改文件：",
+    ...listLines(filesChanged, "未提供"),
     "",
-    `Commit hash: ${input.gitCommitSha || "not reported"}`,
-    `Needs boss confirmation: ${needsBossConfirmation ? "yes" : "no"}`,
-    `Next step: ${data.next_step}`,
-  ].join("\n");
+    "完成内容：",
+    ...numberedLines(completionItems, input.status === "failed" ? "任务失败，未生成完成内容" : "未提供"),
+    "",
+    "验证结果：",
+    ...listLines(validation, "未提供"),
+    "",
+    "安全边界：",
+    ...listLines(safetyBoundary, "未提供"),
+    "",
+    "Git 自动备份：",
+    `commit SHA：${gitCommitSha || "未生成"}`,
+    `GitHub 推送状态：${placeholder(githubPushStatus)}`,
+    "",
+    "下一步建议：",
+    data.next_step,
+  ];
+
+  const text = requiredHeader.join("\n");
 
   return { text, data };
 }

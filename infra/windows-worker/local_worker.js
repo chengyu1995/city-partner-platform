@@ -412,6 +412,37 @@ function formatPreviewReport(reportResult) {
   ].join("\n");
 }
 
+function getPreviewValidationLines(reportResult) {
+  if (!reportResult) {
+    return ["静态预览诊断：未执行（WORKER_PREVIEW_SMOKE 未开启）"];
+  }
+
+  const lines = [
+    `静态预览诊断：${reportResult.ok ? "通过" : "warning"}`,
+    "本地预览：未启动 dev server / 浏览器",
+  ];
+
+  for (const item of safeReportArray(reportResult.staticChecks)) {
+    lines.push(`${item.label}: exit ${item.code} ${item.ok ? "通过" : "失败"}`);
+  }
+
+  if (reportResult.warning) {
+    lines.push(`本地预览静态诊断 warning：${reportResult.error || "诊断未通过"}`);
+  }
+
+  return lines;
+}
+
+function buildGithubPushStatus(pushResult) {
+  if (!pushResult) {
+    return "未生成";
+  }
+
+  return pushResult.pushed
+    ? `已推送：${pushResult.remote}/${pushResult.branch}`
+    : pushResult.message || "未推送";
+}
+
 async function runCodexWithRetries(job) {
   const prompts = [
     () => buildCodexPrompt(job),
@@ -469,6 +500,7 @@ async function commitGitTask(job) {
     return {
       committed: false,
       message: "Codex 没有产生文件变更",
+      filesChanged: [],
     };
   }
 
@@ -478,6 +510,7 @@ async function commitGitTask(job) {
     return {
       committed: false,
       message: "Codex 没有产生可提交的文件变更",
+      filesChanged: [],
     };
   }
 
@@ -498,6 +531,7 @@ async function commitGitTask(job) {
     committed: true,
     commitSha: commit.stdout,
     summary: summary.stdout,
+    filesChanged: stagedPaths,
   };
 }
 
@@ -1098,6 +1132,20 @@ async function pollOnce() {
       finalResult,
       {
         attempt_id: attemptId,
+        project_name: "同城搭子网站",
+        project_dir: PROJECT_DIR,
+        files_changed: gitResult.filesChanged || [],
+        validation_results: [
+          "Codex 执行：通过",
+          ...getPreviewValidationLines(previewReport),
+          gitResult.committed
+            ? `Git 自动备份：通过（${gitResult.commitSha}）`
+            : `Git 自动备份：warning（${gitResult.message}）`,
+          pushResult.pushed
+            ? `GitHub 推送：通过（${pushResult.remote}/${pushResult.branch}）`
+            : `GitHub 推送：warning（${pushResult.message}）`,
+        ],
+        github_push_status: buildGithubPushStatus(pushResult),
         git_commit_sha:
           gitResult.commitSha || null,
         deploy_status:
@@ -1110,6 +1158,16 @@ async function pollOnce() {
     console.error("任务执行失败：", error);
 
     let rollbackMessage = "";
+    let failureChangedPaths = [];
+
+    try {
+      failureChangedPaths = await getTaskChangedPaths();
+    } catch (statusError) {
+      console.warn(
+        "读取失败任务修改文件失败：",
+        statusError instanceof Error ? statusError.message : String(statusError)
+      );
+    }
 
     try {
       const rollbackResult = await rollbackGitTask(gitCheckpoint);
@@ -1139,7 +1197,20 @@ async function pollOnce() {
       `${
       error instanceof Error ? error.message : String(error)
       }${rollbackMessage}`,
-      { attempt_id: attemptId }
+      {
+        attempt_id: attemptId,
+        project_name: "同城搭子网站",
+        project_dir: PROJECT_DIR,
+        files_changed: failureChangedPaths,
+        validation_results: [
+          `Codex 执行：失败（${error instanceof Error ? error.message : String(error)}`.slice(0, 600) + "）",
+          rollbackMessage.trim() || "Git 回滚：未提供",
+          "本地预览：未启动 dev server / 浏览器",
+        ],
+        github_push_status: "失败任务未推送",
+        git_commit_sha: null,
+        deploy_status: null,
+      }
     );
   } finally {
     stopHeartbeat();
