@@ -4,11 +4,12 @@
 
 1. Feishu receives a boss request.
 2. Project director classifies the request.
-3. The task tree generator creates a planning tree.
-4. A single planning job is queued in `hermes_jobs`.
-5. The boss replies `批准执行`.
-6. The dispatch plan creates concrete Agent execution jobs.
-7. Workers keep using `request_text` as the source of truth.
+3. Ordinary website requests enter `planning_only`; they do not go directly to Codex.
+4. The task tree generator records a planning tree in `hermes_messages`.
+5. The boss reviews or modifies the plan.
+6. The boss replies `总管 批准执行`.
+7. The dispatch plan creates concrete Agent execution jobs.
+8. Workers keep using `request_text` as the source of truth.
 
 ## Sources
 
@@ -37,3 +38,14 @@ The boss sees only the demand understanding, Agent subtasks, execution order, ap
 The Windows Worker wraps Agent tasks with a guard that forbids Codex from committing, pushing,
 starting a dev server, opening a browser, or modifying files outside the task scope. Local preview
 smoke is disabled by default for system-upgrade jobs; static validation remains the accepted path.
+
+## BATCH-19 Production Mode
+
+BATCH-19 marks the upgrade complete. The dispatcher can be used for real 同城搭子网站 product
+planning, but execution remains approval-gated:
+
+- `新需求：状态`, `新需求：查看计划`, and `新需求：帮助` are boss-facing control commands.
+- `新需求：我要做一个 xxx 功能` enters planning first.
+- `总管 批准执行` is required before Worker/Codex tasks are created.
+- `总管 暂停` blocks new dispatch.
+- `验收反馈：xxx` is routed back to the project director for diagnosis and follow-up.

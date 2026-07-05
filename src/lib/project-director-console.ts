@@ -3,6 +3,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 type ConsoleCommand =
   | "help"
   | "status"
+  | "view_plan"
   | "pause_agents"
   | "resume_agents"
   | "approve_execution";
@@ -13,7 +14,7 @@ export interface ProjectDirectorConsoleAction {
   record: string;
 }
 
-const COMMAND_PREFIXES = ["总管", "项目总管", "老板控制台", "/pd", "/director"];
+const COMMAND_PREFIXES = ["总管", "项目总管", "老板控制台", "新需求", "/pd", "/director"];
 
 function normalizeConsoleText(text: string): string {
   return text.trim().replace(/\s+/g, " ");
@@ -34,6 +35,7 @@ export function parseProjectDirectorConsoleCommand(text: string): ConsoleCommand
   const body = stripCommandPrefix(text);
   if (/^(帮助|命令|控制台|菜单|help)$/i.test(body)) return "help";
   if (/^(状态|总览|进度|任务状态|队列|queue|status)$/i.test(body)) return "status";
+  if (/^(查看计划|计划|当前计划|任务树|分发计划|plan)$/i.test(body)) return "view_plan";
   if (/^(暂停|暂停Agent|暂停 Agents|停止分发|暂停分发|pause)$/i.test(body)) return "pause_agents";
   if (/^(恢复|继续|恢复Agent|恢复 Agents|继续分发|resume)$/i.test(body)) return "resume_agents";
   if (/^(批准执行|同意执行|开始执行|approve)$/i.test(body)) return "approve_execution";
@@ -141,12 +143,21 @@ export async function buildProjectDirectorConsoleAction(
       reply: [
         "[项目总管控制台]",
         "可用命令：",
-        "- 总管状态：查看项目总管和多 Agent 队列",
+        "- 新需求：状态",
+        "- 新需求：查看计划",
+        "- 新需求：帮助",
+        "- 新需求：我要做一个 xxx 功能",
+        "- 新需求：修改计划：xxx",
+        "- 总管 状态：查看项目总管和多 Agent 队列",
         "- 总管 批准执行：批准最近任务树进入 Agent 执行",
         "- 总管 暂停：暂停新的 Agent 分发",
         "- 总管 恢复：恢复新的 Agent 分发",
+        "- 验收反馈：xxx 点不开",
+        "- 验收反馈：xxx 不好看",
+        "- 验收反馈：xxx 报错",
         "",
-        "高风险事项仍需单独确认：生产部署、环境变量、数据库结构、删除数据、依赖变更。",
+        "正式模式：普通网站需求先进入项目总管 planning，不直接进入 Codex。只有老板发送“总管 批准执行”后，才会分发 Worker/Codex。",
+        "高风险事项仍需单独确认：生产部署、环境变量、数据库结构、删除数据、依赖变更、恢复 stash。",
       ].join("\n"),
       record: "PROJECT_DIRECTOR_CONSOLE\ncommand: help\nstate: replied",
     };
@@ -188,10 +199,12 @@ export async function buildProjectDirectorConsoleAction(
         `last_failure: ${failedTask}`,
         "",
         "[项目总管状态]",
+        "system_upgrade: BATCH-14..BATCH-19 completed",
+        "mode: production_project_director_planning_first",
         "队列统计：",
         formatCounts(counts),
         "",
-        "控制命令：总管 批准执行 / 总管 暂停 / 总管 恢复",
+        "控制命令：新需求：查看计划 / 总管 批准执行 / 总管 暂停 / 总管 恢复",
       ].join("\n"),
       record: [
         "PROJECT_DIRECTOR_CONSOLE",
@@ -204,6 +217,53 @@ export async function buildProjectDirectorConsoleAction(
         `last_completed_task: ${completedTask}`,
         `last_failure: ${failedTask}`,
         `counts: ${JSON.stringify(counts)}`,
+      ].join("\n"),
+    };
+  }
+
+  if (command === "view_plan") {
+    const recentPlan = await loadLatestSystemRecord(
+      supabase,
+      convId,
+      "PROJECT_DIRECTOR_TASK_TREE_DRAFT"
+    );
+    const recentDispatchPlan = await loadLatestSystemRecord(
+      supabase,
+      convId,
+      "PROJECT_DIRECTOR_DISPATCH_PLAN_DRAFT"
+    );
+    const recentDispatch = await loadLatestSystemRecord(
+      supabase,
+      convId,
+      "PROJECT_DIRECTOR_APPROVED_EXECUTION_DISPATCHED"
+    );
+    const source = recentDispatchPlan || recentPlan || recentDispatch;
+    const recentDemand = readLineValue(source, "original_demand") || "none";
+    const recentPlanId =
+      readLineValue(source, "plan_id") || readLineValue(source, "task_tree_id") || "none";
+    const state = readLineValue(source, "state") || "none";
+    const executionMode = readLineValue(source, "execution_mode") || "planning_only";
+
+    return {
+      command,
+      reply: [
+        "[Project Director Plan]",
+        `recent_boss_request: ${oneLine(recentDemand)}`,
+        `recent_plan: ${oneLine(recentPlanId)}`,
+        `state: ${oneLine(state)}`,
+        `execution_mode: ${oneLine(executionMode)}`,
+        "",
+        "规则：普通网站需求先进入 planning；老板发送“总管 批准执行”后才会分发 Worker/Codex。",
+        "可继续发送：修改计划：xxx / 总管 批准执行 / 总管 暂停",
+      ].join("\n"),
+      record: [
+        "PROJECT_DIRECTOR_CONSOLE",
+        "command: view_plan",
+        "state: replied",
+        `recent_boss_request: ${recentDemand}`,
+        `recent_plan: ${recentPlanId}`,
+        `plan_state: ${state}`,
+        `execution_mode: ${executionMode}`,
       ].join("\n"),
     };
   }
