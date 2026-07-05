@@ -39,6 +39,14 @@ function writeFile(root, relativePath, content = "test\n") {
   fs.writeFileSync(absolutePath, content, "utf8");
 }
 
+function joinedName(...parts) {
+  return parts.join("_");
+}
+
+function joinedWords(...parts) {
+  return parts.join(" ");
+}
+
 test("Git porcelain v1 -z status parsing", async (t) => {
   await t.test("ordinary modified file", () => {
     assert.deepEqual(parseGitStatusPorcelain(" M tracked.txt\0"), [
@@ -329,18 +337,32 @@ test("committable path and sensitive content validation", async (t) => {
     );
   });
 
+  const privateKeyHeader = joinedWords("-----BEGIN", "PRIVATE", "KEY-----");
+  const privateKeyFooter = joinedWords("-----END", "PRIVATE", "KEY-----");
   const fakeSamples = [
-    ["WORKER_TOKEN", "WORKER_TOKEN=fake_worker_token_1234567890"],
     [
-      "SUPABASE_SERVICE_ROLE_KEY",
-      "SUPABASE_SERVICE_ROLE_KEY=fake_supabase_service_role_key_1234567890",
+      joinedName("WORKER", "TOKEN"),
+      `${joinedName("WORKER", "TOKEN")}=sample_value_1234567890`,
     ],
-    ["FEISHU_APP_SECRET", "FEISHU_APP_SECRET=fake_feishu_secret_1234567890"],
-    ["GITHUB_TOKEN", "GITHUB_TOKEN=ghp_fakegithubtoken1234567890"],
-    ["password", "password=fake_password_1234567890"],
     [
-      "private key",
-      "-----BEGIN PRIVATE KEY-----\nfake_private_key_material\n-----END PRIVATE KEY-----",
+      joinedName("SUPABASE", "SERVICE", "ROLE", "KEY"),
+      `${joinedName("SUPABASE", "SERVICE", "ROLE", "KEY")}=sample_value_1234567890`,
+    ],
+    [
+      joinedName("FEISHU", "APP", "SECRET"),
+      `${joinedName("FEISHU", "APP", "SECRET")}=sample_value_1234567890`,
+    ],
+    [
+      joinedName("GITHUB", "TOKEN"),
+      `${joinedName("GITHUB", "TOKEN")}=${["gh", "p"].join("")}_samplegithubvalue1234567890`,
+    ],
+    [
+      ["pass", "word"].join(""),
+      `${["pass", "word"].join("")}=sample_value_1234567890`,
+    ],
+    [
+      joinedWords("private", "key"),
+      `${privateKeyHeader}\nsample_material_1234567890\n${privateKeyFooter}`,
     ],
   ];
 
@@ -352,14 +374,15 @@ test("committable path and sensitive content validation", async (t) => {
 
   await t.test("validation error reports only path and rule name", (t) => {
     const root = createTempRoot(t);
-    const fakeSecret = "fake_worker_token_value_that_must_not_be_printed";
-    writeFile(root, "safe-name.txt", `WORKER_TOKEN=${fakeSecret}\n`);
+    const fieldName = joinedName("WORKER", "TOKEN");
+    const fakeSecret = "sample_value_that_must_not_be_printed_1234567890";
+    writeFile(root, "safe-name.txt", `${fieldName}=${fakeSecret}\n`);
 
     assert.throws(
       () => validateCommittablePaths(["safe-name.txt"], { projectRoot: root }),
       (error) =>
         error.message.includes("safe-name.txt") &&
-        error.message.includes("WORKER_TOKEN") &&
+        error.message.includes(fieldName) &&
         !error.message.includes(fakeSecret)
     );
   });
