@@ -35,6 +35,7 @@ import {
   buildTaskTreeChangeRecordedReply,
   buildTaskTreeReviewReceivedReply,
   classifyProjectDirectorDemand,
+  isDirectWorkerTaskRequest,
   getAcceptanceFeedbackBody,
   getDemandBody,
   isAcceptanceFeedbackMessage,
@@ -557,6 +558,56 @@ function attachProjectDirectorDispatchMetadata(
   });
 }
 
+function buildDirectWorkerTaskText(text: string): string {
+  return normalizeFeishuTaskText(
+    text
+      .replace(/请直接创建\s*Worker\s*任务[：:，,。.]?/gi, "")
+      .replace(/直接创建\s*Worker\s*任务[：:，,。.]?/gi, "")
+      .replace(/直接进入\s*Worker\s*创建流程[：:，,。.]?/gi, "")
+      .replace(/跳过\s*A\/B\s*询问[：:，,。.]?/gi, "")
+  );
+}
+
+async function insertDirectWorkerTask(
+  supabase: SupabaseClient,
+  input: {
+    requestText: string;
+    rawText: string;
+    feishuMessageId: string;
+    feishuEventId: string;
+    feishuChatId: string;
+    feishuUserId: string;
+  }
+): Promise<{ jobId: string | null }> {
+  const row = {
+    source: "feishu",
+    job_type: "direct_worker_task",
+    title: `Direct Worker task: ${input.requestText.slice(0, 80)}`,
+    description: input.requestText,
+    prompt: input.requestText,
+    request_text: input.requestText,
+    status: "queued",
+    priority: 10,
+    feishu_message_id: input.feishuMessageId,
+    feishu_event_id: input.feishuEventId,
+    feishu_chat_id: input.feishuChatId,
+    feishu_user_id: input.feishuUserId,
+    payload: {
+      route: "direct_worker_task",
+      raw_message: input.rawText,
+      skip_planning_choice: true,
+    },
+  };
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .insert(row)
+    .select("id, job_id")
+    .maybeSingle();
+
+  if (error) throw new Error(`insert direct worker task failed: ${error.message}`);
+  return { jobId: (data?.job_id as string | null | undefined) ?? (data?.id as string | null | undefined) ?? null };
+}
+
 export async function POST(req: NextRequest) {
   try {
     // 1. 飞书 URL 验证 (challenge) - 明文 challenge 必须最快返回。
@@ -772,6 +823,98 @@ export async function POST(req: NextRequest) {
           state: "acceptance_feedback_queued",
           dispatched_batch: "BATCH-12",
           inserted_jobs: insertResult.insertedCount,
+        });
+      }
+
+      if (isDirectWorkerTaskRequest(text)) {
+        const requestText = buildDirectWorkerTaskText(text) || normalizeFeishuTaskText(text);
+        const duplicateCheck = await findRecentDuplicateFeishuJob(supabase, requestText);
+        const token = await getFeishuToken();
+
+        if (duplicateCheck.error) {
+          console.error(
+            "[feishu-event] direct worker duplicate check skipped:",
+            sanitizeLogText(duplicateCheck.error.message ?? "unknown error")
+          );
+        } else if (duplicateCheck.duplicate) {
+          const existingJobNo = duplicateCheck.duplicate.job_id ?? duplicateCheck.duplicate.id;
+          const reply = `检测到重复 Worker 任务，已跳过创建。已有任务编号：${existingJobNo}`;
+          await saveSystemRecordedReply(
+            supabase,
+            convId,
+            text,
+            reply,
+            [
+              "PROJECT_DIRECTOR_DIRECT_WORKER_TASK_DUPLICATE",
+              "state: duplicate_skipped",
+              `request_text: ${requestText}`,
+              "skip_planning_choice: true",
+              "note: direct Worker task requests are handled before A/B choice parsing.",
+            ].join("\n"),
+            "project_director_direct_worker_task_duplicate",
+            ev.message.message_id
+          );
+          await sendFeishuMessage(
+            token,
+            ev.message.chat_id,
+            ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+            reply
+          );
+          await markReceiptCompleted(supabase, eventId);
+          return NextResponse.json({
+            code: 0,
+            direct_worker_task: true,
+            state: "duplicate_skipped",
+            worker_jobs_created: false,
+            existing_job_id: duplicateCheck.duplicate.id,
+            existing_job_no: duplicateCheck.duplicate.job_id ?? null,
+          });
+        }
+
+        const insertResult = await insertDirectWorkerTask(supabase, {
+          requestText,
+          rawText: text,
+          feishuMessageId: ev.message.message_id,
+          feishuEventId: eventId,
+          feishuChatId: ev.message.chat_id,
+          feishuUserId: userId,
+        });
+        const reply = [
+          "【项目总管：已直接创建 Worker 任务】",
+          `任务编号：${insertResult.jobId ?? "pending"}`,
+          "",
+          "已按你的明确指令跳过 A/B 方案询问，并写入 Worker 队列。",
+          "后续由 Worker 领取执行，完成后回报修改文件、验证结果和剩余风险。",
+        ].join("\n");
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          [
+            "PROJECT_DIRECTOR_DIRECT_WORKER_TASK_CREATED",
+            "state: queued",
+            `job_id: ${insertResult.jobId ?? "pending"}`,
+            `request_text: ${requestText}`,
+            "skip_planning_choice: true",
+            "worker_jobs_created: yes",
+          ].join("\n"),
+          "project_director_direct_worker_task",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          direct_worker_task: true,
+          state: "queued",
+          worker_jobs_created: true,
+          job_id: insertResult.jobId,
         });
       }
 

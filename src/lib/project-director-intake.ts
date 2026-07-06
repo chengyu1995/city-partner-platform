@@ -27,6 +27,12 @@ export type ProjectDirectorRequestType =
 
 export type ProjectDirectorPlanningChoice = "homepage_mvp" | "complete_mvp_plan";
 
+export type ProjectDirectorWorkRequestKind =
+  | "document_organization"
+  | "system_repair"
+  | "product_design"
+  | "other";
+
 const WEBSITE_PRODUCT_KEYWORDS = [
   "网站",
   "页面",
@@ -119,6 +125,8 @@ const DISPATCH_PLAN_CHANGE_PREFIX = "修改分发清单：";
 const DISPATCH_PLAN_CHANGE_PREFIX_ASCII = "修改分发清单:";
 
 const DISPATCH_BATCH_APPROVAL_PHRASES = [
+  "批准批次",
+  "仅批准",
   "批准分发第 1 批",
   "批准分发第1批",
   "批准第 1 批",
@@ -144,19 +152,15 @@ const APPROVED_EXECUTION_PHRASES = [
 const PLAN_CHANGE_PREFIX = "修改计划：";
 const PLAN_CHANGE_PREFIX_ASCII = "修改计划:";
 
-const PLANNING_CHOICE_A_PATTERNS = [
-  /^选\s*A[。.!！]?$/i,
-  /^选择\s*A[。.!！]?$/i,
-  /^按\s*A\s*做[。.!！]?$/i,
-  /先做首页\s*MVP/i,
-];
+const PLANNING_CHOICE_A_PATTERNS = [/^选\s*A[。.!！]?$/i, /^选择\s*A[。.!！]?$/i];
 
-const PLANNING_CHOICE_B_PATTERNS = [
-  /^选\s*B[。.!！]?$/i,
-  /^选择\s*B[。.!！]?$/i,
-  /^按\s*B\s*做[。.!！]?$/i,
-  /先做完整产品规划/i,
-  /完整产品规划/i,
+const PLANNING_CHOICE_B_PATTERNS = [/^选\s*B[。.!！]?$/i, /^选择\s*B[。.!！]?$/i];
+
+const DIRECT_WORKER_TASK_PATTERNS = [
+  /请直接创建\s*Worker\s*任务/i,
+  /直接创建\s*Worker\s*任务/i,
+  /直接进入\s*Worker\s*创建流程/i,
+  /跳过\s*A\/B\s*询问/i,
 ];
 
 function normalizeDemandText(text: string): string {
@@ -173,9 +177,6 @@ export function parseProjectDirectorPlanningChoice(
   if (PLANNING_CHOICE_B_PATTERNS.some((pattern) => pattern.test(normalized))) {
     return "complete_mvp_plan";
   }
-  if (normalized === "批准建议") {
-    return "complete_mvp_plan";
-  }
   return null;
 }
 
@@ -186,6 +187,11 @@ export function isProjectDirectorPlanningChoiceReply(text: string): boolean {
 export function isNewDemandMessage(text: string): boolean {
   const normalized = normalizeDemandText(text);
   return NEW_DEMAND_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+
+export function isDirectWorkerTaskRequest(text: string): boolean {
+  const normalized = normalizeDemandText(text);
+  return DIRECT_WORKER_TASK_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 export function getDemandBody(text: string): string {
@@ -227,6 +233,16 @@ export function classifyProjectDirectorDemand(text: string): ProjectDirectorDema
     return "website_product_request";
   }
   return "other_request";
+}
+
+export function classifyProjectDirectorWorkRequest(text: string): ProjectDirectorWorkRequestKind {
+  const demand = getDemandBody(text);
+  if (/文档|整理|归档|规范|README|docs?/i.test(demand)) return "document_organization";
+  if (/系统|修复|故障|报错|bug|Worker|Hermes|飞书|BATCH|调度|接口|数据库|Supabase|SQL/i.test(demand)) {
+    return "system_repair";
+  }
+  if (classifyProjectDirectorDemand(text) === "website_product_request") return "product_design";
+  return "other";
 }
 
 export function classifyProjectDirectorRequestType(text: string): ProjectDirectorRequestType {
@@ -504,6 +520,36 @@ function summarizeDemand(text: string): string {
 
 export function buildProjectDirectorReply(text: string): string {
   const summary = summarizeDemand(text);
+  const workRequestKind = classifyProjectDirectorWorkRequest(text);
+
+  if (workRequestKind === "document_organization") {
+    return [
+      "【项目总管确认】",
+      `需求理解：${summary}`,
+      "",
+      "这属于文档整理任务，不是产品设计需求。我会按文档范围、文件边界和验收标准进入任务树规划。",
+      "",
+      "下一步老板可回复：",
+      "- 批准执行",
+      "- 修改计划：{你的要求}",
+      "- 暂停",
+    ].join("\n");
+  }
+
+  if (workRequestKind === "system_repair" && !isSystemUpgradeDemand(text)) {
+    return [
+      "【项目总管确认】",
+      `需求理解：${summary}`,
+      "",
+      "这属于系统修复任务，不是产品设计需求。我会按故障范围、最小修复边界和验证步骤进入任务树规划。",
+      "",
+      "下一步老板可回复：",
+      "- 批准执行",
+      "- 修改计划：{你的要求}",
+      "- 暂停",
+    ].join("\n");
+  }
+
   if (isSystemUpgradeDemand(text)) {
     return [
       "【项目总管确认】",
