@@ -5,29 +5,11 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 import { getPartnerPost } from "@/lib/db";
+import { PARTNER_CATEGORIES } from "@/types/db";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
 import { ReportButton } from "./ReportButton";
-
-const partnerCategoryMeta: Record<string, { label: string; emoji: string; color: string }> = {
-  饭搭子: { label: "饭搭子", emoji: "🍜", color: "from-orange-500 to-amber-400" },
-  运动搭子: { label: "运动搭子", emoji: "🏸", color: "from-emerald-500 to-teal-400" },
-  学习搭子: { label: "学习搭子", emoji: "📚", color: "from-blue-500 to-cyan-400" },
-  出游搭子: { label: "出游搭子", emoji: "🧳", color: "from-sky-500 to-indigo-400" },
-  "K 歌搭子": { label: "K 歌搭子", emoji: "🎤", color: "from-pink-500 to-rose-400" },
-  摩友搭子: { label: "摩友搭子", emoji: "🏍️", color: "from-violet-500 to-purple-400" },
-  钓友搭子: { label: "钓友搭子", emoji: "🎣", color: "from-lime-500 to-emerald-400" },
-};
-
-const fallbackCategoryMeta = {
-  label: "搭子需求",
-  emoji: "📌",
-  color: "from-slate-500 to-slate-400",
-};
-
-function getPartnerCategoryMeta(category: string) {
-  return partnerCategoryMeta[category] ?? fallbackCategoryMeta;
-}
+import { CopyButton } from "./CopyButton";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -40,10 +22,10 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { id } = await params;
   const post = await getPartnerPost(id);
   if (!post) return { title: "搭子详情 - 同城搭子" };
-  const cat = getPartnerCategoryMeta(post.category);
+  const cat = PARTNER_CATEGORIES.find((c) => c.key === post.category);
   return {
-    title: `${post.title} - ${post.city} ${cat.label} | 同城搭子`,
-    description: `${post.description.slice(0, 100)}... ${post.city} ${cat.label}，当前阶段联系方式暂不公开。`,
+    title: `${post.title} - ${post.city} ${cat?.key ?? ""}搭子 | 同城搭子`,
+    description: `${post.description.slice(0, 100)}... 📍 ${post.city} ${cat?.emoji ?? ""} ${cat?.key ?? ""}搭子, 快来联系 ${post.host_name}!`,
     openGraph: {
       title: post.title,
       description: post.description.slice(0, 200),
@@ -58,7 +40,10 @@ export default async function PartnerDetailPage({ params }: Props) {
   const post = await getPartnerPost(id);
   if (!post) notFound();
 
-  const meta = getPartnerCategoryMeta(post.category);
+  const meta = PARTNER_CATEGORIES.find((c) => c.key === post.category) ?? {
+    emoji: "📌",
+    color: "from-slate-500 to-slate-400",
+  };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-violet-50 via-white to-amber-50">
@@ -92,14 +77,13 @@ export default async function PartnerDetailPage({ params }: Props) {
 
         {/* 联系方式 */}
         <div className="mt-4 rounded-2xl bg-white p-6 shadow-sm">
-          <h2 className="text-sm font-bold text-slate-400">联系信息</h2>
-          <div className="mt-3">
+          <h2 className="text-sm font-bold text-slate-400">联系发起人</h2>
+          <div className="mt-3 flex items-center justify-between">
             <div>
               <p className="text-lg font-bold text-slate-900">👤 {post.host_name}</p>
-              <p className="mt-2 text-sm leading-6 text-slate-600">
-                暂不开放联系方式。联系方式展示策略不在本批实现，后续需要老板单独批准。
-              </p>
+              <p className="mt-1 text-base text-violet-600">{post.contact}</p>
             </div>
+            <CopyButton text={post.contact} />
           </div>
         </div>
 
