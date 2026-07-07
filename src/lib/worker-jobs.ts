@@ -142,6 +142,38 @@ function truncateText(value: string, maxLength: number): string {
   return `${value.slice(0, maxLength - 40)}\n...[已截断，保留关键字段]`;
 }
 
+function readDiagnosticLine(content: string, label: string): string | null {
+  const line = content
+    .split(/\r?\n/)
+    .find((item) => item.trim().startsWith(`${label}：`) || item.trim().startsWith(`${label}:`));
+
+  if (!line) return null;
+  return line.replace(new RegExp(`^\\s*${label}[：:]\\s*`), "").trim() || null;
+}
+
+function isActionableEngineeringFailure(errorText: string): boolean {
+  return /pathspec|git add|git commit|git push|typescript|tsc|eslint|lint|build|permission|access denied|eacces/i.test(
+    errorText
+  );
+}
+
+function buildFailureNextStep(errorText: string): string {
+  const explicitSuggestion = readDiagnosticLine(errorText, "建议修复动作");
+  const explicitApproval = readDiagnosticLine(errorText, "是否建议老板回复“总管 批准修复”");
+
+  if (explicitSuggestion) {
+    return explicitApproval === "是"
+      ? `${explicitSuggestion}\n建议老板回复：“总管 批准修复”。`
+      : explicitSuggestion;
+  }
+
+  if (isActionableEngineeringFailure(errorText)) {
+    return "这是可修复工程错误。项目总管应基于失败阶段和关键错误生成最小范围修复建议；如不涉及越权操作，建议老板回复：“总管 批准修复”。";
+  }
+
+  return "需要老板查看失败原因后决定是否重试、扩大修改范围或调整需求。";
+}
+
 function listLines(items: string[], emptyText: string, maxItems = 40): string[] {
   if (!items.length) return [`- ${emptyText}`];
   const visibleItems = items.slice(0, maxItems).map((item) => `- ${sanitizeReportText(item)}`);
@@ -274,6 +306,16 @@ export function buildProjectDirectorWorkerReport(input: {
   const githubPushStatus = input.githubPushStatus ?? "未提供";
   const completionItems = input.status === "failed" ? [] : extractCompletionItems(summary);
   const safetyBoundary = buildSafetyBoundary(filesChanged, input.deployStatus);
+  const sanitizedError = input.errorText ? sanitizeReportText(input.errorText) : "";
+  const failureStage = input.status === "failed"
+    ? readDiagnosticLine(sanitizedError, "失败阶段") ?? "未提供"
+    : null;
+  const keyError = input.status === "failed"
+    ? readDiagnosticLine(sanitizedError, "关键错误") ?? truncateText(sanitizedError, 500)
+    : null;
+  const failureSuggestion = input.status === "failed"
+    ? buildFailureNextStep(sanitizedError)
+    : null;
 
   const data = {
     job_id: jobId,
@@ -296,8 +338,11 @@ export function buildProjectDirectorWorkerReport(input: {
     needs_boss_confirmation: needsBossConfirmation,
     next_step: needsBossConfirmation
       ? "可以进入下一批次；如本批次影响关键链路，请老板验收后再继续。"
-      : "需要老板查看失败原因后决定是否重试、扩大修改范围或调整需求。",
-    error: input.errorText ? sanitizeReportText(input.errorText) : null,
+      : failureSuggestion ?? "需要老板查看失败原因后决定是否重试、扩大修改范围或调整需求。",
+    failure_stage: failureStage,
+    key_error: keyError,
+    repair_suggestion: failureSuggestion,
+    error: sanitizedError || null,
   };
 
   const requiredHeader = [
@@ -314,6 +359,8 @@ export function buildProjectDirectorWorkerReport(input: {
     "",
     "执行结果摘要：",
     truncateText(sanitizeReportText(summary), 1200),
+    input.status === "failed" ? `失败阶段：${failureStage}` : "",
+    input.status === "failed" ? `关键错误：${keyError || "未提供"}` : "",
     "",
     "修改文件：",
     ...listLines(filesChanged, "未提供"),

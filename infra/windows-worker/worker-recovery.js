@@ -1,6 +1,13 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
+const {
+  getStatusPaths,
+  getTrackedStatusPaths,
+  getUntrackedStatusPaths,
+  parseGitStatusPorcelain,
+} = require("./git-safety");
 
 const NEXT_ENV_CONTENT = [
   '/// <reference types="next" />',
@@ -82,21 +89,6 @@ function resolveProjectDir(projectDir) {
   return resolved;
 }
 
-function normalizeGitPath(filePath) {
-  return String(filePath || "")
-    .replace(/\0/g, "")
-    .replace(/\\/g, "/")
-    .replace(/^\.\/+/, "")
-    .replace(/^\/+/, "")
-    .trim();
-}
-
-function uniqueSorted(values) {
-  return [...new Set(values.map(normalizeGitPath).filter(Boolean))].sort((a, b) =>
-    a.localeCompare(b)
-  );
-}
-
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     execFile(
@@ -144,28 +136,8 @@ async function runGit(projectDir, args, options = {}) {
   });
 }
 
-function parseGitStatusShort(output) {
-  return String(output || "")
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter(Boolean)
-    .map((line) => {
-      const status = line.slice(0, 2);
-      const rawPath = line.slice(3).replace(/^"|"$/g, "");
-      const renamedPath = rawPath.includes(" -> ")
-        ? rawPath.split(" -> ").pop()
-        : rawPath;
-
-      return {
-        status,
-        path: normalizeGitPath(renamedPath),
-        line,
-      };
-    });
-}
-
 function isGeneratedPath(filePath) {
-  const normalized = normalizeGitPath(filePath);
+  const normalized = String(filePath || "").replace(/\\/g, "/").replace(/^\.\/+/, "").trim();
   const lower = normalized.toLowerCase();
 
   if (GENERATED_FILE_PATHS.has(normalized)) {
@@ -181,8 +153,8 @@ function isGeneratedPath(filePath) {
 }
 
 async function getGitStatusEntries(projectDir) {
-  const status = await runGit(projectDir, ["status", "--short"]);
-  return parseGitStatusShort(status.stdout);
+  const status = await runGit(projectDir, ["status", "--porcelain=v1", "-z"]);
+  return parseGitStatusPorcelain(status.stdout);
 }
 
 async function restoreGeneratedEnvFiles(projectDir, options = {}) {
@@ -238,17 +210,9 @@ async function cleanBuildCaches(projectDir) {
 }
 
 async function cleanGitStatusPaths(projectDir, entries, options = {}) {
-  const paths = uniqueSorted(entries.map((entry) => entry.path));
-  const trackedPaths = uniqueSorted(
-    entries
-      .filter((entry) => entry.status !== "??")
-      .map((entry) => entry.path)
-  );
-  const untrackedPaths = uniqueSorted(
-    entries
-      .filter((entry) => entry.status === "??")
-      .map((entry) => entry.path)
-  );
+  const paths = getStatusPaths(entries);
+  const trackedPaths = getTrackedStatusPaths(entries);
+  const untrackedPaths = getUntrackedStatusPaths(entries);
 
   if (trackedPaths.length > 0) {
     await runGit(projectDir, ["restore", "--staged", "--worktree", "--", ...trackedPaths]);
@@ -398,7 +362,7 @@ async function runPreflight(projectDir, options = {}) {
 
 async function checkRouteFiles(projectDir, routes = STATIC_PREVIEW_ROUTE_FILES) {
   return routes.map((routePath) => ({
-    path: normalizeGitPath(routePath),
+    path: String(routePath || "").replace(/\\/g, "/").replace(/^\.\/+/, "").trim(),
     ok: fs.existsSync(path.join(projectDir, routePath)),
   }));
 }

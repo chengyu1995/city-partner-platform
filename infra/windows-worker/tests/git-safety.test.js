@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
@@ -12,12 +13,15 @@ const {
   isSensitivePath,
   normalizeGitPath,
   parseGitStatusPorcelain,
+  parseGitStatusShort,
   scanSensitiveContent,
   validateCommittablePaths,
+  validateGitAddPathsExist,
   validateStagedPaths,
 } = require("../git-safety");
 
 const {
+  buildFailureReport,
   buildWorkerGuardedPrompt,
 } = require("../local_worker");
 
@@ -49,14 +53,13 @@ function joinedWords(...parts) {
 
 test("Git porcelain v1 -z status parsing", async (t) => {
   await t.test("ordinary modified file", () => {
-    assert.deepEqual(parseGitStatusPorcelain(" M tracked.txt\0"), [
-      {
-        status: " M",
-        path: "tracked.txt",
-        originalPath: null,
-        paths: ["tracked.txt"],
-      },
-    ]);
+    const entry = parseGitStatusPorcelain(" M tracked.txt\0")[0];
+
+    assert.equal(entry.status, " M");
+    assert.equal(entry.path, "tracked.txt");
+    assert.equal(entry.originalPath, null);
+    assert.deepEqual(entry.paths, ["tracked.txt"]);
+    assert.equal(entry.line, " M tracked.txt");
   });
 
   await t.test("new untracked file", () => {
@@ -118,6 +121,46 @@ test("Git porcelain v1 -z status parsing", async (t) => {
 
   await t.test("empty output parses as clean", () => {
     assert.deepEqual(parseGitStatusPorcelain(""), []);
+  });
+
+  await t.test("BATCH-P3 acceptance paths are preserved", () => {
+    const entries = parseGitStatusPorcelain(
+      [
+        " M app/page.tsx",
+        " M app/partners/page.tsx",
+        " M src/app/page.tsx",
+        " M infra/windows-worker/local_worker.js",
+      ].join("\0") + "\0"
+    );
+
+    assert.deepEqual(getStatusPaths(entries), [
+      "app/page.tsx",
+      "app/partners/page.tsx",
+      "infra/windows-worker/local_worker.js",
+      "src/app/page.tsx",
+    ]);
+    assert.equal(getStatusPaths(entries).includes("pp/page.tsx"), false);
+  });
+});
+
+test("Git short status fallback parsing", async (t) => {
+  await t.test("ordinary modified paths start after the two status columns and one separator", () => {
+    const entries = parseGitStatusShort(
+      [
+        " M app/page.tsx",
+        " M app/partners/page.tsx",
+        " M src/app/page.tsx",
+        " M infra/windows-worker/local_worker.js",
+      ].join("\n")
+    );
+
+    assert.deepEqual(getStatusPaths(entries), [
+      "app/page.tsx",
+      "app/partners/page.tsx",
+      "infra/windows-worker/local_worker.js",
+      "src/app/page.tsx",
+    ]);
+    assert.equal(getStatusPaths(entries).includes("pp/page.tsx"), false);
   });
 });
 
@@ -294,6 +337,51 @@ test("safe staging path validation", async (t) => {
     assert.doesNotMatch(source, /git\s+add\s+-A/i);
     assert.doesNotMatch(source, /reset",\s*"--hard|reset --hard/i);
     assert.doesNotMatch(source, /clean",\s*"-fd|clean -fd/i);
+  });
+
+  await t.test("git add path existence failure includes diagnostic fields", (t) => {
+    const root = createTempRoot(t);
+
+    assert.throws(
+      () =>
+        validateGitAddPathsExist(root, [
+          {
+            status: " M",
+            path: "pp/page.tsx",
+            line: " M app/page.tsx",
+          },
+        ]),
+      (error) =>
+        error.message.includes("失败阶段：git add 路径解析") &&
+        error.message.includes("错误路径：pp/page.tsx") &&
+        error.message.includes("原始 git status 行： M app/page.tsx") &&
+        error.message.includes("建议修复动作")
+    );
+  });
+});
+
+test("failure reports include repair diagnostics", async (t) => {
+  await t.test("pathspec failures produce boss repair recommendation", () => {
+    const report = buildFailureReport(
+      {
+        id: "job-123",
+        request_text: "修复 Worker git status 路径解析错误",
+      },
+      new Error("fatal: pathspec 'pp/page.tsx' did not match any files"),
+      {
+        filesChanged: ["infra/windows-worker/local_worker.js"],
+        uncommittedFiles: ["infra/windows-worker/local_worker.js"],
+        head: "abc123",
+      }
+    );
+
+    assert.match(report, /任务编号：job-123/);
+    assert.match(report, /失败阶段：git add 路径解析/);
+    assert.match(report, /关键错误/);
+    assert.match(report, /当前未提交文件清单/);
+    assert.match(report, /当前 HEAD：abc123/);
+    assert.match(report, /建议修复动作/);
+    assert.match(report, /是否建议老板回复“总管 批准修复”：是/);
   });
 });
 

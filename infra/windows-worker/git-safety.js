@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require("fs");
 const path = require("path");
 
@@ -9,23 +10,7 @@ function normalizeGitPath(filePath) {
     normalized = normalized.slice(2);
   }
 
-  
-  const droppedFirstCharPrefixes = [
-    ["ocs/", "docs/"],
-    ["rc/", "src/"],
-    ["nfra/", "infra/"],
-    ["ackage.json", "package.json"],
-    ["ackage-lock.json", "package-lock.json"],
-    ["EADME.md", "README.md"],
-  ];
-
-  for (const [badPrefix, goodPrefix] of droppedFirstCharPrefixes) {
-    if (normalized.startsWith(badPrefix)) {
-      return goodPrefix + normalized.slice(badPrefix.length);
-    }
-  }
-
-return normalized;
+  return normalized;
 }
 
 function uniqueSortedPaths(paths) {
@@ -47,6 +32,7 @@ function parseGitStatusPorcelain(output) {
 
     const status = record.slice(0, 2);
     const filePath = normalizeGitPath(record.slice(3));
+    const line = `${status} ${filePath}`;
 
     if (!filePath) {
       continue;
@@ -61,6 +47,8 @@ function parseGitStatusPorcelain(output) {
         path: filePath,
         originalPath,
         paths: [filePath],
+        line,
+        raw: record,
       });
       continue;
     }
@@ -70,10 +58,44 @@ function parseGitStatusPorcelain(output) {
       path: filePath,
       originalPath: null,
       paths: [filePath],
+      line,
+      raw: record,
     });
   }
 
   return entries;
+}
+
+function unquoteGitShortPath(value) {
+  const text = String(value || "").trim();
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
+    return text.slice(1, -1);
+  }
+  return text;
+}
+
+function parseGitStatusShort(output) {
+  return String(output || "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .map((line) => {
+      const status = line.slice(0, 2);
+      const rawPath = unquoteGitShortPath(line.length > 3 ? line.slice(3) : "");
+      const filePath = normalizeGitPath(
+        rawPath.includes(" -> ") ? rawPath.split(" -> ").pop() : rawPath
+      );
+
+      return {
+        status,
+        path: filePath,
+        originalPath: null,
+        paths: filePath ? [filePath] : [],
+        line,
+        raw: line,
+      };
+    })
+    .filter((entry) => entry.path);
 }
 
 function formatPathList(paths) {
@@ -209,6 +231,52 @@ function resolveInsideRoot(projectRoot, filePath) {
   return absolutePath;
 }
 
+function createPathResolutionFailure({ filePath, line, stage = "git add 路径解析" }) {
+  const normalizedPath = normalizeGitPath(filePath);
+  const error = new Error(
+    [
+      `失败阶段：${stage}`,
+      `错误路径：${normalizedPath || "未提供"}`,
+      `原始 git status 行：${line || "未提供"}`,
+      "建议修复动作：改用 git status --porcelain=v1 -z 解析；普通 status 行必须从 2 个状态位后的单个空格之后提取完整路径，并在 git add 前校验路径存在。",
+    ].join("\n")
+  );
+
+  error.code = "GIT_ADD_PATH_RESOLUTION";
+  error.failureStage = stage;
+  error.badPath = normalizedPath;
+  error.rawStatusLine = line || "";
+  error.suggestion =
+    "改用 git status --porcelain=v1 -z 解析，并在 git add 前对每个路径执行项目根目录内存在性校验。";
+
+  return error;
+}
+
+function validateGitAddPathsExist(projectRoot, entriesOrPaths) {
+  const root = path.resolve(projectRoot || process.cwd());
+  const entries = (entriesOrPaths || []).map((item) =>
+    typeof item === "string"
+      ? {
+          status: "",
+          path: normalizeGitPath(item),
+          line: item,
+        }
+      : item
+  );
+
+  for (const entry of entries) {
+    const filePath = normalizeGitPath(entry.path);
+    const absolutePath = resolveInsideRoot(root, filePath);
+
+    if (!absolutePath || !fs.existsSync(absolutePath)) {
+      throw createPathResolutionFailure({
+        filePath,
+        line: entry.line || entry.raw || `${entry.status || ""} ${filePath}`.trim(),
+      });
+    }
+  }
+}
+
 function scanFileForSensitiveContent(projectRoot, filePath) {
   const absolutePath = resolveInsideRoot(projectRoot, filePath);
 
@@ -339,8 +407,10 @@ module.exports = {
   isSensitivePath,
   normalizeGitPath,
   parseGitStatusPorcelain,
+  parseGitStatusShort,
   scanSensitiveContent,
   uniqueSortedPaths,
   validateCommittablePaths,
+  validateGitAddPathsExist,
   validateStagedPaths,
 };

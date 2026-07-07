@@ -1,4 +1,5 @@
-﻿require("dotenv").config();
+﻿/* eslint-disable @typescript-eslint/no-require-imports */
+require("dotenv").config();
 
 const { spawn, execFile } = require("child_process");
 const os = require("os");
@@ -10,6 +11,7 @@ const {
   parseGitStatusPorcelain,
   uniqueSortedPaths,
   validateCommittablePaths,
+  validateGitAddPathsExist,
   validateStagedPaths,
 } = require("./git-safety");
 const {
@@ -31,27 +33,6 @@ const CODEX_PROGRESS_HEARTBEAT_INTERVAL_MS = 30 * 1000;
 const CODEX_EXE = process.env.CODEX_EXE || "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe";
 const WORKER_PREVIEW_SMOKE =
   String(process.env.WORKER_PREVIEW_SMOKE || "false").toLowerCase() === "true";
-
-function repairKnownDroppedFirstCharPath(filePath) {
-  const value = String(filePath || "").trim();
-
-  const knownPrefixes = [
-    ["ocs/", "docs/"],
-    ["rc/", "src/"],
-    ["nfra/", "infra/"],
-    ["ackage.json", "package.json"],
-    ["EADME.md", "README.md"],
-  ];
-
-  for (const [badPrefix, goodPrefix] of knownPrefixes) {
-    if (value.startsWith(badPrefix)) {
-      return goodPrefix + value.slice(badPrefix.length);
-    }
-  }
-
-  return value;
-}
-
 
 const required = {
   WORKER_API_URL,
@@ -221,6 +202,10 @@ async function getTaskChangedPaths() {
   return getStatusPaths(entries);
 }
 
+async function getTaskChangedEntries() {
+  return readGitStatusEntries();
+}
+
 async function unstagePaths(paths) {
   const uniquePaths = uniqueSortedPaths(paths);
 
@@ -233,16 +218,17 @@ async function unstagePaths(paths) {
 
 async function getCachedDiffPaths() {
   const diff = await runGit(["diff", "--cached", "--name-only"]);
-  return uniqueSortedPaths(String(diff.stdout || "").split(/\r?\n/).filter(Boolean).map(repairKnownDroppedFirstCharPath));
+  return uniqueSortedPaths(String(diff.stdout || "").split(/\r?\n/).filter(Boolean));
 }
 
-async function stageTaskPaths(paths) {
-  const taskPaths = uniqueSortedPaths(paths.map(repairKnownDroppedFirstCharPath));
+async function stageTaskPaths(paths, statusEntries = null) {
+  const taskPaths = uniqueSortedPaths(paths);
 
   if (taskPaths.length === 0) {
     return [];
   }
 
+  validateGitAddPathsExist(PROJECT_DIR, statusEntries || taskPaths);
   validateCommittablePaths(taskPaths, { projectRoot: PROJECT_DIR });
 
   await runGit(["add", "--", ...taskPaths]);
@@ -412,6 +398,117 @@ function formatPreviewReport(reportResult) {
   ].join("\n");
 }
 
+function classifyFailure(error) {
+  const errorText = error instanceof Error ? error.message : String(error);
+  const lower = errorText.toLowerCase();
+
+  if (error?.code === "GIT_ADD_PATH_RESOLUTION" || lower.includes("pathspec")) {
+    return {
+      stage: "git add 路径解析",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion:
+        "检查 git status 解析逻辑，使用 git status --porcelain=v1 -z；git add 前校验路径真实存在，保留原始 status 行用于排查。",
+      recommendBossApproval: true,
+    };
+  }
+
+  if (lower.includes("typescript") || lower.includes("tsc")) {
+    return {
+      stage: "TypeScript 静态检查",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion: "根据 tsc 输出修复类型错误，保持最小修改范围后重新执行静态检查。",
+      recommendBossApproval: true,
+    };
+  }
+
+  if (lower.includes("eslint") || lower.includes("lint")) {
+    return {
+      stage: "ESLint 静态检查",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion: "根据 ESLint 输出修复规则违规，不删除测试或绕过 lint。",
+      recommendBossApproval: true,
+    };
+  }
+
+  if (lower.includes("build")) {
+    return {
+      stage: "build 构建",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion: "根据构建错误定位最小代码修复，优先检查 Next.js 路由、导入和 Server/Client 边界。",
+      recommendBossApproval: true,
+    };
+  }
+
+  if (lower.includes("permission") || lower.includes("access denied") || lower.includes("eacces")) {
+    return {
+      stage: "权限检查",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion: "检查本机文件权限、Git 凭据或 Worker 运行用户权限；不要输出或写入任何密钥。",
+      recommendBossApproval: true,
+    };
+  }
+
+  if (lower.includes("git commit")) {
+    return {
+      stage: "git commit",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion: "检查 staged 文件、commit message、作者配置和敏感文件拦截结果后重试。",
+      recommendBossApproval: true,
+    };
+  }
+
+  if (lower.includes("git push")) {
+    return {
+      stage: "git push",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion: "检查远程分支、凭据、权限和分支保护规则；不要把 token 写入日志或仓库。",
+      recommendBossApproval: true,
+    };
+  }
+
+  return {
+    stage: "未知失败阶段",
+    keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+    suggestion: "先查看 Worker 上报的关键错误和未提交文件清单，再决定是否批准最小范围修复。",
+    recommendBossApproval: false,
+  };
+}
+
+async function getCurrentHead() {
+  try {
+    const head = await runGit(["rev-parse", "HEAD"]);
+    return head.stdout || "未提供";
+  } catch (error) {
+    return `读取失败：${sanitizeGitErrorMessage(error instanceof Error ? error.message : String(error)).slice(-300)}`;
+  }
+}
+
+function buildFailureReport(job, error, context = {}) {
+  const analysis = classifyFailure(error);
+  const filesChanged = uniqueSortedPaths(context.filesChanged || []);
+  const uncommittedFiles = uniqueSortedPaths(context.uncommittedFiles || filesChanged);
+  const taskName = String(job?.request_text || "未提供").replace(/\s+/g, " ").trim().slice(0, 120);
+
+  return [
+    "Codex 任务执行失败",
+    `任务编号：${job?.id || "未提供"}`,
+    `任务名称：${taskName || "未提供"}`,
+    `失败阶段：${analysis.stage}`,
+    "关键错误：",
+    analysis.keyError || "未提供",
+    `是否已经修改文件：${filesChanged.length > 0 ? "是" : "否"}`,
+    "当前未提交文件清单：",
+    ...(uncommittedFiles.length ? uncommittedFiles.map((filePath) => `- ${filePath}`) : ["- 无"]),
+    `是否已生成 commit：${context.commitSha ? "是" : "否"}`,
+    `当前 HEAD：${context.head || "未提供"}`,
+    `建议修复动作：${analysis.suggestion}`,
+    `是否建议老板回复“总管 批准修复”：${analysis.recommendBossApproval ? "是" : "否"}`,
+    context.rollbackMessage ? context.rollbackMessage.trim() : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 function getPreviewValidationLines(reportResult) {
   if (!reportResult) {
     return ["静态预览诊断：未执行（WORKER_PREVIEW_SMOKE 未开启）"];
@@ -494,7 +591,8 @@ async function commitGitTask(job) {
     };
   }
 
-  const taskChangedPaths = await getTaskChangedPaths();
+  const taskChangedEntries = await getTaskChangedEntries();
+  const taskChangedPaths = getStatusPaths(taskChangedEntries);
 
   if (taskChangedPaths.length === 0) {
     return {
@@ -504,7 +602,7 @@ async function commitGitTask(job) {
     };
   }
 
-  const stagedPaths = await stageTaskPaths(taskChangedPaths);
+  const stagedPaths = await stageTaskPaths(taskChangedPaths, taskChangedEntries);
 
   if (stagedPaths.length === 0) {
     return {
@@ -638,8 +736,8 @@ async function rollbackGitTask(checkpoint) {
   }
 
   const entries = await readGitStatusEntries();
-  const trackedPaths = getTrackedStatusPaths(entries).map(repairKnownDroppedFirstCharPath);
-  const untrackedPaths = getUntrackedStatusPaths(entries).map(repairKnownDroppedFirstCharPath);
+  const trackedPaths = getTrackedStatusPaths(entries);
+  const untrackedPaths = getUntrackedStatusPaths(entries);
 
   await unstagePaths(trackedPaths);
 
@@ -1159,6 +1257,7 @@ async function pollOnce() {
 
     let rollbackMessage = "";
     let failureChangedPaths = [];
+    let currentHead = "未提供";
 
     try {
       failureChangedPaths = await getTaskChangedPaths();
@@ -1168,6 +1267,8 @@ async function pollOnce() {
         statusError instanceof Error ? statusError.message : String(statusError)
       );
     }
+
+    currentHead = await getCurrentHead();
 
     try {
       const rollbackResult = await rollbackGitTask(gitCheckpoint);
@@ -1191,19 +1292,26 @@ async function pollOnce() {
       "任务执行失败，正在上报错误"
     );
 
+    const failureReport = buildFailureReport(job, error, {
+      filesChanged: failureChangedPaths,
+      uncommittedFiles: failureChangedPaths,
+      head: currentHead,
+      rollbackMessage,
+    });
+
     await report(
       job.id,
       "failed",
-      `${
-      error instanceof Error ? error.message : String(error)
-      }${rollbackMessage}`,
+      failureReport,
       {
         attempt_id: attemptId,
         project_name: "同城搭子网站",
         project_dir: PROJECT_DIR,
         files_changed: failureChangedPaths,
         validation_results: [
-          `Codex 执行：失败（${error instanceof Error ? error.message : String(error)}`.slice(0, 600) + "）",
+          `失败阶段：${classifyFailure(error).stage}`,
+          `关键错误：${classifyFailure(error).keyError}`.slice(0, 600),
+          `当前 HEAD：${currentHead}`,
           rollbackMessage.trim() || "Git 回滚：未提供",
           "本地预览：未启动 dev server / 浏览器",
         ],
@@ -1260,7 +1368,9 @@ if (require.main === module) {
 module.exports = {
   assertCleanWorktreeBeforeCodex,
   buildCodexPrompt,
+  buildFailureReport,
   buildWorkerGuardedPrompt,
+  classifyFailure,
   commitGitTask,
   getTaskChangedPaths,
   main,
@@ -1317,9 +1427,3 @@ function safeReportArray(value) {
 }
 
 
-function safeReportJoin(value, separator = "\n") {
-  // SAFE_REPORT_JOIN_FOR_UNDEFINED_VALUES
-  if (Array.isArray(value)) return value.join(separator);
-  if (value == null) return "";
-  return String(value);
-}
