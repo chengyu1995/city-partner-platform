@@ -1,5 +1,11 @@
 ﻿/* eslint-disable @typescript-eslint/no-require-imports */
-require("dotenv").config();
+try {
+  require("dotenv").config();
+} catch (error) {
+  if (!error || error.code !== "MODULE_NOT_FOUND") {
+    throw error;
+  }
+}
 
 const { spawn, execFile } = require("child_process");
 const os = require("os");
@@ -139,7 +145,7 @@ const GIT_PUSH_BRANCH =
 const REQUIRED_GIT_PUSH_REMOTE = "origin";
 const REQUIRED_GIT_PUSH_BRANCH = "master";
 
-function runCommand(command, args, cwd = PROJECT_DIR) {
+function runCommand(command, args, cwd = PROJECT_DIR, options = {}) {
   return new Promise((resolve, reject) => {
     execFile(
       command,
@@ -168,16 +174,22 @@ function runCommand(command, args, cwd = PROJECT_DIR) {
         }
 
         resolve({
-          stdout: String(stdout || "").trim(),
-          stderr: String(stderr || "").trim(),
+          stdout:
+            options.trimOutput === false
+              ? String(stdout || "")
+              : String(stdout || "").trim(),
+          stderr:
+            options.trimOutput === false
+              ? String(stderr || "")
+              : String(stderr || "").trim(),
         });
       }
     );
   });
 }
 
-async function runGit(args) {
-  return runCommand("git", args, PROJECT_DIR);
+async function runGit(args, options = {}) {
+  return runCommand("git", args, PROJECT_DIR, options);
 }
 
 function sanitizeGitErrorMessage(message) {
@@ -188,7 +200,9 @@ function sanitizeGitErrorMessage(message) {
 }
 
 async function readGitStatusEntries() {
-  const status = await runGit(["status", "--porcelain=v1", "-z"]);
+  const status = await runGit(["status", "--porcelain=v1", "-z"], {
+    trimOutput: false,
+  });
   return parseGitStatusPorcelain(status.stdout);
 }
 

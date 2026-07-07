@@ -122,6 +122,25 @@ test("Git porcelain v1 -z status parsing", async (t) => {
     ]);
   });
 
+  await t.test("BATCH-34 modified src and infra paths keep their first character", () => {
+    const cases = [
+      [" M src/lib/db/mock.ts", "src/lib/db/mock.ts"],
+      ["M src/lib/db/mock.ts", "src/lib/db/mock.ts"],
+      [" M src/app/post/page.tsx", "src/app/post/page.tsx"],
+      ["M src/app/post/page.tsx", "src/app/post/page.tsx"],
+      [" M infra/windows-worker/git-safety.js", "infra/windows-worker/git-safety.js"],
+      ["M infra/windows-worker/git-safety.js", "infra/windows-worker/git-safety.js"],
+      ["?? docs/test.md", "docs/test.md"],
+      ["A  docs/test.md", "docs/test.md"],
+    ];
+
+    for (const [rawStatusLine, expectedPath] of cases) {
+      assert.deepEqual(getStatusPaths(parseGitStatusPorcelain(`${rawStatusLine}\0`)), [
+        expectedPath,
+      ]);
+    }
+  });
+
   await t.test("empty output parses as clean", () => {
     assert.deepEqual(parseGitStatusPorcelain(""), []);
   });
@@ -229,6 +248,14 @@ test("path normalization and path-set comparison", async (t) => {
     assert.equal(normalizeGitPath(".\\src\\\\file.ts"), "src/file.ts");
     assert.equal(normalizeGitPath("./src/file.ts"), "src/file.ts");
     assert.equal(normalizeGitPath("src//file.ts"), "src/file.ts");
+  });
+
+  await t.test("does not silently repair dropped-first-character paths", () => {
+    assert.equal(normalizeGitPath("rc/lib/db/mock.ts"), "rc/lib/db/mock.ts");
+    assert.equal(
+      normalizeGitPath("nfra/windows-worker/git-safety.js"),
+      "nfra/windows-worker/git-safety.js"
+    );
   });
 
   await t.test("path comparisons are exact and case-sensitive", () => {
@@ -412,12 +439,15 @@ test("safe staging path validation", async (t) => {
           },
         ]),
       (error) =>
-        error.message.includes("失败阶段：git add 路径解析") &&
-        error.message.includes("错误路径：pp/page.tsx") &&
-        error.message.includes("原始 git status 行： M app/page.tsx") &&
-        error.message.includes("建议修复动作")
+        error.code === "GIT_ADD_PATH_RESOLUTION" &&
+        error.message.includes("rawStatusLine:  M app/page.tsx") &&
+        error.message.includes("parsedPath: pp/page.tsx") &&
+        error.message.includes("cwd: ") &&
+        error.message.includes("projectRoot: ") &&
+        error.message.includes("reason: path does not exist")
     );
   });
+
 });
 
 test("failure reports include repair diagnostics", async (t) => {

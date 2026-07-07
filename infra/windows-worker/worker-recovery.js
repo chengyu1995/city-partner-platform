@@ -102,8 +102,14 @@ function runCommand(command, args, options = {}) {
       },
       (error, stdout, stderr) => {
         const result = {
-          stdout: String(stdout || "").trim(),
-          stderr: String(stderr || "").trim(),
+          stdout:
+            options.trimOutput === false
+              ? String(stdout || "")
+              : String(stdout || "").trim(),
+          stderr:
+            options.trimOutput === false
+              ? String(stderr || "")
+              : String(stderr || "").trim(),
           code: error ? (typeof error.code === "number" ? error.code : 1) : 0,
         };
 
@@ -133,6 +139,7 @@ async function runGit(projectDir, args, options = {}) {
   return runCommand("git", args, {
     cwd: projectDir,
     allowFailure: options.allowFailure,
+    trimOutput: options.trimOutput,
   });
 }
 
@@ -153,7 +160,9 @@ function isGeneratedPath(filePath) {
 }
 
 async function getGitStatusEntries(projectDir) {
-  const status = await runGit(projectDir, ["status", "--porcelain=v1", "-z"]);
+  const status = await runGit(projectDir, ["status", "--porcelain=v1", "-z"], {
+    trimOutput: false,
+  });
   return parseGitStatusPorcelain(status.stdout);
 }
 

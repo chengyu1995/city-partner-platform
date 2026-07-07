@@ -4,7 +4,7 @@ const path = require("path");
 
 function normalizeGitPath(filePath) {
   const raw = String(filePath || "").replace(/\0/g, "");
-  let normalized = raw.replace(/\\/g, "/").replace(/\/+/g, "/").trim();
+  let normalized = raw.replace(/\\/g, "/").replace(/\/+/g, "/");
 
   while (normalized.startsWith("./")) {
     normalized = normalized.slice(2);
@@ -25,45 +25,88 @@ function parseGitStatusPorcelain(output) {
 
   for (let index = 0; index < parts.length; index += 1) {
     const record = parts[index];
+    const parsed = parseGitStatusRecord(record);
 
-    if (record.length < 4) {
+    if (!parsed) {
       continue;
     }
 
-    const status = record.slice(0, 2);
-    const filePath = normalizeGitPath(record.slice(3));
-    const line = `${status} ${filePath}`;
-
-    if (!filePath) {
-      continue;
-    }
+    const { status, filePath, rawStatusLine } = parsed;
 
     if (status[0] === "R" || status[0] === "C") {
       const originalPath = normalizeGitPath(parts[index + 1] || "");
       index += 1;
 
-      entries.push({
-        status,
-        path: filePath,
-        originalPath,
-        paths: [filePath],
-        line,
-        raw: record,
-      });
+      entries.push(
+        withRawStatusLine(
+          {
+            status,
+            path: filePath,
+            originalPath,
+            paths: [filePath],
+            line: rawStatusLine,
+            raw: record,
+          },
+          rawStatusLine
+        )
+      );
       continue;
     }
 
-    entries.push({
-      status,
-      path: filePath,
-      originalPath: null,
-      paths: [filePath],
-      line,
-      raw: record,
-    });
+    entries.push(
+      withRawStatusLine(
+        {
+          status,
+          path: filePath,
+          originalPath: null,
+          paths: [filePath],
+          line: rawStatusLine,
+          raw: record,
+        },
+        rawStatusLine
+      )
+    );
   }
 
   return entries;
+}
+
+function parseGitStatusRecord(record) {
+  const rawStatusLine = String(record || "").replace(/\0/g, "").replace(/\r?\n$/, "");
+
+  if (!rawStatusLine) {
+    return null;
+  }
+
+  const match = rawStatusLine.match(/^([ MTADRCU?!]{1,2}) (.*)$/);
+
+  if (!match) {
+    return null;
+  }
+
+  const rawPath = match[2].replace(/^"|"$/g, "");
+  const filePath = normalizeGitPath(
+    rawPath.includes(" -> ") ? rawPath.split(" -> ").pop() : rawPath
+  );
+
+  if (!filePath) {
+    return null;
+  }
+
+  return {
+    status: match[1],
+    filePath,
+    rawStatusLine,
+  };
+}
+
+function withRawStatusLine(entry, rawStatusLine) {
+  Object.defineProperty(entry, "rawStatusLine", {
+    value: rawStatusLine,
+    enumerable: false,
+  });
+
+  return entry;
 }
 
 function unquoteGitShortPath(value) {
@@ -80,22 +123,22 @@ function parseGitStatusShort(output) {
     .map((line) => line.trimEnd())
     .filter(Boolean)
     .map((line) => {
-      const status = line.slice(0, 2);
-      const rawPath = unquoteGitShortPath(line.length > 3 ? line.slice(3) : "");
-      const filePath = normalizeGitPath(
-        rawPath.includes(" -> ") ? rawPath.split(" -> ").pop() : rawPath
-      );
+      const parsed = parseGitStatusRecord(line);
+
+      if (!parsed) {
+        return null;
+      }
 
       return {
-        status,
-        path: filePath,
+        status: parsed.status,
+        path: parsed.filePath,
         originalPath: null,
-        paths: filePath ? [filePath] : [],
-        line,
+        paths: [parsed.filePath],
+        line: parsed.rawStatusLine,
         raw: line,
       };
     })
-    .filter((entry) => entry.path);
+    .filter(Boolean);
 }
 
 const AUTOMATION_TASK_MARKERS = [
@@ -296,25 +339,46 @@ function resolveInsideRoot(projectRoot, filePath) {
   return absolutePath;
 }
 
-function createPathResolutionFailure({ filePath, line, stage = "git add 路径解析" }) {
+function createPathResolutionFailure({
+  filePath,
+  line,
+  projectRoot,
+  absolutePath = null,
+  reason = "path does not exist",
+  stage = "git add path resolution",
+}) {
   const normalizedPath = normalizeGitPath(filePath);
+  const root = path.resolve(projectRoot || process.cwd());
   const error = new Error(
     [
-      `失败阶段：${stage}`,
-      `错误路径：${normalizedPath || "未提供"}`,
-      `原始 git status 行：${line || "未提供"}`,
-      "建议修复动作：改用 git status --porcelain=v1 -z 解析；普通 status 行必须从 2 个状态位后的单个空格之后提取完整路径，并在 git add 前校验路径存在。",
-    ].join("\n")
+      "GIT_ADD_PATH_RESOLUTION",
+      "git add path resolution failed; refusing to stage parsed path.",
+      `rawStatusLine: ${line || "(unavailable)"}`,
+      `parsedPath: ${normalizedPath || "(empty)"}`,
+      `cwd: ${process.cwd()}`,
+      `projectRoot: ${root}`,
+      absolutePath ? `absolutePath: ${absolutePath}` : null,
+      `reason: ${reason}`,
+    ]
+      .filter(Boolean)
+      .join("\n")
   );
 
   error.code = "GIT_ADD_PATH_RESOLUTION";
   error.failureStage = stage;
   error.badPath = normalizedPath;
+  error.parsedPath = normalizedPath;
   error.rawStatusLine = line || "";
-  error.suggestion =
-    "改用 git status --porcelain=v1 -z 解析，并在 git add 前对每个路径执行项目根目录内存在性校验。";
+  error.projectRoot = root;
+  error.cwd = process.cwd();
+  error.reason = reason;
 
   return error;
+}
+
+function isDeletedStatus(status) {
+  const value = String(status || "");
+  return value !== "??" && value.includes("D");
 }
 
 function validateGitAddPathsExist(projectRoot, entriesOrPaths) {
@@ -325,6 +389,7 @@ function validateGitAddPathsExist(projectRoot, entriesOrPaths) {
           status: "",
           path: normalizeGitPath(item),
           line: item,
+          rawStatusLine: item,
         }
       : item
   );
@@ -332,16 +397,31 @@ function validateGitAddPathsExist(projectRoot, entriesOrPaths) {
   for (const entry of entries) {
     const filePath = normalizeGitPath(entry.path);
     const absolutePath = resolveInsideRoot(root, filePath);
+    const rawStatusLine =
+      entry.rawStatusLine || entry.line || entry.raw || `${entry.status || ""} ${filePath}`.trim();
 
-    if (!absolutePath || !fs.existsSync(absolutePath)) {
+    if (!absolutePath) {
       throw createPathResolutionFailure({
         filePath,
-        line: entry.line || entry.raw || `${entry.status || ""} ${filePath}`.trim(),
+        line: rawStatusLine,
+        projectRoot: root,
+        reason: "path resolves outside project root",
       });
     }
+
+    if (fs.existsSync(absolutePath) || isDeletedStatus(entry.status)) {
+      continue;
+    }
+
+    throw createPathResolutionFailure({
+      filePath,
+      line: rawStatusLine,
+      projectRoot: root,
+      absolutePath,
+      reason: "path does not exist",
+    });
   }
 }
-
 function scanFileForSensitiveContent(projectRoot, filePath) {
   const absolutePath = resolveInsideRoot(projectRoot, filePath);
 
@@ -471,6 +551,7 @@ module.exports = {
   getUntrackedStatusPaths,
   isSensitivePath,
   normalizeGitPath,
+  parseGitStatusRecord,
   parseGitStatusPorcelain,
   parseGitStatusShort,
   scanSensitiveContent,
