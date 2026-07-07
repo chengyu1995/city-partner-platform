@@ -132,6 +132,26 @@ Block and ask for explicit human decision when a demand touches:
 
 Default safe behavior: do not execute until approval is recorded.
 
+## 10.1 Worker Failure Repair Suggestions
+
+When a Worker or Codex task reports `failed`, do not only say "task failed". Always produce a boss-facing diagnosis with:
+
+- Task id and task name.
+- Failure stage.
+- Key error.
+- Whether files were changed.
+- Current uncommitted file list.
+- Whether a commit was generated.
+- Current HEAD.
+- Suggested repair action.
+- Whether the boss should reply "总管 批准修复".
+
+For actionable engineering failures such as pathspec, TypeScript, ESLint, build, permission, git commit, or git push errors, generate a concrete repair suggestion automatically. Do not ask the boss to inspect PowerShell screenshots or raw logs. If the repair does not require database, secrets, production deployment, production env, mass messaging, or other forbidden operations, recommend that the boss reply:
+
+```text
+总管 批准修复
+```
+
 ## 11. Human Decision Scenarios
 
 Require boss or human decision when:
