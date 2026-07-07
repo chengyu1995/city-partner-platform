@@ -4,8 +4,11 @@ import {
   assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
   buildAttemptPayload,
+  buildRunningJobNotFoundPayload,
   findHermesJob,
   getAttemptIdFromBody,
+  getBatchCodeFromBody,
+  getCreatedAtFromBody,
   getWorkerIdFromBody,
   getWorkerIdFromRequest,
   getWorkerSupabase,
@@ -24,6 +27,9 @@ interface WorkerHeartbeatBody {
   worker_id?: string;
   worker_name?: string;
   attempt_id?: string;
+  batch_code?: string;
+  job_created_at?: string;
+  created_at?: string;
   status_message?: string;
 }
 
@@ -42,19 +48,29 @@ export async function POST(req: NextRequest) {
   const supabase = await getWorkerSupabase();
   if (responseFromMaybe(supabase)) return supabase;
 
+  const workerId = getWorkerIdFromBody(body);
+  const attemptId = getAttemptIdFromBody(body);
   const { data: existingJob, error: findError } = await findHermesJob(supabase, jobId);
   if (findError) {
     return NextResponse.json({ ok: false, error: findError.message ?? "job lookup failed" }, { status: 500 });
   }
   if (!existingJob) {
-    return NextResponse.json({ ok: false, error: "job not found" }, { status: 404 });
+    return NextResponse.json(
+      buildRunningJobNotFoundPayload({
+        endpoint: "worker/heartbeat",
+        jobId,
+        attemptId,
+        batchCode: getBatchCodeFromBody(body),
+        createdAt: getCreatedAtFromBody(body),
+        workerId,
+      }),
+      { status: 404 }
+    );
   }
 
-  const workerId = getWorkerIdFromBody(body);
   const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
   if (ownershipError) return ownershipError;
 
-  const attemptId = getAttemptIdFromBody(body);
   const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
   if (attemptError) return attemptError;
 

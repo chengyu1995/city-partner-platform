@@ -76,6 +76,56 @@ export function getAttemptIdFromBody(body: {
   return readString(body.attempt_id) ?? readString(body.attemptId);
 }
 
+export function getBatchCodeFromBody(body: {
+  batch_code?: unknown;
+  batchCode?: unknown;
+  dispatch_batch?: unknown;
+  task_code?: unknown;
+}): string | null {
+  return (
+    readString(body.batch_code) ??
+    readString(body.batchCode) ??
+    readString(body.dispatch_batch) ??
+    readString(body.task_code)
+  );
+}
+
+export function getCreatedAtFromBody(body: {
+  created_at?: unknown;
+  createdAt?: unknown;
+  job_created_at?: unknown;
+  jobCreatedAt?: unknown;
+}): string | null {
+  return (
+    readString(body.job_created_at) ??
+    readString(body.jobCreatedAt) ??
+    readString(body.created_at) ??
+    readString(body.createdAt)
+  );
+}
+
+export function buildRunningJobNotFoundPayload(input: {
+  jobId: string;
+  attemptId: string | null;
+  batchCode?: string | null;
+  createdAt?: string | null;
+  workerId?: string | null;
+  endpoint: string;
+}): Record<string, unknown> {
+  return {
+    ok: false,
+    error: "running_job_not_found",
+    endpoint: input.endpoint,
+    job_id: input.jobId,
+    batch_code: input.batchCode ?? "not_provided",
+    attempt_id: input.attemptId ?? "not_provided",
+    created_at: input.createdAt ?? "not_provided",
+    worker_id: input.workerId ?? "not_provided",
+    message:
+      "Worker reported a job id that does not exist in hermes_jobs. Check stale Worker state, duplicate attempts, and whether the final report used the claimed job id.",
+  };
+}
+
 export function createWorkerAttemptId(jobId: string, workerId: string, now = Date.now()): string {
   const safeJob = jobId.replace(/[^A-Za-z0-9._:-]/g, "_");
   const safeWorker = workerId.replace(/[^A-Za-z0-9._:-]/g, "_");
@@ -254,6 +304,16 @@ export function getProjectDirectorJobCorrelation(job: JobRecord | null | undefin
   };
 }
 
+function getJobBatchCode(job: JobRecord | null | undefined): string | null {
+  const payload = readRecord(job?.payload);
+  return (
+    readString(payload?.batch_code) ??
+    readString(job?.dispatch_batch) ??
+    readString(job?.task_code) ??
+    readString(job?.job_id)
+  );
+}
+
 export function buildProjectDirectorWorkerReport(input: {
   job: JobRecord | null;
   workerId: string;
@@ -273,6 +333,7 @@ export function buildProjectDirectorWorkerReport(input: {
   errorText?: string | null;
 }): { text: string; data: Record<string, unknown> } {
   const correlation = getProjectDirectorJobCorrelation(input.job);
+  const batchCode = getJobBatchCode(input.job) ?? correlation.task_key;
   const submittedFilesChanged = readStringArray(input.filesChanged);
   const filesChanged =
     submittedFilesChanged.length > 0
@@ -319,6 +380,7 @@ export function buildProjectDirectorWorkerReport(input: {
 
   const data = {
     job_id: jobId,
+    batch_code: batchCode,
     boss_request_id: correlation.boss_request_id,
     plan_id: correlation.plan_id,
     task_key: correlation.task_key,
@@ -349,13 +411,16 @@ export function buildProjectDirectorWorkerReport(input: {
     statusTitle,
     `任务编号：${placeholder(jobId)}`,
     `job_id：${placeholder(jobId)}`,
+    `实际执行批次：${placeholder(batchCode)}`,
     `attempt_id：${placeholder(input.attemptId)}`,
     `需求：${placeholder(truncateText(sanitizeReportText(demand), 800))}`,
     `项目名称：${placeholder(input.projectName ?? "同城搭子网站")}`,
     `项目目录：${placeholder(input.projectDir)}`,
     "",
     "本阶段性质：",
-    "系统升级阶段 BATCH-27：统一 Worker 完成后飞书项目总管报告模板",
+    batchCode
+      ? `系统升级阶段 ${batchCode}：Worker/Codex 自动化任务执行结果`
+      : "系统升级阶段：Worker/Codex 自动化任务执行结果",
     "",
     "执行结果摘要：",
     truncateText(sanitizeReportText(summary), 1200),

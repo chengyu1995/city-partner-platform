@@ -98,6 +98,71 @@ function parseGitStatusShort(output) {
     .filter((entry) => entry.path);
 }
 
+const AUTOMATION_TASK_MARKERS = [
+  /BATCH-30/i,
+  /Windows Worker/i,
+  /local_worker/i,
+  /worker-recovery/i,
+  /git-safety/i,
+  /GIT_ADD_PATH_RESOLUTION/i,
+  /running_job_not_found/i,
+  /Worker\s*\/\s*Codex/i,
+  /heartbeat/i,
+  /report API/i,
+  /automation system/i,
+  /自动化系统/,
+  /任务正文串线/,
+  /飞书最终报告/,
+];
+
+const FROZEN_BUSINESS_PAGE_PREFIXES = [
+  "app/page.tsx",
+  "app/post",
+  "app/partners",
+  "src/app/page.tsx",
+  "src/app/post",
+  "src/app/partners",
+];
+
+function isAutomationSystemTaskText(requestText) {
+  const text = String(requestText || "");
+  return AUTOMATION_TASK_MARKERS.some((pattern) => pattern.test(text));
+}
+
+function isFrozenBusinessPagePath(filePath) {
+  const normalized = normalizeGitPath(filePath);
+  return FROZEN_BUSINESS_PAGE_PREFIXES.some(
+    (prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`)
+  );
+}
+
+function validateAutomationTaskBoundaries(paths, options = {}) {
+  if (!options.enforce && !isAutomationSystemTaskText(options.requestText)) {
+    return;
+  }
+
+  const forbiddenPaths = uniqueSortedPaths(paths).filter(isFrozenBusinessPagePath);
+
+  if (forbiddenPaths.length === 0) {
+    return;
+  }
+
+  const error = new Error(
+    [
+      "自动化系统任务触碰了冻结业务页面，Worker 已停止 git add/commit。",
+      "本批次只允许修复 Worker / Codex / report / heartbeat 链路，不允许修改同城搭子网站业务页面。",
+      "禁止路径：",
+      ...forbiddenPaths.map((filePath) => `- ${filePath}`),
+      "建议修复动作：撤回业务页面改动，只保留本批次允许范围内的自动化系统文件。",
+    ].join("\n")
+  );
+
+  error.code = "BUSINESS_PAGE_BOUNDARY_VIOLATION";
+  error.failureStage = "自动化任务范围边界检查";
+  error.forbiddenPaths = forbiddenPaths;
+  throw error;
+}
+
 function formatPathList(paths) {
   return uniqueSortedPaths(paths).map((filePath) => `- ${filePath}`).join("\n");
 }
@@ -409,7 +474,10 @@ module.exports = {
   parseGitStatusPorcelain,
   parseGitStatusShort,
   scanSensitiveContent,
+  isAutomationSystemTaskText,
+  isFrozenBusinessPagePath,
   uniqueSortedPaths,
+  validateAutomationTaskBoundaries,
   validateCommittablePaths,
   validateGitAddPathsExist,
   validateStagedPaths,

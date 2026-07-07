@@ -10,11 +10,14 @@ const {
   comparePathSets,
   getStatusPaths,
   getTrackedStatusPaths,
+  isAutomationSystemTaskText,
+  isFrozenBusinessPagePath,
   isSensitivePath,
   normalizeGitPath,
   parseGitStatusPorcelain,
   parseGitStatusShort,
   scanSensitiveContent,
+  validateAutomationTaskBoundaries,
   validateCommittablePaths,
   validateGitAddPathsExist,
   validateStagedPaths,
@@ -141,6 +144,13 @@ test("Git porcelain v1 -z status parsing", async (t) => {
     ]);
     assert.equal(getStatusPaths(entries).includes("pp/page.tsx"), false);
   });
+
+  await t.test("BATCH-30 incident path is preserved", () => {
+    const entries = parseGitStatusPorcelain(" M src/app/post/page.tsx\0");
+
+    assert.deepEqual(getStatusPaths(entries), ["src/app/post/page.tsx"]);
+    assert.equal(getStatusPaths(entries).includes("rc/app/post/page.tsx"), false);
+  });
 });
 
 test("Git short status fallback parsing", async (t) => {
@@ -161,6 +171,56 @@ test("Git short status fallback parsing", async (t) => {
       "src/app/page.tsx",
     ]);
     assert.equal(getStatusPaths(entries).includes("pp/page.tsx"), false);
+  });
+
+  await t.test("BATCH-30 incident path is not truncated", () => {
+    const entries = parseGitStatusShort(" M src/app/post/page.tsx");
+
+    assert.deepEqual(getStatusPaths(entries), ["src/app/post/page.tsx"]);
+    assert.equal(getStatusPaths(entries).includes("rc/app/post/page.tsx"), false);
+  });
+});
+
+test("automation system task boundaries", async (t) => {
+  await t.test("detects BATCH-30 worker repair tasks", () => {
+    assert.equal(
+      isAutomationSystemTaskText("执行 BATCH-30：修复 Windows Worker / Codex 上报链路"),
+      true
+    );
+  });
+
+  await t.test("detects frozen city-partner business page paths", () => {
+    assert.equal(isFrozenBusinessPagePath("src/app/post/page.tsx"), true);
+    assert.equal(isFrozenBusinessPagePath("src/app/partners/page.tsx"), true);
+    assert.equal(isFrozenBusinessPagePath("infra/windows-worker/local_worker.js"), false);
+  });
+
+  await t.test("allows worker files for automation repair tasks", () => {
+    assert.doesNotThrow(() =>
+      validateAutomationTaskBoundaries(["infra/windows-worker/local_worker.js"], {
+        requestText: "BATCH-30 Windows Worker system repair",
+      })
+    );
+  });
+
+  await t.test("blocks business page changes for automation repair tasks", () => {
+    assert.throws(
+      () =>
+        validateAutomationTaskBoundaries(["src/app/post/page.tsx"], {
+          requestText: "BATCH-30 Windows Worker system repair",
+        }),
+      (error) =>
+        error.code === "BUSINESS_PAGE_BOUNDARY_VIOLATION" &&
+        error.message.includes("src/app/post/page.tsx")
+    );
+  });
+
+  await t.test("does not enforce automation boundaries for non-automation tasks", () => {
+    assert.doesNotThrow(() =>
+      validateAutomationTaskBoundaries(["src/app/post/page.tsx"], {
+        requestText: "普通产品页面任务",
+      })
+    );
   });
 });
 
@@ -512,6 +572,7 @@ test("Codex prompt git operation guard", async (t) => {
     assert.match(prompt, /不允许执行 git push/);
     assert.match(prompt, /Git 提交和推送由外层 Worker 自动完成/);
     assert.match(prompt, /如果任务要求生成 Git Commit，Codex 不应自行执行/);
+    assert.match(prompt, /docs\/NEXT_TASK_CARD\.md/);
   });
 
   await t.test("keeps git-related acceptance text but explains worker ownership", () => {

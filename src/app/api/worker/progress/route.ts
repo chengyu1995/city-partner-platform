@@ -5,10 +5,13 @@ import {
   assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
   buildAttemptPayload,
+  buildRunningJobNotFoundPayload,
   clampProgress,
   findHermesJob,
   getAttemptIdFromBody,
+  getBatchCodeFromBody,
   getBitableRecordId,
+  getCreatedAtFromBody,
   getWorkerIdFromBody,
   getWorkerSupabase,
   isTerminalWorkerStatus,
@@ -31,6 +34,9 @@ interface WorkerProgressBody {
   status_message?: string;
   worker_id?: string;
   worker_name?: string;
+  batch_code?: string;
+  job_created_at?: string;
+  created_at?: string;
   bitable_record_id?: string;
   feishu_record_id?: string;
   record_id?: string;
@@ -55,19 +61,29 @@ export async function POST(req: NextRequest) {
   const progressPercent = clampProgress(body.progress_percent, 0);
   const workerStatus = normalizeWorkerStatus(body.status);
   const currentStep = body.current_step ?? (workerStatus === "queued" ? "waiting_worker_claim" : "running");
+  const workerId = getWorkerIdFromBody(body);
+  const attemptId = getAttemptIdFromBody(body);
   const { data: existingJob, error: findError } = await findHermesJob(supabase, jobId);
   if (findError) {
     return NextResponse.json({ ok: false, error: findError.message ?? "job lookup failed" }, { status: 500 });
   }
   if (!existingJob) {
-    return NextResponse.json({ ok: false, error: "job not found" }, { status: 404 });
+    return NextResponse.json(
+      buildRunningJobNotFoundPayload({
+        endpoint: "worker/progress",
+        jobId,
+        attemptId,
+        batchCode: getBatchCodeFromBody(body),
+        createdAt: getCreatedAtFromBody(body),
+        workerId,
+      }),
+      { status: 404 }
+    );
   }
 
-  const workerId = getWorkerIdFromBody(body);
   const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
   if (ownershipError) return ownershipError;
 
-  const attemptId = getAttemptIdFromBody(body);
   const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
   if (attemptError) return attemptError;
 

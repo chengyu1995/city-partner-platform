@@ -10,6 +10,7 @@ const {
   getUntrackedStatusPaths,
   parseGitStatusPorcelain,
   uniqueSortedPaths,
+  validateAutomationTaskBoundaries,
   validateCommittablePaths,
   validateGitAddPathsExist,
   validateStagedPaths,
@@ -296,10 +297,32 @@ function createCommitMessage(job) {
   return `worker: ${job.id} ${summary}`;
 }
 
+function readRecord(value) {
+  return value && typeof value === "object" ? value : null;
+}
+
+function readString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function getJobBatchCode(job) {
+  const payload = readRecord(job?.payload);
+  return (
+    readString(payload?.batch_code) ||
+    readString(job?.dispatch_batch) ||
+    readString(job?.task_code) ||
+    readString(job?.job_id) ||
+    null
+  );
+}
+
 const CODEX_GIT_OPERATION_GUARD = [
   "【Windows Worker 强制规则】",
   "Codex 只负责修改文件和汇报结果，Git 提交和推送由外层 Worker 自动完成。",
   "只允许修改任务要求的文件。",
+  "原始任务正文是唯一执行来源；不得用 docs/NEXT_TASK_CARD.md、docs/PROJECT_INDEX.md 或历史批次文档替换本次任务正文。",
+  "如果本次任务是 Worker / Codex / 自动化系统修复，只允许处理任务正文明确批准的批次和自动化系统文件，不得执行产品开发任务。",
+  "自动化系统修复任务不得修改 /、/partners、/post 业务页面，也不得修改 src/app/page.tsx、src/app/partners/**、src/app/post/**。",
   "不允许阻塞式启动本地预览。",
   "不允许执行 npm run dev。",
   "不允许执行 next dev。",
@@ -408,6 +431,16 @@ function classifyFailure(error) {
       keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
       suggestion:
         "检查 git status 解析逻辑，使用 git status --porcelain=v1 -z；git add 前校验路径真实存在，保留原始 status 行用于排查。",
+      recommendBossApproval: true,
+    };
+  }
+
+  if (error?.code === "BUSINESS_PAGE_BOUNDARY_VIOLATION") {
+    return {
+      stage: "自动化任务范围边界检查",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion:
+        "撤回业务页面改动，只保留 Worker / Codex / report / heartbeat 相关允许文件；如确需改业务页面，必须由老板单独批准对应产品开发批次。",
       recommendBossApproval: true,
     };
   }
@@ -601,6 +634,10 @@ async function commitGitTask(job) {
       filesChanged: [],
     };
   }
+
+  validateAutomationTaskBoundaries(taskChangedPaths, {
+    requestText: job?.request_text || job?.prompt || "",
+  });
 
   const stagedPaths = await stageTaskPaths(taskChangedPaths, taskChangedEntries);
 
@@ -1230,6 +1267,8 @@ async function pollOnce() {
       finalResult,
       {
         attempt_id: attemptId,
+        batch_code: getJobBatchCode(job),
+        job_created_at: job.created_at || null,
         project_name: "同城搭子网站",
         project_dir: PROJECT_DIR,
         files_changed: gitResult.filesChanged || [],
@@ -1305,6 +1344,8 @@ async function pollOnce() {
       failureReport,
       {
         attempt_id: attemptId,
+        batch_code: getJobBatchCode(job),
+        job_created_at: job.created_at || null,
         project_name: "同城搭子网站",
         project_dir: PROJECT_DIR,
         files_changed: failureChangedPaths,

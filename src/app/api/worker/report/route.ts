@@ -4,11 +4,14 @@ import {
   assertWorkerAuthorized,
   assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
+  buildRunningJobNotFoundPayload,
   buildProjectDirectorWorkerReport,
   clampProgress,
   findHermesJob,
   getAttemptIdFromBody,
+  getBatchCodeFromBody,
   getBitableRecordId,
+  getCreatedAtFromBody,
   getWorkerIdFromBody,
   getWorkerSupabase,
   isTerminalWorkerStatus,
@@ -31,6 +34,9 @@ interface WorkerReportBody {
   status_message?: string;
   worker_id?: string;
   worker_name?: string;
+  batch_code?: string;
+  job_created_at?: string;
+  created_at?: string;
   git_commit_sha?: string;
   deploy_status?: string | null;
   result_text?: string;
@@ -54,6 +60,8 @@ interface WorkerReportBody {
 function buildResult(body: WorkerReportBody): Record<string, unknown> {
   return {
     attempt_id: body.attempt_id ?? null,
+    batch_code: body.batch_code ?? null,
+    job_created_at: body.job_created_at ?? body.created_at ?? null,
     worker_id: body.worker_id ?? body.worker_name ?? null,
     output: body.output ?? null,
     pr_url: body.pr_url ?? null,
@@ -110,19 +118,29 @@ export async function POST(req: NextRequest) {
   const now = new Date().toISOString();
   const progressPercent = terminal ? 100 : clampProgress(body.progress_percent, 0);
   const errorText = body.error_text ?? body.error ?? null;
+  const workerId = getWorkerIdFromBody(body);
+  const attemptId = getAttemptIdFromBody(body);
   const { data: existingJob, error: findError } = await findHermesJob(supabase, jobId);
   if (findError) {
     return NextResponse.json({ ok: false, error: findError.message ?? "job lookup failed" }, { status: 500 });
   }
   if (!existingJob) {
-    return NextResponse.json({ ok: false, error: "job not found" }, { status: 404 });
+    return NextResponse.json(
+      buildRunningJobNotFoundPayload({
+        endpoint: "worker/report",
+        jobId,
+        attemptId,
+        batchCode: getBatchCodeFromBody(body),
+        createdAt: getCreatedAtFromBody(body),
+        workerId,
+      }),
+      { status: 404 }
+    );
   }
 
-  const workerId = getWorkerIdFromBody(body);
   const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
   if (ownershipError) return ownershipError;
 
-  const attemptId = getAttemptIdFromBody(body);
   const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
   if (attemptError) return attemptError;
 
@@ -148,6 +166,25 @@ export async function POST(req: NextRequest) {
   if (isTerminalWorkerStatus(existingJob.status)) {
     const storedProjectDirectorReport =
       getStoredProjectDirectorReport(existingJob) ?? projectDirectorReport;
+    const storedResult = readRecord(existingJob.result);
+    const storedTerminalStatus =
+      normalizeWorkerStatus(existingJob.status) === "failed" ? "failed" : "succeeded";
+    const recordId = getBitableRecordId(body, existingJob);
+
+    await syncWorkerStatusToFeishu({
+      recordId,
+      status: storedTerminalStatus,
+      stage: storedTerminalStatus === "failed" ? "failed" : "completed",
+      progressPercent: 100,
+      currentStep: storedTerminalStatus === "failed" ? "failed" : "completed",
+      statusMessage: storedProjectDirectorReport.text,
+      gitCommitSha:
+        body.git_commit_sha ??
+        (typeof storedResult?.git_commit_sha === "string" ? storedResult.git_commit_sha : null),
+      errorText: storedTerminalStatus === "failed" ? storedProjectDirectorReport.text : "",
+      completedAt: typeof existingJob.completed_at === "string" ? existingJob.completed_at : now,
+      updatedAt: now,
+    });
 
     return NextResponse.json({
       ok: true,
@@ -156,6 +193,7 @@ export async function POST(req: NextRequest) {
       project_director_report: storedProjectDirectorReport,
       idempotent: true,
       skipped: "terminal_job_report_ignored",
+      feishu_sync: recordId ? "attempted_idempotent_terminal_retry" : "skipped_no_record_id",
     });
   }
 
