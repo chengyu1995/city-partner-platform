@@ -6,11 +6,16 @@ const path = require("path");
 
 const {
   assertCleanStatusEntries,
+  classifyGitPath,
   comparePathSets,
   getStatusPaths,
   getTrackedStatusPaths,
+  isAutomationSystemPath,
+  isProtectedBusinessPath,
   isSensitivePath,
+  isWorkerSystemPath,
   normalizeGitPath,
+  pathMatchesGitPattern,
   parseGitStatusPorcelain,
   scanSensitiveContent,
   validateCommittablePaths,
@@ -18,7 +23,17 @@ const {
 } = require("../git-safety");
 
 const {
+  assertChangedPathsAllowedForJob,
+  assertGitWriteAllowedForJob,
+  assertProductTaskCardAccessAllowed,
+  buildTaskBoundaryPolicy,
   buildWorkerGuardedPrompt,
+  classifyWorkerTask,
+  getJobBatchCode,
+  isReadOnlyJob,
+  referencesProductTaskCardAsExecutionText,
+  shouldAutoPushJob,
+  validateJobBatchConsistency,
 } = require("../local_worker");
 
 const workerRoot = path.resolve(__dirname, "..");
@@ -108,6 +123,38 @@ test("Git porcelain v1 -z status parsing", async (t) => {
     ]);
   });
 
+  await t.test("modified src and infra paths keep their first character", () => {
+    const cases = [
+      [" M src/lib/db/mock.ts", "src/lib/db/mock.ts"],
+      ["M src/lib/db/mock.ts", "src/lib/db/mock.ts"],
+      [" M src/app/post/page.tsx", "src/app/post/page.tsx"],
+      ["M src/app/post/page.tsx", "src/app/post/page.tsx"],
+      [" M infra/windows-worker/git-safety.js", "infra/windows-worker/git-safety.js"],
+      ["M infra/windows-worker/git-safety.js", "infra/windows-worker/git-safety.js"],
+    ];
+
+    for (const [rawStatusLine, expectedPath] of cases) {
+      assert.deepEqual(getStatusPaths(parseGitStatusPorcelain(`${rawStatusLine}\0`)), [
+        expectedPath,
+      ]);
+    }
+  });
+
+  await t.test("supported status records parse without fixed-width path loss", () => {
+    const cases = [
+      [" M infra/windows-worker/git-safety.js", "infra/windows-worker/git-safety.js"],
+      ["M infra/windows-worker/git-safety.js", "infra/windows-worker/git-safety.js"],
+      ["?? docs/test.md", "docs/test.md"],
+      ["A  docs/test.md", "docs/test.md"],
+    ];
+
+    for (const [rawStatusLine, expectedPath] of cases) {
+      assert.deepEqual(getStatusPaths(parseGitStatusPorcelain(`${rawStatusLine}\0`)), [
+        expectedPath,
+      ]);
+    }
+  });
+
   await t.test("empty output parses as clean", () => {
     assert.deepEqual(parseGitStatusPorcelain(""), []);
   });
@@ -118,6 +165,14 @@ test("path normalization and path-set comparison", async (t) => {
     assert.equal(normalizeGitPath(".\\src\\\\file.ts"), "src/file.ts");
     assert.equal(normalizeGitPath("./src/file.ts"), "src/file.ts");
     assert.equal(normalizeGitPath("src//file.ts"), "src/file.ts");
+  });
+
+  await t.test("does not silently repair dropped-first-character paths", () => {
+    assert.equal(normalizeGitPath("rc/lib/db/mock.ts"), "rc/lib/db/mock.ts");
+    assert.equal(
+      normalizeGitPath("nfra/windows-worker/git-safety.js"),
+      "nfra/windows-worker/git-safety.js"
+    );
   });
 
   await t.test("path comparisons are exact and case-sensitive", () => {
@@ -134,6 +189,32 @@ test("path normalization and path-set comparison", async (t) => {
     assert.equal(comparison.ok, true);
     assert.deepEqual(comparison.expected, ["a.txt", "b.txt"]);
     assert.deepEqual(comparison.actual, ["a.txt", "b.txt"]);
+  });
+});
+
+test("automation and worker system path classification", async (t) => {
+  await t.test("classifies agents/project-director.md as automation system", () => {
+    assert.equal(classifyGitPath("agents/project-director.md"), "automation_system");
+    assert.equal(isAutomationSystemPath("agents/project-director.md"), true);
+  });
+
+  await t.test("classifies infra/windows-worker/local_worker.js as worker system", () => {
+    assert.equal(classifyGitPath("infra/windows-worker/local_worker.js"), "worker_system");
+    assert.equal(isWorkerSystemPath("infra/windows-worker/local_worker.js"), true);
+  });
+
+  await t.test("classifies src/lib/worker-jobs.ts as worker system", () => {
+    assert.equal(classifyGitPath("src/lib/worker-jobs.ts"), "worker_system");
+    assert.equal(isWorkerSystemPath("src/lib/worker-jobs.ts"), true);
+  });
+
+  await t.test("classifies protected application pages as protected business", () => {
+    assert.equal(classifyGitPath("src/app/page.tsx"), "protected_business");
+    assert.equal(isProtectedBusinessPath("src/app/page.tsx"), true);
+    assert.equal(isProtectedBusinessPath("src/app/partners/123/page.tsx"), true);
+    assert.equal(pathMatchesGitPattern("src/app/post/layout.tsx", "src/app/post/**"), true);
+    assert.equal(isWorkerSystemPath("src/app/page.tsx"), false);
+    assert.equal(isAutomationSystemPath("src/app/page.tsx"), false);
   });
 });
 
@@ -395,5 +476,221 @@ test("Codex prompt git operation guard", async (t) => {
       prompt,
       /Codex 应理解为外层 Worker 的验收目标，而不是自己执行 Git/
     );
+  });
+});
+
+test("Worker read-only and batch mismatch guards", async (t) => {
+  await t.test("BATCH-22A read-only inventory is recognized without write flow", () => {
+    const job = {
+      id: "job-batch-22a",
+      title: "BATCH-22A read-only workspace inventory",
+      request_text: [
+        "仅批准 BATCH-22A。",
+        "只读工作区盘点：运行 git status --short 和 git diff --name-only。",
+        "禁止修改文件、stash、reset、commit、push。",
+      ].join("\n"),
+      payload: {
+        batch_code: "BATCH-22A",
+        boss_original_text: "仅批准 BATCH-22A 只读工作区盘点",
+      },
+    };
+
+    assert.equal(isReadOnlyJob(job), true);
+    assert.equal(getJobBatchCode(job), "BATCH-22A");
+    assert.equal(validateJobBatchConsistency(job).ok, true);
+  });
+
+  await t.test("worker repair task is not treated as read-only", () => {
+    const job = {
+      id: "job-batch-23",
+      title: "BATCH-23 修复 Windows Worker 安全自检和任务串队问题",
+      request_text: [
+        "修复 git-safety 分类规则。",
+        "只读任务包括 git status --short 和 git diff --name-only。",
+        "允许修改 infra/windows-worker/local_worker.js。",
+      ].join("\n"),
+      payload: {
+        batch_code: "BATCH-23",
+      },
+    };
+
+    assert.equal(isReadOnlyJob(job), false);
+  });
+
+  await t.test("BATCH-22A read-only task tolerates automation and worker system changes", () => {
+    const changedPaths = [
+      "agents/project-director.md",
+      "infra/windows-worker/local_worker.js",
+      "src/lib/worker-jobs.ts",
+    ];
+    const classifications = changedPaths.map(classifyGitPath);
+    const job = {
+      id: "job-batch-22a-system-dirty",
+      title: "BATCH-22A read-only project classification inventory",
+      request_text: "仅批准 BATCH-22A。只读项目分类盘点，包含 git status --short 与 git diff --name-only。",
+      payload: {
+        batch_code: "BATCH-22A",
+        boss_original_text: "仅批准 BATCH-22A",
+      },
+    };
+
+    assert.equal(isReadOnlyJob(job), true);
+    assert.deepEqual(classifications, [
+      "automation_system",
+      "worker_system",
+      "worker_system",
+    ]);
+  });
+
+  await t.test("BATCH-22A approval rejects stale BATCH-P1 job before execution", () => {
+    const staleJob = {
+      id: "job-old-batch-p1",
+      title: "同城搭子网站 MVP 第一阶段 BATCH-P1：产品范围和页面结构定稿",
+      request_text: "同城搭子网站 MVP 第一阶段 BATCH-P1：产品范围和页面结构定稿",
+      payload: {
+        batch_code: "BATCH-P1",
+        boss_original_text: "仅批准 BATCH-22A 只读工作区盘点，不执行旧 BATCH-P1。",
+      },
+    };
+    const result = validateJobBatchConsistency(staleJob);
+
+    assert.equal(getJobBatchCode(staleJob), "BATCH-P1");
+    assert.equal(result.ok, false);
+    assert.equal(result.errorCode, "TASK_BATCH_MISMATCH");
+    assert.equal(result.approvedBatch, "BATCH-22A");
+    assert.equal(result.jobBatch, "BATCH-P1");
+    assert.match(result.message, /TASK_BATCH_MISMATCH/);
+  });
+});
+
+test("BATCH-35 task boundary guards", async (t) => {
+  const batch31ReadOnlyJob = {
+    id: "simulate-batch-31",
+    title: "BATCH-31 Worker path parsing read-only validation",
+    request_text: [
+      "Only approve BATCH-31.",
+      "Read-only validation task: run git status --short and git diff --name-only.",
+      "Do not modify files. No commit. No push.",
+    ].join("\n"),
+    payload: {
+      batch_code: "BATCH-31",
+      boss_original_text:
+        "Only approve BATCH-31 read-only validation. Do not modify files. No commit. No push.",
+    },
+  };
+
+  const batch35SystemJob = {
+    id: "simulate-batch-35",
+    title: "BATCH-35 fix Worker system task boundaries",
+    request_text: [
+      "BATCH-35 fix Worker system task boundaries.",
+      "Allowed files:",
+      "- infra/windows-worker/local_worker.js",
+      "- infra/windows-worker/git-safety.js",
+      "- infra/windows-worker/worker-recovery.js",
+      "- infra/windows-worker/tests/git-safety.test.js",
+      "- src/lib/worker-jobs.ts",
+    ].join("\n"),
+    payload: {
+      batch_code: "BATCH-35",
+      boss_original_text:
+        "Only approve BATCH-35 Worker system fix. Allowed files: infra/windows-worker/** and src/lib/worker-jobs.ts.",
+    },
+  };
+
+  const batchP3ProductJob = {
+    id: "simulate-batch-p3",
+    title: "BATCH-P3 product development",
+    request_text: "BATCH-P3 product development task for city partner pages.",
+    payload: {
+      batch_code: "BATCH-P3",
+      boss_original_text: "Approve BATCH-P3 product development.",
+    },
+  };
+
+  function assertOutOfScope(job, filePath) {
+    assert.throws(
+      () => assertChangedPathsAllowedForJob(job, [filePath]),
+      (error) =>
+        error.code === "OUT_OF_SCOPE_BUSINESS_CHANGE" &&
+        error.message.includes("OUT_OF_SCOPE_BUSINESS_CHANGE") &&
+        error.message.includes(filePath) &&
+        error.message.includes("allowed_scope") &&
+        error.message.includes("next_step")
+    );
+  }
+
+  await t.test("BATCH-31 read-only validation rejects src/app/layout.tsx", () => {
+    assert.equal(isReadOnlyJob(batch31ReadOnlyJob), true);
+    assert.equal(classifyWorkerTask(batch31ReadOnlyJob), "read_only_validation");
+    assertOutOfScope(batch31ReadOnlyJob, "src/app/layout.tsx");
+  });
+
+  await t.test("BATCH-31 read-only validation rejects partners detail page", () => {
+    assertOutOfScope(batch31ReadOnlyJob, "src/app/partners/[id]/page.tsx");
+  });
+
+  await t.test("BATCH-35 system task rejects post layout business page", () => {
+    const policy = buildTaskBoundaryPolicy(batch35SystemJob);
+
+    assert.equal(policy.systemGuarded, true);
+    assert.ok(policy.allowedPathPatterns.includes("src/lib/worker-jobs.ts"));
+    assert.equal(policy.allowedPathPatterns.includes("src/lib/worker-jobs.ts."), false);
+    assertOutOfScope(batch35SystemJob, "src/app/post/layout.tsx");
+  });
+
+  await t.test("BATCH-P3 product task is not blocked by system business-path guard", () => {
+    const policy = assertChangedPathsAllowedForJob(batchP3ProductJob, [
+      "src/app/post/layout.tsx",
+    ]);
+
+    assert.equal(policy.productDevelopment, true);
+    assert.equal(policy.allowedPathPatterns, null);
+  });
+
+  await t.test("read-only task blocks git add, git commit, and git push", () => {
+    for (const operation of ["git add", "git commit", "git push"]) {
+      assert.throws(
+        () => assertGitWriteAllowedForJob(batch31ReadOnlyJob, operation),
+        (error) =>
+          error.code === "READ_ONLY_GIT_OPERATION_BLOCKED" &&
+          error.message.includes(operation)
+      );
+    }
+  });
+
+  await t.test("system repair task skips auto push without explicit boss approval", () => {
+    const decision = shouldAutoPushJob(batch35SystemJob, true);
+
+    assert.equal(decision.allowed, false);
+    assert.match(decision.message, /no explicit boss approval/i);
+  });
+
+  await t.test("system task stops when changed files exceed allowed scope", () => {
+    assertOutOfScope(batch35SystemJob, "src/lib/env.ts");
+  });
+
+  await t.test("non-product task may not read product task card as execution text", () => {
+    const systemCardJob = {
+      ...batch35SystemJob,
+      request_text:
+        "BATCH-35 system fix. Please read docs/NEXT_TASK_CARD.md and execute that product task.",
+    };
+
+    assert.equal(referencesProductTaskCardAsExecutionText(systemCardJob), true);
+    assert.throws(
+      () => assertProductTaskCardAccessAllowed(systemCardJob),
+      (error) => error.code === "OUT_OF_SCOPE_PRODUCT_TASK_CARD"
+    );
+  });
+
+  await t.test("product task may read product task card", () => {
+    const productCardJob = {
+      ...batchP3ProductJob,
+      request_text:
+        "BATCH-P3 product task. Please read docs/NEXT_TASK_CARD.md before editing product pages.",
+    };
+
+    assert.doesNotThrow(() => assertProductTaskCardAccessAllowed(productCardJob));
   });
 });

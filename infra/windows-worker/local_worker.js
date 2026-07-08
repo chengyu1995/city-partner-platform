@@ -1,13 +1,28 @@
-﻿require("dotenv").config();
+﻿try {
+  require("dotenv").config();
+} catch (error) {
+  if (!error || error.code !== "MODULE_NOT_FOUND") {
+    throw error;
+  }
+}
 
 const { spawn, execFile } = require("child_process");
+const fs = require("fs");
 const os = require("os");
+const path = require("path");
 const {
   assertCleanStatusEntries,
+  classifyGitPath,
+  formatPathList,
+  getProtectedBusinessPathPatterns,
   getStatusPaths,
   getTrackedStatusPaths,
   getUntrackedStatusPaths,
+  isProtectedBusinessPath,
+  normalizeGitPath,
+  pathMatchesGitPattern,
   parseGitStatusPorcelain,
+  resolveInsideRoot,
   uniqueSortedPaths,
   validateCommittablePaths,
   validateStagedPaths,
@@ -32,27 +47,6 @@ const CODEX_EXE = process.env.CODEX_EXE || "C:/Users/admin/AppData/Local/Program
 const WORKER_PREVIEW_SMOKE =
   String(process.env.WORKER_PREVIEW_SMOKE || "false").toLowerCase() === "true";
 
-function repairKnownDroppedFirstCharPath(filePath) {
-  const value = String(filePath || "").trim();
-
-  const knownPrefixes = [
-    ["ocs/", "docs/"],
-    ["rc/", "src/"],
-    ["nfra/", "infra/"],
-    ["ackage.json", "package.json"],
-    ["EADME.md", "README.md"],
-  ];
-
-  for (const [badPrefix, goodPrefix] of knownPrefixes) {
-    if (value.startsWith(badPrefix)) {
-      return goodPrefix + value.slice(badPrefix.length);
-    }
-  }
-
-  return value;
-}
-
-
 const required = {
   WORKER_API_URL,
   [WORKER_AUTH_ENV_KEY]: WORKER_AUTH,
@@ -76,6 +70,541 @@ let currentAttemptId = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readRecord(value) {
+  return value && typeof value === "object" ? value : null;
+}
+
+function readJobString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function normalizeBatchCode(value) {
+  const raw = readJobString(value);
+  if (!raw) {
+    return null;
+  }
+
+  const match = raw.match(/\bBATCH-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?\b/i);
+  return match ? match[0].toUpperCase() : null;
+}
+
+function findBatchCodeInText(text) {
+  return normalizeBatchCode(String(text || ""));
+}
+
+function getJobPayload(job) {
+  return readRecord(job?.payload) || {};
+}
+
+function getJobBatchCode(job) {
+  const payload = getJobPayload(job);
+
+  return (
+    normalizeBatchCode(job?.batch_code) ||
+    normalizeBatchCode(payload.batch_code) ||
+    normalizeBatchCode(job?.dispatch_batch) ||
+    normalizeBatchCode(payload.dispatch_batch) ||
+    normalizeBatchCode(job?.task_code) ||
+    findBatchCodeInText(job?.request_text) ||
+    findBatchCodeInText(job?.title) ||
+    null
+  );
+}
+
+function getJobTaskTitle(job) {
+  const payload = getJobPayload(job);
+
+  return (
+    readJobString(job?.title) ||
+    readJobString(payload.task_title) ||
+    readJobString(payload.title) ||
+    readJobString(job?.task_title) ||
+    readJobString(job?.job_id) ||
+    "untitled"
+  );
+}
+
+function getBossOriginalText(job) {
+  const payload = getJobPayload(job);
+
+  return (
+    readJobString(job?.boss_original_text) ||
+    readJobString(job?.bossOriginalText) ||
+    readJobString(payload.boss_original_text) ||
+    readJobString(payload.bossOriginalText) ||
+    readJobString(payload.original_demand) ||
+    readJobString(payload.raw_message_text) ||
+    readJobString(job?.original_demand) ||
+    readJobString(job?.request_text) ||
+    ""
+  );
+}
+
+function compactText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function previewText(text, maxLength = 200) {
+  return compactText(text).slice(0, maxLength);
+}
+
+function getExplicitlyApprovedBatch(bossOriginalText) {
+  const text = compactText(bossOriginalText);
+  const patterns = [
+    /(?:仅|只)\s*批准\s*(?:的是|为|:|：)?\s*(BATCH-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)/i,
+    /(?:仅|只)\s*(?:允许|执行|领取|处理)\s*(?:的是|为|:|：)?\s*(BATCH-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)/i,
+    /only\s+(?:approve|approved|allow|execute|run)\s+(BATCH-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) {
+      return normalizeBatchCode(match[1]);
+    }
+  }
+
+  return null;
+}
+
+function validateJobBatchConsistency(job) {
+  const bossOriginalText = getBossOriginalText(job);
+  const approvedBatch = getExplicitlyApprovedBatch(bossOriginalText);
+  const jobBatch = getJobBatchCode(job);
+
+  if (!approvedBatch) {
+    return {
+      ok: true,
+      errorCode: null,
+      approvedBatch: null,
+      jobBatch,
+      message: "no explicit single-batch approval found",
+    };
+  }
+
+  if (jobBatch === approvedBatch) {
+    return {
+      ok: true,
+      errorCode: null,
+      approvedBatch,
+      jobBatch,
+      message: "job batch matches boss approval",
+    };
+  }
+
+  return {
+    ok: false,
+    errorCode: "TASK_BATCH_MISMATCH",
+    approvedBatch,
+    jobBatch,
+    message: [
+      "TASK_BATCH_MISMATCH",
+      `approved_batch=${approvedBatch}`,
+      `job_batch=${jobBatch || "missing"}`,
+      `job_id=${job?.id || "missing"}`,
+      `title=${getJobTaskTitle(job)}`,
+      `boss_original_text_preview=${previewText(bossOriginalText)}`,
+    ].join("\n"),
+  };
+}
+
+function getJobSearchText(job) {
+  const payload = getJobPayload(job);
+  return [
+    job?.id,
+    job?.title,
+    job?.request_text,
+    job?.description,
+    job?.prompt,
+    payload.task_title,
+    payload.original_demand,
+    payload.boss_original_text,
+    payload.raw_message_text,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function hasExplicitAllowedFileModification(text) {
+  return (
+    /允许修改|允许变更|允许写入|allowed\s+(?:files|paths|changes|modifications)|permitted\s+(?:files|paths|changes)/i.test(
+      text
+    ) && /\b(?:infra|src|docs|app)\//i.test(text.replace(/\\/g, "/"))
+  );
+}
+
+function hasReadOnlyDirective(text) {
+  const compacted = compactText(text);
+
+  return (
+    /只读(?:任务|验证|工作区|盘点|模式)?/.test(compacted) ||
+    /验证任务|只读验证/.test(compacted) ||
+    /不修改文件|禁止修改文件|不得修改文件|不提交|禁止提交|不得提交|不推送|禁止推送|不得推送/.test(
+      compacted
+    ) ||
+    /\b(?:read[-\s]?only|validation[-\s]?only|verify[-\s]?only)\b/i.test(compacted) ||
+    /\b(?:do not|don't|no)\s+(?:modify files|commit|push)\b/i.test(compacted)
+  );
+}
+
+function isReadOnlyJob(job) {
+  const text = getJobSearchText(job);
+
+  if (hasReadOnlyDirective(text)) {
+    if (hasExplicitAllowedFileModification(text) && /修复|修改|实现|开发|write|modify|fix|implement/i.test(text)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  const hasReadOnlySignal =
+    /git\s+status\s+--short/i.test(text) ||
+    /git\s+diff\s+--name-only/i.test(text) ||
+    /工作区盘点/.test(text) ||
+    /项目分类盘点/.test(text) ||
+    (/只读/.test(text) && /\bBATCH-22A\b/i.test(text));
+
+  if (!hasReadOnlySignal) {
+    return false;
+  }
+
+  const writeIntentText = text.replace(
+    /(?:禁止|不得|不允许|不可|不能)[^\n。；;]*(?:修复|修改|创建|删除|实现|开发|写入|生成|变更|提交|推送|commit|push|stash|reset|add|restore|clean|write|modify|delete|create|fix)[^\n。；;]*/gi,
+    ""
+  );
+  const hasWriteIntent =
+    /修复|修改|创建|删除|实现|开发|写入|生成|变更|提交|推送/i.test(writeIntentText) ||
+    /\b(?:commit|push|stash|reset|add|restore|clean|write|modify|delete|create|fix)\b/i.test(writeIntentText);
+
+  return !hasWriteIntent;
+}
+
+const SYSTEM_DEFAULT_ALLOWED_PATH_PATTERNS = [
+  "agents/**",
+  "infra/windows-worker/**",
+  "src/lib/worker-jobs.ts",
+];
+
+function isProductDevelopmentBatch(batchCode) {
+  return /^BATCH-P[A-Z0-9-]*$/i.test(String(batchCode || ""));
+}
+
+function classifyWorkerTask(job) {
+  const batchCode = getJobBatchCode(job);
+  const text = getJobSearchText(job);
+
+  if (isProductDevelopmentBatch(batchCode)) {
+    return "product_development";
+  }
+
+  if (isReadOnlyJob(job)) {
+    return "read_only_validation";
+  }
+
+  if (/worker|windows-worker|local_worker|git-safety|codex|路径解析|工作区盘点/i.test(text)) {
+    return "worker_system";
+  }
+
+  if (/飞书|总经理|项目总管|hermes|boss|feishu|project director/i.test(text)) {
+    return "feishu_gm";
+  }
+
+  if (/运维|配置|部署|自动化|system|automation|ops|vercel|网关|gateway/i.test(text)) {
+    return "automation_system";
+  }
+
+  if (/^BATCH-\d+/i.test(String(batchCode || ""))) {
+    return "automation_system";
+  }
+
+  return "automation_system";
+}
+
+function isSystemGuardedTask(job) {
+  return classifyWorkerTask(job) !== "product_development";
+}
+
+function extractPathPatternsFromLine(line) {
+  const normalizedLine = String(line || "").replace(/\\/g, "/");
+  const patterns = [];
+  const regex = /(?:^|[\s`'"])((?:agents|infra|src|docs|app)\/[A-Za-z0-9_./\-[\]*]+)(?=$|[\s`'",，。；;:：])/g;
+  let match = regex.exec(normalizedLine);
+
+  while (match) {
+    patterns.push(normalizeGitPath(match[1]).replace(/[.,，。；;:：]+$/, ""));
+    match = regex.exec(normalizedLine);
+  }
+
+  return patterns;
+}
+
+function extractExplicitAllowedPathPatterns(job) {
+  const text = [getBossOriginalText(job), job?.request_text, job?.description, job?.prompt]
+    .filter(Boolean)
+    .join("\n");
+  const lines = String(text || "").split(/\r?\n/);
+  const patterns = [];
+  let inAllowedSection = false;
+
+  for (const line of lines) {
+    if (/允许修改|允许变更|允许写入|allowed\s+(?:files|paths|changes|modifications)|permitted\s+(?:files|paths|changes)/i.test(line)) {
+      inAllowedSection = true;
+      patterns.push(...extractPathPatternsFromLine(line));
+      continue;
+    }
+
+    if (/禁止修改|禁止|不得|不允许|验证要求|完成后|当前问题|修复目标|forbidden|validation|must not/i.test(line)) {
+      inAllowedSection = false;
+    }
+
+    if (inAllowedSection) {
+      patterns.push(...extractPathPatternsFromLine(line));
+    }
+  }
+
+  return uniqueSortedPaths(patterns);
+}
+
+function buildTaskBoundaryPolicy(job) {
+  const taskType = classifyWorkerTask(job);
+  const productDevelopment = taskType === "product_development";
+  const readOnly = isReadOnlyJob(job);
+  const systemGuarded = !productDevelopment;
+  const explicitAllowedPaths = extractExplicitAllowedPathPatterns(job);
+  const allowedPathPatterns = readOnly
+    ? []
+    : explicitAllowedPaths.length > 0
+      ? explicitAllowedPaths
+      : systemGuarded
+        ? SYSTEM_DEFAULT_ALLOWED_PATH_PATTERNS
+        : null;
+
+  return {
+    taskType,
+    batchCode: getJobBatchCode(job) || "unknown",
+    productDevelopment,
+    readOnly,
+    systemGuarded,
+    allowedPathPatterns,
+    explicitAllowedPaths,
+    protectedBusinessPathPatterns: systemGuarded ? getProtectedBusinessPathPatterns() : [],
+  };
+}
+
+function matchesAnyPathPattern(filePath, patterns) {
+  return (patterns || []).some((pattern) => pathMatchesGitPattern(filePath, pattern));
+}
+
+function formatAllowedScope(policy) {
+  if (policy.readOnly) {
+    return ["read-only task: no file changes, no git add, no git commit, no git push"];
+  }
+
+  if (policy.allowedPathPatterns === null) {
+    return ["product development batch: product paths are allowed by product task policy"];
+  }
+
+  return policy.allowedPathPatterns.length > 0
+    ? policy.allowedPathPatterns
+    : ["no writable paths"];
+}
+
+function buildOutOfScopeBusinessChangeReport(policy, paths, reason) {
+  return [
+    "OUT_OF_SCOPE_BUSINESS_CHANGE",
+    `batch_code: ${policy.batchCode}`,
+    `task_type: ${policy.taskType}`,
+    "",
+    "out_of_scope_files:",
+    formatPathList(paths) || "- (none)",
+    "",
+    "allowed_scope:",
+    ...formatAllowedScope(policy).map((item) => `- ${item}`),
+    "",
+    "why_stopped:",
+    reason,
+    "",
+    "next_step:",
+    "Boss should either send an explicit product development batch such as BATCH-P3/BATCH-P4 for product pages, or resend a system task with a narrower allowed system-file scope.",
+  ].join("\n");
+}
+
+function createOutOfScopeBusinessChangeError(policy, paths, reason) {
+  const error = new Error(buildOutOfScopeBusinessChangeReport(policy, paths, reason));
+  error.code = "OUT_OF_SCOPE_BUSINESS_CHANGE";
+  error.paths = uniqueSortedPaths(paths);
+  error.allowedPathPatterns = policy.allowedPathPatterns;
+  error.taskType = policy.taskType;
+  return error;
+}
+
+function assertChangedPathsAllowedForJob(job, changedPaths) {
+  const policy = buildTaskBoundaryPolicy(job);
+  const paths = uniqueSortedPaths(changedPaths);
+
+  if (paths.length === 0) {
+    return policy;
+  }
+
+  if (policy.readOnly) {
+    throw createOutOfScopeBusinessChangeError(
+      policy,
+      paths,
+      "This job is read-only/validation-only, so any file change must stop before git add or commit."
+    );
+  }
+
+  const protectedBusinessPaths = policy.systemGuarded
+    ? paths.filter((filePath) => isProtectedBusinessPath(filePath))
+    : [];
+
+  if (protectedBusinessPaths.length > 0) {
+    throw createOutOfScopeBusinessChangeError(
+      policy,
+      protectedBusinessPaths,
+      "A system/Worker/ops task attempted to modify protected product business paths."
+    );
+  }
+
+  if (policy.allowedPathPatterns !== null) {
+    const outOfScopePaths = paths.filter(
+      (filePath) => !matchesAnyPathPattern(filePath, policy.allowedPathPatterns)
+    );
+
+    if (outOfScopePaths.length > 0) {
+      throw createOutOfScopeBusinessChangeError(
+        policy,
+        outOfScopePaths,
+        "Changed files are outside the paths explicitly allowed by the boss/system policy."
+      );
+    }
+  }
+
+  return policy;
+}
+
+function assertGitWriteAllowedForJob(job, operation) {
+  if (!isReadOnlyJob(job)) {
+    return;
+  }
+
+  const error = new Error(
+    [
+      "READ_ONLY_GIT_OPERATION_BLOCKED",
+      `operation: ${operation}`,
+      "This job is read-only/validation-only. git add, git commit, and git push are forbidden.",
+    ].join("\n")
+  );
+  error.code = "READ_ONLY_GIT_OPERATION_BLOCKED";
+  throw error;
+}
+
+function bossExplicitlyAllowsAutoPush(job) {
+  const text = compactText(getBossOriginalText(job));
+
+  if (/不推送|禁止推送|不得推送|不允许推送|no push|do not push|don't push/i.test(text)) {
+    return false;
+  }
+
+  return /(?:明确|显式|允许|批准|可以|同意)[^。；;\n]*(?:自动)?(?:推送|push)|(?:auto[-\s]?push|git push)[^。；;\n]*(?:allowed|approved|explicitly allowed)/i.test(
+    text
+  );
+}
+
+function shouldAutoPushJob(job, autoPushEnabled = GIT_AUTO_PUSH) {
+  if (!autoPushEnabled) {
+    return {
+      allowed: false,
+      message: "Git auto push is disabled",
+    };
+  }
+
+  if (isReadOnlyJob(job)) {
+    return {
+      allowed: false,
+      message: "Read-only task: git push is forbidden",
+    };
+  }
+
+  const policy = buildTaskBoundaryPolicy(job);
+
+  if (policy.systemGuarded && !bossExplicitlyAllowsAutoPush(job)) {
+    return {
+      allowed: false,
+      message: "System/Worker task has no explicit boss approval for auto push; skipping git push",
+    };
+  }
+
+  return {
+    allowed: true,
+    message: "Git auto push allowed",
+  };
+}
+
+function isNegatedProductTaskCardLine(line) {
+  return /不得|禁止|不允许|不要|不能|must\s+not|do\s+not|don't|forbid/i.test(line);
+}
+
+function referencesProductTaskCardAsExecutionText(job) {
+  const lines = getJobSearchText(job).split(/\r?\n/);
+
+  return lines.some((line) => {
+    if (!/docs[\\/]NEXT_TASK_CARD\.md|NEXT_TASK_CARD\.md/i.test(line)) {
+      return false;
+    }
+
+    if (isNegatedProductTaskCardLine(line)) {
+      return false;
+    }
+
+    return /读取|使用|执行|打开|根据|按|read|use|execute|open|load/i.test(line);
+  });
+}
+
+function assertProductTaskCardAccessAllowed(job) {
+  const policy = buildTaskBoundaryPolicy(job);
+
+  if (policy.productDevelopment || !referencesProductTaskCardAsExecutionText(job)) {
+    return policy;
+  }
+
+  const error = new Error(
+    [
+      "OUT_OF_SCOPE_PRODUCT_TASK_CARD",
+      `batch_code: ${policy.batchCode}`,
+      `task_type: ${policy.taskType}`,
+      "System/Worker tasks must not read docs/NEXT_TASK_CARD.md as execution text.",
+      "Only product development batches such as BATCH-P3/BATCH-P4 may use the product task card.",
+    ].join("\n")
+  );
+  error.code = "OUT_OF_SCOPE_PRODUCT_TASK_CARD";
+  throw error;
+}
+
+function buildJobExecutionContext(job, attemptId = null) {
+  const bossOriginalText = getBossOriginalText(job);
+
+  return {
+    jobId: job?.id || "missing",
+    batchCode: getJobBatchCode(job) || "unknown",
+    title: getJobTaskTitle(job),
+    bossOriginalTextPreview: previewText(bossOriginalText),
+    createdAt: readJobString(job?.created_at) || "unknown",
+    attemptId: attemptId || "legacy-no-attempt-id",
+  };
+}
+
+function logClaimedJob(job, attemptId = null) {
+  const context = buildJobExecutionContext(job, attemptId);
+
+  console.log(`领取任务： ${context.jobId}`);
+  console.log(`任务批次： ${context.batchCode}`);
+  console.log(`任务标题： ${context.title}`);
+  console.log(`老板原文前200字： ${context.bossOriginalTextPreview || "(empty)"}`);
+  console.log(`任务创建时间： ${context.createdAt}`);
+  console.log(`执行尝试： ${context.attemptId}`);
 }
 
 async function request(path, options = {}) {
@@ -157,7 +686,7 @@ const GIT_PUSH_BRANCH =
 const REQUIRED_GIT_PUSH_REMOTE = "origin";
 const REQUIRED_GIT_PUSH_BRANCH = "master";
 
-function runCommand(command, args, cwd = PROJECT_DIR) {
+function runCommand(command, args, cwd = PROJECT_DIR, options = {}) {
   return new Promise((resolve, reject) => {
     execFile(
       command,
@@ -186,16 +715,63 @@ function runCommand(command, args, cwd = PROJECT_DIR) {
         }
 
         resolve({
-          stdout: String(stdout || "").trim(),
-          stderr: String(stderr || "").trim(),
+          stdout:
+            options.trimOutput === false
+              ? String(stdout || "")
+              : String(stdout || "").trim(),
+          stderr:
+            options.trimOutput === false
+              ? String(stderr || "")
+              : String(stderr || "").trim(),
         });
       }
     );
   });
 }
 
-async function runGit(args) {
-  return runCommand("git", args, PROJECT_DIR);
+async function runGit(args, options = {}) {
+  return runCommand("git", args, PROJECT_DIR, options);
+}
+
+async function runReadOnlyJob(job) {
+  const status = await runGit(["status", "--short"]);
+  const porcelain = await runGit(["status", "--porcelain=v1", "-z"], {
+    trimOutput: false,
+  });
+  const diff = await runGit(["diff", "--name-only"]);
+  const statusPaths = getStatusPaths(parseGitStatusPorcelain(porcelain.stdout));
+  const diffPaths = uniqueSortedPaths(
+    String(diff.stdout || "")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map(normalizeGitPath)
+  );
+  const classifiedPaths = uniqueSortedPaths([...statusPaths, ...diffPaths]).map((filePath) => ({
+    path: filePath,
+    classification: classifyGitPath(filePath),
+  }));
+  const context = buildJobExecutionContext(job, currentAttemptId);
+
+  return [
+    "READ_ONLY_WORKSPACE_INVENTORY",
+    `job_id: ${context.jobId}`,
+    `attempt_id: ${context.attemptId}`,
+    `batch_code: ${context.batchCode}`,
+    `task_title: ${context.title}`,
+    `created_at: ${context.createdAt}`,
+    `boss_original_text_preview: ${context.bossOriginalTextPreview || "(empty)"}`,
+    "",
+    "git status --short:",
+    status.stdout || "(clean)",
+    "",
+    "git diff --name-only:",
+    diff.stdout || "(none)",
+    "",
+    "project classification:",
+    ...(classifiedPaths.length
+      ? classifiedPaths.map((item) => `- ${item.path}: ${item.classification}`)
+      : ["- no changed paths"]),
+  ].join("\n");
 }
 
 function sanitizeGitErrorMessage(message) {
@@ -206,7 +782,9 @@ function sanitizeGitErrorMessage(message) {
 }
 
 async function readGitStatusEntries() {
-  const status = await runGit(["status", "--porcelain=v1", "-z"]);
+  const status = await runGit(["status", "--porcelain=v1", "-z"], {
+    trimOutput: false,
+  });
   return parseGitStatusPorcelain(status.stdout);
 }
 
@@ -233,16 +811,114 @@ async function unstagePaths(paths) {
 
 async function getCachedDiffPaths() {
   const diff = await runGit(["diff", "--cached", "--name-only"]);
-  return uniqueSortedPaths(String(diff.stdout || "").split(/\r?\n/).filter(Boolean).map(repairKnownDroppedFirstCharPath));
+  return uniqueSortedPaths(
+    String(diff.stdout || "").split(/\r?\n/).filter(Boolean).map(normalizeGitPath)
+  );
 }
 
-async function stageTaskPaths(paths) {
-  const taskPaths = uniqueSortedPaths(paths.map(repairKnownDroppedFirstCharPath));
+function getStatusEntryPathRecords(entry) {
+  const paths = Array.isArray(entry?.paths) ? entry.paths : [entry?.path];
+
+  return paths.filter(Boolean).map((filePath) => ({
+    parsedPath: normalizeGitPath(filePath),
+    status: entry?.status || null,
+    rawStatusLine: entry?.rawStatusLine || null,
+  }));
+}
+
+function getStagePathRecords(pathsOrEntries) {
+  const records = [];
+
+  for (const item of pathsOrEntries || []) {
+    if (typeof item === "string") {
+      records.push({
+        parsedPath: normalizeGitPath(item),
+        status: null,
+        rawStatusLine: null,
+      });
+      continue;
+    }
+
+    if (item && typeof item === "object") {
+      records.push(...getStatusEntryPathRecords(item));
+    }
+  }
+
+  const byPath = new Map();
+
+  for (const record of records) {
+    if (!record.parsedPath || byPath.has(record.parsedPath)) {
+      continue;
+    }
+
+    byPath.set(record.parsedPath, record);
+  }
+
+  return [...byPath.values()].sort((a, b) => a.parsedPath.localeCompare(b.parsedPath));
+}
+
+function isDeletedStatus(status) {
+  const value = String(status || "");
+  return value !== "??" && value.includes("D");
+}
+
+function createGitAddPathResolutionError(record, details = {}) {
+  const projectRoot = path.resolve(PROJECT_DIR || process.cwd());
+  const error = new Error(
+    [
+      "GIT_ADD_PATH_RESOLUTION",
+      "git add 前路径解析失败，拒绝继续暂存。",
+      `rawStatusLine: ${record.rawStatusLine || "(unavailable)"}`,
+      `parsedPath: ${record.parsedPath || "(empty)"}`,
+      `cwd: ${process.cwd()}`,
+      `projectRoot: ${projectRoot}`,
+      details.absolutePath ? `absolutePath: ${details.absolutePath}` : null,
+      details.reason ? `reason: ${details.reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
+
+  error.code = "GIT_ADD_PATH_RESOLUTION";
+  return error;
+}
+
+function assertGitAddPathsExist(pathRecords) {
+  const projectRoot = path.resolve(PROJECT_DIR || process.cwd());
+
+  for (const record of pathRecords) {
+    const absolutePath = resolveInsideRoot(projectRoot, record.parsedPath);
+
+    if (!absolutePath) {
+      throw createGitAddPathResolutionError(record, {
+        reason: "path resolves outside project root",
+      });
+    }
+
+    if (fs.existsSync(absolutePath) || isDeletedStatus(record.status)) {
+      continue;
+    }
+
+    throw createGitAddPathResolutionError(record, {
+      absolutePath,
+      reason: "path does not exist",
+    });
+  }
+}
+
+async function stageTaskPaths(pathsOrEntries, options = {}) {
+  if (options.job) {
+    assertGitWriteAllowedForJob(options.job, "git add");
+  }
+
+  const pathRecords = getStagePathRecords(pathsOrEntries);
+  const taskPaths = uniqueSortedPaths(pathRecords.map((record) => record.parsedPath));
 
   if (taskPaths.length === 0) {
     return [];
   }
 
+  assertGitAddPathsExist(pathRecords);
   validateCommittablePaths(taskPaths, { projectRoot: PROJECT_DIR });
 
   await runGit(["add", "--", ...taskPaths]);
@@ -336,11 +1012,42 @@ const CODEX_GIT_OPERATION_GUARD = [
   "如果任务要求生成 Git Commit，Codex 不应自行执行。",
 ].join("\n");
 
-function buildWorkerGuardedPrompt(requestText) {
+function buildTaskBoundaryPrompt(policy) {
+  if (!policy) {
+    return "";
+  }
+
+  const lines = [
+    "【Task Boundary Guard】",
+    `batch_code: ${policy.batchCode}`,
+    `task_type: ${policy.taskType}`,
+  ];
+
+  if (policy.systemGuarded) {
+    lines.push(
+      "This is a system/Worker/ops/read-only guarded task, not a product-page task.",
+      "Do not read docs/NEXT_TASK_CARD.md or docs/product/** as execution text.",
+      "If a requested change touches protected business paths, stop and report OUT_OF_SCOPE_BUSINESS_CHANGE.",
+      "Protected business paths:",
+      ...policy.protectedBusinessPathPatterns.map((pattern) => `- ${pattern}`)
+    );
+  }
+
+  lines.push(
+    "Allowed write scope:",
+    ...formatAllowedScope(policy).map((item) => `- ${item}`)
+  );
+
+  return lines.join("\n");
+}
+
+function buildWorkerGuardedPrompt(requestText, policy = null) {
   const taskText = String(requestText || "").trim();
+  const boundaryPrompt = buildTaskBoundaryPrompt(policy);
 
   return [
     CODEX_GIT_OPERATION_GUARD,
+    boundaryPrompt,
     "",
     "【原始任务内容】",
     taskText,
@@ -351,13 +1058,15 @@ function buildWorkerGuardedPrompt(requestText) {
 }
 
 function buildCodexPrompt(job) {
-  return buildWorkerGuardedPrompt(job?.request_text || "");
+  const policy = assertProductTaskCardAccessAllowed(job);
+  return buildWorkerGuardedPrompt(job?.request_text || "", policy);
 }
 
 function buildCodexRepairPrompt(job, error, attempt) {
   const errorText = error instanceof Error ? error.message : String(error);
   const category = classifyLocalError(errorText);
   const taskText = String(job?.request_text || "").trim();
+  const policy = assertProductTaskCardAccessAllowed(job);
   const mode =
     attempt === 2
       ? "第 1 次失败：请先诊断错误类型，优先安全修复缓存、路由、语法、端口或依赖引用问题，然后再次验证。"
@@ -373,7 +1082,8 @@ function buildCodexRepairPrompt(job, error, attempt) {
       "",
       "【原始任务】",
       taskText,
-    ].join("\n")
+    ].join("\n"),
+    policy
   );
 }
 
@@ -383,6 +1093,7 @@ function formatPreflightResult(result) {
     `清理缓存：${result.removedCaches.join(", ") || "无"}`,
     `还原生成文件：${result.restoredEnvFiles.join(", ") || "无"}`,
     `清理已知生成文件：${result.cleanedGeneratedPaths.join(", ") || "无"}`,
+    `系统改动放行：${safeReportArray(result.allowedSystemChanges).join("; ") || "无"}`,
     `Git 状态：${result.gitStatusShort.length ? result.gitStatusShort.join("; ") : "clean"}`,
   ].join("\n");
 }
@@ -463,7 +1174,19 @@ async function commitGitTask(job) {
     };
   }
 
-  const taskChangedPaths = await getTaskChangedPaths();
+  const taskChangedEntries = await readGitStatusEntries();
+  const taskChangedPaths = getStatusPaths(taskChangedEntries);
+
+  if (isReadOnlyJob(job)) {
+    if (taskChangedPaths.length > 0) {
+      assertChangedPathsAllowedForJob(job, taskChangedPaths);
+    }
+
+    return {
+      committed: false,
+      message: "Read-only task: skipped git add and git commit",
+    };
+  }
 
   if (taskChangedPaths.length === 0) {
     return {
@@ -472,7 +1195,9 @@ async function commitGitTask(job) {
     };
   }
 
-  const stagedPaths = await stageTaskPaths(taskChangedPaths);
+  assertChangedPathsAllowedForJob(job, taskChangedPaths);
+
+  const stagedPaths = await stageTaskPaths(taskChangedEntries, { job });
 
   if (stagedPaths.length === 0) {
     return {
@@ -480,6 +1205,8 @@ async function commitGitTask(job) {
       message: "Codex 没有产生可提交的文件变更",
     };
   }
+
+  assertGitWriteAllowedForJob(job, "git commit");
 
   await runGit(["commit", "-m", createCommitMessage(job)]);
 
@@ -501,13 +1228,17 @@ async function commitGitTask(job) {
   };
 }
 
-async function pushGitTask(commitSha) {
-  if (!GIT_AUTO_PUSH) {
+async function pushGitTask(commitSha, job) {
+  const pushDecision = shouldAutoPushJob(job);
+
+  if (!pushDecision.allowed) {
     return {
       pushed: false,
-      message: "Git 自动推送已关闭",
+      message: pushDecision.message,
     };
   }
+
+  assertGitWriteAllowedForJob(job, "git push");
 
   if (GIT_REMOTE_NAME !== REQUIRED_GIT_PUSH_REMOTE) {
     throw new Error(
@@ -604,8 +1335,8 @@ async function rollbackGitTask(checkpoint) {
   }
 
   const entries = await readGitStatusEntries();
-  const trackedPaths = getTrackedStatusPaths(entries).map(repairKnownDroppedFirstCharPath);
-  const untrackedPaths = getUntrackedStatusPaths(entries).map(repairKnownDroppedFirstCharPath);
+  const trackedPaths = getTrackedStatusPaths(entries);
+  const untrackedPaths = getUntrackedStatusPaths(entries);
 
   await unstagePaths(trackedPaths);
 
@@ -941,8 +1672,7 @@ async function pollOnce() {
   working = true;
   currentAttemptId = attemptId;
 
-  console.log(`领取任务： ${job.id}`);
-  console.log(`执行尝试： ${attemptId || "legacy-no-attempt-id"}`);
+  logClaimedJob(job, attemptId);
 
   await updateProgress(
     job.id,
@@ -950,12 +1680,56 @@ async function pollOnce() {
     "已领取任务",
     "任务已被 Worker 领取"
   );
-  console.log(`任务内容：${job.request_text}`);
 
   const stopHeartbeat = startHeartbeat(job.id, attemptId);
   let gitCheckpoint = null;
 
   try {
+    const batchCheck = validateJobBatchConsistency(job);
+
+    if (!batchCheck.ok) {
+      const mismatchError = new Error(batchCheck.message);
+      mismatchError.code = batchCheck.errorCode;
+      await updateProgress(
+        job.id,
+        100,
+        "任务批次不匹配",
+        batchCheck.message
+      );
+      throw mismatchError;
+    }
+
+    if (isReadOnlyJob(job)) {
+      await updateProgress(
+        job.id,
+        10,
+        "只读任务确认",
+        "检测到只读盘点任务，将跳过自检清理、Git 同步、Codex、stash/reset/commit/push"
+      );
+
+      const result = await runReadOnlyJob(job);
+
+      await updateProgress(
+        job.id,
+        100,
+        "只读任务完成",
+        "只读工作区盘点已完成，未修改文件"
+      );
+
+      await report(
+        job.id,
+        "succeeded",
+        result,
+        {
+          attempt_id: attemptId,
+          read_only: true,
+        }
+      );
+      return;
+    }
+
+    assertProductTaskCardAccessAllowed(job);
+
     await updateProgress(
       job.id,
       10,
@@ -1041,16 +1815,26 @@ async function pollOnce() {
     };
 
     if (gitResult.committed) {
-      await updateProgress(
-        job.id,
-        90,
-        "推送 GitHub",
-        "正在推送代码到远程仓库"
-      );
+      const pushDecision = shouldAutoPushJob(job);
 
-      pushResult = await pushGitTask(
-        gitResult.commitSha
-      );
+      if (pushDecision.allowed) {
+        await updateProgress(
+          job.id,
+          90,
+          "推送 GitHub",
+          "正在推送代码到远程仓库"
+        );
+
+        pushResult = await pushGitTask(
+          gitResult.commitSha,
+          job
+        );
+      } else {
+        pushResult = {
+          pushed: false,
+          message: pushDecision.message,
+        };
+      }
     }
 
     await updateProgress(
@@ -1139,7 +1923,13 @@ async function pollOnce() {
       `${
       error instanceof Error ? error.message : String(error)
       }${rollbackMessage}`,
-      { attempt_id: attemptId }
+      {
+        attempt_id: attemptId,
+        error_code:
+          error && typeof error === "object" && error.code
+            ? String(error.code)
+            : undefined,
+      }
     );
   } finally {
     stopHeartbeat();
@@ -1187,15 +1977,32 @@ if (require.main === module) {
 }
 
 module.exports = {
+  assertChangedPathsAllowedForJob,
   assertCleanWorktreeBeforeCodex,
+  assertGitWriteAllowedForJob,
+  assertProductTaskCardAccessAllowed,
+  buildJobExecutionContext,
   buildCodexPrompt,
+  buildTaskBoundaryPolicy,
   buildWorkerGuardedPrompt,
+  classifyWorkerTask,
   commitGitTask,
+  extractExplicitAllowedPathPatterns,
+  getBossOriginalText,
+  getExplicitlyApprovedBatch,
+  getJobBatchCode,
+  getJobTaskTitle,
   getTaskChangedPaths,
+  isReadOnlyJob,
+  isProductDevelopmentBatch,
+  referencesProductTaskCardAsExecutionText,
   main,
   prepareGitTask,
   rollbackGitTask,
+  runReadOnlyJob,
+  shouldAutoPushJob,
   stageTaskPaths,
+  validateJobBatchConsistency,
 };
 
 

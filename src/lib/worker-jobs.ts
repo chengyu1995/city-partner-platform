@@ -41,6 +41,154 @@ function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
 }
 
+export interface WorkerJobClaimDiagnostics {
+  jobId: string;
+  batchCode: string;
+  title: string;
+  bossOriginalTextPreview: string;
+  createdAt: string;
+  attemptId: string;
+}
+
+export interface WorkerJobBatchConsistencyResult {
+  ok: boolean;
+  errorCode: "TASK_BATCH_MISMATCH" | null;
+  approvedBatch: string | null;
+  jobBatch: string | null;
+  message: string;
+}
+
+function compactText(value: unknown): string {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeBatchCode(value: unknown): string | null {
+  const raw = readString(value);
+  if (!raw) return null;
+  const match = raw.match(/\bBATCH-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?\b/i);
+  return match ? match[0].toUpperCase() : null;
+}
+
+function findBatchCodeInText(value: unknown): string | null {
+  return normalizeBatchCode(compactText(value));
+}
+
+export function getWorkerJobBatchCode(job: JobRecord | null | undefined): string | null {
+  const payload = readRecord(job?.payload);
+
+  return (
+    normalizeBatchCode(job?.batch_code) ??
+    normalizeBatchCode(payload?.batch_code) ??
+    normalizeBatchCode(job?.dispatch_batch) ??
+    normalizeBatchCode(payload?.dispatch_batch) ??
+    normalizeBatchCode(job?.task_code) ??
+    findBatchCodeInText(job?.request_text) ??
+    findBatchCodeInText(job?.title)
+  );
+}
+
+export function getWorkerJobTitle(job: JobRecord | null | undefined): string {
+  const payload = readRecord(job?.payload);
+
+  return (
+    readString(job?.title) ??
+    readString(payload?.task_title) ??
+    readString(payload?.title) ??
+    readString(job?.task_title) ??
+    readString(job?.job_id) ??
+    "untitled"
+  );
+}
+
+export function getWorkerJobBossOriginalText(job: JobRecord | null | undefined): string {
+  const payload = readRecord(job?.payload);
+
+  return (
+    readString(job?.boss_original_text) ??
+    readString(job?.bossOriginalText) ??
+    readString(payload?.boss_original_text) ??
+    readString(payload?.bossOriginalText) ??
+    readString(payload?.original_demand) ??
+    readString(payload?.raw_message_text) ??
+    readString(job?.original_demand) ??
+    readString(job?.request_text) ??
+    ""
+  );
+}
+
+export function getExplicitlyApprovedBatchFromText(text: string): string | null {
+  const compacted = compactText(text);
+  const patterns = [
+    /(?:仅|只)\s*批准\s*(?:的是|为|:|：)?\s*(BATCH-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)/i,
+    /(?:仅|只)\s*(?:允许|执行|领取|处理)\s*(?:的是|为|:|：)?\s*(BATCH-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)/i,
+    /only\s+(?:approve|approved|allow|execute|run)\s+(BATCH-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = compacted.match(pattern);
+    if (match) return normalizeBatchCode(match[1]);
+  }
+
+  return null;
+}
+
+export function validateWorkerJobBatchConsistency(
+  job: JobRecord | null | undefined
+): WorkerJobBatchConsistencyResult {
+  const bossOriginalText = getWorkerJobBossOriginalText(job);
+  const approvedBatch = getExplicitlyApprovedBatchFromText(bossOriginalText);
+  const jobBatch = getWorkerJobBatchCode(job);
+
+  if (!approvedBatch) {
+    return {
+      ok: true,
+      errorCode: null,
+      approvedBatch: null,
+      jobBatch,
+      message: "no explicit single-batch approval found",
+    };
+  }
+
+  if (jobBatch === approvedBatch) {
+    return {
+      ok: true,
+      errorCode: null,
+      approvedBatch,
+      jobBatch,
+      message: "job batch matches boss approval",
+    };
+  }
+
+  return {
+    ok: false,
+    errorCode: "TASK_BATCH_MISMATCH",
+    approvedBatch,
+    jobBatch,
+    message: [
+      "TASK_BATCH_MISMATCH",
+      `approved_batch=${approvedBatch}`,
+      `job_batch=${jobBatch ?? "missing"}`,
+      `job_id=${readString(job?.id) ?? "missing"}`,
+      `title=${getWorkerJobTitle(job)}`,
+      `boss_original_text_preview=${compactText(bossOriginalText).slice(0, 200)}`,
+    ].join("\n"),
+  };
+}
+
+export function buildWorkerJobClaimDiagnostics(
+  job: JobRecord | null | undefined,
+  attemptId: string | null
+): WorkerJobClaimDiagnostics {
+  return {
+    jobId: readString(job?.id) ?? "missing",
+    batchCode: getWorkerJobBatchCode(job) ?? "unknown",
+    title: getWorkerJobTitle(job),
+    bossOriginalTextPreview: compactText(getWorkerJobBossOriginalText(job)).slice(0, 200),
+    createdAt: readString(job?.created_at) ?? "unknown",
+    attemptId: attemptId ?? "legacy-no-attempt-id",
+  };
+}
+
 function isSafePostgrestFilterValue(value: string): boolean {
   return /^[A-Za-z0-9._:@-]+$/.test(value);
 }

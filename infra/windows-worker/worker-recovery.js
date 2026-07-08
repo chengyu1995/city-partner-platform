@@ -1,6 +1,11 @@
 const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
+const {
+  classifyGitPath,
+  isProtectedBusinessPath,
+  parseGitStatusPorcelain,
+} = require("./git-safety");
 
 const NEXT_ENV_CONTENT = [
   '/// <reference types="next" />',
@@ -110,8 +115,14 @@ function runCommand(command, args, options = {}) {
       },
       (error, stdout, stderr) => {
         const result = {
-          stdout: String(stdout || "").trim(),
-          stderr: String(stderr || "").trim(),
+          stdout:
+            options.trimOutput === false
+              ? String(stdout || "")
+              : String(stdout || "").trim(),
+          stderr:
+            options.trimOutput === false
+              ? String(stderr || "")
+              : String(stderr || "").trim(),
           code: error ? (typeof error.code === "number" ? error.code : 1) : 0,
         };
 
@@ -141,27 +152,8 @@ async function runGit(projectDir, args, options = {}) {
   return runCommand("git", args, {
     cwd: projectDir,
     allowFailure: options.allowFailure,
+    trimOutput: options.trimOutput,
   });
-}
-
-function parseGitStatusShort(output) {
-  return String(output || "")
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter(Boolean)
-    .map((line) => {
-      const status = line.slice(0, 2);
-      const rawPath = line.slice(3).replace(/^"|"$/g, "");
-      const renamedPath = rawPath.includes(" -> ")
-        ? rawPath.split(" -> ").pop()
-        : rawPath;
-
-      return {
-        status,
-        path: normalizeGitPath(renamedPath),
-        line,
-      };
-    });
 }
 
 function isGeneratedPath(filePath) {
@@ -180,9 +172,19 @@ function isGeneratedPath(filePath) {
   );
 }
 
+function isAutomationOrWorkerSystemChange(filePath) {
+  const kind = classifyGitPath(filePath);
+  return kind === "automation_system" || kind === "worker_system";
+}
+
 async function getGitStatusEntries(projectDir) {
-  const status = await runGit(projectDir, ["status", "--short"]);
-  return parseGitStatusShort(status.stdout);
+  const status = await runGit(projectDir, ["status", "--porcelain=v1", "-z"], {
+    trimOutput: false,
+  });
+  return parseGitStatusPorcelain(status.stdout).map((entry) => ({
+    ...entry,
+    line: entry.rawStatusLine || `${entry.status} ${entry.path}`,
+  }));
 }
 
 async function restoreGeneratedEnvFiles(projectDir, options = {}) {
@@ -371,9 +373,17 @@ async function runPreflight(projectDir, options = {}) {
   const beforeGeneratedClean = await getGitStatusEntries(root);
   const cleanedGeneratedPaths = await cleanKnownGeneratedGitChanges(root, beforeGeneratedClean);
   const finalEntries = await getGitStatusEntries(root);
-  const unknownEntries = finalEntries.filter((entry) => !isGeneratedPath(entry.path));
+  const allowedSystemEntries = finalEntries.filter((entry) =>
+    isAutomationOrWorkerSystemChange(entry.path)
+  );
+  const unknownEntries = finalEntries.filter(
+    (entry) => !isGeneratedPath(entry.path) && !isAutomationOrWorkerSystemChange(entry.path)
+  );
 
   if (unknownEntries.length > 0) {
+    const protectedEntries = unknownEntries.filter((entry) =>
+      isProtectedBusinessPath(entry.path)
+    );
     const error = new Error(
       [
         "发现未确认业务修改，项目总管已停止执行。",
@@ -382,7 +392,10 @@ async function runPreflight(projectDir, options = {}) {
         ...unknownEntries.map((entry) => `- ${entry.line}`),
       ].join("\n")
     );
-    error.code = "UNKNOWN_BUSINESS_CHANGES";
+    error.code =
+      protectedEntries.length > 0
+        ? "OUT_OF_SCOPE_BUSINESS_CHANGE"
+        : "UNKNOWN_BUSINESS_CHANGES";
     error.entries = unknownEntries;
     throw error;
   }
@@ -392,6 +405,7 @@ async function runPreflight(projectDir, options = {}) {
     removedCaches,
     restoredEnvFiles,
     cleanedGeneratedPaths,
+    allowedSystemChanges: allowedSystemEntries.map((entry) => entry.line),
     gitStatusShort: finalEntries.map((entry) => entry.line),
   };
 }

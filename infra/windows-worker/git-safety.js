@@ -3,29 +3,13 @@ const path = require("path");
 
 function normalizeGitPath(filePath) {
   const raw = String(filePath || "").replace(/\0/g, "");
-  let normalized = raw.replace(/\\/g, "/").replace(/\/+/g, "/").trim();
+  let normalized = raw.replace(/\\/g, "/").replace(/\/+/g, "/");
 
   while (normalized.startsWith("./")) {
     normalized = normalized.slice(2);
   }
 
-  
-  const droppedFirstCharPrefixes = [
-    ["ocs/", "docs/"],
-    ["rc/", "src/"],
-    ["nfra/", "infra/"],
-    ["ackage.json", "package.json"],
-    ["ackage-lock.json", "package-lock.json"],
-    ["EADME.md", "README.md"],
-  ];
-
-  for (const [badPrefix, goodPrefix] of droppedFirstCharPrefixes) {
-    if (normalized.startsWith(badPrefix)) {
-      return goodPrefix + normalized.slice(badPrefix.length);
-    }
-  }
-
-return normalized;
+  return normalized;
 }
 
 function uniqueSortedPaths(paths) {
@@ -40,40 +24,81 @@ function parseGitStatusPorcelain(output) {
 
   for (let index = 0; index < parts.length; index += 1) {
     const record = parts[index];
+    const parsed = parseGitStatusRecord(record);
 
-    if (record.length < 4) {
+    if (!parsed) {
       continue;
     }
 
-    const status = record.slice(0, 2);
-    const filePath = normalizeGitPath(record.slice(3));
-
-    if (!filePath) {
-      continue;
-    }
+    const { status, filePath, rawStatusLine } = parsed;
 
     if (status[0] === "R" || status[0] === "C") {
       const originalPath = normalizeGitPath(parts[index + 1] || "");
       index += 1;
 
-      entries.push({
-        status,
-        path: filePath,
-        originalPath,
-        paths: [filePath],
-      });
+      entries.push(
+        withRawStatusLine(
+          {
+            status,
+            path: filePath,
+            originalPath,
+            paths: [filePath],
+          },
+          rawStatusLine
+        )
+      );
       continue;
     }
 
-    entries.push({
-      status,
-      path: filePath,
-      originalPath: null,
-      paths: [filePath],
-    });
+    entries.push(
+      withRawStatusLine(
+        {
+          status,
+          path: filePath,
+          originalPath: null,
+          paths: [filePath],
+        },
+        rawStatusLine
+      )
+    );
   }
 
   return entries;
+}
+
+function parseGitStatusRecord(record) {
+  const rawStatusLine = String(record || "").replace(/\0/g, "").replace(/\r?\n$/, "");
+
+  if (!rawStatusLine) {
+    return null;
+  }
+
+  const match = rawStatusLine.match(/^([ MTADRCU?!]{1,2}) (.*)$/);
+
+  if (!match) {
+    return null;
+  }
+
+  const filePath = normalizeGitPath(match[2].replace(/^"|"$/g, ""));
+
+  if (!filePath) {
+    return null;
+  }
+
+  return {
+    status: match[1],
+    filePath,
+    rawStatusLine,
+  };
+}
+
+function withRawStatusLine(entry, rawStatusLine) {
+  Object.defineProperty(entry, "rawStatusLine", {
+    value: rawStatusLine,
+    enumerable: false,
+  });
+
+  return entry;
 }
 
 function formatPathList(paths) {
@@ -106,6 +131,83 @@ function getUntrackedStatusPaths(entries) {
       .filter((entry) => entry.status === "??")
       .flatMap((entry) => entry.paths || [])
   );
+}
+
+const PROTECTED_BUSINESS_PATH_PATTERNS = [
+  "src/app/page.tsx",
+  "src/app/layout.tsx",
+  "src/app/partners/**",
+  "src/app/post/**",
+  "app/**",
+  "src/lib/db/mock.ts",
+  "src/types/db.ts",
+  "docs/product/**",
+];
+
+function pathMatchesGitPattern(filePath, pattern) {
+  const normalizedPath = normalizeGitPath(filePath).replace(/\/+$/, "");
+  const normalizedPattern = normalizeGitPath(pattern).replace(/\/+$/, "");
+
+  if (!normalizedPath || !normalizedPattern) {
+    return false;
+  }
+
+  if (normalizedPattern.endsWith("/**")) {
+    const root = normalizedPattern.slice(0, -3);
+    return normalizedPath === root || normalizedPath.startsWith(`${root}/`);
+  }
+
+  return normalizedPath === normalizedPattern;
+}
+
+function isProtectedBusinessPath(filePath) {
+  return PROTECTED_BUSINESS_PATH_PATTERNS.some((pattern) =>
+    pathMatchesGitPattern(filePath, pattern)
+  );
+}
+
+function getProtectedBusinessPathPatterns() {
+  return [...PROTECTED_BUSINESS_PATH_PATTERNS];
+}
+
+function isAutomationSystemPath(filePath) {
+  const normalized = normalizeGitPath(filePath);
+  return normalized === "agents" || normalized.startsWith("agents/");
+}
+
+function isWorkerSystemPath(filePath) {
+  const normalized = normalizeGitPath(filePath);
+  return (
+    normalized === "infra/windows-worker" ||
+    normalized.startsWith("infra/windows-worker/") ||
+    normalized === "src/lib/worker-jobs.ts"
+  );
+}
+
+function isAutomationOrWorkerSystemPath(filePath) {
+  return isAutomationSystemPath(filePath) || isWorkerSystemPath(filePath);
+}
+
+function classifyGitPath(filePath) {
+  const normalized = normalizeGitPath(filePath);
+
+  if (!normalized) {
+    return "unknown";
+  }
+
+  if (isAutomationSystemPath(normalized)) {
+    return "automation_system";
+  }
+
+  if (isWorkerSystemPath(normalized)) {
+    return "worker_system";
+  }
+
+  if (isProtectedBusinessPath(normalized)) {
+    return "protected_business";
+  }
+
+  return "business_code";
 }
 
 function comparePathSets(expectedPaths, actualPaths) {
@@ -330,15 +432,24 @@ function validateStagedPaths(taskPaths, stagedPaths) {
 
 module.exports = {
   assertCleanStatusEntries,
+  classifyGitPath,
   comparePathSets,
   formatPathList,
   formatStatusList,
   getStatusPaths,
   getTrackedStatusPaths,
   getUntrackedStatusPaths,
+  getProtectedBusinessPathPatterns,
+  isAutomationOrWorkerSystemPath,
+  isAutomationSystemPath,
+  isProtectedBusinessPath,
   isSensitivePath,
+  isWorkerSystemPath,
   normalizeGitPath,
+  pathMatchesGitPattern,
+  parseGitStatusRecord,
   parseGitStatusPorcelain,
+  resolveInsideRoot,
   scanSensitiveContent,
   uniqueSortedPaths,
   validateCommittablePaths,
