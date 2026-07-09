@@ -32,6 +32,10 @@ const RECORD_ID_KEYS = [
 ];
 
 const TERMINAL_WORKER_STATUSES = new Set(["succeeded", "failed"]);
+const TASK_MUTATION_PATTERN =
+  /修复|新增|更新|补齐|建立|修改|改动|创建|写入|补充|fix|repair|add|create|update|modify|patch|implement/i;
+const READ_ONLY_TASK_PATTERN =
+  /read[_ -]?only(?:[_ -]?mode)?\s*(?::|=)?\s*(?:true|1|yes|on)?|只读模式|本任务只读|只读执行|只读检查|只读诊断|只读验证|不修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止\s*(?:执行\s*)?(?:git\s+)?(?:add|commit|push)\b/i;
 const WORKER_BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
 const WORKER_BATCH_RELEVANT_LINE_PATTERN =
   /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
@@ -42,6 +46,13 @@ const WORKER_BATCH_FORBIDDEN_SECTION_EXIT_PATTERN =
   /标题|title|修复目标|(^|\s)目标\s*[:：]|批准|approved|approval|执行批次|当前执行批次/i;
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function readBooleanFlag(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === "number") return value === 1;
+  if (typeof value === "string") return /^(true|1|yes|on)$/i.test(value.trim());
+  return false;
 }
 
 function readRecord(value: unknown): Record<string, unknown> | null {
@@ -352,6 +363,19 @@ function hasEnvChange(filesChanged: string[]): boolean {
   });
 }
 
+function isGithubPushSuccess(value: string | null | undefined): boolean {
+  const text = String(value ?? "").trim();
+  return /^(success|succeeded|pushed)$/i.test(text) || /已推送|推送成功|push success/i.test(text);
+}
+
+function taskRequiresFileChanges(value: unknown): boolean {
+  return TASK_MUTATION_PATTERN.test(String(value ?? ""));
+}
+
+function taskDeclaresReadOnly(value: unknown): boolean {
+  return READ_ONLY_TASK_PATTERN.test(String(value ?? ""));
+}
+
 function buildSafetyBoundary(filesChanged: string[], deployStatus?: string | null): string[] {
   const businessPageChanged = filesChanged.some((file) =>
     pathMatchesAny(file, ["src/app/page.tsx", "src/app/partners", "src/app/post"])
@@ -419,6 +443,7 @@ export function buildProjectDirectorWorkerReport(input: {
   validationResults?: unknown;
   gitCommitSha?: string | null;
   githubPushStatus?: string | null;
+  readOnlyMode?: unknown;
   deployStatus?: string | null;
   buildPassed?: boolean | null;
   testPassed?: boolean | null;
@@ -463,6 +488,27 @@ export function buildProjectDirectorWorkerReport(input: {
   const completionItems = input.status === "failed" ? [] : extractCompletionItems(summary);
   const safetyBoundary = buildSafetyBoundary(filesChanged, input.deployStatus);
   const sanitizedError = input.errorText ? sanitizeReportText(input.errorText) : "";
+  const jobPayload = readRecord(input.job?.payload);
+  const jobResult = readRecord(input.job?.result);
+  const readOnlyMode = [
+    input.readOnlyMode,
+    input.job?.read_only_mode,
+    input.job?.readOnlyMode,
+    jobPayload?.read_only_mode,
+    jobPayload?.readOnlyMode,
+    jobResult?.read_only_mode,
+    jobResult?.readOnlyMode,
+  ].some(readBooleanFlag) || taskDeclaresReadOnly(demand);
+  const readOnlyViolation = input.status === "failed" && /READ_ONLY_MODE_VIOLATION/i.test(sanitizedError);
+  const noFixApplied = input.status === "failed" && /NO_FIX_APPLIED/i.test(sanitizedError);
+  const noOpRun =
+    noFixApplied ||
+    (input.status === "succeeded" &&
+      taskRequiresFileChanges(demand) &&
+      filesChanged.length === 0 &&
+      !gitCommitSha);
+  const committed = Boolean(gitCommitSha);
+  const pushed = isGithubPushSuccess(githubPushStatus);
   const failureStage = input.status === "failed"
     ? readDiagnosticLine(sanitizedError, "失败阶段") ?? "未提供"
     : null;
@@ -473,21 +519,25 @@ export function buildProjectDirectorWorkerReport(input: {
     ? buildFailureNextStep(sanitizedError)
     : null;
   const workerExecutionStatus =
-    input.status === "failed" && /NO_FIX_APPLIED/i.test(sanitizedError)
-      ? "succeeded_until_task_goal_validation"
-      : input.status === "failed"
-        ? "failed"
-        : input.status === "succeeded"
-          ? "succeeded"
-          : input.status;
+    readOnlyViolation
+      ? "succeeded_until_read_only_validation"
+      : noFixApplied
+        ? "succeeded_until_task_goal_validation"
+        : input.status === "failed"
+          ? "failed"
+          : input.status === "succeeded"
+            ? "succeeded"
+            : input.status;
   const taskGoalStatus =
     input.status === "succeeded"
       ? "completed"
-      : /NO_FIX_APPLIED/i.test(sanitizedError)
-        ? "failed_no_fix_applied"
-        : input.status === "failed"
-          ? "failed"
-          : "running";
+      : readOnlyViolation
+        ? "failed_read_only_mode_violation"
+        : noFixApplied
+          ? "failed_no_fix_applied"
+          : input.status === "failed"
+            ? "failed"
+            : "running";
 
   const data = {
     job_id: jobId,
@@ -505,6 +555,11 @@ export function buildProjectDirectorWorkerReport(input: {
     task_domain: taskDomain,
     worker_execution_status: workerExecutionStatus,
     task_goal_status: taskGoalStatus,
+    read_only_mode: readOnlyMode,
+    read_only_violation: readOnlyViolation,
+    no_op_run: noOpRun,
+    committed,
+    pushed,
     what_changed: sanitizeReportText(summary),
     files_changed: filesChanged,
     validation_result: validation,
@@ -533,6 +588,13 @@ export function buildProjectDirectorWorkerReport(input: {
     `任务分类：${taskDomain}`,
     `Worker 执行状态：${workerExecutionStatus}`,
     `任务目标状态：${taskGoalStatus}`,
+    `Worker execution status: ${workerExecutionStatus}`,
+    `Task goal status: ${taskGoalStatus}`,
+    `Read-only mode: ${readOnlyMode ? "yes" : "no"}`,
+    `Read-only violation: ${readOnlyViolation ? "yes" : "no"}`,
+    `No-op run: ${noOpRun ? "yes" : "no"}`,
+    `Committed: ${committed ? "yes" : "no"}`,
+    `Pushed: ${pushed ? "yes" : "no"}`,
     "",
     "本阶段性质：",
     batchCode

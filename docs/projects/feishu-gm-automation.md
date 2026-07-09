@@ -83,3 +83,13 @@
 - 已同步腾讯云 `/home/ubuntu/city-partner-agent/feishu_gateway_canonical.js`：`总管 批准修复` 进入批准执行链路；批次只从标题、修复目标和批准语句提取；自动化、文档、测试、运营任务不会套用同城搭子产品上下文。
 - 腾讯云备份文件：`worker_api.js.bak.batch38a-20260709104241`、`feishu_gateway_canonical.js.bak.batch38a-20260709104241`。
 - 腾讯云 PM2 已重启 `worker-api` 和 `feishu-gateway`；未修改远端 `.env`、数据库、Vercel 配置，也未执行部署。
+
+## BATCH-42A read-only and cloud fallback
+
+- Windows Worker now keeps a process-level read-only Git write lock. When `read_only_mode=true`, `git add`, `git commit`, and `git push` are refused with `READ_ONLY_MODE_VIOLATION`.
+- A read-only task that leaves any Git diff fails during task-goal validation with `READ_ONLY_MODE_VIOLATION`; the failure report lists changed files and does not use `completed_with_warning`.
+- Final reports include separate fields for Worker execution status, task goal status, read-only violation, no-op run, committed, and pushed.
+- Tencent Cloud `/home/ubuntu/city-partner-agent/worker_api.js` now coerces a reported `succeeded` terminal report to `failed` when `read_only_mode=true` but `files_changed`, `git_commit_sha`, or a successful push is present.
+- Tencent Cloud `worker_api.js` still coerces mutation-task empty reports to `failed` with `NO_FIX_APPLIED`.
+- Tencent Cloud `/home/ubuntu/city-partner-agent/feishu_gateway_canonical.js` keeps `总管 批准修复` on the approved-execution path, extracts the current batch only from title/repair/approval text, and keeps `governance_docs`, `automation_system`, `qa_review`, and `operations` separate from city-partner product context.
+- Tencent Cloud backups for this batch: `worker_api.js.bak.batch42a-20260709120234`, `feishu_gateway_canonical.js.bak.batch42a-20260709120234`.

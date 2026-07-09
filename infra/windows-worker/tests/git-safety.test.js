@@ -26,6 +26,7 @@ const {
 const {
   NO_FIX_APPLIED,
   READ_ONLY_MODE_VIOLATION,
+  assertGitOperationAllowed,
   assertTaskGoalApplied,
   buildCodexPrompt,
   buildFailureReport,
@@ -410,6 +411,26 @@ test("read_only_mode task lock", async (t) => {
         error.code === READ_ONLY_MODE_VIOLATION &&
         error.message.includes("infra/windows-worker/local_worker.js")
     );
+  });
+
+  await t.test("hard-blocks git add commit and push in read_only_mode", () => {
+    for (const args of [
+      ["add", "--", "infra/windows-worker/local_worker.js"],
+      ["commit", "-m", "should not commit"],
+      ["push", "origin", "master"],
+    ]) {
+      assert.throws(
+        () =>
+          assertGitOperationAllowed(args, {
+            readOnlyMode: true,
+            changedPaths: ["infra/windows-worker/local_worker.js"],
+          }),
+        (error) =>
+          error.code === READ_ONLY_MODE_VIOLATION &&
+          error.message.includes("READ_ONLY_MODE_VIOLATION") &&
+          error.message.includes("infra/windows-worker/local_worker.js")
+      );
+    }
   });
 
   await t.test("adds read-only lock instructions to the Codex prompt", () => {

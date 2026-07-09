@@ -62,6 +62,7 @@ function assertRequiredEnv() {
 let stopping = false;
 let working = false;
 let currentAttemptId = null;
+let currentReadOnlyMode = false;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -190,6 +191,7 @@ function runCommand(command, args, cwd = PROJECT_DIR, options = {}) {
 }
 
 async function runGit(args, options = {}) {
+  assertGitOperationAllowed(args, options);
   return runCommand("git", args, PROJECT_DIR, options);
 }
 
@@ -583,6 +585,45 @@ function createReadOnlyModeViolationError(changedPaths) {
   return error;
 }
 
+function createReadOnlyGitCommandError(args, details = {}) {
+  const command = ["git", ...(args || [])].join(" ").trim();
+  const changedPaths = uniqueSortedPaths(details.changedPaths || []);
+  const error = new Error(
+    [
+      READ_ONLY_MODE_VIOLATION,
+      `read_only_mode=true blocks ${command}; Worker refused git add/commit/push before any write.`,
+      changedPaths.length
+        ? `changed_paths: ${changedPaths.join(", ")}`
+        : "changed_paths: none",
+    ].join("\n")
+  );
+
+  error.code = READ_ONLY_MODE_VIOLATION;
+  error.failureStage = "read_only_mode git write guard";
+  error.blockedGitCommand = command;
+  error.changedPaths = changedPaths;
+  return error;
+}
+
+function getGitSubcommand(args) {
+  const first = Array.isArray(args) ? args[0] : null;
+  return typeof first === "string" ? first.toLowerCase() : "";
+}
+
+function assertGitOperationAllowed(args, options = {}) {
+  const readOnlyLocked = currentReadOnlyMode || options.readOnlyMode === true;
+
+  if (!readOnlyLocked) {
+    return;
+  }
+
+  const subcommand = getGitSubcommand(args);
+
+  if (subcommand === "add" || subcommand === "commit" || subcommand === "push") {
+    throw createReadOnlyGitCommandError(args, options);
+  }
+}
+
 function assertTaskGoalApplied(job, changedPaths) {
   const requestText = getJobText(job);
   const taskDomain = classifyWorkerTaskDomain(requestText);
@@ -970,13 +1011,32 @@ function buildFailureReport(job, error, context = {}) {
   const filesChanged = uniqueSortedPaths(context.filesChanged || []);
   const uncommittedFiles = uniqueSortedPaths(context.uncommittedFiles || filesChanged);
   const taskName = String(job?.request_text || "未提供").replace(/\s+/g, " ").trim().slice(0, 120);
+  const errorCode = error?.code || "UNKNOWN_ERROR";
+  const readOnlyViolation = errorCode === READ_ONLY_MODE_VIOLATION;
+  const noFixApplied = errorCode === NO_FIX_APPLIED;
+  const workerExecutionStatus = noFixApplied
+    ? "succeeded_until_task_goal_validation"
+    : readOnlyViolation
+    ? "succeeded_until_read_only_validation"
+    : "failed";
+  const taskGoalStatus = readOnlyViolation
+    ? "failed_read_only_mode_violation"
+    : noFixApplied
+    ? "failed_no_fix_applied"
+    : `failed_${errorCode}`;
 
   return [
     "Codex 任务执行失败",
     `任务编号：${job?.id || "未提供"}`,
     `任务名称：${taskName || "未提供"}`,
     "Worker 执行状态：已完成本地执行链路并进入结果验收",
-    `任务目标状态：失败（${error?.code || "UNKNOWN_ERROR"}）`,
+    `任务目标状态：失败（${errorCode}）`,
+    `Worker execution status: ${workerExecutionStatus}`,
+    `Task goal status: ${taskGoalStatus}`,
+    `Read-only violation: ${readOnlyViolation ? "yes" : "no"}`,
+    `No-op run: ${noFixApplied ? "yes" : "no"}`,
+    `Committed: ${context.commitSha ? "yes" : "no"}`,
+    "Pushed: no",
     `失败阶段：${analysis.stage}`,
     "关键错误：",
     analysis.keyError || "未提供",
@@ -1094,11 +1154,15 @@ async function runCodexWithRetries(job) {
 }
 
 async function commitGitTask(job) {
+  const readOnlyMode = isReadOnlyTask(job);
   const taskChangedEntries = await getTaskChangedEntries();
   const taskChangedPaths = getStatusPaths(taskChangedEntries);
-  assertTaskGoalApplied(job, taskChangedPaths);
 
-  if (isReadOnlyTask(job)) {
+  if (readOnlyMode) {
+    if (taskChangedPaths.length > 0) {
+      throw createReadOnlyModeViolationError(taskChangedPaths);
+    }
+
     return {
       committed: false,
       commitSha: null,
@@ -1108,6 +1172,8 @@ async function commitGitTask(job) {
       readOnlyMode: true,
     };
   }
+
+  assertTaskGoalApplied(job, taskChangedPaths);
 
   if (!GIT_AUTO_COMMIT) {
     return {
@@ -1162,6 +1228,10 @@ async function commitGitTask(job) {
 }
 
 async function pushGitTask(commitSha) {
+  assertGitOperationAllowed(["push", GIT_REMOTE_NAME, GIT_PUSH_BRANCH], {
+    commitSha,
+  });
+
   if (!GIT_AUTO_PUSH) {
     return {
       pushed: false,
@@ -1613,6 +1683,7 @@ async function pollOnce() {
   console.log(`任务内容：${job.request_text}`);
 
   const readOnlyMode = isReadOnlyTask(job);
+  currentReadOnlyMode = readOnlyMode;
   const stopHeartbeat = startHeartbeat(job.id, attemptId);
   let gitCheckpoint = null;
 
@@ -1791,13 +1862,27 @@ async function pollOnce() {
       "",
       "Worker / task status:",
       "Worker execution: succeeded",
+      "Worker execution status: succeeded",
       readOnlyMode
         ? "Task goal: completed_read_only_no_file_changes"
         : gitResult.filesChanged?.length
         ? "Task goal: completed_with_file_changes"
         : "Task goal: completed_no_file_change_required",
+      readOnlyMode
+        ? "Task goal status: completed_read_only_no_file_changes"
+        : gitResult.filesChanged?.length
+        ? "Task goal status: completed_with_file_changes"
+        : "Task goal status: completed_no_file_change_required",
       `task_domain: ${classifyWorkerTaskDomain(getJobText(job))}`,
       `read_only_mode: ${readOnlyMode ? "true" : "false"}`,
+      "read_only_violation: false",
+      `no_op_run: ${
+        !readOnlyMode && taskRequiresFileChanges(getJobText(job)) && !gitResult.filesChanged?.length
+          ? "true"
+          : "false"
+      }`,
+      `committed: ${gitResult.committed ? "true" : "false"}`,
+      `pushed: ${pushResult.pushed ? "true" : "false"}`,
       "",
       formatPreviewReport(previewReport),
       "",
@@ -1840,13 +1925,27 @@ async function pollOnce() {
         validation_results: [
           "Codex 执行：通过",
           "Worker 执行：通过",
+          "Worker execution status: succeeded",
           readOnlyMode
             ? "任务目标验收：通过（read_only_mode，无文件变更）"
             : gitResult.filesChanged?.length
             ? "任务目标验收：通过（已产生文件变更）"
             : "任务目标验收：通过（任务不要求文件变更）",
+          readOnlyMode
+            ? "Task goal status: completed_read_only_no_file_changes"
+            : gitResult.filesChanged?.length
+            ? "Task goal status: completed_with_file_changes"
+            : "Task goal status: completed_no_file_change_required",
           `任务分类：${classifyWorkerTaskDomain(getJobText(job))}`,
           `read_only_mode：${readOnlyMode ? "true" : "false"}`,
+          "Read-only violation: no",
+          `No-op run: ${
+            !readOnlyMode && taskRequiresFileChanges(getJobText(job)) && !gitResult.filesChanged?.length
+              ? "yes"
+              : "no"
+          }`,
+          `Committed: ${gitResult.committed ? "yes" : "no"}`,
+          `Pushed: ${pushResult.pushed ? "yes" : "no"}`,
           ...getPreviewValidationLines(previewReport),
           gitResult.readOnlyMode
             ? "Git 自动备份：跳过（read_only_mode=true）"
@@ -1933,9 +2032,27 @@ async function pollOnce() {
         read_only_mode: readOnlyMode,
         validation_results: [
           "Worker 执行：已进入失败上报链路",
+          `Worker execution status: ${
+            errorCode === NO_FIX_APPLIED
+              ? "succeeded_until_task_goal_validation"
+              : errorCode === READ_ONLY_MODE_VIOLATION
+              ? "succeeded_until_read_only_validation"
+              : "failed"
+          }`,
+          `Task goal status: ${
+            errorCode === NO_FIX_APPLIED
+              ? "failed_no_fix_applied"
+              : errorCode === READ_ONLY_MODE_VIOLATION
+              ? "failed_read_only_mode_violation"
+              : "failed"
+          }`,
           `失败阶段：${classifyFailure(error).stage}`,
           errorCode ? `错误代码：${errorCode}` : "错误代码：未提供",
           `read_only_mode：${readOnlyMode ? "true" : "false"}`,
+          `Read-only violation: ${errorCode === READ_ONLY_MODE_VIOLATION ? "yes" : "no"}`,
+          `No-op run: ${errorCode === NO_FIX_APPLIED ? "yes" : "no"}`,
+          "Committed: no",
+          "Pushed: no",
           `关键错误：${classifyFailure(error).keyError}`.slice(0, 600),
           `当前 HEAD：${currentHead}`,
           rollbackMessage.trim() || "Git 回滚：未提供",
@@ -1949,6 +2066,7 @@ async function pollOnce() {
   } finally {
     stopHeartbeat();
     currentAttemptId = null;
+    currentReadOnlyMode = false;
     working = false;
   }
 }
@@ -1995,6 +2113,7 @@ module.exports = {
   NO_FIX_APPLIED,
   READ_ONLY_MODE_VIOLATION,
   assertTaskGoalApplied,
+  assertGitOperationAllowed,
   assertCleanWorktreeBeforeCodex,
   buildCodexPrompt,
   buildFailureReport,
