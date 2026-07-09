@@ -93,3 +93,14 @@
 - Tencent Cloud `worker_api.js` still coerces mutation-task empty reports to `failed` with `NO_FIX_APPLIED`.
 - Tencent Cloud `/home/ubuntu/city-partner-agent/feishu_gateway_canonical.js` keeps `总管 批准修复` on the approved-execution path, extracts the current batch only from title/repair/approval text, and keeps `governance_docs`, `automation_system`, `qa_review`, and `operations` separate from city-partner product context.
 - Tencent Cloud backups for this batch: `worker_api.js.bak.batch42a-20260709120234`, `feishu_gateway_canonical.js.bak.batch42a-20260709120234`.
+
+## BATCH-GM-STABILIZE-01 task_mode and final-status guard
+
+- Unified task modes are `read_only`, `docs_write_allowed`, `automation_system_write_allowed`, and `product_write_allowed`.
+- `BATCH-43` is `read_only`; any diff, commit SHA, or successful push fails with `READ_ONLY_MODE_VIOLATION`.
+- `BATCH-37-FIX` and governance-doc tasks are `docs_write_allowed`, even if an older `read_only_mode=true` flag is present.
+- `BATCH-44`, `BATCH-45A`, Worker, Gateway, Codex, Hermes, route, and report fixes are `automation_system_write_allowed`, even if an older `read_only_mode=true` flag is present.
+- Effective final status is failed when `READ_ONLY_MODE_VIOLATION`, `OUT_OF_SCOPE_BUSINESS_CHANGE`, `NO_FIX_APPLIED`, failed task-goal status, or read-only Git side effects are present.
+- Tencent Cloud `worker_api.js` recomputes `effective_final_status` from the report payload instead of trusting `body.status=succeeded`.
+- Tencent Cloud `feishu_gateway_canonical.js` preserves `original_request_text`, `approved_batch`, `task_mode`, `read_only_mode`, `allowed_scope`, `forbidden_scope`, `task_goal`, and `project_domain` in Worker request text.
+- Tencent Cloud backups for this stabilization: `worker_api.js.bak.gm-stabilize-20260709163919`, `feishu_gateway_canonical.js.bak.gm-stabilize-20260709163919`.

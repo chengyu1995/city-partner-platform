@@ -320,6 +320,14 @@ function readString(value) {
 
 const NO_FIX_APPLIED = "NO_FIX_APPLIED";
 const READ_ONLY_MODE_VIOLATION = "READ_ONLY_MODE_VIOLATION";
+const OUT_OF_SCOPE_BUSINESS_CHANGE = "OUT_OF_SCOPE_BUSINESS_CHANGE";
+
+const TASK_MODES = {
+  READ_ONLY: "read_only",
+  DOCS_WRITE_ALLOWED: "docs_write_allowed",
+  AUTOMATION_SYSTEM_WRITE_ALLOWED: "automation_system_write_allowed",
+  PRODUCT_WRITE_ALLOWED: "product_write_allowed",
+};
 
 const TASK_MUTATION_PATTERN =
   /修复|新增|更新|补齐|建立|修改|改动|创建|写入|补充|fix|repair|add|create|update|modify|patch|implement/i;
@@ -328,7 +336,14 @@ const READ_ONLY_TASK_PATTERN =
 const READ_ONLY_POLICY_IMPLEMENTATION_PATTERN =
   /只读任务锁死|强制\s*read[_ -]?only[_ -]?mode|read[_ -]?only(?:[_ -]?mode)?.*(?:lock|guard)/i;
 const AUTOMATION_CONTEXT_PATTERN =
-  /Worker|Codex|Hermes|飞书|总管|自动化|worker|route|路由|上报|NO_FIX_APPLIED|git_commit_sha|attempt_id/i;
+  /Worker|Codex|Hermes|飞书|总管|自动化|worker|worker_api|feishu_gateway|route|路由|上报|NO_FIX_APPLIED|READ_ONLY_MODE_VIOLATION|git_commit_sha|attempt_id/i;
+const DOCS_WRITE_TASK_PATTERN =
+  /BATCH-37-FIX|docs_write_allowed|governance[_ -]?docs|文档整理|整理文档|归档|docs\/|文档/i;
+const AUTOMATION_WRITE_TASK_PATTERN =
+  /BATCH-44|BATCH-45A|automation_system_write_allowed|Worker|Codex|Hermes|飞书|总管|自动化|worker|worker_api|feishu_gateway|route|路由|上报|NO_FIX_APPLIED|READ_ONLY_MODE_VIOLATION|git_commit_sha|attempt_id/i;
+const PRODUCT_WRITE_TASK_PATTERN =
+  /product_write_allowed|产品开发|业务页面开发|同城搭子.*(?:页面|产品|业务)/i;
+const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b/i;
 const FORBIDDEN_SECTION_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden/i;
 const BATCH_RELEVANT_LINE_PATTERN =
   /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
@@ -341,6 +356,35 @@ const REQUIRED_FILE_SECTION_PATTERN =
   /输出文件|目标文件|指定文件|必须修改|要求修改|要求新增|要求创建|需要修改|需要新增|请修改|请新增|修复文件|required files?|output files?|target files?/i;
 const ALLOWED_ONLY_SECTION_PATTERN = /允许修改|只允许修改|allowed files?|editable files?/i;
 const BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
+const DOCS_WRITE_ALLOWED_PREFIXES = ["docs/"];
+const AUTOMATION_WRITE_ALLOWED_PATHS = [
+  "infra/windows-worker",
+  "src/lib/worker-jobs.ts",
+  "src/app/api/feishu/event/route.ts",
+  "src/lib/project-director-console.ts",
+  "docs/projects/feishu-gm-automation.md",
+  "docs/projects/team-routing.md",
+  "docs/projects/feishu-group-routing.md",
+];
+const PRODUCT_WRITE_ALLOWED_PREFIXES = ["src/app"];
+const BUSINESS_PAGE_PREFIXES = [
+  "app/page.tsx",
+  "app/post",
+  "app/partners",
+  "src/app/page.tsx",
+  "src/app/post",
+  "src/app/partners",
+];
+const DATABASE_OR_ENV_PREFIXES = [
+  ".env",
+  "supabase",
+  "prisma",
+  "docs/setup-supabase.sql",
+  "docs/setup-hermes-jobs.sql",
+  "docs/setup-hermes-v2-schema.sql",
+  "src/lib/db",
+  "src/types/db.ts",
+];
 
 function getJobText(job) {
   return [
@@ -433,14 +477,142 @@ function isReadOnlyTaskText(text) {
 
 function isReadOnlyTask(jobOrText) {
   if (typeof jobOrText === "string") {
-    return isReadOnlyTaskText(jobOrText);
+    return getTaskModeFromText(jobOrText) === TASK_MODES.READ_ONLY;
   }
 
-  if (hasReadOnlyField(jobOrText)) {
-    return true;
+  return getTaskMode(jobOrText) === TASK_MODES.READ_ONLY;
+}
+
+function pathMatchesPrefix(filePath, prefixes) {
+  const normalized = normalizeGitPath(filePath);
+  return prefixes.some((prefix) => {
+    const normalizedPrefix = normalizeGitPath(prefix).replace(/\/+$/g, "");
+    return normalized === normalizedPrefix || normalized.startsWith(`${normalizedPrefix}/`);
+  });
+}
+
+function getTaskModeFromText(text) {
+  const raw = String(text || "");
+  const batchCode = extractCurrentExecutionBatchCode({ request_text: raw });
+
+  if (DOCS_WRITE_TASK_PATTERN.test(raw)) {
+    return TASK_MODES.DOCS_WRITE_ALLOWED;
   }
 
-  return isReadOnlyTaskText(getJobText(jobOrText));
+  if (
+    /BATCH-44|BATCH-45A|automation_system_write_allowed/i.test(raw) ||
+    (AUTOMATION_CONTEXT_PATTERN.test(raw) && TASK_MUTATION_PATTERN.test(raw))
+  ) {
+    return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
+  }
+
+  if (READ_ONLY_BATCH_PATTERN.test(raw) || isReadOnlyTaskText(raw)) {
+    return TASK_MODES.READ_ONLY;
+  }
+
+  if (
+    PRODUCT_WRITE_TASK_PATTERN.test(raw) ||
+    (batchCode && /^BATCH-P\d+$/i.test(batchCode))
+  ) {
+    return TASK_MODES.PRODUCT_WRITE_ALLOWED;
+  }
+
+  return null;
+}
+
+function readTaskModeField(job) {
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const result = job && typeof job.result === "object" ? job.result : null;
+  const candidates = [
+    job?.task_mode,
+    job?.taskMode,
+    payload?.task_mode,
+    payload?.taskMode,
+    result?.task_mode,
+    result?.taskMode,
+  ];
+
+  for (const candidate of candidates) {
+    const value = readString(candidate);
+    if (!value) continue;
+    const normalized = value.toLowerCase();
+    if (Object.values(TASK_MODES).includes(normalized)) {
+      return normalized;
+    }
+  }
+
+  return null;
+}
+
+function getTaskMode(job) {
+  const text = getJobText(job);
+  const textMode = getTaskModeFromText(text);
+
+  if (textMode !== TASK_MODES.READ_ONLY) {
+    if (textMode) {
+      return textMode;
+    }
+  }
+
+  const explicitMode = readTaskModeField(job);
+  if (explicitMode) {
+    return explicitMode;
+  }
+
+  if (hasReadOnlyField(job)) {
+    return TASK_MODES.READ_ONLY;
+  }
+
+  return textMode || TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
+}
+
+function createOutOfScopeBusinessChangeError(message, details = {}) {
+  const outOfScopePaths = uniqueSortedPaths(details.outOfScopePaths || []);
+  const error = new Error(
+    [
+      OUT_OF_SCOPE_BUSINESS_CHANGE,
+      message,
+      details.taskMode ? `task_mode: ${details.taskMode}` : null,
+      outOfScopePaths.length
+        ? `out_of_scope_paths: ${outOfScopePaths.join(", ")}`
+        : "out_of_scope_paths: none",
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
+
+  error.code = OUT_OF_SCOPE_BUSINESS_CHANGE;
+  error.failureStage = "task_mode scope validation";
+  error.outOfScopePaths = outOfScopePaths;
+  error.taskMode = details.taskMode || null;
+  return error;
+}
+
+function isBusinessPagePath(filePath) {
+  return pathMatchesPrefix(filePath, BUSINESS_PAGE_PREFIXES);
+}
+
+function isDatabaseOrEnvPath(filePath) {
+  const normalized = normalizeGitPath(filePath);
+  const baseName = normalized.split("/").pop() || normalized;
+  return (
+    pathMatchesPrefix(normalized, DATABASE_OR_ENV_PREFIXES) ||
+    baseName === ".env" ||
+    baseName.startsWith(".env.") ||
+    baseName.endsWith(".env")
+  );
+}
+
+function isDocsWriteAllowedPath(filePath) {
+  return pathMatchesPrefix(filePath, DOCS_WRITE_ALLOWED_PREFIXES);
+}
+
+function isAutomationWriteAllowedPath(filePath) {
+  return pathMatchesPrefix(filePath, AUTOMATION_WRITE_ALLOWED_PATHS);
+}
+
+function isProductWriteAllowedPath(filePath) {
+  return pathMatchesPrefix(filePath, PRODUCT_WRITE_ALLOWED_PREFIXES);
 }
 
 function classifyWorkerTaskDomain(requestText) {
@@ -554,6 +726,7 @@ function createNoFixAppliedError(message, details = {}) {
         ? `changed_paths: ${uniqueSortedPaths(details.changedPaths).join(", ")}`
         : "changed_paths: none",
       details.taskDomain ? `task_domain: ${details.taskDomain}` : null,
+      details.taskMode ? `task_mode: ${details.taskMode}` : null,
     ]
       .filter(Boolean)
       .join("\n")
@@ -564,6 +737,7 @@ function createNoFixAppliedError(message, details = {}) {
   error.requiredPaths = details.requiredPaths || [];
   error.changedPaths = details.changedPaths || [];
   error.taskDomain = details.taskDomain || null;
+  error.taskMode = details.taskMode || null;
   return error;
 }
 
@@ -627,15 +801,104 @@ function assertGitOperationAllowed(args, options = {}) {
 function assertTaskGoalApplied(job, changedPaths) {
   const requestText = getJobText(job);
   const taskDomain = classifyWorkerTaskDomain(requestText);
+  const taskMode = getTaskMode(job);
   const requiredPaths = extractRequiredChangePaths(requestText);
   const normalizedChangedPaths = uniqueSortedPaths(changedPaths || []);
 
-  if (isReadOnlyTask(job)) {
+  if (taskMode === TASK_MODES.READ_ONLY) {
     if (normalizedChangedPaths.length > 0) {
       throw createReadOnlyModeViolationError(normalizedChangedPaths);
     }
 
     return;
+  }
+
+  const blockedSafetyPaths = normalizedChangedPaths.filter(
+    (filePath) => isBusinessPagePath(filePath) || isDatabaseOrEnvPath(filePath)
+  );
+
+  if (blockedSafetyPaths.length > 0) {
+    throw createOutOfScopeBusinessChangeError(
+      "Task mode forbids business page, database, or env changes.",
+      {
+        taskMode,
+        outOfScopePaths: blockedSafetyPaths,
+      }
+    );
+  }
+
+  if (taskMode === TASK_MODES.DOCS_WRITE_ALLOWED) {
+    const outOfScopePaths = normalizedChangedPaths.filter(
+      (filePath) => !isDocsWriteAllowedPath(filePath)
+    );
+
+    if (outOfScopePaths.length > 0) {
+      throw createOutOfScopeBusinessChangeError(
+        "docs_write_allowed only permits docs/** changes.",
+        {
+          taskMode,
+          outOfScopePaths,
+        }
+      );
+    }
+
+    const docsChangedPaths = normalizedChangedPaths.filter(isDocsWriteAllowedPath);
+    if (docsChangedPaths.length === 0) {
+      throw createNoFixAppliedError(
+        "docs_write_allowed task produced no docs/** diff; refusing succeeded.",
+        {
+          requiredPaths,
+          changedPaths: normalizedChangedPaths,
+          taskDomain,
+          taskMode,
+        }
+      );
+    }
+  }
+
+  if (taskMode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED) {
+    const outOfScopePaths = normalizedChangedPaths.filter(
+      (filePath) => !isAutomationWriteAllowedPath(filePath)
+    );
+
+    if (outOfScopePaths.length > 0) {
+      throw createOutOfScopeBusinessChangeError(
+        "automation_system_write_allowed only permits automation-system files.",
+        {
+          taskMode,
+          outOfScopePaths,
+        }
+      );
+    }
+
+    const automationChangedPaths = normalizedChangedPaths.filter(isAutomationWriteAllowedPath);
+    if (automationChangedPaths.length === 0) {
+      throw createNoFixAppliedError(
+        "automation_system_write_allowed task produced no automation-system diff; refusing succeeded.",
+        {
+          requiredPaths,
+          changedPaths: normalizedChangedPaths,
+          taskDomain,
+          taskMode,
+        }
+      );
+    }
+  }
+
+  if (taskMode === TASK_MODES.PRODUCT_WRITE_ALLOWED) {
+    const outOfScopePaths = normalizedChangedPaths.filter(
+      (filePath) => !isProductWriteAllowedPath(filePath) && !isDocsWriteAllowedPath(filePath)
+    );
+
+    if (outOfScopePaths.length > 0) {
+      throw createOutOfScopeBusinessChangeError(
+        "product_write_allowed only permits product or docs files.",
+        {
+          taskMode,
+          outOfScopePaths,
+        }
+      );
+    }
   }
 
   if (taskRequiresFileChanges(requestText) && normalizedChangedPaths.length === 0) {
@@ -645,6 +908,7 @@ function assertTaskGoalApplied(job, changedPaths) {
         requiredPaths,
         changedPaths: normalizedChangedPaths,
         taskDomain,
+        taskMode,
       }
     );
   }
@@ -661,6 +925,7 @@ function assertTaskGoalApplied(job, changedPaths) {
         requiredPaths,
         changedPaths: normalizedChangedPaths,
         taskDomain,
+        taskMode,
       }
     );
   }
@@ -792,8 +1057,9 @@ function buildReadOnlyGuard(taskText, options = {}) {
 function buildWorkerGuardedPrompt(requestText, options = {}) {
   const taskText = String(requestText || "").trim();
   const taskDomain = classifyWorkerTaskDomain(taskText);
+  const taskMode = options.taskMode || getTaskModeFromText(taskText) || TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
   const readOnlyGuard = buildReadOnlyGuard(taskText, {
-    force: options.readOnlyMode === true,
+    force: options.readOnlyMode === true || taskMode === TASK_MODES.READ_ONLY,
   });
   const domainGuard = isAutomationSystemTask(taskText)
     ? [
@@ -812,6 +1078,13 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
     readOnlyGuard ? "" : null,
     domainGuard,
     "",
+    "【统一任务模式】",
+    `task_mode: ${taskMode}`,
+    `read_only_mode: ${taskMode === TASK_MODES.READ_ONLY ? "true" : "false"}`,
+    "docs_write_allowed: only docs/** may change.",
+    "automation_system_write_allowed: only approved automation-system files may change.",
+    "product_write_allowed: only separately approved product batches may change src/app product pages.",
+    "",
     "【原始任务内容】",
     taskText,
     "",
@@ -823,6 +1096,7 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
 function buildCodexPrompt(job) {
   return buildWorkerGuardedPrompt(job?.request_text || "", {
     readOnlyMode: isReadOnlyTask(job),
+    taskMode: getTaskMode(job),
   });
 }
 
@@ -848,6 +1122,7 @@ function buildCodexRepairPrompt(job, error, attempt) {
     ].join("\n"),
     {
       readOnlyMode: isReadOnlyTask(job),
+      taskMode: getTaskMode(job),
     }
   );
 }
@@ -925,7 +1200,11 @@ function classifyFailure(error) {
     };
   }
 
-  if (error?.code === "BUSINESS_PAGE_BOUNDARY_VIOLATION") {
+  if (
+    error?.code === "BUSINESS_PAGE_BOUNDARY_VIOLATION" ||
+    error?.code === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+    errorText.includes(OUT_OF_SCOPE_BUSINESS_CHANGE)
+  ) {
     return {
       stage: "自动化任务范围边界检查",
       keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
@@ -1014,16 +1293,24 @@ function buildFailureReport(job, error, context = {}) {
   const errorCode = error?.code || "UNKNOWN_ERROR";
   const readOnlyViolation = errorCode === READ_ONLY_MODE_VIOLATION;
   const noFixApplied = errorCode === NO_FIX_APPLIED;
+  const outOfScopeBusinessChange =
+    errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+    errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION";
   const workerExecutionStatus = noFixApplied
     ? "succeeded_until_task_goal_validation"
     : readOnlyViolation
     ? "succeeded_until_read_only_validation"
+    : outOfScopeBusinessChange
+    ? "succeeded_until_scope_validation"
     : "failed";
   const taskGoalStatus = readOnlyViolation
     ? "failed_read_only_mode_violation"
     : noFixApplied
     ? "failed_no_fix_applied"
+    : outOfScopeBusinessChange
+    ? "failed_out_of_scope_business_change"
     : `failed_${errorCode}`;
+  const taskMode = getTaskMode(job);
 
   return [
     "Codex 任务执行失败",
@@ -1033,8 +1320,11 @@ function buildFailureReport(job, error, context = {}) {
     `任务目标状态：失败（${errorCode}）`,
     `Worker execution status: ${workerExecutionStatus}`,
     `Task goal status: ${taskGoalStatus}`,
+    `task_mode: ${taskMode}`,
+    "effective_final_status: failed",
     `Read-only violation: ${readOnlyViolation ? "yes" : "no"}`,
     `No-op run: ${noFixApplied ? "yes" : "no"}`,
+    `Out-of-scope business change: ${outOfScopeBusinessChange ? "yes" : "no"}`,
     `Committed: ${context.commitSha ? "yes" : "no"}`,
     "Pushed: no",
     `失败阶段：${analysis.stage}`,
@@ -1154,7 +1444,8 @@ async function runCodexWithRetries(job) {
 }
 
 async function commitGitTask(job) {
-  const readOnlyMode = isReadOnlyTask(job);
+  const taskMode = getTaskMode(job);
+  const readOnlyMode = taskMode === TASK_MODES.READ_ONLY;
   const taskChangedEntries = await getTaskChangedEntries();
   const taskChangedPaths = getStatusPaths(taskChangedEntries);
 
@@ -1874,8 +2165,13 @@ async function pollOnce() {
         ? "Task goal status: completed_with_file_changes"
         : "Task goal status: completed_no_file_change_required",
       `task_domain: ${classifyWorkerTaskDomain(getJobText(job))}`,
+      `task_mode: ${taskMode}`,
       `read_only_mode: ${readOnlyMode ? "true" : "false"}`,
+      "original_worker_status: succeeded",
+      "effective_final_status: succeeded",
       "read_only_violation: false",
+      "no_fix_applied: false",
+      "out_of_scope_business_change: false",
       `no_op_run: ${
         !readOnlyMode && taskRequiresFileChanges(getJobText(job)) && !gitResult.filesChanged?.length
           ? "true"
@@ -1937,8 +2233,13 @@ async function pollOnce() {
             ? "Task goal status: completed_with_file_changes"
             : "Task goal status: completed_no_file_change_required",
           `任务分类：${classifyWorkerTaskDomain(getJobText(job))}`,
+          `task_mode: ${taskMode}`,
           `read_only_mode：${readOnlyMode ? "true" : "false"}`,
+          "original_worker_status: succeeded",
+          "effective_final_status: succeeded",
           "Read-only violation: no",
+          "NO_FIX_APPLIED: no",
+          "OUT_OF_SCOPE_BUSINESS_CHANGE: no",
           `No-op run: ${
             !readOnlyMode && taskRequiresFileChanges(getJobText(job)) && !gitResult.filesChanged?.length
               ? "yes"
@@ -1960,6 +2261,12 @@ async function pollOnce() {
         ],
         github_push_status: buildGithubPushStatus(pushResult),
         read_only_mode: readOnlyMode,
+        task_mode: taskMode,
+        original_worker_status: "succeeded",
+        effective_final_status: "succeeded",
+        no_fix_applied: false,
+        read_only_mode_violation: false,
+        out_of_scope_business_change: false,
         git_commit_sha:
           gitResult.commitSha || null,
         deploy_status:
@@ -2030,6 +2337,14 @@ async function pollOnce() {
         error_code: errorCode,
         files_changed: failureChangedPaths,
         read_only_mode: readOnlyMode,
+        task_mode: taskMode,
+        original_worker_status: "failed",
+        effective_final_status: "failed",
+        no_fix_applied: errorCode === NO_FIX_APPLIED,
+        read_only_mode_violation: errorCode === READ_ONLY_MODE_VIOLATION,
+        out_of_scope_business_change:
+          errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+          errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION",
         validation_results: [
           "Worker 执行：已进入失败上报链路",
           `Worker execution status: ${
@@ -2037,6 +2352,9 @@ async function pollOnce() {
               ? "succeeded_until_task_goal_validation"
               : errorCode === READ_ONLY_MODE_VIOLATION
               ? "succeeded_until_read_only_validation"
+              : errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+                errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION"
+              ? "succeeded_until_scope_validation"
               : "failed"
           }`,
           `Task goal status: ${
@@ -2044,13 +2362,25 @@ async function pollOnce() {
               ? "failed_no_fix_applied"
               : errorCode === READ_ONLY_MODE_VIOLATION
               ? "failed_read_only_mode_violation"
+              : errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+                errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION"
+              ? "failed_out_of_scope_business_change"
               : "failed"
           }`,
           `失败阶段：${classifyFailure(error).stage}`,
           errorCode ? `错误代码：${errorCode}` : "错误代码：未提供",
+          `task_mode: ${taskMode}`,
           `read_only_mode：${readOnlyMode ? "true" : "false"}`,
+          "original_worker_status: failed",
+          "effective_final_status: failed",
           `Read-only violation: ${errorCode === READ_ONLY_MODE_VIOLATION ? "yes" : "no"}`,
           `No-op run: ${errorCode === NO_FIX_APPLIED ? "yes" : "no"}`,
+          `Out-of-scope business change: ${
+            errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+            errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION"
+              ? "yes"
+              : "no"
+          }`,
           "Committed: no",
           "Pushed: no",
           `关键错误：${classifyFailure(error).keyError}`.slice(0, 600),
@@ -2112,6 +2442,8 @@ if (require.main === module) {
 module.exports = {
   NO_FIX_APPLIED,
   READ_ONLY_MODE_VIOLATION,
+  OUT_OF_SCOPE_BUSINESS_CHANGE,
+  TASK_MODES,
   assertTaskGoalApplied,
   assertGitOperationAllowed,
   assertCleanWorktreeBeforeCodex,
@@ -2123,6 +2455,7 @@ module.exports = {
   commitGitTask,
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
+  getTaskMode,
   getTaskChangedPaths,
   isReadOnlyTask,
   isReadOnlyTaskText,

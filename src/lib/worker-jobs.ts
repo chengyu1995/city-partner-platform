@@ -36,6 +36,17 @@ const TASK_MUTATION_PATTERN =
   /修复|新增|更新|补齐|建立|修改|改动|创建|写入|补充|fix|repair|add|create|update|modify|patch|implement/i;
 const READ_ONLY_TASK_PATTERN =
   /read[_ -]?only(?:[_ -]?mode)?\s*(?::|=)?\s*(?:true|1|yes|on)?|只读模式|本任务只读|只读执行|只读检查|只读诊断|只读验证|不修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止\s*(?:执行\s*)?(?:git\s+)?(?:add|commit|push)\b/i;
+const TASK_MODES = {
+  READ_ONLY: "read_only",
+  DOCS_WRITE_ALLOWED: "docs_write_allowed",
+  AUTOMATION_SYSTEM_WRITE_ALLOWED: "automation_system_write_allowed",
+  PRODUCT_WRITE_ALLOWED: "product_write_allowed",
+} as const;
+const DOCS_WRITE_TASK_PATTERN =
+  /BATCH-37-FIX|docs_write_allowed|governance[_ -]?docs|文档整理|整理文档|归档|docs\/|文档/i;
+const AUTOMATION_WRITE_TASK_PATTERN =
+  /BATCH-44|BATCH-45A|automation_system_write_allowed|Worker|Codex|Hermes|飞书|总管|自动化|worker|worker_api|feishu_gateway|route|路由|上报|NO_FIX_APPLIED|READ_ONLY_MODE_VIOLATION|git_commit_sha|attempt_id/i;
+const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b/i;
 const WORKER_BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
 const WORKER_BATCH_RELEVANT_LINE_PATTERN =
   /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
@@ -376,6 +387,75 @@ function taskDeclaresReadOnly(value: unknown): boolean {
   return READ_ONLY_TASK_PATTERN.test(String(value ?? ""));
 }
 
+function readTaskModeField(...values: unknown[]): string | null {
+  for (const value of values) {
+    const text = readString(value)?.toLowerCase();
+    if (!text) continue;
+    if (Object.values(TASK_MODES).includes(text as typeof TASK_MODES[keyof typeof TASK_MODES])) {
+      return text;
+    }
+  }
+  return null;
+}
+
+function inferTaskMode(input: {
+  demand: string | null;
+  batchCode: string | null;
+  jobPayload: Record<string, unknown> | null;
+  jobResult: Record<string, unknown> | null;
+  submitted?: unknown;
+}): string {
+  const text = [input.demand, input.batchCode].filter(Boolean).join("\n");
+  if (DOCS_WRITE_TASK_PATTERN.test(text)) return TASK_MODES.DOCS_WRITE_ALLOWED;
+  if (
+    /BATCH-44|BATCH-45A|automation_system_write_allowed/i.test(text) ||
+    (AUTOMATION_WRITE_TASK_PATTERN.test(text) && TASK_MUTATION_PATTERN.test(text))
+  ) {
+    return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
+  }
+  if (READ_ONLY_BATCH_PATTERN.test(text) || taskDeclaresReadOnly(text)) return TASK_MODES.READ_ONLY;
+  if (input.batchCode && /^BATCH-P\d+$/i.test(input.batchCode)) return TASK_MODES.PRODUCT_WRITE_ALLOWED;
+
+  const submittedMode = readTaskModeField(
+    input.submitted,
+    input.jobPayload?.task_mode,
+    input.jobPayload?.taskMode,
+    input.jobResult?.task_mode,
+    input.jobResult?.taskMode
+  );
+  if (submittedMode) return submittedMode;
+
+  if (
+    [
+      input.submitted,
+      input.jobPayload?.read_only_mode,
+      input.jobPayload?.readOnlyMode,
+      input.jobResult?.read_only_mode,
+      input.jobResult?.readOnlyMode,
+    ].some(readBooleanFlag)
+  ) {
+    return TASK_MODES.READ_ONLY;
+  }
+
+  return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
+}
+
+function reportTextHasNoFixApplied(value: string): boolean {
+  return /NO_FIX_APPLIED|no_fix_applied\s*[:=]\s*(true|yes)|NO_FIX_APPLIED\s*(?:是否触发)?\s*[:：]\s*(?:是|yes|true)/i.test(value);
+}
+
+function reportTextHasReadOnlyViolation(value: string): boolean {
+  return /READ_ONLY_MODE_VIOLATION|read_only_mode_violation\s*[:=]\s*(true|yes)|Read-only violation:\s*yes/i.test(value);
+}
+
+function reportTextHasOutOfScope(value: string): boolean {
+  return /OUT_OF_SCOPE_BUSINESS_CHANGE|out_of_scope_business_change\s*[:=]\s*(true|yes)|Out-of-scope business change:\s*yes/i.test(value);
+}
+
+function reportTextHasFailedTaskGoal(value: string): boolean {
+  return /task_goal_status\s*[:=]\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change)|Task goal status:\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change)|任务目标状态[:：]\s*(failed|失败|未完成)/i.test(value);
+}
+
 function buildSafetyBoundary(filesChanged: string[], deployStatus?: string | null): string[] {
   const businessPageChanged = filesChanged.some((file) =>
     pathMatchesAny(file, ["src/app/page.tsx", "src/app/partners", "src/app/post"])
@@ -490,17 +570,19 @@ export function buildProjectDirectorWorkerReport(input: {
   const sanitizedError = input.errorText ? sanitizeReportText(input.errorText) : "";
   const jobPayload = readRecord(input.job?.payload);
   const jobResult = readRecord(input.job?.result);
-  const readOnlyMode = [
-    input.readOnlyMode,
-    input.job?.read_only_mode,
-    input.job?.readOnlyMode,
-    jobPayload?.read_only_mode,
-    jobPayload?.readOnlyMode,
-    jobResult?.read_only_mode,
-    jobResult?.readOnlyMode,
-  ].some(readBooleanFlag) || taskDeclaresReadOnly(demand);
-  const readOnlyViolation = input.status === "failed" && /READ_ONLY_MODE_VIOLATION/i.test(sanitizedError);
-  const noFixApplied = input.status === "failed" && /NO_FIX_APPLIED/i.test(sanitizedError);
+  const combinedReportText = [summary, sanitizedError, ...validation].join("\n");
+  const taskMode = inferTaskMode({
+    demand,
+    batchCode,
+    jobPayload,
+    jobResult,
+    submitted: input.readOnlyMode,
+  });
+  const readOnlyMode = taskMode === TASK_MODES.READ_ONLY;
+  const readOnlyViolation = reportTextHasReadOnlyViolation(combinedReportText);
+  const noFixApplied = reportTextHasNoFixApplied(combinedReportText);
+  const outOfScopeBusinessChange = reportTextHasOutOfScope(combinedReportText);
+  const failedTaskGoal = reportTextHasFailedTaskGoal(combinedReportText);
   const noOpRun =
     noFixApplied ||
     (input.status === "succeeded" &&
@@ -509,6 +591,16 @@ export function buildProjectDirectorWorkerReport(input: {
       !gitCommitSha);
   const committed = Boolean(gitCommitSha);
   const pushed = isGithubPushSuccess(githubPushStatus);
+  const effectiveFinalStatus =
+    readOnlyViolation ||
+    noFixApplied ||
+    outOfScopeBusinessChange ||
+    failedTaskGoal ||
+    (readOnlyMode && (filesChanged.length > 0 || committed || pushed))
+      ? "failed"
+      : input.status === "succeeded"
+        ? "succeeded"
+        : input.status;
   const failureStage = input.status === "failed"
     ? readDiagnosticLine(sanitizedError, "失败阶段") ?? "未提供"
     : null;
@@ -523,6 +615,8 @@ export function buildProjectDirectorWorkerReport(input: {
       ? "succeeded_until_read_only_validation"
       : noFixApplied
         ? "succeeded_until_task_goal_validation"
+        : outOfScopeBusinessChange
+          ? "succeeded_until_scope_validation"
         : input.status === "failed"
           ? "failed"
           : input.status === "succeeded"
@@ -535,6 +629,10 @@ export function buildProjectDirectorWorkerReport(input: {
         ? "failed_read_only_mode_violation"
         : noFixApplied
           ? "failed_no_fix_applied"
+          : outOfScopeBusinessChange
+            ? "failed_out_of_scope_business_change"
+          : failedTaskGoal
+            ? "failed"
           : input.status === "failed"
             ? "failed"
             : "running";
@@ -551,12 +649,17 @@ export function buildProjectDirectorWorkerReport(input: {
     worker_id: input.workerId,
     attempt_id: input.attemptId,
     status: input.status,
+    original_worker_status: input.status,
+    effective_final_status: effectiveFinalStatus,
     status_title: statusTitle,
     task_domain: taskDomain,
+    task_mode: taskMode,
     worker_execution_status: workerExecutionStatus,
     task_goal_status: taskGoalStatus,
     read_only_mode: readOnlyMode,
     read_only_violation: readOnlyViolation,
+    no_fix_applied: noFixApplied,
+    out_of_scope_business_change: outOfScopeBusinessChange,
     no_op_run: noOpRun,
     committed,
     pushed,
@@ -588,10 +691,15 @@ export function buildProjectDirectorWorkerReport(input: {
     `任务分类：${taskDomain}`,
     `Worker 执行状态：${workerExecutionStatus}`,
     `任务目标状态：${taskGoalStatus}`,
+    `Original worker status: ${input.status}`,
+    `Effective final status: ${effectiveFinalStatus}`,
+    `Task mode: ${taskMode}`,
     `Worker execution status: ${workerExecutionStatus}`,
     `Task goal status: ${taskGoalStatus}`,
     `Read-only mode: ${readOnlyMode ? "yes" : "no"}`,
+    `NO_FIX_APPLIED: ${noFixApplied ? "yes" : "no"}`,
     `Read-only violation: ${readOnlyViolation ? "yes" : "no"}`,
+    `Out-of-scope business change: ${outOfScopeBusinessChange ? "yes" : "no"}`,
     `No-op run: ${noOpRun ? "yes" : "no"}`,
     `Committed: ${committed ? "yes" : "no"}`,
     `Pushed: ${pushed ? "yes" : "no"}`,

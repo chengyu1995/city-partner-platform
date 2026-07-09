@@ -25,7 +25,9 @@ const {
 
 const {
   NO_FIX_APPLIED,
+  OUT_OF_SCOPE_BUSINESS_CHANGE,
   READ_ONLY_MODE_VIOLATION,
+  TASK_MODES,
   assertGitOperationAllowed,
   assertTaskGoalApplied,
   buildCodexPrompt,
@@ -34,6 +36,7 @@ const {
   classifyWorkerTaskDomain,
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
+  getTaskMode,
   isReadOnlyTask,
   isReadOnlyTaskText,
 } = require("../local_worker");
@@ -341,6 +344,63 @@ test("NO_FIX_APPLIED task goal validation", async (t) => {
 });
 
 test("read_only_mode task lock", async (t) => {
+  await t.test("task_mode prevents docs and automation tasks from being misread as read-only", () => {
+    const docsJob = {
+      request_text: "BATCH-37-FIX 文档整理：更新 docs/projects/team-routing.md，只允许 docs/**。",
+      payload: { read_only_mode: true },
+    };
+    const automationJob = {
+      request_text: "BATCH-44 系统修复：修复 Worker / 飞书总管 / 腾讯云中转。",
+      payload: { read_only_mode: true },
+    };
+    const readOnlyJob = {
+      request_text: "BATCH-43 只读验证：只读检查，不修改任何文件，禁止 git add/commit/push。",
+    };
+
+    assert.equal(getTaskMode(docsJob), TASK_MODES.DOCS_WRITE_ALLOWED);
+    assert.equal(isReadOnlyTask(docsJob), false);
+    assert.equal(getTaskMode(automationJob), TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.equal(isReadOnlyTask(automationJob), false);
+    assert.equal(getTaskMode(readOnlyJob), TASK_MODES.READ_ONLY);
+    assert.equal(isReadOnlyTask(readOnlyJob), true);
+  });
+
+  await t.test("docs_write_allowed requires docs diff and blocks business pages", () => {
+    const job = {
+      request_text: "BATCH-37-FIX 文档整理：更新 docs/projects/team-routing.md。",
+    };
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/projects/team-routing.md"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, []),
+      (error) => error.code === NO_FIX_APPLIED
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["src/app/page.tsx"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
+  await t.test("automation_system_write_allowed requires automation diff and blocks product pages", () => {
+    const job = {
+      request_text: "BATCH-44 系统修复：修复 infra/windows-worker/local_worker.js。",
+    };
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["infra/windows-worker/local_worker.js"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, []),
+      (error) => error.code === NO_FIX_APPLIED
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["src/app/partners/page.tsx"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
   await t.test("detects explicit read-only task text", () => {
     assert.equal(
       isReadOnlyTaskText("本任务只读，不修改文件，禁止 git add，禁止 git commit，禁止 git push。"),
