@@ -340,6 +340,7 @@ const READ_ONLY_TASK_PATTERN =
   /read[_ -]?only(?:[_ -]?mode)?\s*(?::|=)?\s*(?:true|1|yes|on)?|只读模式|本任务只读|只读执行|只读检查|只读诊断|只读验证|不修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止\s*(?:执行\s*)?(?:git\s+)?(?:add|commit|push)\b/i;
 const READ_ONLY_POLICY_IMPLEMENTATION_PATTERN =
   /只读任务锁死|强制\s*read[_ -]?only[_ -]?mode|read[_ -]?only(?:[_ -]?mode)?.*(?:lock|guard)/i;
+const QA_BATCH_PATTERN = /\bBATCH-QA(?:-[A-Z0-9]+)*\b/i;
 const AUTOMATION_CONTEXT_PATTERN =
   /Worker|Codex|Hermes|飞书|总管|自动化|worker|worker_api|feishu_gateway|route|路由|上报|NO_FIX_APPLIED|READ_ONLY_MODE_VIOLATION|git_commit_sha|attempt_id/i;
 const DOCS_WRITE_TASK_PATTERN =
@@ -350,6 +351,8 @@ const AUTOMATION_WRITE_TASK_PATTERN =
 const PRODUCT_WRITE_TASK_PATTERN =
   /product_write_allowed|产品开发|业务页面开发|同城搭子.*(?:页面|产品|业务)/i;
 const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
+const FORCED_READ_ONLY_BATCH_PATTERN =
+  /\bBATCH-QA(?:-[A-Z0-9]+)*\b|\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const FORBIDDEN_SECTION_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden/i;
 const BATCH_RELEVANT_LINE_PATTERN =
   /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
@@ -401,12 +404,36 @@ const DATABASE_OR_ENV_PREFIXES = [
   "src/types/db.ts",
 ];
 
+const FAILURE_FINGERPRINTS = {
+  QA_TASK_MODE_MISMATCH:
+    "BATCH-QA-* was misclassified as automation_system_write_allowed.",
+  DOCS_INSUFFICIENT_OUTPUT:
+    "BATCH-37-DOCS-* only changed feishu-gm-automation.md.",
+  READ_ONLY_LOCKED_DOCS:
+    "docs_write_allowed was locked by read_only_mode=true.",
+  PATH_PARSE_FIRST_CHAR_LOSS:
+    "git status path lost its first character.",
+  FALSE_SUCCEEDED:
+    "Task goal was incomplete but reported succeeded.",
+};
+
 function getJobText(job) {
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const result = job && typeof job.result === "object" ? job.result : null;
   return [
     readString(job?.title),
     readString(job?.request_text),
     readString(job?.prompt),
     readString(job?.description),
+    readString(job?.approved_batch),
+    readString(job?.current_batch),
+    readString(job?.batch_code),
+    readString(payload?.approved_batch),
+    readString(payload?.current_batch),
+    readString(payload?.batch_code),
+    readString(result?.approved_batch),
+    readString(result?.current_batch),
+    readString(result?.batch_code),
   ]
     .filter(Boolean)
     .join("\n");
@@ -563,7 +590,7 @@ function getTaskModeFromText(text) {
   const raw = String(text || "");
   const batchCode = extractCurrentExecutionBatchCode({ request_text: raw });
 
-  if (READ_ONLY_BATCH_PATTERN.test(raw)) {
+  if (FORCED_READ_ONLY_BATCH_PATTERN.test(raw)) {
     return TASK_MODES.READ_ONLY;
   }
 
@@ -623,6 +650,10 @@ function getTaskMode(job) {
   try {
     const text = getJobText(job);
     const textMode = getTaskModeFromText(text);
+
+    if (FORCED_READ_ONLY_BATCH_PATTERN.test(text)) {
+      return TASK_MODES.READ_ONLY;
+    }
 
     if (textMode !== TASK_MODES.READ_ONLY) {
       if (textMode) {
@@ -712,8 +743,49 @@ function isProductWriteAllowedPath(filePath) {
   return pathMatchesPrefix(filePath, PRODUCT_WRITE_ALLOWED_PREFIXES);
 }
 
+function normalizeFailureMemory(memory) {
+  return memory && typeof memory === "object" && !Array.isArray(memory)
+    ? { ...memory }
+    : {};
+}
+
+function recordFailureMemory(memory, fingerprint, batchCode, now = new Date().toISOString()) {
+  const normalizedMemory = normalizeFailureMemory(memory);
+  const errorFingerprint = String(fingerprint || "").trim();
+  if (!Object.prototype.hasOwnProperty.call(FAILURE_FINGERPRINTS, errorFingerprint)) {
+    throw new Error(`Unknown failure fingerprint: ${errorFingerprint || "empty"}`);
+  }
+
+  const previous = normalizedMemory[errorFingerprint] || {};
+  const count = Number(previous.count || 0) + 1;
+  const entry = {
+    error_fingerprint: errorFingerprint,
+    first_seen_at: previous.first_seen_at || now,
+    last_seen_at: now,
+    count,
+    last_batch: batchCode || previous.last_batch || "unknown",
+    suggested_guard: FAILURE_FINGERPRINTS[errorFingerprint],
+  };
+  const status =
+    count >= 3 ? "blocked" : count === 2 ? "repeated_warning" : "warning";
+
+  return {
+    memory: {
+      ...normalizedMemory,
+      [errorFingerprint]: entry,
+    },
+    entry,
+    status,
+    blocked: status === "blocked",
+  };
+}
+
 function classifyWorkerTaskDomain(requestText) {
   const text = String(requestText || "");
+
+  if (QA_BATCH_PATTERN.test(text)) {
+    return "qa_review";
+  }
 
   if (/文档整理|整理文档|归档|governance[_ -]?docs/i.test(text)) {
     return "governance_docs";
@@ -2706,6 +2778,7 @@ module.exports = {
   TASK_MODE_MISMATCH,
   MISSING_REQUIRED_DOCS,
   INSUFFICIENT_DOC_OUTPUT,
+  FAILURE_FINGERPRINTS,
   TASK_MODES,
   assertTaskGoalApplied,
   assertGitOperationAllowed,
@@ -2719,6 +2792,7 @@ module.exports = {
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
   getTaskMode,
+  recordFailureMemory,
   getTaskChangedPaths,
   isReadOnlyTask,
   isReadOnlyTaskText,

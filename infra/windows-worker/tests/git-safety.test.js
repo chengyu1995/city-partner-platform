@@ -42,6 +42,7 @@ const {
   getTaskMode,
   isReadOnlyTask,
   isReadOnlyTaskText,
+  recordFailureMemory,
 } = require("../local_worker");
 
 const workerRoot = path.resolve(__dirname, "..");
@@ -347,6 +348,30 @@ test("NO_FIX_APPLIED task goal validation", async (t) => {
 });
 
 test("read_only_mode task lock", async (t) => {
+  await t.test("BATCH-QA tasks are qa_review read-only and allow no-diff success", () => {
+    const qaJob = {
+      request_text: [
+        "BATCH-QA-01",
+        "task_mode=read_only",
+        "read_only_mode=true",
+        "allowed_scope=git status / git diff only",
+        "禁止修改文件",
+      ].join("\n"),
+      payload: {
+        task_mode: "automation_system_write_allowed",
+      },
+    };
+
+    assert.equal(classifyWorkerTaskDomain(qaJob.request_text), "qa_review");
+    assert.equal(getTaskMode(qaJob), TASK_MODES.READ_ONLY);
+    assert.equal(isReadOnlyTask(qaJob), true);
+    assert.doesNotThrow(() => assertTaskGoalApplied(qaJob, []));
+    assert.throws(
+      () => assertTaskGoalApplied(qaJob, ["infra/windows-worker/local_worker.js"]),
+      (error) => error.code === READ_ONLY_MODE_VIOLATION
+    );
+  });
+
   await t.test("BATCH-GM-SMOKE is read-only and never docs_write_allowed", () => {
     const smokeJob = {
       request_text: [
@@ -761,6 +786,40 @@ test("approved repair route remains on approved execution path", async (t) => {
     assert.match(source, /extractApprovedRepairBatchCode/);
     assert.match(source, /filterApprovedRepairBuildResult/);
   });
+});
+
+test("failure memory blocks after three repeated fingerprints", () => {
+  let state = {};
+  let result = recordFailureMemory(
+    state,
+    "QA_TASK_MODE_MISMATCH",
+    "BATCH-QA-01",
+    "2026-07-09T00:00:00.000Z"
+  );
+  assert.equal(result.status, "warning");
+  assert.equal(result.blocked, false);
+
+  state = result.memory;
+  result = recordFailureMemory(
+    state,
+    "QA_TASK_MODE_MISMATCH",
+    "BATCH-QA-01",
+    "2026-07-09T00:01:00.000Z"
+  );
+  assert.equal(result.status, "repeated_warning");
+  assert.equal(result.blocked, false);
+
+  state = result.memory;
+  result = recordFailureMemory(
+    state,
+    "QA_TASK_MODE_MISMATCH",
+    "BATCH-QA-01",
+    "2026-07-09T00:02:00.000Z"
+  );
+  assert.equal(result.status, "blocked");
+  assert.equal(result.blocked, true);
+  assert.equal(result.entry.count, 3);
+  assert.match(result.entry.suggested_guard, /BATCH-QA/);
 });
 
 test("path normalization and path-set comparison", async (t) => {

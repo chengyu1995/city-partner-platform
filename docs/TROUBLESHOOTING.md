@@ -68,3 +68,20 @@
 | 自动化系统 | `docs/projects/feishu-gm-automation.md` |
 | 运维配置 | `docs/projects/ops-config.md` |
 | 归档内容 | `docs/projects/archive.md` |
+## Error Fingerprint Memory
+
+The automation system keeps lightweight repeated-failure memory without database or env changes.
+
+Known fingerprints:
+
+- `QA_TASK_MODE_MISMATCH`: `BATCH-QA-*` was misclassified as `automation_system_write_allowed`.
+- `DOCS_INSUFFICIENT_OUTPUT`: `BATCH-37-DOCS-*` only changed `docs/projects/feishu-gm-automation.md`.
+- `READ_ONLY_LOCKED_DOCS`: `docs_write_allowed` was locked by `read_only_mode=true`.
+- `PATH_PARSE_FIRST_CHAR_LOSS`: `git status` path parsing lost the first character.
+- `FALSE_SUCCEEDED`: task goal was incomplete but reported `succeeded`.
+
+Escalation:
+
+- Count 1: record `warning`.
+- Count 2: report `repeated_warning`.
+- Count 3 or more: mark `blocked` and require a system-fix batch before creating more tasks of the same type.

@@ -36,6 +36,7 @@ const TASK_MUTATION_PATTERN =
   /修复|新增|更新|补齐|建立|修改|改动|创建|写入|补充|fix|repair|add|create|update|modify|patch|implement/i;
 const READ_ONLY_TASK_PATTERN =
   /read[_ -]?only(?:[_ -]?mode)?\s*(?::|=)?\s*(?:true|1|yes|on)?|只读模式|本任务只读|只读执行|只读检查|只读诊断|只读验证|不修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止\s*(?:执行\s*)?(?:git\s+)?(?:add|commit|push)\b/i;
+const QA_BATCH_PATTERN = /\bBATCH-QA(?:-[A-Z0-9]+)*\b/i;
 const TASK_MODES = {
   READ_ONLY: "read_only",
   DOCS_WRITE_ALLOWED: "docs_write_allowed",
@@ -47,7 +48,8 @@ const DOCS_WRITE_TASK_PATTERN =
 const DOCS_WRITE_TARGET_PATTERN = /\bdocs\//i;
 const AUTOMATION_WRITE_TASK_PATTERN =
   /\bBATCH-44\b|\bBATCH-45A\b|automation_system_write_allowed|Worker|Windows Worker|Gateway|worker-api|worker_api|feishu_gateway|project-director|project director|project-director-console|worker-jobs|local_worker|git-safety/i;
-const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
+const READ_ONLY_BATCH_PATTERN =
+  /\bBATCH-QA(?:-[A-Z0-9]+)*\b|\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const WORKER_BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
 const WORKER_BATCH_RELEVANT_LINE_PATTERN =
   /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
@@ -150,6 +152,7 @@ export function extractCurrentExecutionBatchCode(
 
 function classifyWorkerTaskDomain(text: unknown): string {
   const value = String(text ?? "");
+  if (QA_BATCH_PATTERN.test(value)) return "qa_review";
 
   if (/文档整理|整理文档|归档|governance[_ -]?docs/i.test(value)) return "governance_docs";
   if (/Worker|Codex|Hermes|飞书|项目总管|总管|自动化|路由|上报|NO_FIX_APPLIED|git_commit_sha|attempt_id|automation[_ -]?system/i.test(value)) {
