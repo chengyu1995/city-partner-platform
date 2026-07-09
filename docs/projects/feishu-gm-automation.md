@@ -112,3 +112,11 @@
 - `automation_system_write_allowed` is limited to explicit Worker, Gateway, worker-api, project-director, worker-jobs, local_worker, or git-safety repair tasks.
 - When task-mode inference cannot resolve a write mode, the Worker conservatively falls back to `read_only`.
 - `pollOnce` reports use the scoped `taskModeForReport` value so success and failure report paths cannot throw `taskMode is not defined`.
+
+## BATCH-GM-STABILIZE-03 docs task priority and cloud terminal guard
+
+- `BATCH-37-DOCS-*` and `BATCH-37-FIX` resolve to `docs_write_allowed` with `read_only_mode=false`; stale outer `read_only_mode=true` flags do not demote them to read-only.
+- A docs task locked by an outer read-only flag fails with `TASK_MODE_MISMATCH` instead of reporting `succeeded`.
+- Docs write tasks must produce a `docs/**` diff or fail with `NO_FIX_APPLIED`.
+- Tencent Cloud `worker_api.js` scans the full JSON report body before accepting `succeeded`; unfinished task-goal text, `TASK_MODE_MISMATCH`, read-only locks, and known failure codes coerce `effective_final_status=failed`.
+- Tencent Cloud `feishu_gateway_canonical.js` emits `approved_batch`, `task_mode=docs_write_allowed`, `read_only_mode=false`, `allowed_scope=docs/**`, `forbidden_scope`, and `original_request_text` for `BATCH-37-DOCS-*`.

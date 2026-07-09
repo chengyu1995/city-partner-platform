@@ -27,6 +27,7 @@ const {
   NO_FIX_APPLIED,
   OUT_OF_SCOPE_BUSINESS_CHANGE,
   READ_ONLY_MODE_VIOLATION,
+  TASK_MODE_MISMATCH,
   TASK_MODES,
   assertGitOperationAllowed,
   assertTaskGoalApplied,
@@ -347,7 +348,7 @@ test("read_only_mode task lock", async (t) => {
   await t.test("BATCH-GM-SMOKE is read-only and never docs_write_allowed", () => {
     const smokeJob = {
       request_text: [
-        "BATCH-GM-SMOKE-01 final validation smoke test.",
+        "BATCH-GM-SMOKE-02 final validation smoke test.",
         "read_only_mode=true.",
         "Verify docs/projects/feishu-gm-automation.md and Worker/Gateway status only.",
         "Do not modify any files. Do not run git add, git commit, or git push.",
@@ -392,6 +393,40 @@ test("read_only_mode task lock", async (t) => {
     );
     assert.equal(getTaskMode(readOnlyJob), TASK_MODES.READ_ONLY);
     assert.equal(isReadOnlyTask(readOnlyJob), true);
+  });
+
+  await t.test("BATCH-37-DOCS keeps docs_write_allowed above outer read-only flags", () => {
+    const explicitDocsJob = {
+      request_text: [
+        "BATCH-37-DOCS-01",
+        "task_mode=docs_write_allowed",
+        "read_only_mode=false",
+        "允许修改 docs/**",
+      ].join("\n"),
+      payload: { read_only_mode: true },
+    };
+    const lockedDocsJob = {
+      request_text: [
+        "BATCH-37-DOCS-01",
+        "task_mode=docs_write_allowed",
+        "允许修改 docs/**",
+      ].join("\n"),
+      payload: { read_only_mode: true },
+    };
+
+    assert.equal(getTaskMode(explicitDocsJob), TASK_MODES.DOCS_WRITE_ALLOWED);
+    assert.equal(isReadOnlyTask(explicitDocsJob), false);
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(explicitDocsJob, ["docs/projects/feishu-gm-automation.md"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(explicitDocsJob, []),
+      (error) => error.code === NO_FIX_APPLIED
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(lockedDocsJob, []),
+      (error) => error.code === TASK_MODE_MISMATCH
+    );
   });
 
   await t.test("docs_write_allowed requires docs diff and blocks business pages", () => {

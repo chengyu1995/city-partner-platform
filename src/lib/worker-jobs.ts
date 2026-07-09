@@ -43,7 +43,7 @@ const TASK_MODES = {
   PRODUCT_WRITE_ALLOWED: "product_write_allowed",
 } as const;
 const DOCS_WRITE_TASK_PATTERN =
-  /\bBATCH-37-FIX\b|docs_write_allowed/i;
+  /\bBATCH-37-(?:DOCS(?:-[A-Z0-9]+)*|FIX)\b|docs_write_allowed/i;
 const DOCS_WRITE_TARGET_PATTERN = /\bdocs\//i;
 const AUTOMATION_WRITE_TASK_PATTERN =
   /\bBATCH-44\b|\bBATCH-45A\b|automation_system_write_allowed|Worker|Windows Worker|Gateway|worker-api|worker_api|feishu_gateway|project-director|project director|project-director-console|worker-jobs|local_worker|git-safety/i;
@@ -459,7 +459,7 @@ function reportTextHasOutOfScope(value: string): boolean {
 }
 
 function reportTextHasFailedTaskGoal(value: string): boolean {
-  return /task_goal_status\s*[:=]\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change)|Task goal status:\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change)|任务目标状态[:：]\s*(failed|失败|未完成)/i.test(value);
+  return /TASK_MODE_MISMATCH|task_goal_status\s*[:=]\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change|task_mode_mismatch)|Task goal status:\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change|task_mode_mismatch)|任务目标状态[:：]\s*(failed|失败|未完成)/i.test(value);
 }
 
 function buildSafetyBoundary(filesChanged: string[], deployStatus?: string | null): string[] {
