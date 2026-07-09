@@ -79,6 +79,7 @@ Known fingerprints:
 - `READ_ONLY_LOCKED_DOCS`: `docs_write_allowed` was locked by `read_only_mode=true`.
 - `PATH_PARSE_FIRST_CHAR_LOSS`: `git status` path parsing lost the first character.
 - `FALSE_SUCCEEDED`: task goal was incomplete but reported `succeeded`.
+- `INCOMPLETE_QA_REPORT`: `BATCH-QA-*` returned only status/diff or missed required QA report sections.
 
 Escalation:
 

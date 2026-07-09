@@ -326,6 +326,7 @@ const OUT_OF_SCOPE_BUSINESS_CHANGE = "OUT_OF_SCOPE_BUSINESS_CHANGE";
 const TASK_MODE_MISMATCH = "TASK_MODE_MISMATCH";
 const MISSING_REQUIRED_DOCS = "MISSING_REQUIRED_DOCS";
 const INSUFFICIENT_DOC_OUTPUT = "INSUFFICIENT_DOC_OUTPUT";
+const INCOMPLETE_QA_REPORT = "INCOMPLETE_QA_REPORT";
 
 const TASK_MODES = {
   READ_ONLY: "read_only",
@@ -374,6 +375,76 @@ const BATCH_37_REQUIRED_DOCS = [
   "docs/projects/operations-team-plan.md",
   "docs/projects/agent-expansion-plan.md",
   "docs/NEXT_TASK_CARD.md",
+];
+const QA_READ_ONLY_ALLOWED_READS = [
+  "src/app/page.tsx",
+  "src/app/partners/**",
+  "src/app/post/**",
+  "src/app/login/**",
+  "src/app/profile/**",
+  "src/lib/db/mock.ts",
+  "src/types/db.ts",
+  "docs/**",
+  "package.json",
+  "next.config.*",
+  "tsconfig.json",
+];
+const QA_REPORT_REQUIRED_FIELDS = [
+  {
+    key: "currently_usable_features",
+    label: "当前能直接用的功能",
+    pattern: /当前能直接用的功能|能直接用的功能|currently usable features/i,
+  },
+  {
+    key: "features_needing_fixes",
+    label: "当前需要修的功能",
+    pattern: /当前需要修的功能|需要修的功能|features needing fixes/i,
+  },
+  {
+    key: "home_page_acceptance",
+    label: "首页验收结论",
+    pattern: /首页验收结论|首页.*验收|home page acceptance/i,
+  },
+  {
+    key: "partners_page_acceptance",
+    label: "搭子浏览页验收结论",
+    pattern: /搭子浏览页验收结论|搭子浏览页.*验收|partners page acceptance/i,
+  },
+  {
+    key: "post_page_acceptance",
+    label: "发布页验收结论",
+    pattern: /发布页验收结论|发布页.*验收|post page acceptance/i,
+  },
+  {
+    key: "draft_review_flow_acceptance",
+    label: "本地草稿 / 待审核流程验收结论",
+    pattern: /本地草稿\s*\/?\s*待审核流程验收结论|本地草稿.*待审核.*验收|draft.*review.*acceptance/i,
+  },
+  {
+    key: "login_profile_warning",
+    label: "登录页和个人中心 warning 说明",
+    pattern: /登录页和个人中心\s*warning\s*说明|登录页.*个人中心.*warning|login.*profile.*warning/i,
+  },
+  {
+    key: "dev_team_next_steps",
+    label: "开发团队下一步建议",
+    pattern: /开发团队下一步建议|开发团队.*下一步|dev team next steps/i,
+  },
+  {
+    key: "qa_team_next_steps",
+    label: "测试审核团队下一步建议",
+    pattern: /测试审核团队下一步建议|测试.*审核.*下一步|qa team next steps/i,
+  },
+  {
+    key: "operations_team_join",
+    label: "运营团队是否可以加入",
+    pattern: /运营团队是否可以加入|运营团队.*可以加入|operations team.*join/i,
+  },
+  {
+    key: "next_batch_recommendation",
+    label: "下一批建议从哪个 BATCH 开始",
+    pattern: /下一批建议从哪个\s*BATCH\s*开始|下一批建议.*BATCH|next batch/i,
+  },
 ];
 const AUTOMATION_WRITE_ALLOWED_PATHS = [
   "infra/windows-worker",
@@ -995,6 +1066,56 @@ function createReadOnlyModeViolationError(changedPaths) {
   return error;
 }
 
+function getMissingQaReportFields(reportText) {
+  const text = String(reportText || "");
+  return QA_REPORT_REQUIRED_FIELDS.filter((field) => !field.pattern.test(text));
+}
+
+function createIncompleteQaReportError(missingFields) {
+  const missing = (missingFields || []).map((field) => field.label);
+  const error = new Error(
+    [
+      INCOMPLETE_QA_REPORT,
+      "BATCH-QA read-only task must output a full static QA report, not only git status / git diff.",
+      `qa_report_required_total: ${QA_REPORT_REQUIRED_FIELDS.length}`,
+      `qa_report_present: ${QA_REPORT_REQUIRED_FIELDS.length - missing.length}`,
+      missing.length
+        ? `missing_qa_report_fields: ${missing.join(", ")}`
+        : "missing_qa_report_fields: none",
+      `qa_allowed_static_reads: ${QA_READ_ONLY_ALLOWED_READS.join(", ")}`,
+    ].join("\n")
+  );
+
+  error.code = INCOMPLETE_QA_REPORT;
+  error.failureStage = "QA read-only report completeness validation";
+  error.missingQaReportFields = missing;
+  return error;
+}
+
+function assertQaReportComplete(job, reportText) {
+  if (!QA_BATCH_PATTERN.test(getJobText(job))) {
+    return;
+  }
+
+  const missingFields = getMissingQaReportFields(reportText);
+  if (missingFields.length > 0) {
+    throw createIncompleteQaReportError(missingFields);
+  }
+}
+
+function assertQaTaskOutcome(job, changedPaths, reportText) {
+  if (!QA_BATCH_PATTERN.test(getJobText(job))) {
+    return;
+  }
+
+  const normalizedChangedPaths = uniqueSortedPaths(changedPaths || []);
+  if (normalizedChangedPaths.length > 0) {
+    throw createReadOnlyModeViolationError(normalizedChangedPaths);
+  }
+
+  assertQaReportComplete(job, reportText);
+}
+
 function createReadOnlyGitCommandError(args, details = {}) {
   const command = ["git", ...(args || [])].join(" ").trim();
   const changedPaths = uniqueSortedPaths(details.changedPaths || []);
@@ -1336,6 +1457,24 @@ function buildReadOnlyGuard(taskText, options = {}) {
   ].join("\n");
 }
 
+function buildQaReviewGuard(taskText) {
+  if (!QA_BATCH_PATTERN.test(String(taskText || ""))) {
+    return null;
+  }
+
+  return [
+    "【BATCH-QA 只读验收规则】",
+    "project_domain: qa_review",
+    "task_mode: read_only",
+    "read_only_mode: true",
+    `allowed_static_reads: ${QA_READ_ONLY_ALLOWED_READS.join(", ")}`,
+    "必须静态读取首页、搭子浏览页、发布页、登录页、个人中心、mock 数据、类型定义和 docs 文档后再输出 QA 报告。",
+    "禁止修改任何文件，禁止 apply_patch，禁止 git add/commit/push，禁止 npm run dev / next dev，禁止数据库、环境变量和部署操作。",
+    "QA 报告必须包含：当前能直接用的功能、当前需要修的功能、首页验收结论、搭子浏览页验收结论、发布页验收结论、本地草稿 / 待审核流程验收结论、登录页和个人中心 warning 说明、开发团队下一步建议、测试审核团队下一步建议、运营团队是否可以加入、下一批建议从哪个 BATCH 开始。",
+    `failure_code_if_incomplete: ${INCOMPLETE_QA_REPORT}`,
+  ].join("\n");
+}
+
 function buildWorkerGuardedPrompt(requestText, options = {}) {
   const taskText = String(requestText || "").trim();
   const taskDomain = classifyWorkerTaskDomain(taskText);
@@ -1343,6 +1482,7 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
   const readOnlyGuard = buildReadOnlyGuard(taskText, {
     force: options.readOnlyMode === true || taskMode === TASK_MODES.READ_ONLY,
   });
+  const qaReviewGuard = buildQaReviewGuard(taskText);
   const domainGuard = isAutomationSystemTask(taskText)
     ? [
         "【自动化系统任务边界】",
@@ -1358,6 +1498,8 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
     "",
     readOnlyGuard,
     readOnlyGuard ? "" : null,
+    qaReviewGuard,
+    qaReviewGuard ? "" : null,
     domainGuard,
     "",
     "【统一任务模式】",
@@ -2412,6 +2554,7 @@ async function pollOnce() {
     );
 
     const gitResult = await commitGitTask(job);
+    assertQaTaskOutcome(job, gitResult.filesChanged || [], result);
 
     await updateProgress(
       job.id,
@@ -2651,6 +2794,8 @@ async function pollOnce() {
         read_only_mode_violation: errorCode === READ_ONLY_MODE_VIOLATION,
         task_mode_mismatch: errorCode === TASK_MODE_MISMATCH,
         missing_required_docs: error?.missingDocs || [],
+        incomplete_qa_report: errorCode === INCOMPLETE_QA_REPORT,
+        missing_qa_report_fields: error?.missingQaReportFields || [],
         required_docs_total: error?.requiredDocs?.length || 0,
         required_docs_present: error?.presentDocs?.length || 0,
         required_docs_changed: error?.changedDocs?.length || 0,
@@ -2668,6 +2813,8 @@ async function pollOnce() {
               ? "succeeded_until_required_docs_validation"
               : errorCode === READ_ONLY_MODE_VIOLATION
               ? "succeeded_until_read_only_validation"
+              : errorCode === INCOMPLETE_QA_REPORT
+              ? "succeeded_until_qa_report_validation"
               : errorCode === TASK_MODE_MISMATCH
               ? "succeeded_until_task_mode_validation"
               : errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
@@ -2684,6 +2831,8 @@ async function pollOnce() {
               ? "failed_insufficient_doc_output"
               : errorCode === READ_ONLY_MODE_VIOLATION
               ? "failed_read_only_mode_violation"
+              : errorCode === INCOMPLETE_QA_REPORT
+              ? "failed_incomplete_qa_report"
               : errorCode === TASK_MODE_MISMATCH
               ? "failed_task_mode_mismatch"
               : errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
@@ -2700,6 +2849,12 @@ async function pollOnce() {
           `Read-only violation: ${errorCode === READ_ONLY_MODE_VIOLATION ? "yes" : "no"}`,
           `No-op run: ${errorCode === NO_FIX_APPLIED ? "yes" : "no"}`,
           `Task mode mismatch: ${errorCode === TASK_MODE_MISMATCH ? "yes" : "no"}`,
+          `Incomplete QA report: ${errorCode === INCOMPLETE_QA_REPORT ? "yes" : "no"}`,
+          `missing_qa_report_fields: ${
+            error?.missingQaReportFields?.length
+              ? error.missingQaReportFields.join(", ")
+              : "none"
+          }`,
           `required_docs_total: ${error?.requiredDocs?.length || 0}`,
           `required_docs_present: ${error?.presentDocs?.length || 0}`,
           `required_docs_changed: ${error?.changedDocs?.length || 0}`,
@@ -2778,9 +2933,12 @@ module.exports = {
   TASK_MODE_MISMATCH,
   MISSING_REQUIRED_DOCS,
   INSUFFICIENT_DOC_OUTPUT,
+  INCOMPLETE_QA_REPORT,
   FAILURE_FINGERPRINTS,
   TASK_MODES,
   assertTaskGoalApplied,
+  assertQaReportComplete,
+  assertQaTaskOutcome,
   assertGitOperationAllowed,
   assertCleanWorktreeBeforeCodex,
   buildCodexPrompt,

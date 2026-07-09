@@ -113,6 +113,14 @@
 - When task-mode inference cannot resolve a write mode, the Worker conservatively falls back to `read_only`.
 - `pollOnce` reports use the scoped `taskModeForReport` value so success and failure report paths cannot throw `taskMode is not defined`.
 
+## BATCH-GM-STABILIZE-06 QA read-only review guard
+
+- `BATCH-QA-*` is always `project_domain=qa_review`, `task_mode=read_only`, and `read_only_mode=true`.
+- QA tasks may statically read product and documentation files, including `src/app/page.tsx`, `src/app/partners/**`, `src/app/post/**`, `src/app/login/**`, `src/app/profile/**`, `src/lib/db/mock.ts`, `src/types/db.ts`, `docs/**`, `package.json`, `next.config.*`, and `tsconfig.json`.
+- QA tasks still may not modify any file, run `git add`, `git commit`, `git push`, start a dev server, touch database/env files, or deploy.
+- A successful QA task must include a full report with usable features, features needing fixes, homepage acceptance, partners page acceptance, post page acceptance, draft/review flow acceptance, login/profile warnings, development next steps, QA next steps, operations readiness, and the recommended next batch.
+- If the QA report is missing any required field, the Worker fails the task with `INCOMPLETE_QA_REPORT`. A no-diff complete QA report succeeds and must not trigger `NO_FIX_APPLIED`.
+
 ## BATCH-GM-STABILIZE-03 docs task priority and cloud terminal guard
 
 - `BATCH-37-DOCS-*` and `BATCH-37-FIX` resolve to `docs_write_allowed` with `read_only_mode=false`; stale outer `read_only_mode=true` flags do not demote them to read-only.

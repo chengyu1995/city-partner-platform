@@ -30,8 +30,10 @@ const {
   TASK_MODE_MISMATCH,
   MISSING_REQUIRED_DOCS,
   INSUFFICIENT_DOC_OUTPUT,
+  INCOMPLETE_QA_REPORT,
   TASK_MODES,
   assertGitOperationAllowed,
+  assertQaTaskOutcome,
   assertTaskGoalApplied,
   buildCodexPrompt,
   buildFailureReport,
@@ -62,6 +64,20 @@ function writeFile(root, relativePath, content = "test\n") {
   fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
   fs.writeFileSync(absolutePath, content, "utf8");
 }
+
+const COMPLETE_QA_REPORT = [
+  "当前能直接用的功能：访客可静态查看首页信息。",
+  "当前需要修的功能：发布链路仍需补齐验收。",
+  "首页验收结论：通过静态读取 src/app/page.tsx。",
+  "搭子浏览页验收结论：通过静态读取 src/app/partners/**。",
+  "发布页验收结论：通过静态读取 src/app/post/**。",
+  "本地草稿 / 待审核流程验收结论：需要开发团队继续补齐。",
+  "登录页和个人中心 warning 说明：登录页和个人中心仅做 warning，不阻断 QA。",
+  "开发团队下一步建议：优先处理发布和审核链路。",
+  "测试审核团队下一步建议：按页面和流程补测试用例。",
+  "运营团队是否可以加入：暂不建议全面加入。",
+  "下一批建议从哪个 BATCH 开始：建议从 BATCH-QA-04 开始。",
+].join("\n");
 
 function joinedName(...parts) {
   return parts.join("_");
@@ -348,13 +364,14 @@ test("NO_FIX_APPLIED task goal validation", async (t) => {
 });
 
 test("read_only_mode task lock", async (t) => {
-  await t.test("BATCH-QA tasks are qa_review read-only and allow no-diff success", () => {
+  await t.test("BATCH-QA tasks are qa_review read-only and require complete no-diff QA reports", () => {
     const qaJob = {
       request_text: [
-        "BATCH-QA-01",
+        "BATCH-QA-03",
         "task_mode=read_only",
         "read_only_mode=true",
-        "allowed_scope=git status / git diff only",
+        "project_domain=qa_review",
+        "allowed_scope=static reads for src/app/page.tsx, src/app/partners/**, src/app/post/**, docs/**",
         "禁止修改文件",
       ].join("\n"),
       payload: {
@@ -365,9 +382,22 @@ test("read_only_mode task lock", async (t) => {
     assert.equal(classifyWorkerTaskDomain(qaJob.request_text), "qa_review");
     assert.equal(getTaskMode(qaJob), TASK_MODES.READ_ONLY);
     assert.equal(isReadOnlyTask(qaJob), true);
+    const prompt = buildCodexPrompt(qaJob);
+    assert.match(prompt, /project_domain: qa_review/);
+    assert.match(prompt, /src\/app\/page\.tsx/);
+    assert.match(prompt, /src\/app\/partners\/\*\*/);
+    assert.match(prompt, /docs\/\*\*/);
+    assert.match(prompt, /INCOMPLETE_QA_REPORT/);
     assert.doesNotThrow(() => assertTaskGoalApplied(qaJob, []));
+    assert.doesNotThrow(() => assertQaTaskOutcome(qaJob, [], COMPLETE_QA_REPORT));
     assert.throws(
-      () => assertTaskGoalApplied(qaJob, ["infra/windows-worker/local_worker.js"]),
+      () => assertQaTaskOutcome(qaJob, [], "Worker only ran git status and git diff."),
+      (error) =>
+        error.code === INCOMPLETE_QA_REPORT &&
+        error.message.includes("missing_qa_report_fields")
+    );
+    assert.throws(
+      () => assertQaTaskOutcome(qaJob, ["src/app/page.tsx"], COMPLETE_QA_REPORT),
       (error) => error.code === READ_ONLY_MODE_VIOLATION
     );
   });

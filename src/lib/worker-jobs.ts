@@ -462,7 +462,7 @@ function reportTextHasOutOfScope(value: string): boolean {
 }
 
 function reportTextHasFailedTaskGoal(value: string): boolean {
-  return /MISSING_REQUIRED_DOCS|INSUFFICIENT_DOC_OUTPUT|TASK_MODE_MISMATCH|task_goal_status\s*[:=]\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change|task_mode_mismatch|missing_required_docs|insufficient_doc_output)|Task goal status:\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change|task_mode_mismatch|missing_required_docs|insufficient_doc_output)|任务目标状态[:：]\s*(failed|失败|未完成)/i.test(value);
+  return /MISSING_REQUIRED_DOCS|INSUFFICIENT_DOC_OUTPUT|INCOMPLETE_QA_REPORT|TASK_MODE_MISMATCH|task_goal_status\s*[:=]\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change|task_mode_mismatch|missing_required_docs|insufficient_doc_output|incomplete_qa_report)|Task goal status:\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change|task_mode_mismatch|missing_required_docs|insufficient_doc_output|incomplete_qa_report)|任务目标状态[:：]\s*(failed|失败|未完成)/i.test(value);
 }
 
 function buildSafetyBoundary(filesChanged: string[], deployStatus?: string | null): string[] {
