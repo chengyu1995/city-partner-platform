@@ -459,7 +459,7 @@ function reportTextHasOutOfScope(value: string): boolean {
 }
 
 function reportTextHasFailedTaskGoal(value: string): boolean {
-  return /TASK_MODE_MISMATCH|task_goal_status\s*[:=]\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change|task_mode_mismatch)|Task goal status:\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change|task_mode_mismatch)|任务目标状态[:：]\s*(failed|失败|未完成)/i.test(value);
+  return /MISSING_REQUIRED_DOCS|INSUFFICIENT_DOC_OUTPUT|TASK_MODE_MISMATCH|task_goal_status\s*[:=]\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change|task_mode_mismatch|missing_required_docs|insufficient_doc_output)|Task goal status:\s*(failed|failed_[a-z_]+|no_fix_applied|read_only_violation|out_of_scope_business_change|task_mode_mismatch|missing_required_docs|insufficient_doc_output)|任务目标状态[:：]\s*(failed|失败|未完成)/i.test(value);
 }
 
 function buildSafetyBoundary(filesChanged: string[], deployStatus?: string | null): string[] {
@@ -589,6 +589,12 @@ export function buildProjectDirectorWorkerReport(input: {
   const noFixApplied = reportTextHasNoFixApplied(combinedReportText);
   const outOfScopeBusinessChange = reportTextHasOutOfScope(combinedReportText);
   const failedTaskGoal = reportTextHasFailedTaskGoal(combinedReportText);
+  const requiredDocsTotal = readDiagnosticLine(combinedReportText, "required_docs_total") ?? "0";
+  const requiredDocsPresent = readDiagnosticLine(combinedReportText, "required_docs_present") ?? "0";
+  const requiredDocsChanged = readDiagnosticLine(combinedReportText, "required_docs_changed") ?? "0";
+  const missingRequiredDocs = readDiagnosticLine(combinedReportText, "missing_required_docs") ?? "none";
+  const insufficientDocOutput =
+    /INSUFFICIENT_DOC_OUTPUT|insufficient_doc_output\s*[:=]\s*(yes|true)/i.test(combinedReportText);
   const noOpRun =
     noFixApplied ||
     (input.status === "succeeded" &&
@@ -666,6 +672,11 @@ export function buildProjectDirectorWorkerReport(input: {
     read_only_violation: readOnlyViolation,
     no_fix_applied: noFixApplied,
     out_of_scope_business_change: outOfScopeBusinessChange,
+    required_docs_total: requiredDocsTotal,
+    required_docs_present: requiredDocsPresent,
+    required_docs_changed: requiredDocsChanged,
+    missing_required_docs: missingRequiredDocs,
+    insufficient_doc_output: insufficientDocOutput,
     no_op_run: noOpRun,
     committed,
     pushed,
@@ -706,6 +717,11 @@ export function buildProjectDirectorWorkerReport(input: {
     `NO_FIX_APPLIED: ${noFixApplied ? "yes" : "no"}`,
     `Read-only violation: ${readOnlyViolation ? "yes" : "no"}`,
     `Out-of-scope business change: ${outOfScopeBusinessChange ? "yes" : "no"}`,
+    `required_docs_total: ${requiredDocsTotal}`,
+    `required_docs_present: ${requiredDocsPresent}`,
+    `required_docs_changed: ${requiredDocsChanged}`,
+    `missing_required_docs: ${missingRequiredDocs}`,
+    `insufficient_doc_output: ${insufficientDocOutput ? "yes" : "no"}`,
     `No-op run: ${noOpRun ? "yes" : "no"}`,
     `Committed: ${committed ? "yes" : "no"}`,
     `Pushed: ${pushed ? "yes" : "no"}`,

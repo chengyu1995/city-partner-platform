@@ -28,6 +28,8 @@ const {
   OUT_OF_SCOPE_BUSINESS_CHANGE,
   READ_ONLY_MODE_VIOLATION,
   TASK_MODE_MISMATCH,
+  MISSING_REQUIRED_DOCS,
+  INSUFFICIENT_DOC_OUTPUT,
   TASK_MODES,
   assertGitOperationAllowed,
   assertTaskGoalApplied,
@@ -395,10 +397,10 @@ test("read_only_mode task lock", async (t) => {
     assert.equal(isReadOnlyTask(readOnlyJob), true);
   });
 
-  await t.test("BATCH-37-DOCS keeps docs_write_allowed above outer read-only flags", () => {
+  await t.test("BATCH-37 docs modes keep docs_write_allowed above outer read-only flags", () => {
     const explicitDocsJob = {
       request_text: [
-        "BATCH-37-DOCS-01",
+        "BATCH-37-FIX",
         "task_mode=docs_write_allowed",
         "read_only_mode=false",
         "允许修改 docs/**",
@@ -427,6 +429,66 @@ test("read_only_mode task lock", async (t) => {
       () => assertTaskGoalApplied(lockedDocsJob, []),
       (error) => error.code === TASK_MODE_MISMATCH
     );
+  });
+
+  await t.test("BATCH-37-DOCS requires all required docs, not just any docs diff", () => {
+    const job = {
+      request_text: [
+        "BATCH-37-DOCS-03",
+        "task_mode=docs_write_allowed",
+        "read_only_mode=false",
+        "必须新增或更新以下全部文件，缺一个就失败，MISSING_REQUIRED_DOCS：",
+        "- docs/projects/reusable-assets.md",
+        "- docs/projects/modification-needed.md",
+        "- docs/projects/team-management.md",
+        "- docs/projects/qa-handoff-process.md",
+        "- docs/projects/operations-team-plan.md",
+        "- docs/projects/agent-expansion-plan.md",
+        "- docs/NEXT_TASK_CARD.md",
+      ].join("\n"),
+    };
+
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["docs/projects/feishu-gm-automation.md"]),
+      (error) =>
+        error.code === INSUFFICIENT_DOC_OUTPUT &&
+        error.requiredDocs.length === 7 &&
+        error.changedDocs.length === 0
+    );
+
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["docs/projects/reusable-assets.md"]),
+      (error) =>
+        error.code === MISSING_REQUIRED_DOCS &&
+        error.requiredDocs.length === 7 &&
+        error.missingDocs.includes("docs/projects/modification-needed.md")
+    );
+  });
+
+  await t.test("BATCH-37-DOCS completes only when all required docs exist and changed", (t) => {
+    const job = {
+      request_text: "BATCH-37-DOCS-03 task_mode=docs_write_allowed read_only_mode=false",
+    };
+    const requiredDocs = [
+      "docs/projects/reusable-assets.md",
+      "docs/projects/modification-needed.md",
+      "docs/projects/team-management.md",
+      "docs/projects/qa-handoff-process.md",
+      "docs/projects/operations-team-plan.md",
+      "docs/projects/agent-expansion-plan.md",
+      "docs/NEXT_TASK_CARD.md",
+    ];
+    const originalExistsSync = fs.existsSync;
+
+    fs.existsSync = (targetPath) => {
+      const normalized = normalizeGitPath(String(targetPath));
+      return requiredDocs.some((doc) => normalized.endsWith(doc)) || originalExistsSync(targetPath);
+    };
+    t.after(() => {
+      fs.existsSync = originalExistsSync;
+    });
+
+    assert.doesNotThrow(() => assertTaskGoalApplied(job, requiredDocs));
   });
 
   await t.test("docs_write_allowed requires docs diff and blocks business pages", () => {

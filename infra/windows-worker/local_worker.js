@@ -8,7 +8,9 @@ try {
 }
 
 const { spawn, execFile } = require("child_process");
+const fs = require("fs");
 const os = require("os");
+const path = require("path");
 const {
   assertCleanStatusEntries,
   getStatusPaths,
@@ -322,6 +324,8 @@ const NO_FIX_APPLIED = "NO_FIX_APPLIED";
 const READ_ONLY_MODE_VIOLATION = "READ_ONLY_MODE_VIOLATION";
 const OUT_OF_SCOPE_BUSINESS_CHANGE = "OUT_OF_SCOPE_BUSINESS_CHANGE";
 const TASK_MODE_MISMATCH = "TASK_MODE_MISMATCH";
+const MISSING_REQUIRED_DOCS = "MISSING_REQUIRED_DOCS";
+const INSUFFICIENT_DOC_OUTPUT = "INSUFFICIENT_DOC_OUTPUT";
 
 const TASK_MODES = {
   READ_ONLY: "read_only",
@@ -359,6 +363,15 @@ const REQUIRED_FILE_SECTION_PATTERN =
 const ALLOWED_ONLY_SECTION_PATTERN = /允许修改|只允许修改|allowed files?|editable files?/i;
 const BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
 const DOCS_WRITE_ALLOWED_PREFIXES = ["docs/"];
+const BATCH_37_REQUIRED_DOCS = [
+  "docs/projects/reusable-assets.md",
+  "docs/projects/modification-needed.md",
+  "docs/projects/team-management.md",
+  "docs/projects/qa-handoff-process.md",
+  "docs/projects/operations-team-plan.md",
+  "docs/projects/agent-expansion-plan.md",
+  "docs/NEXT_TASK_CARD.md",
+];
 const AUTOMATION_WRITE_ALLOWED_PATHS = [
   "infra/windows-worker",
   "src/lib/worker-jobs.ts",
@@ -798,6 +811,73 @@ function getMissingRequiredChangePaths(requiredPaths, changedPaths) {
   );
 }
 
+function taskRequiresCompleteRequiredDocs(requestText) {
+  return /必须新增或更新以下全部文件|缺一个就失败|MISSING_REQUIRED_DOCS|required_docs/i.test(
+    String(requestText || "")
+  );
+}
+
+function getRequiredDocsForTask(requestText) {
+  const text = String(requestText || "");
+  const docs = [];
+
+  if (/\bBATCH-37-DOCS(?:-[A-Z0-9]+)*\b/i.test(text)) {
+    docs.push(...BATCH_37_REQUIRED_DOCS);
+  }
+
+  if (taskRequiresCompleteRequiredDocs(text)) {
+    docs.push(
+      ...extractPathLikeTokens(text).filter((filePath) =>
+        isDocsWriteAllowedPath(filePath)
+      )
+    );
+  }
+
+  return uniqueSortedPaths(docs);
+}
+
+function getPresentRequiredDocs(requiredDocs) {
+  return uniqueSortedPaths(requiredDocs).filter((filePath) =>
+    fs.existsSync(path.join(PROJECT_DIR, normalizeGitPath(filePath)))
+  );
+}
+
+function getChangedRequiredDocs(requiredDocs, changedPaths) {
+  return uniqueSortedPaths(requiredDocs).filter((requiredDoc) =>
+    uniqueSortedPaths(changedPaths || []).some((changedPath) =>
+      requestedPathMatchesChangedPath(requiredDoc, changedPath)
+    )
+  );
+}
+
+function createRequiredDocsError(code, message, details = {}) {
+  const requiredDocs = uniqueSortedPaths(details.requiredDocs || []);
+  const presentDocs = uniqueSortedPaths(details.presentDocs || []);
+  const changedDocs = uniqueSortedPaths(details.changedDocs || []);
+  const missingDocs = uniqueSortedPaths(details.missingDocs || []);
+  const error = new Error(
+    [
+      code,
+      message,
+      `required_docs_total: ${requiredDocs.length}`,
+      `required_docs_present: ${presentDocs.length}`,
+      `required_docs_changed: ${changedDocs.length}`,
+      missingDocs.length
+        ? `missing_required_docs: ${missingDocs.join(", ")}`
+        : "missing_required_docs: none",
+      `insufficient_doc_output: ${code === INSUFFICIENT_DOC_OUTPUT ? "yes" : "no"}`,
+    ].join("\n")
+  );
+
+  error.code = code;
+  error.failureStage = "required docs completion validation";
+  error.requiredDocs = requiredDocs;
+  error.presentDocs = presentDocs;
+  error.changedDocs = changedDocs;
+  error.missingDocs = missingDocs;
+  return error;
+}
+
 function createNoFixAppliedError(message, details = {}) {
   const error = new Error(
     [
@@ -934,6 +1014,45 @@ function assertTaskGoalApplied(job, changedPaths) {
     }
 
     const docsChangedPaths = normalizedChangedPaths.filter(isDocsWriteAllowedPath);
+    const requiredDocs = getRequiredDocsForTask(requestText);
+    const presentRequiredDocs = getPresentRequiredDocs(requiredDocs);
+    const changedRequiredDocs = getChangedRequiredDocs(requiredDocs, normalizedChangedPaths);
+    const missingRequiredDocs = uniqueSortedPaths(requiredDocs).filter(
+      (requiredDoc) =>
+        !presentRequiredDocs.includes(normalizeGitPath(requiredDoc)) ||
+        !changedRequiredDocs.includes(normalizeGitPath(requiredDoc))
+    );
+
+    if (
+      requiredDocs.length > 0 &&
+      normalizedChangedPaths.length === 1 &&
+      normalizedChangedPaths[0] === "docs/projects/feishu-gm-automation.md"
+    ) {
+      throw createRequiredDocsError(
+        INSUFFICIENT_DOC_OUTPUT,
+        "docs_write_allowed task only changed feishu-gm-automation.md and did not produce the required docs output.",
+        {
+          requiredDocs,
+          presentDocs: presentRequiredDocs,
+          changedDocs: changedRequiredDocs,
+          missingDocs: missingRequiredDocs,
+        }
+      );
+    }
+
+    if (requiredDocs.length > 0 && missingRequiredDocs.length > 0) {
+      throw createRequiredDocsError(
+        MISSING_REQUIRED_DOCS,
+        "docs_write_allowed task did not create or update every required doc.",
+        {
+          requiredDocs,
+          presentDocs: presentRequiredDocs,
+          changedDocs: changedRequiredDocs,
+          missingDocs: missingRequiredDocs,
+        }
+      );
+    }
+
     if (docsChangedPaths.length === 0) {
       throw createNoFixAppliedError(
         "docs_write_allowed task produced no docs/** diff; refusing succeeded.",
@@ -1295,6 +1414,8 @@ function classifyFailure(error) {
     error?.code === "BUSINESS_PAGE_BOUNDARY_VIOLATION" ||
     error?.code === OUT_OF_SCOPE_BUSINESS_CHANGE ||
     error?.code === TASK_MODE_MISMATCH ||
+    error?.code === MISSING_REQUIRED_DOCS ||
+    error?.code === INSUFFICIENT_DOC_OUTPUT ||
     errorText.includes(OUT_OF_SCOPE_BUSINESS_CHANGE)
   ) {
     return {
@@ -1389,8 +1510,12 @@ function buildFailureReport(job, error, context = {}) {
     errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
     errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION";
   const taskModeMismatch = errorCode === TASK_MODE_MISMATCH;
+  const missingRequiredDocs = errorCode === MISSING_REQUIRED_DOCS;
+  const insufficientDocOutput = errorCode === INSUFFICIENT_DOC_OUTPUT;
   const workerExecutionStatus = noFixApplied
     ? "succeeded_until_task_goal_validation"
+    : missingRequiredDocs || insufficientDocOutput
+    ? "succeeded_until_required_docs_validation"
     : readOnlyViolation
     ? "succeeded_until_read_only_validation"
     : taskModeMismatch
@@ -1402,6 +1527,10 @@ function buildFailureReport(job, error, context = {}) {
     ? "failed_read_only_mode_violation"
     : noFixApplied
     ? "failed_no_fix_applied"
+    : missingRequiredDocs
+    ? "failed_missing_required_docs"
+    : insufficientDocOutput
+    ? "failed_insufficient_doc_output"
     : taskModeMismatch
     ? "failed_task_mode_mismatch"
     : outOfScopeBusinessChange
@@ -1422,6 +1551,13 @@ function buildFailureReport(job, error, context = {}) {
     `Read-only violation: ${readOnlyViolation ? "yes" : "no"}`,
     `No-op run: ${noFixApplied ? "yes" : "no"}`,
     `Task mode mismatch: ${taskModeMismatch ? "yes" : "no"}`,
+    `required_docs_total: ${error?.requiredDocs?.length || 0}`,
+    `required_docs_present: ${error?.presentDocs?.length || 0}`,
+    `required_docs_changed: ${error?.changedDocs?.length || 0}`,
+    `missing_required_docs: ${
+      error?.missingDocs?.length ? error.missingDocs.join(", ") : "none"
+    }`,
+    `insufficient_doc_output: ${insufficientDocOutput ? "yes" : "no"}`,
     `Out-of-scope business change: ${outOfScopeBusinessChange ? "yes" : "no"}`,
     `Committed: ${context.commitSha ? "yes" : "no"}`,
     "Pushed: no",
@@ -2442,6 +2578,11 @@ async function pollOnce() {
         no_fix_applied: errorCode === NO_FIX_APPLIED,
         read_only_mode_violation: errorCode === READ_ONLY_MODE_VIOLATION,
         task_mode_mismatch: errorCode === TASK_MODE_MISMATCH,
+        missing_required_docs: error?.missingDocs || [],
+        required_docs_total: error?.requiredDocs?.length || 0,
+        required_docs_present: error?.presentDocs?.length || 0,
+        required_docs_changed: error?.changedDocs?.length || 0,
+        insufficient_doc_output: errorCode === INSUFFICIENT_DOC_OUTPUT,
         out_of_scope_business_change:
           errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
           errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION",
@@ -2450,6 +2591,9 @@ async function pollOnce() {
           `Worker execution status: ${
             errorCode === NO_FIX_APPLIED
               ? "succeeded_until_task_goal_validation"
+              : errorCode === MISSING_REQUIRED_DOCS ||
+                errorCode === INSUFFICIENT_DOC_OUTPUT
+              ? "succeeded_until_required_docs_validation"
               : errorCode === READ_ONLY_MODE_VIOLATION
               ? "succeeded_until_read_only_validation"
               : errorCode === TASK_MODE_MISMATCH
@@ -2462,6 +2606,10 @@ async function pollOnce() {
           `Task goal status: ${
             errorCode === NO_FIX_APPLIED
               ? "failed_no_fix_applied"
+              : errorCode === MISSING_REQUIRED_DOCS
+              ? "failed_missing_required_docs"
+              : errorCode === INSUFFICIENT_DOC_OUTPUT
+              ? "failed_insufficient_doc_output"
               : errorCode === READ_ONLY_MODE_VIOLATION
               ? "failed_read_only_mode_violation"
               : errorCode === TASK_MODE_MISMATCH
@@ -2480,6 +2628,13 @@ async function pollOnce() {
           `Read-only violation: ${errorCode === READ_ONLY_MODE_VIOLATION ? "yes" : "no"}`,
           `No-op run: ${errorCode === NO_FIX_APPLIED ? "yes" : "no"}`,
           `Task mode mismatch: ${errorCode === TASK_MODE_MISMATCH ? "yes" : "no"}`,
+          `required_docs_total: ${error?.requiredDocs?.length || 0}`,
+          `required_docs_present: ${error?.presentDocs?.length || 0}`,
+          `required_docs_changed: ${error?.changedDocs?.length || 0}`,
+          `missing_required_docs: ${
+            error?.missingDocs?.length ? error.missingDocs.join(", ") : "none"
+          }`,
+          `insufficient_doc_output: ${errorCode === INSUFFICIENT_DOC_OUTPUT ? "yes" : "no"}`,
           `Out-of-scope business change: ${
             errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
             errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION"
@@ -2549,6 +2704,8 @@ module.exports = {
   READ_ONLY_MODE_VIOLATION,
   OUT_OF_SCOPE_BUSINESS_CHANGE,
   TASK_MODE_MISMATCH,
+  MISSING_REQUIRED_DOCS,
+  INSUFFICIENT_DOC_OUTPUT,
   TASK_MODES,
   assertTaskGoalApplied,
   assertGitOperationAllowed,
