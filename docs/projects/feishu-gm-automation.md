@@ -129,3 +129,14 @@
 - Completion requires a real `docs/**` diff. If no documentation change is produced, task-goal validation must fail with `NO_FIX_APPLIED`.
 - Final reporting must separate Worker execution status from task goal status, and must explicitly report `NO_FIX_APPLIED`, `READ_ONLY_MODE_VIOLATION`, read-only violation, empty run, committed, and pushed fields.
 - This batch does not validate city-partner product pages, product batches, first-city/category content, guest browsing, local drafts, or pending-review flows.
+
+## BATCH-37-DOCS-03 approved docs execution
+
+- Approval source: `总管 批准执行：仅批准 BATCH-37-DOCS-03`.
+- Task classification: `automation_system`; task mode: `docs_write_allowed`; read-only mode: `false`.
+- Allowed scope: `docs/**` only. Forbidden scope remains `src/app/**`, `src/lib/db/mock.ts`, `src/types/db.ts`, env, database, worker, and Tencent Cloud files.
+- Current batch identity must come only from the task title, repair goal, and approval statement. BATCH-P3, BATCH-P4, and historical batch names in forbidden or reference text must not override `BATCH-37-DOCS-03`.
+- Completion requires a real `docs/**` diff. If no documentation change is produced, task-goal validation must fail with `NO_FIX_APPLIED`.
+- Final reporting must separate Worker execution status from task goal status, and must explicitly report modified files, task classification, Worker execution status, task goal status, `NO_FIX_APPLIED`, `READ_ONLY_MODE_VIOLATION`, read-only violation, empty run, committed, pushed, and validation results.
+- Worker success alone is not completion proof. Task-goal status is complete only when the approved docs-only scope produced a documentation diff and no read-only or out-of-scope violation is present.
+- This batch does not validate city-partner product pages, product batches, first-city/category content, guest browsing, local drafts, or pending-review flows.
