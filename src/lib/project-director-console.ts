@@ -48,7 +48,8 @@ export function parseProjectDirectorConsoleCommand(text: string): ConsoleCommand
   }
   if (/^(暂停|暂停Agent|暂停 Agents|停止分发|暂停分发|pause)$/i.test(body)) return "pause_agents";
   if (/^(恢复|继续|恢复Agent|恢复 Agents|继续分发|resume)$/i.test(body)) return "resume_agents";
-  if (/^(批准执行|同意执行|开始执行|approve)$/i.test(body)) return "approve_execution";
+  if (/^(批准执行|批准修复|同意执行|开始执行|approve)$/i.test(body)) return "approve_execution";
+  if (/^批准修复[:：\s]/i.test(body)) return "approve_execution";
   return null;
 }
 

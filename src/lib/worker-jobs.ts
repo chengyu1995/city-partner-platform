@@ -32,12 +32,69 @@ const RECORD_ID_KEYS = [
 ];
 
 const TERMINAL_WORKER_STATUSES = new Set(["succeeded", "failed"]);
+const WORKER_BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
+const WORKER_FORBIDDEN_SECTION_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden/i;
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function findBatchCodes(text: unknown): string[] {
+  return Array.from(new Set(String(text ?? "").match(WORKER_BATCH_CODE_PATTERN) ?? []));
+}
+
+function extractRelevantBatchTextFromRequest(text: unknown): string {
+  const lines = String(text ?? "").split(/\r?\n/);
+  const chunks: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (!line || WORKER_FORBIDDEN_SECTION_PATTERN.test(line)) continue;
+
+    if (index === 0 && /^新需求[:：]/.test(line)) {
+      chunks.push(line);
+      continue;
+    }
+
+    if (/标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i.test(line)) {
+      chunks.push(line);
+    }
+  }
+
+  return chunks.join("\n");
+}
+
+export function extractCurrentExecutionBatchCode(
+  job: JobRecord | null | undefined
+): string | null {
+  const titleCodes = findBatchCodes(job?.title);
+  if (titleCodes.length > 0) return titleCodes[0];
+
+  const requestText = [
+    readString(job?.request_text),
+    readString(job?.prompt),
+    readString(job?.description),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const requestCodes = findBatchCodes(extractRelevantBatchTextFromRequest(requestText));
+  return requestCodes[0] ?? null;
+}
+
+function classifyWorkerTaskDomain(text: unknown): string {
+  const value = String(text ?? "");
+
+  if (/文档整理|整理文档|归档|governance[_ -]?docs/i.test(value)) return "governance_docs";
+  if (/Worker|Codex|Hermes|飞书|项目总管|总管|自动化|路由|上报|NO_FIX_APPLIED|git_commit_sha|attempt_id|automation[_ -]?system/i.test(value)) {
+    return "automation_system";
+  }
+  if (/测试审核|测试|审核|验收|复测|qa[_ -]?review|QA review|test review/i.test(value)) return "qa_review";
+  if (/运营|运维|发布|部署|上线|监控|operations?|ops|release|deploy/i.test(value)) return "operations";
+
+  return "general";
 }
 
 function isSafePostgrestFilterValue(value: string): boolean {
@@ -305,13 +362,7 @@ export function getProjectDirectorJobCorrelation(job: JobRecord | null | undefin
 }
 
 function getJobBatchCode(job: JobRecord | null | undefined): string | null {
-  const payload = readRecord(job?.payload);
-  return (
-    readString(payload?.batch_code) ??
-    readString(job?.dispatch_batch) ??
-    readString(job?.task_code) ??
-    readString(job?.job_id)
-  );
+  return extractCurrentExecutionBatchCode(job);
 }
 
 export function buildProjectDirectorWorkerReport(input: {
@@ -333,7 +384,7 @@ export function buildProjectDirectorWorkerReport(input: {
   errorText?: string | null;
 }): { text: string; data: Record<string, unknown> } {
   const correlation = getProjectDirectorJobCorrelation(input.job);
-  const batchCode = getJobBatchCode(input.job) ?? correlation.task_key;
+  const batchCode = getJobBatchCode(input.job);
   const submittedFilesChanged = readStringArray(input.filesChanged);
   const filesChanged =
     submittedFilesChanged.length > 0
@@ -356,6 +407,9 @@ export function buildProjectDirectorWorkerReport(input: {
     readString(input.job?.request_text) ??
     readString(input.job?.prompt) ??
     null;
+  const taskDomain = classifyWorkerTaskDomain(
+    [demand, readString(input.job?.title), readString(input.job?.job_type)].filter(Boolean).join("\n")
+  );
   const jobId = readString(input.job?.id) ?? readString(input.job?.job_id);
   const statusTitle =
     input.status === "succeeded"
@@ -377,6 +431,22 @@ export function buildProjectDirectorWorkerReport(input: {
   const failureSuggestion = input.status === "failed"
     ? buildFailureNextStep(sanitizedError)
     : null;
+  const workerExecutionStatus =
+    input.status === "failed" && /NO_FIX_APPLIED/i.test(sanitizedError)
+      ? "succeeded_until_task_goal_validation"
+      : input.status === "failed"
+        ? "failed"
+        : input.status === "succeeded"
+          ? "succeeded"
+          : input.status;
+  const taskGoalStatus =
+    input.status === "succeeded"
+      ? "completed"
+      : /NO_FIX_APPLIED/i.test(sanitizedError)
+        ? "failed_no_fix_applied"
+        : input.status === "failed"
+          ? "failed"
+          : "running";
 
   const data = {
     job_id: jobId,
@@ -391,6 +461,9 @@ export function buildProjectDirectorWorkerReport(input: {
     attempt_id: input.attemptId,
     status: input.status,
     status_title: statusTitle,
+    task_domain: taskDomain,
+    worker_execution_status: workerExecutionStatus,
+    task_goal_status: taskGoalStatus,
     what_changed: sanitizeReportText(summary),
     files_changed: filesChanged,
     validation_result: validation,
@@ -416,11 +489,14 @@ export function buildProjectDirectorWorkerReport(input: {
     `需求：${placeholder(truncateText(sanitizeReportText(demand), 800))}`,
     `项目名称：${placeholder(input.projectName ?? "同城搭子网站")}`,
     `项目目录：${placeholder(input.projectDir)}`,
+    `任务分类：${taskDomain}`,
+    `Worker 执行状态：${workerExecutionStatus}`,
+    `任务目标状态：${taskGoalStatus}`,
     "",
     "本阶段性质：",
     batchCode
-      ? `系统升级阶段 ${batchCode}：Worker/Codex 自动化任务执行结果`
-      : "系统升级阶段：Worker/Codex 自动化任务执行结果",
+      ? `${taskDomain} ${batchCode}：Worker/Codex 任务执行结果`
+      : `${taskDomain}：Worker/Codex 任务执行结果`,
     "",
     "执行结果摘要：",
     truncateText(sanitizeReportText(summary), 1200),

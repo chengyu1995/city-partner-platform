@@ -65,3 +65,21 @@
 - 不修改数据库。
 - 不部署生产。
 - 不删除旧备份文件。
+
+## BATCH-38A 空跑防护规则
+
+- Worker 执行成功不等于任务目标完成；最终报告必须同时区分 `Worker execution` 和 `Task goal`。
+- 如果任务正文要求修复、新增、更新、补齐、建立或修改，但 Codex 结束后没有任何文件变更，Worker 必须上报 failed。
+- 该失败统一使用 `NO_FIX_APPLIED`，并进入失败报告和验证结果，不允许作为 Git warning 后继续 succeeded。
+- 如果任务明确要求修改指定文件，而变更文件没有命中任何指定文件，也必须按 `NO_FIX_APPLIED` failed。
+- 当前执行批次只从标题、修复目标和批准语句提取；禁止从“禁止范围”中的 BATCH-P3、BATCH-P4 或历史批次文字提取当前批次。
+- `总管 批准修复` 等价进入 `总管 批准执行` 链路，但只能执行对应失败批次的最小修复任务；找不到匹配批次时不得分发其他批次。
+- 自动化系统修复任务归类为 `automation_system`，不得把同城搭子产品页面、首批城市、首批分类、访客浏览、本地草稿或待审核流程作为完成依据。
+- 文档整理、测试审核和运营类任务分别归类为 `governance_docs`、`qa_review` 和 `operations`。
+
+## BATCH-38A 腾讯云同步记录
+
+- 已同步腾讯云 `/home/ubuntu/city-partner-agent/worker_api.js`：云端 Worker report 会把变更型任务的空跑 succeeded 改判为 failed，并在错误文本中写入 `NO_FIX_APPLIED`、`Worker execution` 和 `Task goal`。
+- 已同步腾讯云 `/home/ubuntu/city-partner-agent/feishu_gateway_canonical.js`：`总管 批准修复` 进入批准执行链路；批次只从标题、修复目标和批准语句提取；自动化、文档、测试、运营任务不会套用同城搭子产品上下文。
+- 腾讯云备份文件：`worker_api.js.bak.batch38a-20260709104241`、`feishu_gateway_canonical.js.bak.batch38a-20260709104241`。
+- 腾讯云 PM2 已重启 `worker-api` 和 `feishu-gateway`；未修改远端 `.env`、数据库、Vercel 配置，也未执行部署。

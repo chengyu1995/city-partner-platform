@@ -24,8 +24,13 @@ const {
 } = require("../git-safety");
 
 const {
+  NO_FIX_APPLIED,
+  assertTaskGoalApplied,
   buildFailureReport,
   buildWorkerGuardedPrompt,
+  classifyWorkerTaskDomain,
+  extractCurrentExecutionBatchCode,
+  extractRequiredChangePaths,
 } = require("../local_worker");
 
 const workerRoot = path.resolve(__dirname, "..");
@@ -240,6 +245,136 @@ test("automation system task boundaries", async (t) => {
         requestText: "普通产品页面任务",
       })
     );
+  });
+});
+
+test("NO_FIX_APPLIED task goal validation", async (t) => {
+  await t.test("fails BATCH-37 reusable asset task when no files changed", () => {
+    assert.throws(
+      () =>
+        assertTaskGoalApplied(
+          {
+            title: "BATCH-37 reusable assets",
+            request_text: "修复目标：新增 docs/projects/reusable-assets.md",
+          },
+          []
+        ),
+      (error) =>
+        error.code === NO_FIX_APPLIED &&
+        error.message.includes("docs/projects/reusable-assets.md")
+    );
+  });
+
+  await t.test("fails when task asks for a specified file but another file changed", () => {
+    assert.throws(
+      () =>
+        assertTaskGoalApplied(
+          {
+            title: "BATCH-38A worker repair",
+            request_text: "修复目标：修改 infra/windows-worker/local_worker.js",
+          },
+          ["docs/projects/feishu-gm-automation.md"]
+        ),
+      (error) =>
+        error.code === NO_FIX_APPLIED &&
+        error.message.includes("infra/windows-worker/local_worker.js")
+    );
+  });
+
+  await t.test("allows mutation tasks when a required file changed", () => {
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(
+        {
+          title: "BATCH-38A worker repair",
+          request_text: "修复目标：修改 infra/windows-worker/local_worker.js",
+        },
+        ["infra/windows-worker/local_worker.js"]
+      )
+    );
+  });
+
+  await t.test("extracts required files without treating allowed-only scope as required", () => {
+    assert.deepEqual(
+      extractRequiredChangePaths(
+        [
+          "允许修改：",
+          "- infra/windows-worker/local_worker.js",
+          "修复目标：新增 docs/projects/reusable-assets.md",
+        ].join("\n")
+      ),
+      ["docs/projects/reusable-assets.md"]
+    );
+  });
+});
+
+test("batch extraction and automation routing guards", async (t) => {
+  await t.test("does not extract forbidden BATCH-P3 or BATCH-P4 as current batch", () => {
+    assert.equal(
+      extractCurrentExecutionBatchCode({
+        title: "",
+        request_text: [
+          "新需求：修复飞书总经理路由",
+          "禁止范围",
+          "- 不执行 BATCH-P3",
+          "- 不执行 BATCH-P4",
+          "批准语句：总管 批准修复：仅修复 BATCH-37",
+        ].join("\n"),
+      }),
+      "BATCH-37"
+    );
+  });
+
+  await t.test("uses title before forbidden batch mentions", () => {
+    assert.equal(
+      extractCurrentExecutionBatchCode({
+        title: "BATCH-38A local worker repair",
+        request_text: "禁止范围：不执行 BATCH-P3 / BATCH-P4",
+      }),
+      "BATCH-38A"
+    );
+  });
+
+  await t.test("classifies system repair separately from product context", () => {
+    assert.equal(
+      classifyWorkerTaskDomain(
+        "BATCH-38 修复 Worker/Codex 空跑 succeeded 和飞书总经理路由污染"
+      ),
+      "automation_system"
+    );
+  });
+
+  await t.test("automation prompt forbids city-partner product context as completion evidence", () => {
+    const prompt = buildWorkerGuardedPrompt(
+      "BATCH-38 修复 Worker/Codex 空跑 succeeded 和飞书总经理路由污染"
+    );
+
+    assert.match(prompt, /task_domain: automation_system/);
+    assert.match(prompt, /不得把同城搭子产品页面/);
+    assert.match(prompt, /首批城市/);
+    assert.match(prompt, /本地草稿/);
+  });
+});
+
+test("approved repair route remains on approved execution path", async (t) => {
+  await t.test("console command accepts approve repair", () => {
+    const source = fs.readFileSync(
+      path.join(workerRoot, "..", "..", "src", "lib", "project-director-console.ts"),
+      "utf8"
+    );
+
+    assert.match(source, /批准修复/);
+    assert.match(source, /approve_execution/);
+  });
+
+  await t.test("feishu route filters approved repair by explicit batch", () => {
+    const source = fs.readFileSync(
+      path.join(workerRoot, "..", "..", "src", "app", "api", "feishu", "event", "route.ts"),
+      "utf8"
+    );
+
+    assert.match(source, /isApprovedRepairReply/);
+    assert.match(source, /extractApprovedRepairBatchCode/);
+    assert.match(source, /filterApprovedRepairBuildResult/);
   });
 });
 

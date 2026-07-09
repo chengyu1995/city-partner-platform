@@ -34,12 +34,12 @@ import {
   buildPlanningChoiceOriginalDemand,
   buildTaskTreeChangeRecordedReply,
   buildTaskTreeReviewReceivedReply,
-  classifyProjectDirectorDemand,
+  classifyProjectDirectorDemand as classifyBaseProjectDirectorDemand,
   isDirectWorkerTaskRequest,
   getAcceptanceFeedbackBody,
   getDemandBody,
   isAcceptanceFeedbackMessage,
-  isApprovedExecutionReply,
+  isApprovedExecutionReply as isBaseApprovedExecutionReply,
   isBossApprovalReply,
   isDispatchBatchApprovalReply,
   isDispatchPlanChangeReply,
@@ -75,6 +75,7 @@ import {
   insertAcceptanceFeedbackJob,
   insertBatch01ProductPlanningJobs,
   PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD_NAME,
+  type DispatchJobBuildResult,
 } from "@/lib/project-director-job-builder";
 import {
   buildProjectDirectorTaskTreeDraft,
@@ -106,6 +107,95 @@ function sanitizeLogText(text: string): string {
   return text
     .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
     .replace(/(token|secret|password|key)["':=\s]+[^"',\s}]+/gi, "$1=[redacted]");
+}
+
+const ROUTE_BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
+
+function isAutomationSystemRepairDemand(text: string): boolean {
+  const normalized = normalizeFeishuTaskText(text);
+  return (
+    /Worker|Codex|Hermes|飞书|项目总管|总管|自动化|路由|上报|NO_FIX_APPLIED|git_commit_sha|attempt_id/i.test(
+      normalized
+    ) && /修复|新增|更新|补齐|建立|修改|失败|failed|fix|repair|route/i.test(normalized)
+  );
+}
+
+function classifyFeishuWorkerTaskDomain(text: string): string {
+  const normalized = normalizeFeishuTaskText(text);
+
+  if (/文档整理|整理文档|归档|governance[_ -]?docs/i.test(normalized)) return "governance_docs";
+  if (isAutomationSystemRepairDemand(normalized) || /automation[_ -]?system/i.test(normalized)) {
+    return "automation_system";
+  }
+  if (/测试审核|测试|审核|验收|复测|qa[_ -]?review|QA review|test review/i.test(normalized)) {
+    return "qa_review";
+  }
+  if (/运营|运维|发布|部署|上线|监控|operations?|ops|release|deploy/i.test(normalized)) {
+    return "operations";
+  }
+
+  return "direct_worker_task";
+}
+
+function classifyProjectDirectorDemand(
+  text: string
+): ReturnType<typeof classifyBaseProjectDirectorDemand> {
+  if (isAutomationSystemRepairDemand(text)) {
+    return "system_upgrade_request";
+  }
+
+  return classifyBaseProjectDirectorDemand(text);
+}
+
+function isApprovedRepairReply(text: string): boolean {
+  return /总管\s*批准修复|批准修复/i.test(normalizeFeishuTaskText(text));
+}
+
+function isApprovedExecutionReply(text: string): boolean {
+  const normalized = normalizeFeishuTaskText(text);
+  return (
+    isBaseApprovedExecutionReply(normalized) ||
+    /^(总管\s*)?批准执行$/i.test(normalized) ||
+    isApprovedRepairReply(normalized)
+  );
+}
+
+function extractApprovedRepairBatchCode(text: string): string | null {
+  if (!isApprovedRepairReply(text)) return null;
+  const match = normalizeFeishuTaskText(text).match(ROUTE_BATCH_CODE_PATTERN);
+  return match?.[0] ?? null;
+}
+
+function dispatchTaskMatchesBatch(
+  task: DispatchJobBuildResult["tasks"][number],
+  batchCode: string
+): boolean {
+  const values = [
+    task.task_code,
+    task.task_key,
+    task.dispatch_batch,
+    task.task_title,
+    ...(Array.isArray(task.input) ? task.input : []),
+  ];
+
+  return values.some((value) => String(value ?? "").includes(batchCode));
+}
+
+function filterApprovedRepairBuildResult(
+  buildResult: DispatchJobBuildResult,
+  batchCode: string | null
+): DispatchJobBuildResult {
+  if (!batchCode) return buildResult;
+
+  const indexes = buildResult.tasks
+    .map((task, index) => (dispatchTaskMatchesBatch(task, batchCode) ? index : -1))
+    .filter((index) => index >= 0);
+
+  return {
+    ...buildResult,
+    tasks: indexes.map((index) => buildResult.tasks[index]),
+    requestTexts: indexes.map((index) => buildResult.requestTexts[index]),
+  };
 }
 
 async function markReceiptCompleted(supabase: SupabaseClient, eventId: string): Promise<void> {
@@ -579,9 +669,10 @@ async function insertDirectWorkerTask(
     feishuUserId: string;
   }
 ): Promise<{ jobId: string | null }> {
+  const taskDomain = classifyFeishuWorkerTaskDomain(input.requestText);
   const row = {
     source: "feishu",
-    job_type: "direct_worker_task",
+    job_type: taskDomain,
     title: `Direct Worker task: ${input.requestText.slice(0, 80)}`,
     description: input.requestText,
     prompt: input.requestText,
@@ -593,6 +684,7 @@ async function insertDirectWorkerTask(
     feishu_chat_id: input.feishuChatId,
     feishu_user_id: input.feishuUserId,
     payload: {
+      task_domain: taskDomain,
       route: "direct_worker_task",
       raw_message: input.rawText,
       skip_planning_choice: true,
@@ -752,7 +844,7 @@ export async function POST(req: NextRequest) {
         }
       }
       if (consoleCommand === "approve_execution") {
-        text = "批准执行";
+        text = isApprovedRepairReply(text) ? text : "总管 批准执行";
       }
 
       if (isAcceptanceFeedbackMessage(text)) {
@@ -1165,7 +1257,41 @@ export async function POST(req: NextRequest) {
         "approved_execution"
       );
       const dispatchPlan = buildProjectDirectorDispatchPlanDraft(approvedTree, "approved_execution");
-      const buildResult = buildApprovedAgentDispatchJobs(dispatchPlan);
+      const repairBatchCode = extractApprovedRepairBatchCode(text);
+      const buildResult = filterApprovedRepairBuildResult(
+        buildApprovedAgentDispatchJobs(dispatchPlan),
+        repairBatchCode
+      );
+      if (repairBatchCode && buildResult.tasks.length === 0) {
+        const reply = `未找到可执行的 ${repairBatchCode} 最小修复任务，本次不会分发其他批次。`;
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          [
+            "PROJECT_DIRECTOR_APPROVED_REPAIR_BLOCKED",
+            "state: repair_batch_missing",
+            `batch_code: ${repairBatchCode}`,
+            "reason: boss approved repair for a specific failed batch, but the current task tree has no matching task.",
+          ].join("\n"),
+          "project_director_approved_repair_blocked",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "approved_repair_batch_missing",
+          batch_code: repairBatchCode,
+        });
+      }
       attachProjectDirectorDispatchMetadata(buildResult, {
         bossRequestId: approvedTree.boss_request_id,
         planId: approvedTree.plan_id,
@@ -1235,6 +1361,7 @@ export async function POST(req: NextRequest) {
           `boss_request_id: ${approvedTree.boss_request_id}`,
           `plan_id: ${approvedTree.plan_id}`,
           `original_demand: ${recentDraft.originalDemand}`,
+          `repair_batch_filter: ${repairBatchCode || "none"}`,
           "attempt_id_contract: assigned_on_worker_claim_and_required_on_report",
           `inserted_jobs: ${insertResult.insertedCount}`,
           `skipped_hermes_jobs_columns: ${insertResult.skippedColumns.join(", ") || "none"}`,

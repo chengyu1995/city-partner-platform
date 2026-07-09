@@ -14,6 +14,7 @@ const {
   getStatusPaths,
   getTrackedStatusPaths,
   getUntrackedStatusPaths,
+  normalizeGitPath,
   parseGitStatusPorcelain,
   uniqueSortedPaths,
   validateAutomationTaskBoundaries,
@@ -311,23 +312,238 @@ function createCommitMessage(job) {
   return `worker: ${job.id} ${summary}`;
 }
 
-function readRecord(value) {
-  return value && typeof value === "object" ? value : null;
-}
-
 function readString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function getJobBatchCode(job) {
-  const payload = readRecord(job?.payload);
-  return (
-    readString(payload?.batch_code) ||
-    readString(job?.dispatch_batch) ||
-    readString(job?.task_code) ||
-    readString(job?.job_id) ||
-    null
+const NO_FIX_APPLIED = "NO_FIX_APPLIED";
+
+const TASK_MUTATION_PATTERN =
+  /修复|新增|更新|补齐|建立|修改|改动|创建|写入|补充|fix|repair|add|create|update|modify|patch|implement/i;
+const AUTOMATION_CONTEXT_PATTERN =
+  /Worker|Codex|Hermes|飞书|总管|自动化|worker|route|路由|上报|NO_FIX_APPLIED|git_commit_sha|attempt_id/i;
+const FORBIDDEN_SECTION_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden/i;
+const REQUIRED_FILE_SECTION_PATTERN =
+  /输出文件|目标文件|指定文件|必须修改|要求修改|要求新增|要求创建|需要修改|需要新增|请修改|请新增|修复文件|required files?|output files?|target files?/i;
+const ALLOWED_ONLY_SECTION_PATTERN = /允许修改|只允许修改|allowed files?|editable files?/i;
+const BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
+
+function getJobText(job) {
+  return [
+    readString(job?.title),
+    readString(job?.request_text),
+    readString(job?.prompt),
+    readString(job?.description),
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function taskRequiresFileChanges(requestText) {
+  return TASK_MUTATION_PATTERN.test(String(requestText || ""));
+}
+
+function classifyWorkerTaskDomain(requestText) {
+  const text = String(requestText || "");
+
+  if (/文档整理|整理文档|归档|governance[_ -]?docs/i.test(text)) {
+    return "governance_docs";
+  }
+
+  if (AUTOMATION_CONTEXT_PATTERN.test(text) || /系统修复|系统升级|automation[_ -]?system/i.test(text)) {
+    return "automation_system";
+  }
+
+  if (/测试审核|测试|审核|验收|复测|qa[_ -]?review|QA review|test review/i.test(text)) {
+    return "qa_review";
+  }
+
+  if (/运营|运维|发布|部署|上线|监控|operations?|ops|release|deploy/i.test(text)) {
+    return "operations";
+  }
+
+  return "general";
+}
+
+function isAutomationSystemTask(requestText) {
+  return classifyWorkerTaskDomain(requestText) === "automation_system";
+}
+
+function stripTrailingPunctuation(value) {
+  return String(value || "").replace(/[。；;，,、)）\]】}>"'`]+$/g, "");
+}
+
+function extractPathLikeTokens(line) {
+  const tokens = [];
+  const pathPattern =
+    /(?:^|[\s`"'“”‘’（(：:，,])((?:\.\/)?(?:src|infra|docs|app|pages|lib|components|tests|scripts|public|supabase)\/[A-Za-z0-9._@+\-=()[\]*/?]+(?:\/[A-Za-z0-9._@+\-=()[\]*/?]+)*)/g;
+  let match = pathPattern.exec(line);
+
+  while (match) {
+    tokens.push(stripTrailingPunctuation(match[1]));
+    match = pathPattern.exec(line);
+  }
+
+  return uniqueSortedPaths(tokens);
+}
+
+function extractRequiredChangePaths(requestText) {
+  const lines = String(requestText || "").split(/\r?\n/);
+  const paths = [];
+  let inRequiredSection = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    if (!line) {
+      inRequiredSection = false;
+      continue;
+    }
+
+    if (FORBIDDEN_SECTION_PATTERN.test(line)) {
+      inRequiredSection = false;
+      continue;
+    }
+
+    const isAllowedOnlyLine = ALLOWED_ONLY_SECTION_PATTERN.test(line);
+    const hasRequiredMarker = REQUIRED_FILE_SECTION_PATTERN.test(line) && !isAllowedOnlyLine;
+    const hasMutationInstruction = TASK_MUTATION_PATTERN.test(line) && !isAllowedOnlyLine;
+    const linePaths = extractPathLikeTokens(line);
+
+    if (hasRequiredMarker) {
+      inRequiredSection = true;
+    }
+
+    if (linePaths.length > 0 && (inRequiredSection || hasMutationInstruction)) {
+      paths.push(...linePaths);
+    }
+  }
+
+  return uniqueSortedPaths(paths);
+}
+
+function requestedPathMatchesChangedPath(requestedPath, changedPath) {
+  const requested = normalizeGitPath(requestedPath).replace(/\*+$/g, "").replace(/\/+$/g, "");
+  const changed = normalizeGitPath(changedPath);
+
+  if (!requested || !changed) {
+    return false;
+  }
+
+  return changed === requested || changed.startsWith(`${requested}/`);
+}
+
+function getMissingRequiredChangePaths(requiredPaths, changedPaths) {
+  return uniqueSortedPaths(requiredPaths).filter(
+    (requiredPath) =>
+      !uniqueSortedPaths(changedPaths).some((changedPath) =>
+        requestedPathMatchesChangedPath(requiredPath, changedPath)
+      )
   );
+}
+
+function createNoFixAppliedError(message, details = {}) {
+  const error = new Error(
+    [
+      NO_FIX_APPLIED,
+      message,
+      details.requiredPaths?.length
+        ? `required_paths: ${uniqueSortedPaths(details.requiredPaths).join(", ")}`
+        : null,
+      details.changedPaths?.length
+        ? `changed_paths: ${uniqueSortedPaths(details.changedPaths).join(", ")}`
+        : "changed_paths: none",
+      details.taskDomain ? `task_domain: ${details.taskDomain}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
+
+  error.code = NO_FIX_APPLIED;
+  error.failureStage = "任务目标完成验收";
+  error.requiredPaths = details.requiredPaths || [];
+  error.changedPaths = details.changedPaths || [];
+  error.taskDomain = details.taskDomain || null;
+  return error;
+}
+
+function assertTaskGoalApplied(job, changedPaths) {
+  const requestText = getJobText(job);
+  const taskDomain = classifyWorkerTaskDomain(requestText);
+  const requiredPaths = extractRequiredChangePaths(requestText);
+  const normalizedChangedPaths = uniqueSortedPaths(changedPaths || []);
+
+  if (taskRequiresFileChanges(requestText) && normalizedChangedPaths.length === 0) {
+    throw createNoFixAppliedError(
+      "任务正文要求修复/新增/更新/补齐/建立/修改，但 Codex 没有产生任何文件变更；禁止空跑 succeeded。",
+      {
+        requiredPaths,
+        changedPaths: normalizedChangedPaths,
+        taskDomain,
+      }
+    );
+  }
+
+  const missingRequiredPaths = getMissingRequiredChangePaths(
+    requiredPaths,
+    normalizedChangedPaths
+  );
+
+  if (requiredPaths.length > 0 && missingRequiredPaths.length === requiredPaths.length) {
+    throw createNoFixAppliedError(
+      "任务要求修改指定文件，但 Codex 没有修改任何指定文件；禁止上报 succeeded。",
+      {
+        requiredPaths,
+        changedPaths: normalizedChangedPaths,
+        taskDomain,
+      }
+    );
+  }
+}
+
+function findBatchCodes(text) {
+  return uniqueSortedPaths(String(text || "").match(BATCH_CODE_PATTERN) || []);
+}
+
+function extractRelevantBatchTextFromRequest(requestText) {
+  const lines = String(requestText || "").split(/\r?\n/);
+  const chunks = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+
+    if (!line || FORBIDDEN_SECTION_PATTERN.test(line)) {
+      continue;
+    }
+
+    if (index === 0 && /^新需求[:：]/.test(line)) {
+      chunks.push(line);
+      continue;
+    }
+
+    if (/标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i.test(line)) {
+      chunks.push(line);
+    }
+  }
+
+  return chunks.join("\n");
+}
+
+function extractCurrentExecutionBatchCode(job) {
+  const titleCodes = findBatchCodes(job?.title || "");
+  if (titleCodes.length > 0) {
+    return titleCodes[0];
+  }
+
+  const relevantRequestText = extractRelevantBatchTextFromRequest(
+    `${job?.request_text || ""}\n${job?.prompt || ""}`
+  );
+  const requestCodes = findBatchCodes(relevantRequestText);
+  return requestCodes[0] || null;
+}
+
+function getJobBatchCode(job) {
+  return extractCurrentExecutionBatchCode(job);
 }
 
 const CODEX_GIT_OPERATION_GUARD = [
@@ -361,9 +577,21 @@ const CODEX_GIT_OPERATION_GUARD = [
 
 function buildWorkerGuardedPrompt(requestText) {
   const taskText = String(requestText || "").trim();
+  const taskDomain = classifyWorkerTaskDomain(taskText);
+  const domainGuard = isAutomationSystemTask(taskText)
+    ? [
+        "【自动化系统任务边界】",
+        "task_domain: automation_system",
+        "本任务只验收 Worker / Codex / 飞书总经理 / Hermes / 路由 / 上报链路相关目标。",
+        "不得把同城搭子产品页面、首批城市、首批分类、访客浏览、本地草稿、待审核流程当作完成依据。",
+        "不得读取 docs/NEXT_TASK_CARD.md、docs/PROJECT_INDEX.md 或产品规划文档来替代本次系统修复目标。",
+      ].join("\n")
+    : `【任务分类】\ntask_domain: ${taskDomain}`;
 
   return [
     CODEX_GIT_OPERATION_GUARD,
+    "",
+    domainGuard,
     "",
     "【原始任务内容】",
     taskText,
@@ -430,6 +658,7 @@ function formatPreviewReport(reportResult) {
     ...(routeLines.length ? routeLines : ["- 未执行"]),
     "静态检查：",
     ...(checkLines.length ? checkLines : ["- 未执行"]),
+    reportResult.skipped ? `skipped: ${reportResult.note || "true"}` : "",
     reportResult.reportWriteError ? `warning: 诊断报告写入失败：${reportResult.reportWriteError}` : "",
     reportResult.warning ? `warning: ${reportResult.error || "本地预览诊断失败"}` : "",
   ].join("\n");
@@ -438,6 +667,16 @@ function formatPreviewReport(reportResult) {
 function classifyFailure(error) {
   const errorText = error instanceof Error ? error.message : String(error);
   const lower = errorText.toLowerCase();
+
+  if (error?.code === NO_FIX_APPLIED || errorText.includes(NO_FIX_APPLIED)) {
+    return {
+      stage: "任务目标完成验收",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion:
+        "重新执行对应失败批次的最小修复任务；必须产生任务要求的文件变更，或明确报告阻塞原因，禁止空跑成功。",
+      recommendBossApproval: true,
+    };
+  }
 
   if (error?.code === "GIT_ADD_PATH_RESOLUTION" || lower.includes("pathspec")) {
     return {
@@ -540,6 +779,8 @@ function buildFailureReport(job, error, context = {}) {
     "Codex 任务执行失败",
     `任务编号：${job?.id || "未提供"}`,
     `任务名称：${taskName || "未提供"}`,
+    "Worker 执行状态：已完成本地执行链路并进入结果验收",
+    `任务目标状态：失败（${error?.code || "UNKNOWN_ERROR"}）`,
     `失败阶段：${analysis.stage}`,
     "关键错误：",
     analysis.keyError || "未提供",
@@ -575,6 +816,18 @@ function getPreviewValidationLines(reportResult) {
   }
 
   return lines;
+}
+
+function buildSkippedAutomationPreviewReport() {
+  return {
+    ok: true,
+    skipped: true,
+    removedCaches: [],
+    routeFiles: [],
+    staticChecks: [],
+    note:
+      "automation_system task: skipped city-partner product route checks; product pages are not completion evidence for system repair tasks.",
+  };
 }
 
 function buildGithubPushStatus(pushResult) {
@@ -631,15 +884,17 @@ async function runCodexWithRetries(job) {
 }
 
 async function commitGitTask(job) {
+  const taskChangedEntries = await getTaskChangedEntries();
+  const taskChangedPaths = getStatusPaths(taskChangedEntries);
+  assertTaskGoalApplied(job, taskChangedPaths);
+
   if (!GIT_AUTO_COMMIT) {
     return {
       committed: false,
       message: "Git 自动提交已关闭",
+      filesChanged: taskChangedPaths,
     };
   }
-
-  const taskChangedEntries = await getTaskChangedEntries();
-  const taskChangedPaths = getStatusPaths(taskChangedEntries);
 
   if (taskChangedPaths.length === 0) {
     return {
@@ -654,6 +909,7 @@ async function commitGitTask(job) {
   });
 
   const stagedPaths = await stageTaskPaths(taskChangedPaths, taskChangedEntries);
+  assertTaskGoalApplied(job, stagedPaths);
 
   if (stagedPaths.length === 0) {
     return {
@@ -1189,7 +1445,16 @@ async function pollOnce() {
 
     let previewReport = null;
 
-    if (WORKER_PREVIEW_SMOKE) {
+    if (WORKER_PREVIEW_SMOKE && isAutomationSystemTask(getJobText(job))) {
+      previewReport = buildSkippedAutomationPreviewReport();
+
+      await updateProgress(
+        job.id,
+        70,
+        "跳过产品页面预览诊断",
+        "automation_system 任务不读取同城搭子产品页面作为完成依据"
+      );
+    } else if (WORKER_PREVIEW_SMOKE) {
       await updateProgress(
         job.id,
         70,
@@ -1248,6 +1513,13 @@ async function pollOnce() {
     const finalResult = [
       result,
       "",
+      "Worker / task status:",
+      "Worker execution: succeeded",
+      gitResult.filesChanged?.length
+        ? "Task goal: completed_with_file_changes"
+        : "Task goal: completed_no_file_change_required",
+      `task_domain: ${classifyWorkerTaskDomain(getJobText(job))}`,
+      "",
       formatPreviewReport(previewReport),
       "",
       "Git 自动备份：",
@@ -1288,6 +1560,11 @@ async function pollOnce() {
         files_changed: gitResult.filesChanged || [],
         validation_results: [
           "Codex 执行：通过",
+          "Worker 执行：通过",
+          gitResult.filesChanged?.length
+            ? "任务目标验收：通过（已产生文件变更）"
+            : "任务目标验收：通过（任务不要求文件变更）",
+          `任务分类：${classifyWorkerTaskDomain(getJobText(job))}`,
           ...getPreviewValidationLines(previewReport),
           gitResult.committed
             ? `Git 自动备份：通过（${gitResult.commitSha}）`
@@ -1308,6 +1585,8 @@ async function pollOnce() {
   } catch (error) {
     console.error("任务执行失败：", error);
 
+    const errorCode =
+      error && typeof error === "object" && "code" in error ? error.code : null;
     let rollbackMessage = "";
     let failureChangedPaths = [];
     let currentHead = "未提供";
@@ -1362,9 +1641,12 @@ async function pollOnce() {
         job_created_at: job.created_at || null,
         project_name: "同城搭子网站",
         project_dir: PROJECT_DIR,
+        error_code: errorCode,
         files_changed: failureChangedPaths,
         validation_results: [
+          "Worker 执行：已进入失败上报链路",
           `失败阶段：${classifyFailure(error).stage}`,
+          errorCode ? `错误代码：${errorCode}` : "错误代码：未提供",
           `关键错误：${classifyFailure(error).keyError}`.slice(0, 600),
           `当前 HEAD：${currentHead}`,
           rollbackMessage.trim() || "Git 回滚：未提供",
@@ -1421,12 +1703,17 @@ if (require.main === module) {
 }
 
 module.exports = {
+  NO_FIX_APPLIED,
+  assertTaskGoalApplied,
   assertCleanWorktreeBeforeCodex,
   buildCodexPrompt,
   buildFailureReport,
   buildWorkerGuardedPrompt,
+  classifyWorkerTaskDomain,
   classifyFailure,
   commitGitTask,
+  extractCurrentExecutionBatchCode,
+  extractRequiredChangePaths,
   getTaskChangedPaths,
   main,
   prepareGitTask,
