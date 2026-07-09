@@ -120,3 +120,12 @@
 - Docs write tasks must produce a `docs/**` diff or fail with `NO_FIX_APPLIED`.
 - Tencent Cloud `worker_api.js` scans the full JSON report body before accepting `succeeded`; unfinished task-goal text, `TASK_MODE_MISMATCH`, read-only locks, and known failure codes coerce `effective_final_status=failed`.
 - Tencent Cloud `feishu_gateway_canonical.js` emits `approved_batch`, `task_mode=docs_write_allowed`, `read_only_mode=false`, `allowed_scope=docs/**`, `forbidden_scope`, and `original_request_text` for `BATCH-37-DOCS-*`.
+
+## BATCH-37-DOCS-02 approved docs execution
+
+- Approval source: `总管 批准执行：仅批准 BATCH-37-DOCS-02`.
+- Task classification: `automation_system`; task mode: `docs_write_allowed`; read-only mode: `false`.
+- Allowed scope: `docs/**` only. Forbidden scope remains `src/app/**`, `src/lib/db/mock.ts`, `src/types/db.ts`, env, database, worker, and Tencent Cloud files.
+- Completion requires a real `docs/**` diff. If no documentation change is produced, task-goal validation must fail with `NO_FIX_APPLIED`.
+- Final reporting must separate Worker execution status from task goal status, and must explicitly report `NO_FIX_APPLIED`, `READ_ONLY_MODE_VIOLATION`, read-only violation, empty run, committed, and pushed fields.
+- This batch does not validate city-partner product pages, product batches, first-city/category content, guest browsing, local drafts, or pending-review flows.
