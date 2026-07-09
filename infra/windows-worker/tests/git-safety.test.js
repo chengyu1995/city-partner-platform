@@ -79,6 +79,32 @@ const COMPLETE_QA_REPORT = [
   "下一批建议从哪个 BATCH 开始：建议从 BATCH-QA-04 开始。",
 ].join("\n");
 
+const GROUPED_QA_REPORT = [
+  "当前能直接使用的功能：访客可以进入首页并浏览公开内容。",
+  "当前需要修复的功能：发布后的审核闭环仍需要继续修。",
+  "首页：通过，已静态读取 src/app/page.tsx。",
+  "搭子浏览页：通过，已静态读取 src/app/partners/**。",
+  "发布页：不通过，发布后的流转仍需补齐。",
+  "本地草稿 / 待审核流程：warning，需要继续补端到端验收。",
+  "登录页 / 个人中心 warning：登录页和个人中心存在未完成风险。",
+  "下一步建议：",
+  "开发团队：下一批优先修发布、草稿和待审核流程。",
+  "测试审核团队：补首页、搭子浏览页、发布页和审核流测试。",
+  "运营团队：暂不建议加入，等发布和审核闭环稳定。",
+  "下一批建议从哪个 BATCH 开始：建议从 BATCH-QA-04 后续修复批次开始。",
+].join("\n");
+
+const QA_REPORT_WITHOUT_TEAM_RECOMMENDATIONS = [
+  "当前能直接使用的功能：访客可以进入首页并浏览公开内容。",
+  "当前需要修复的功能：发布后的审核闭环仍需要继续修。",
+  "首页：通过，已静态读取 src/app/page.tsx。",
+  "搭子浏览页：通过，已静态读取 src/app/partners/**。",
+  "发布页：不通过，发布后的流转仍需补齐。",
+  "本地草稿 / 待审核流程：warning，需要继续补端到端验收。",
+  "登录页 / 个人中心 warning：登录页和个人中心存在未完成风险。",
+  "下一批建议从哪个 BATCH 开始：建议从 BATCH-QA-04 后续修复批次开始。",
+].join("\n");
+
 function joinedName(...parts) {
   return parts.join("_");
 }
@@ -398,6 +424,33 @@ test("read_only_mode task lock", async (t) => {
     );
     assert.throws(
       () => assertQaTaskOutcome(qaJob, ["src/app/page.tsx"], COMPLETE_QA_REPORT),
+      (error) => error.code === READ_ONLY_MODE_VIOLATION
+    );
+  });
+
+  await t.test("BATCH-QA accepts grouped next-step headings but still fails missing team guidance", () => {
+    const qaJob = {
+      request_text: [
+        "BATCH-QA-04",
+        "project_domain=qa_review",
+        "task_mode=read_only",
+        "read_only_mode=true",
+      ].join("\n"),
+    };
+
+    assert.equal(classifyWorkerTaskDomain(qaJob.request_text), "qa_review");
+    assert.equal(getTaskMode(qaJob), TASK_MODES.READ_ONLY);
+    assert.doesNotThrow(() => assertQaTaskOutcome(qaJob, [], GROUPED_QA_REPORT));
+    assert.throws(
+      () => assertQaTaskOutcome(qaJob, [], QA_REPORT_WITHOUT_TEAM_RECOMMENDATIONS),
+      (error) =>
+        error.code === INCOMPLETE_QA_REPORT &&
+        error.message.includes("开发团队下一步建议") &&
+        error.message.includes("测试审核团队下一步建议") &&
+        error.message.includes("运营团队是否可以加入")
+    );
+    assert.throws(
+      () => assertQaTaskOutcome(qaJob, ["docs/TROUBLESHOOTING.md"], GROUPED_QA_REPORT),
       (error) => error.code === READ_ONLY_MODE_VIOLATION
     );
   });

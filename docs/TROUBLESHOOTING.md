@@ -80,6 +80,7 @@ Known fingerprints:
 - `PATH_PARSE_FIRST_CHAR_LOSS`: `git status` path parsing lost the first character.
 - `FALSE_SUCCEEDED`: task goal was incomplete but reported `succeeded`.
 - `INCOMPLETE_QA_REPORT`: `BATCH-QA-*` returned only status/diff or missed required QA report sections.
+- `QA_REPORT_FIELD_MATCH_TOO_STRICT`: QA report content was present, but field matching was too strict and caused `INCOMPLETE_QA_REPORT`.
 
 Escalation:
 

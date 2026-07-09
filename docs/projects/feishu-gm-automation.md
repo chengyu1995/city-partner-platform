@@ -120,6 +120,7 @@
 - QA tasks still may not modify any file, run `git add`, `git commit`, `git push`, start a dev server, touch database/env files, or deploy.
 - A successful QA task must include a full report with usable features, features needing fixes, homepage acceptance, partners page acceptance, post page acceptance, draft/review flow acceptance, login/profile warnings, development next steps, QA next steps, operations readiness, and the recommended next batch.
 - If the QA report is missing any required field, the Worker fails the task with `INCOMPLETE_QA_REPORT`. A no-diff complete QA report succeeds and must not trigger `NO_FIX_APPLIED`.
+- QA report field matching accepts semantic equivalents and grouped headings. For example, `开发团队：`, `测试审核团队：`, and `运营团队：暂不建议加入` satisfy the corresponding next-step and operations-readiness sections.
 
 ## BATCH-GM-STABILIZE-03 docs task priority and cloud terminal guard
 

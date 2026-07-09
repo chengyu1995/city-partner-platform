@@ -393,52 +393,52 @@ const QA_REPORT_REQUIRED_FIELDS = [
   {
     key: "currently_usable_features",
     label: "当前能直接用的功能",
-    pattern: /当前能直接用的功能|能直接用的功能|currently usable features/i,
+    pattern: /当前能直接(?:用|使用)的功能|能直接(?:用|使用)的功能|currently usable features/i,
   },
   {
     key: "features_needing_fixes",
     label: "当前需要修的功能",
-    pattern: /当前需要修的功能|需要修的功能|features needing fixes/i,
+    pattern: /当前需要(?:修|修复)的功能|需要(?:修|修复)的功能|features needing fixes/i,
   },
   {
     key: "home_page_acceptance",
     label: "首页验收结论",
-    pattern: /首页验收结论|首页.*验收|home page acceptance/i,
+    pattern: /首页验收结论|首页.*验收|首页\s*[:：]\s*(?:通过|不通过|warning|需修复)|home page acceptance/i,
   },
   {
     key: "partners_page_acceptance",
     label: "搭子浏览页验收结论",
-    pattern: /搭子浏览页验收结论|搭子浏览页.*验收|partners page acceptance/i,
+    pattern: /搭子浏览页验收结论|搭子浏览页.*验收|搭子浏览页\s*[:：]\s*(?:通过|不通过|warning|需修复)|partners page acceptance/i,
   },
   {
     key: "post_page_acceptance",
     label: "发布页验收结论",
-    pattern: /发布页验收结论|发布页.*验收|post page acceptance/i,
+    pattern: /发布页验收结论|发布页.*验收|发布页\s*[:：]\s*(?:通过|不通过|warning|需修复)|post page acceptance/i,
   },
   {
     key: "draft_review_flow_acceptance",
     label: "本地草稿 / 待审核流程验收结论",
-    pattern: /本地草稿\s*\/?\s*待审核流程验收结论|本地草稿.*待审核.*验收|draft.*review.*acceptance/i,
+    pattern: /本地草稿\s*\/?\s*待审核流程验收结论|本地草稿\s*\/?\s*待审核流程\s*[:：]|本地草稿.*待审核.*验收|draft.*review.*acceptance/i,
   },
   {
     key: "login_profile_warning",
     label: "登录页和个人中心 warning 说明",
-    pattern: /登录页和个人中心\s*warning\s*说明|登录页.*个人中心.*warning|login.*profile.*warning/i,
+    pattern: /登录页和个人中心\s*warning\s*说明|登录页\s*\/\s*个人中心\s*warning|登录页.*个人中心.*warning|login.*profile.*warning/i,
   },
   {
     key: "dev_team_next_steps",
     label: "开发团队下一步建议",
-    pattern: /开发团队下一步建议|开发团队.*下一步|dev team next steps/i,
+    pattern: /开发团队下一步建议|开发团队\s*[:：]|下一步建议[\s\S]*开发团队\s*[:：]|dev team next steps/i,
   },
   {
     key: "qa_team_next_steps",
     label: "测试审核团队下一步建议",
-    pattern: /测试审核团队下一步建议|测试.*审核.*下一步|qa team next steps/i,
+    pattern: /测试审核团队下一步建议|测试审核团队\s*[:：]|测试.*审核.*下一步|下一步建议[\s\S]*测试审核团队\s*[:：]|qa team next steps/i,
   },
   {
     key: "operations_team_join",
     label: "运营团队是否可以加入",
-    pattern: /运营团队是否可以加入|运营团队.*可以加入|operations team.*join/i,
+    pattern: /运营团队是否可以加入|运营团队\s*[:：]\s*(?:暂不建议加入|可以加入|不建议加入|建议加入)|运营团队.*可以加入|operations team.*join/i,
   },
   {
     key: "next_batch_recommendation",
@@ -486,6 +486,8 @@ const FAILURE_FINGERPRINTS = {
     "git status path lost its first character.",
   FALSE_SUCCEEDED:
     "Task goal was incomplete but reported succeeded.",
+  QA_REPORT_FIELD_MATCH_TOO_STRICT:
+    "QA report content was present, but field matching was too strict and caused INCOMPLETE_QA_REPORT.",
 };
 
 function getJobText(job) {
