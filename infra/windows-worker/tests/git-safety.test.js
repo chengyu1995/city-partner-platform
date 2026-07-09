@@ -210,6 +210,18 @@ test("Git short status fallback parsing", async (t) => {
 });
 
 test("automation system task boundaries", async (t) => {
+  await t.test("detects BATCH-41 and explicit automation_system domain", () => {
+    assert.equal(
+      isAutomationSystemTaskText(
+        [
+          "task_domain: automation_system",
+          "Current execution batch: BATCH-41",
+        ].join("\n")
+      ),
+      true
+    );
+  });
+
   await t.test("detects BATCH-30 worker repair tasks", () => {
     assert.equal(
       isAutomationSystemTaskText("执行 BATCH-30：修复 Windows Worker / Codex 上报链路"),
@@ -240,6 +252,22 @@ test("automation system task boundaries", async (t) => {
       (error) =>
         error.code === "BUSINESS_PAGE_BOUNDARY_VIOLATION" &&
         error.message.includes("src/app/post/page.tsx")
+    );
+  });
+
+  await t.test("blocks business page changes for BATCH-41 automation_system tasks", () => {
+    assert.throws(
+      () =>
+        validateAutomationTaskBoundaries(["src/app/partners/page.tsx"], {
+          requestText: [
+            "task_domain: automation_system",
+            "Current execution batch: BATCH-41",
+            "Forbidden scope: do not execute BATCH-P3 or BATCH-P4 product work",
+          ].join("\n"),
+        }),
+      (error) =>
+        error.code === "BUSINESS_PAGE_BOUNDARY_VIOLATION" &&
+        error.message.includes("src/app/partners/page.tsx")
     );
   });
 
@@ -436,6 +464,23 @@ test("batch extraction and automation routing guards", async (t) => {
         ].join("\n"),
       }),
       "BATCH-39"
+    );
+  });
+
+  await t.test("extracts BATCH-41 from approved execution and ignores forbidden product batches", () => {
+    assert.equal(
+      extractCurrentExecutionBatchCode({
+        title: "",
+        request_text: [
+          "Title: execute approved project director batch BATCH-41",
+          "Repair target: fix Worker / Codex / route / report chain only",
+          "Forbidden scope:",
+          "- Current batch BATCH-P3 product development task",
+          "- Current batch BATCH-P4 product development task",
+          "Boss approval: approved execution only BATCH-41",
+        ].join("\n"),
+      }),
+      "BATCH-41"
     );
   });
 
