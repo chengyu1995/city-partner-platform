@@ -121,6 +121,8 @@
 - A successful QA task must include a full report with usable features, features needing fixes, homepage acceptance, partners page acceptance, post page acceptance, draft/review flow acceptance, login/profile warnings, development next steps, QA next steps, operations readiness, and the recommended next batch.
 - If the QA report is missing any required field, the Worker fails the task with `INCOMPLETE_QA_REPORT`. A no-diff complete QA report succeeds and must not trigger `NO_FIX_APPLIED`.
 - QA report field matching accepts semantic equivalents and grouped headings. For example, `开发团队：`, `测试审核团队：`, and `运营团队：暂不建议加入` satisfy the corresponding next-step and operations-readiness sections.
+- To avoid natural-language matching drift, QA reports must end with `QA_REPORT_FIELDS` machine fields: `current_usable_features`, `current_fix_needed`, `homepage_verdict`, `partners_verdict`, `post_verdict`, `local_draft_review_verdict`, `login_profile_warning`, `dev_team_next_step`, `qa_team_next_step`, `ops_team_join`, and `next_batch`.
+- When `QA_REPORT_FIELDS` is present, the Worker validates those structured fields first. Natural-language semantic matching is only a fallback for older reports without the machine field block.
 
 ## BATCH-GM-STABILIZE-03 docs task priority and cloud terminal guard
 

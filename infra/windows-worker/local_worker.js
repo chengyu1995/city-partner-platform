@@ -446,6 +446,63 @@ const QA_REPORT_REQUIRED_FIELDS = [
     pattern: /下一批建议从哪个\s*BATCH\s*开始|下一批建议.*BATCH|next batch/i,
   },
 ];
+const QA_REPORT_MACHINE_FIELDS = [
+  {
+    key: "current_usable_features",
+    label: "current_usable_features",
+    pattern: /^(yes|no)$/i,
+  },
+  {
+    key: "current_fix_needed",
+    label: "current_fix_needed",
+    pattern: /^(yes|no)$/i,
+  },
+  {
+    key: "homepage_verdict",
+    label: "homepage_verdict",
+    pattern: /^(pass|fail|warning)$/i,
+  },
+  {
+    key: "partners_verdict",
+    label: "partners_verdict",
+    pattern: /^(pass|fail|warning)$/i,
+  },
+  {
+    key: "post_verdict",
+    label: "post_verdict",
+    pattern: /^(pass|fail|warning)$/i,
+  },
+  {
+    key: "local_draft_review_verdict",
+    label: "local_draft_review_verdict",
+    pattern: /^(pass|fail|warning)$/i,
+  },
+  {
+    key: "login_profile_warning",
+    label: "login_profile_warning",
+    pattern: /^(yes|no)$/i,
+  },
+  {
+    key: "dev_team_next_step",
+    label: "dev_team_next_step",
+    pattern: /^(yes|no)$/i,
+  },
+  {
+    key: "qa_team_next_step",
+    label: "qa_team_next_step",
+    pattern: /^(yes|no)$/i,
+  },
+  {
+    key: "ops_team_join",
+    label: "ops_team_join",
+    pattern: /^(yes|no)$/i,
+  },
+  {
+    key: "next_batch",
+    label: "next_batch",
+    pattern: /^BATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*$/i,
+  },
+];
 const AUTOMATION_WRITE_ALLOWED_PATHS = [
   "infra/windows-worker",
   "src/lib/worker-jobs.ts",
@@ -488,6 +545,8 @@ const FAILURE_FINGERPRINTS = {
     "Task goal was incomplete but reported succeeded.",
   QA_REPORT_FIELD_MATCH_TOO_STRICT:
     "QA report content was present, but field matching was too strict and caused INCOMPLETE_QA_REPORT.",
+  QA_REPORT_NATURAL_LANGUAGE_MATCH_UNSTABLE:
+    "QA report natural language was complete but unstable to match; prefer QA_REPORT_FIELDS.",
 };
 
 function getJobText(job) {
@@ -1068,7 +1127,45 @@ function createReadOnlyModeViolationError(changedPaths) {
   return error;
 }
 
+function parseQaReportFields(reportText) {
+  const lines = String(reportText || "").split(/\r?\n/);
+  const markerIndex = lines.findIndex((line) =>
+    /^\s*QA_REPORT_FIELDS\s*:\s*$/i.test(line)
+  );
+
+  if (markerIndex < 0) {
+    return null;
+  }
+
+  const fields = new Map();
+  for (const line of lines.slice(markerIndex + 1)) {
+    const match = line.match(/^\s*([a-z_]+)\s*:\s*(\S.*?)\s*$/i);
+    if (!match) {
+      continue;
+    }
+
+    const key = match[1].toLowerCase();
+    if (QA_REPORT_MACHINE_FIELDS.some((field) => field.key === key)) {
+      fields.set(key, match[2].trim());
+    }
+  }
+
+  return fields;
+}
+
+function getMissingMachineQaReportFields(fields) {
+  return QA_REPORT_MACHINE_FIELDS.filter((field) => {
+    const value = fields?.get(field.key);
+    return !value || !field.pattern.test(value);
+  });
+}
+
 function getMissingQaReportFields(reportText) {
+  const machineFields = parseQaReportFields(reportText);
+  if (machineFields) {
+    return getMissingMachineQaReportFields(machineFields);
+  }
+
   const text = String(reportText || "");
   return QA_REPORT_REQUIRED_FIELDS.filter((field) => !field.pattern.test(text));
 }
@@ -1473,6 +1570,19 @@ function buildQaReviewGuard(taskText) {
     "必须静态读取首页、搭子浏览页、发布页、登录页、个人中心、mock 数据、类型定义和 docs 文档后再输出 QA 报告。",
     "禁止修改任何文件，禁止 apply_patch，禁止 git add/commit/push，禁止 npm run dev / next dev，禁止数据库、环境变量和部署操作。",
     "QA 报告必须包含：当前能直接用的功能、当前需要修的功能、首页验收结论、搭子浏览页验收结论、发布页验收结论、本地草稿 / 待审核流程验收结论、登录页和个人中心 warning 说明、开发团队下一步建议、测试审核团队下一步建议、运营团队是否可以加入、下一批建议从哪个 BATCH 开始。",
+    "报告末尾必须输出固定机器字段：",
+    "QA_REPORT_FIELDS:",
+    "current_usable_features: yes/no",
+    "current_fix_needed: yes/no",
+    "homepage_verdict: pass/fail/warning",
+    "partners_verdict: pass/fail/warning",
+    "post_verdict: pass/fail/warning",
+    "local_draft_review_verdict: pass/fail/warning",
+    "login_profile_warning: yes/no",
+    "dev_team_next_step: yes/no",
+    "qa_team_next_step: yes/no",
+    "ops_team_join: yes/no",
+    "next_batch: BATCH-xxx",
     `failure_code_if_incomplete: ${INCOMPLETE_QA_REPORT}`,
   ].join("\n");
 }

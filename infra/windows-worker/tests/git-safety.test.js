@@ -105,6 +105,47 @@ const QA_REPORT_WITHOUT_TEAM_RECOMMENDATIONS = [
   "下一批建议从哪个 BATCH 开始：建议从 BATCH-QA-04 后续修复批次开始。",
 ].join("\n");
 
+const STRUCTURED_QA_REPORT = [
+  "页面验收结论",
+  "- 首页：通过",
+  "- 搭子浏览页：通过",
+  "- 发布页：warning",
+  "下一步建议",
+  "- 开发团队：继续修发布和审核闭环。",
+  "- 测试审核团队：补全静态和流程验收。",
+  "- 运营团队：暂不建议加入。",
+  "QA_REPORT_FIELDS:",
+  "current_usable_features: yes",
+  "current_fix_needed: yes",
+  "homepage_verdict: pass",
+  "partners_verdict: pass",
+  "post_verdict: warning",
+  "local_draft_review_verdict: warning",
+  "login_profile_warning: yes",
+  "dev_team_next_step: yes",
+  "qa_team_next_step: yes",
+  "ops_team_join: no",
+  "next_batch: BATCH-QA-05",
+].join("\n");
+
+const STRUCTURED_QA_REPORT_MISSING_NEXT_BATCH = [
+  "页面验收结论",
+  "- 首页：通过",
+  "- 搭子浏览页：通过",
+  "- 发布页：warning",
+  "QA_REPORT_FIELDS:",
+  "current_usable_features: yes",
+  "current_fix_needed: yes",
+  "homepage_verdict: pass",
+  "partners_verdict: pass",
+  "post_verdict: warning",
+  "local_draft_review_verdict: warning",
+  "login_profile_warning: yes",
+  "dev_team_next_step: yes",
+  "qa_team_next_step: yes",
+  "ops_team_join: no",
+].join("\n");
+
 function joinedName(...parts) {
   return parts.join("_");
 }
@@ -414,6 +455,8 @@ test("read_only_mode task lock", async (t) => {
     assert.match(prompt, /src\/app\/partners\/\*\*/);
     assert.match(prompt, /docs\/\*\*/);
     assert.match(prompt, /INCOMPLETE_QA_REPORT/);
+    assert.match(prompt, /QA_REPORT_FIELDS:/);
+    assert.match(prompt, /next_batch: BATCH-xxx/);
     assert.doesNotThrow(() => assertTaskGoalApplied(qaJob, []));
     assert.doesNotThrow(() => assertQaTaskOutcome(qaJob, [], COMPLETE_QA_REPORT));
     assert.throws(
@@ -451,6 +494,31 @@ test("read_only_mode task lock", async (t) => {
     );
     assert.throws(
       () => assertQaTaskOutcome(qaJob, ["docs/TROUBLESHOOTING.md"], GROUPED_QA_REPORT),
+      (error) => error.code === READ_ONLY_MODE_VIOLATION
+    );
+  });
+
+  await t.test("BATCH-QA prefers complete QA_REPORT_FIELDS and fails missing machine fields", () => {
+    const qaJob = {
+      request_text: [
+        "BATCH-QA-05",
+        "project_domain=qa_review",
+        "task_mode=read_only",
+        "read_only_mode=true",
+      ].join("\n"),
+    };
+
+    assert.equal(classifyWorkerTaskDomain(qaJob.request_text), "qa_review");
+    assert.equal(getTaskMode(qaJob), TASK_MODES.READ_ONLY);
+    assert.doesNotThrow(() => assertQaTaskOutcome(qaJob, [], STRUCTURED_QA_REPORT));
+    assert.throws(
+      () => assertQaTaskOutcome(qaJob, [], STRUCTURED_QA_REPORT_MISSING_NEXT_BATCH),
+      (error) =>
+        error.code === INCOMPLETE_QA_REPORT &&
+        error.message.includes("next_batch")
+    );
+    assert.throws(
+      () => assertQaTaskOutcome(qaJob, ["docs/TROUBLESHOOTING.md"], STRUCTURED_QA_REPORT),
       (error) => error.code === READ_ONLY_MODE_VIOLATION
     );
   });
