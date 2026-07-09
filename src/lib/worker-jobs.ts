@@ -43,11 +43,12 @@ const TASK_MODES = {
   PRODUCT_WRITE_ALLOWED: "product_write_allowed",
 } as const;
 const DOCS_WRITE_TASK_PATTERN =
-  /BATCH-37-FIX|docs_write_allowed|governance[_ -]?docs|文档整理|整理文档|归档|docs\/|文档/i;
+  /\bBATCH-37-FIX\b|docs_write_allowed/i;
+const DOCS_WRITE_TARGET_PATTERN = /\bdocs\//i;
 const AUTOMATION_WRITE_TASK_PATTERN =
-  /BATCH-44|BATCH-45A|automation_system_write_allowed|Worker|Codex|Hermes|飞书|总管|自动化|worker|worker_api|feishu_gateway|route|路由|上报|NO_FIX_APPLIED|READ_ONLY_MODE_VIOLATION|git_commit_sha|attempt_id/i;
-const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b/i;
-const WORKER_BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
+  /\bBATCH-44\b|\bBATCH-45A\b|automation_system_write_allowed|Worker|Windows Worker|Gateway|worker-api|worker_api|feishu_gateway|project-director|project director|project-director-console|worker-jobs|local_worker|git-safety/i;
+const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
+const WORKER_BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
 const WORKER_BATCH_RELEVANT_LINE_PATTERN =
   /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
 const WORKER_BATCH_FORBIDDEN_FRAGMENT_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden|不执行/i;
@@ -406,14 +407,19 @@ function inferTaskMode(input: {
   submitted?: unknown;
 }): string {
   const text = [input.demand, input.batchCode].filter(Boolean).join("\n");
-  if (DOCS_WRITE_TASK_PATTERN.test(text)) return TASK_MODES.DOCS_WRITE_ALLOWED;
+  if (READ_ONLY_BATCH_PATTERN.test(text) || taskDeclaresReadOnly(text)) return TASK_MODES.READ_ONLY;
+  if (
+    DOCS_WRITE_TASK_PATTERN.test(text) ||
+    (DOCS_WRITE_TARGET_PATTERN.test(text) && TASK_MUTATION_PATTERN.test(text))
+  ) {
+    return TASK_MODES.DOCS_WRITE_ALLOWED;
+  }
   if (
     /BATCH-44|BATCH-45A|automation_system_write_allowed/i.test(text) ||
     (AUTOMATION_WRITE_TASK_PATTERN.test(text) && TASK_MUTATION_PATTERN.test(text))
   ) {
     return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
   }
-  if (READ_ONLY_BATCH_PATTERN.test(text) || taskDeclaresReadOnly(text)) return TASK_MODES.READ_ONLY;
   if (input.batchCode && /^BATCH-P\d+$/i.test(input.batchCode)) return TASK_MODES.PRODUCT_WRITE_ALLOWED;
 
   const submittedMode = readTaskModeField(
@@ -437,7 +443,7 @@ function inferTaskMode(input: {
     return TASK_MODES.READ_ONLY;
   }
 
-  return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
+  return TASK_MODES.READ_ONLY;
 }
 
 function reportTextHasNoFixApplied(value: string): boolean {

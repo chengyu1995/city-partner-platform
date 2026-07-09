@@ -104,3 +104,11 @@
 - Tencent Cloud `worker_api.js` recomputes `effective_final_status` from the report payload instead of trusting `body.status=succeeded`.
 - Tencent Cloud `feishu_gateway_canonical.js` preserves `original_request_text`, `approved_batch`, `task_mode`, `read_only_mode`, `allowed_scope`, `forbidden_scope`, `task_goal`, and `project_domain` in Worker request text.
 - Tencent Cloud backups for this stabilization: `worker_api.js.bak.gm-stabilize-20260709163919`, `feishu_gateway_canonical.js.bak.gm-stabilize-20260709163919`.
+
+## BATCH-GM-STABILIZE-02 smoke-test mode guard
+
+- `BATCH-GM-SMOKE-*` is always `read_only`; it is a final validation smoke test and may not write files.
+- `docs_write_allowed` is limited to `BATCH-37-FIX`, explicit `docs_write_allowed`, or mutation requests that name a `docs/` path.
+- `automation_system_write_allowed` is limited to explicit Worker, Gateway, worker-api, project-director, worker-jobs, local_worker, or git-safety repair tasks.
+- When task-mode inference cannot resolve a write mode, the Worker conservatively falls back to `read_only`.
+- `pollOnce` reports use the scoped `taskModeForReport` value so success and failure report paths cannot throw `taskMode is not defined`.

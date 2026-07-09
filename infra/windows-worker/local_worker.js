@@ -338,12 +338,13 @@ const READ_ONLY_POLICY_IMPLEMENTATION_PATTERN =
 const AUTOMATION_CONTEXT_PATTERN =
   /Worker|Codex|Hermes|飞书|总管|自动化|worker|worker_api|feishu_gateway|route|路由|上报|NO_FIX_APPLIED|READ_ONLY_MODE_VIOLATION|git_commit_sha|attempt_id/i;
 const DOCS_WRITE_TASK_PATTERN =
-  /BATCH-37-FIX|docs_write_allowed|governance[_ -]?docs|文档整理|整理文档|归档|docs\/|文档/i;
+  /\bBATCH-37-FIX\b|docs_write_allowed/i;
+const DOCS_WRITE_TARGET_PATTERN = /\bdocs\//i;
 const AUTOMATION_WRITE_TASK_PATTERN =
-  /BATCH-44|BATCH-45A|automation_system_write_allowed|Worker|Codex|Hermes|飞书|总管|自动化|worker|worker_api|feishu_gateway|route|路由|上报|NO_FIX_APPLIED|READ_ONLY_MODE_VIOLATION|git_commit_sha|attempt_id/i;
+  /\bBATCH-44\b|\bBATCH-45A\b|automation_system_write_allowed|Worker|Windows Worker|Gateway|worker-api|worker_api|feishu_gateway|project-director|project director|project-director-console|worker-jobs|local_worker|git-safety/i;
 const PRODUCT_WRITE_TASK_PATTERN =
   /product_write_allowed|产品开发|业务页面开发|同城搭子.*(?:页面|产品|业务)/i;
-const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b/i;
+const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const FORBIDDEN_SECTION_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden/i;
 const BATCH_RELEVANT_LINE_PATTERN =
   /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
@@ -355,7 +356,7 @@ const BATCH_FORBIDDEN_SECTION_EXIT_PATTERN =
 const REQUIRED_FILE_SECTION_PATTERN =
   /输出文件|目标文件|指定文件|必须修改|要求修改|要求新增|要求创建|需要修改|需要新增|请修改|请新增|修复文件|required files?|output files?|target files?/i;
 const ALLOWED_ONLY_SECTION_PATTERN = /允许修改|只允许修改|allowed files?|editable files?/i;
-const BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
+const BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
 const DOCS_WRITE_ALLOWED_PREFIXES = ["docs/"];
 const AUTOMATION_WRITE_ALLOWED_PATHS = [
   "infra/windows-worker",
@@ -495,19 +496,22 @@ function getTaskModeFromText(text) {
   const raw = String(text || "");
   const batchCode = extractCurrentExecutionBatchCode({ request_text: raw });
 
-  if (DOCS_WRITE_TASK_PATTERN.test(raw)) {
+  if (READ_ONLY_BATCH_PATTERN.test(raw) || isReadOnlyTaskText(raw)) {
+    return TASK_MODES.READ_ONLY;
+  }
+
+  if (
+    DOCS_WRITE_TASK_PATTERN.test(raw) ||
+    (DOCS_WRITE_TARGET_PATTERN.test(raw) && TASK_MUTATION_PATTERN.test(raw))
+  ) {
     return TASK_MODES.DOCS_WRITE_ALLOWED;
   }
 
   if (
     /BATCH-44|BATCH-45A|automation_system_write_allowed/i.test(raw) ||
-    (AUTOMATION_CONTEXT_PATTERN.test(raw) && TASK_MUTATION_PATTERN.test(raw))
+    (AUTOMATION_WRITE_TASK_PATTERN.test(raw) && TASK_MUTATION_PATTERN.test(raw))
   ) {
     return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
-  }
-
-  if (READ_ONLY_BATCH_PATTERN.test(raw) || isReadOnlyTaskText(raw)) {
-    return TASK_MODES.READ_ONLY;
   }
 
   if (
@@ -545,25 +549,29 @@ function readTaskModeField(job) {
 }
 
 function getTaskMode(job) {
-  const text = getJobText(job);
-  const textMode = getTaskModeFromText(text);
+  try {
+    const text = getJobText(job);
+    const textMode = getTaskModeFromText(text);
 
-  if (textMode !== TASK_MODES.READ_ONLY) {
-    if (textMode) {
-      return textMode;
+    if (textMode !== TASK_MODES.READ_ONLY) {
+      if (textMode) {
+        return textMode;
+      }
     }
-  }
 
-  const explicitMode = readTaskModeField(job);
-  if (explicitMode) {
-    return explicitMode;
-  }
+    const explicitMode = readTaskModeField(job);
+    if (explicitMode) {
+      return explicitMode;
+    }
 
-  if (hasReadOnlyField(job)) {
+    if (hasReadOnlyField(job)) {
+      return TASK_MODES.READ_ONLY;
+    }
+
+    return textMode || TASK_MODES.READ_ONLY;
+  } catch (_) {
     return TASK_MODES.READ_ONLY;
   }
-
-  return textMode || TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
 }
 
 function createOutOfScopeBusinessChangeError(message, details = {}) {
@@ -1057,7 +1065,7 @@ function buildReadOnlyGuard(taskText, options = {}) {
 function buildWorkerGuardedPrompt(requestText, options = {}) {
   const taskText = String(requestText || "").trim();
   const taskDomain = classifyWorkerTaskDomain(taskText);
-  const taskMode = options.taskMode || getTaskModeFromText(taskText) || TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
+  const taskMode = options.taskMode || getTaskModeFromText(taskText) || TASK_MODES.READ_ONLY;
   const readOnlyGuard = buildReadOnlyGuard(taskText, {
     force: options.readOnlyMode === true || taskMode === TASK_MODES.READ_ONLY,
   });
@@ -1973,7 +1981,8 @@ async function pollOnce() {
   );
   console.log(`任务内容：${job.request_text}`);
 
-  const readOnlyMode = isReadOnlyTask(job);
+  const taskModeForReport = getTaskMode(job);
+  const readOnlyMode = taskModeForReport === TASK_MODES.READ_ONLY;
   currentReadOnlyMode = readOnlyMode;
   const stopHeartbeat = startHeartbeat(job.id, attemptId);
   let gitCheckpoint = null;
@@ -2165,7 +2174,7 @@ async function pollOnce() {
         ? "Task goal status: completed_with_file_changes"
         : "Task goal status: completed_no_file_change_required",
       `task_domain: ${classifyWorkerTaskDomain(getJobText(job))}`,
-      `task_mode: ${taskMode}`,
+      `task_mode: ${taskModeForReport}`,
       `read_only_mode: ${readOnlyMode ? "true" : "false"}`,
       "original_worker_status: succeeded",
       "effective_final_status: succeeded",
@@ -2233,7 +2242,7 @@ async function pollOnce() {
             ? "Task goal status: completed_with_file_changes"
             : "Task goal status: completed_no_file_change_required",
           `任务分类：${classifyWorkerTaskDomain(getJobText(job))}`,
-          `task_mode: ${taskMode}`,
+          `task_mode: ${taskModeForReport}`,
           `read_only_mode：${readOnlyMode ? "true" : "false"}`,
           "original_worker_status: succeeded",
           "effective_final_status: succeeded",
@@ -2261,7 +2270,7 @@ async function pollOnce() {
         ],
         github_push_status: buildGithubPushStatus(pushResult),
         read_only_mode: readOnlyMode,
-        task_mode: taskMode,
+        task_mode: taskModeForReport,
         original_worker_status: "succeeded",
         effective_final_status: "succeeded",
         no_fix_applied: false,
@@ -2337,7 +2346,7 @@ async function pollOnce() {
         error_code: errorCode,
         files_changed: failureChangedPaths,
         read_only_mode: readOnlyMode,
-        task_mode: taskMode,
+        task_mode: taskModeForReport,
         original_worker_status: "failed",
         effective_final_status: "failed",
         no_fix_applied: errorCode === NO_FIX_APPLIED,
@@ -2369,7 +2378,7 @@ async function pollOnce() {
           }`,
           `失败阶段：${classifyFailure(error).stage}`,
           errorCode ? `错误代码：${errorCode}` : "错误代码：未提供",
-          `task_mode: ${taskMode}`,
+          `task_mode: ${taskModeForReport}`,
           `read_only_mode：${readOnlyMode ? "true" : "false"}`,
           "original_worker_status: failed",
           "effective_final_status: failed",

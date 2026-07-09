@@ -344,6 +344,29 @@ test("NO_FIX_APPLIED task goal validation", async (t) => {
 });
 
 test("read_only_mode task lock", async (t) => {
+  await t.test("BATCH-GM-SMOKE is read-only and never docs_write_allowed", () => {
+    const smokeJob = {
+      request_text: [
+        "BATCH-GM-SMOKE-01 final validation smoke test.",
+        "read_only_mode=true.",
+        "Verify docs/projects/feishu-gm-automation.md and Worker/Gateway status only.",
+        "Do not modify any files. Do not run git add, git commit, or git push.",
+      ].join("\n"),
+    };
+
+    assert.equal(getTaskMode(smokeJob), TASK_MODES.READ_ONLY);
+    assert.equal(isReadOnlyTask(smokeJob), true);
+    assert.doesNotThrow(() => assertTaskGoalApplied(smokeJob, []));
+    assert.throws(
+      () => assertTaskGoalApplied(smokeJob, ["docs/projects/feishu-gm-automation.md"]),
+      (error) => error.code === READ_ONLY_MODE_VIOLATION
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(smokeJob, ["infra/windows-worker/local_worker.js"]),
+      (error) => error.code === READ_ONLY_MODE_VIOLATION
+    );
+  });
+
   await t.test("task_mode prevents docs and automation tasks from being misread as read-only", () => {
     const docsJob = {
       request_text: "BATCH-37-FIX 文档整理：更新 docs/projects/team-routing.md，只允许 docs/**。",
@@ -361,6 +384,12 @@ test("read_only_mode task lock", async (t) => {
     assert.equal(isReadOnlyTask(docsJob), false);
     assert.equal(getTaskMode(automationJob), TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
     assert.equal(isReadOnlyTask(automationJob), false);
+    assert.equal(
+      getTaskMode({
+        request_text: "BATCH-45A fix Worker / Gateway / worker-api final reporting.",
+      }),
+      TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED
+    );
     assert.equal(getTaskMode(readOnlyJob), TASK_MODES.READ_ONLY);
     assert.equal(isReadOnlyTask(readOnlyJob), true);
   });
@@ -399,6 +428,24 @@ test("read_only_mode task lock", async (t) => {
       () => assertTaskGoalApplied(job, ["src/app/partners/page.tsx"]),
       (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
     );
+  });
+
+  await t.test("failure report paths do not reference an undefined taskMode", () => {
+    const job = {
+      request_text: "BATCH-GM-SMOKE-01 read_only_mode=true final smoke validation.",
+    };
+    const error = Object.assign(new Error("simulated failure"), {
+      code: OUT_OF_SCOPE_BUSINESS_CHANGE,
+    });
+
+    assert.doesNotThrow(() => buildFailureReport(job, error));
+
+    const workerSource = fs.readFileSync(
+      path.join(workerRoot, "local_worker.js"),
+      "utf8"
+    );
+    assert.equal(/task_mode:\s*taskMode\b/.test(workerSource), false);
+    assert.match(workerSource, /const taskModeForReport = getTaskMode\(job\);/);
   });
 
   await t.test("detects explicit read-only task text", () => {
