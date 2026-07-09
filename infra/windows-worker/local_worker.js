@@ -317,9 +317,14 @@ function readString(value) {
 }
 
 const NO_FIX_APPLIED = "NO_FIX_APPLIED";
+const READ_ONLY_MODE_VIOLATION = "READ_ONLY_MODE_VIOLATION";
 
 const TASK_MUTATION_PATTERN =
   /修复|新增|更新|补齐|建立|修改|改动|创建|写入|补充|fix|repair|add|create|update|modify|patch|implement/i;
+const READ_ONLY_TASK_PATTERN =
+  /read[_ -]?only(?:[_ -]?mode)?\s*(?::|=)?\s*(?:true|1|yes|on)?|只读模式|本任务只读|只读执行|只读检查|只读诊断|只读验证|不修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止\s*(?:执行\s*)?(?:git\s+)?(?:add|commit|push)\b/i;
+const READ_ONLY_POLICY_IMPLEMENTATION_PATTERN =
+  /只读任务锁死|强制\s*read[_ -]?only[_ -]?mode|read[_ -]?only(?:[_ -]?mode)?.*(?:lock|guard)/i;
 const AUTOMATION_CONTEXT_PATTERN =
   /Worker|Codex|Hermes|飞书|总管|自动化|worker|route|路由|上报|NO_FIX_APPLIED|git_commit_sha|attempt_id/i;
 const FORBIDDEN_SECTION_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden/i;
@@ -348,6 +353,92 @@ function getJobText(job) {
 
 function taskRequiresFileChanges(requestText) {
   return TASK_MUTATION_PATTERN.test(String(requestText || ""));
+}
+
+function readBooleanFlag(value) {
+  if (value === true) {
+    return true;
+  }
+
+  if (typeof value === "string") {
+    return /^(true|1|yes|on)$/i.test(value.trim());
+  }
+
+  if (typeof value === "number") {
+    return value === 1;
+  }
+
+  return false;
+}
+
+function hasReadOnlyField(job) {
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const result = job && typeof job.result === "object" ? job.result : null;
+  const candidates = [
+    job?.read_only_mode,
+    job?.readOnlyMode,
+    job?.readonly,
+    job?.read_only,
+    payload?.read_only_mode,
+    payload?.readOnlyMode,
+    payload?.readonly,
+    payload?.read_only,
+    result?.read_only_mode,
+    result?.readOnlyMode,
+  ];
+
+  return candidates.some(readBooleanFlag);
+}
+
+function extractOriginalTaskBody(text) {
+  const raw = String(text || "");
+  const marker = "【原始任务内容】";
+  const markerIndex = raw.lastIndexOf(marker);
+
+  if (markerIndex < 0) {
+    return raw;
+  }
+
+  const afterMarker = raw.slice(markerIndex + marker.length);
+  const stopMarkers = ["【再次强调】", "【Windows Worker 强制规则】"];
+  const stopIndex = stopMarkers
+    .map((stopMarker) => afterMarker.indexOf(stopMarker))
+    .filter((index) => index >= 0)
+    .sort((a, b) => a - b)[0];
+
+  return (stopIndex >= 0 ? afterMarker.slice(0, stopIndex) : afterMarker).trim();
+}
+
+function isReadOnlyPolicyImplementationTask(text) {
+  const raw = String(text || "");
+  return (
+    READ_ONLY_POLICY_IMPLEMENTATION_PATTERN.test(raw) &&
+    TASK_MUTATION_PATTERN.test(raw) &&
+    AUTOMATION_CONTEXT_PATTERN.test(raw)
+  );
+}
+
+function isReadOnlyTaskText(text) {
+  const raw = String(text || "");
+  const originalTaskBody = extractOriginalTaskBody(raw);
+
+  if (isReadOnlyPolicyImplementationTask(originalTaskBody)) {
+    return false;
+  }
+
+  return READ_ONLY_TASK_PATTERN.test(originalTaskBody);
+}
+
+function isReadOnlyTask(jobOrText) {
+  if (typeof jobOrText === "string") {
+    return isReadOnlyTaskText(jobOrText);
+  }
+
+  if (hasReadOnlyField(jobOrText)) {
+    return true;
+  }
+
+  return isReadOnlyTaskText(getJobText(jobOrText));
 }
 
 function classifyWorkerTaskDomain(requestText) {
@@ -474,11 +565,37 @@ function createNoFixAppliedError(message, details = {}) {
   return error;
 }
 
+function createReadOnlyModeViolationError(changedPaths) {
+  const normalizedChangedPaths = uniqueSortedPaths(changedPaths || []);
+  const error = new Error(
+    [
+      READ_ONLY_MODE_VIOLATION,
+      "任务正文要求只读 / 不修改 / 禁止 Git 写入，但 Codex 产生了文件变更；Worker 已停止 git add/commit/push。",
+      normalizedChangedPaths.length
+        ? `changed_paths: ${normalizedChangedPaths.join(", ")}`
+        : "changed_paths: none",
+    ].join("\n")
+  );
+
+  error.code = READ_ONLY_MODE_VIOLATION;
+  error.failureStage = "read_only_mode 验收";
+  error.changedPaths = normalizedChangedPaths;
+  return error;
+}
+
 function assertTaskGoalApplied(job, changedPaths) {
   const requestText = getJobText(job);
   const taskDomain = classifyWorkerTaskDomain(requestText);
   const requiredPaths = extractRequiredChangePaths(requestText);
   const normalizedChangedPaths = uniqueSortedPaths(changedPaths || []);
+
+  if (isReadOnlyTask(job)) {
+    if (normalizedChangedPaths.length > 0) {
+      throw createReadOnlyModeViolationError(normalizedChangedPaths);
+    }
+
+    return;
+  }
 
   if (taskRequiresFileChanges(requestText) && normalizedChangedPaths.length === 0) {
     throw createNoFixAppliedError(
@@ -616,9 +733,27 @@ const CODEX_GIT_OPERATION_GUARD = [
   "如果任务要求生成 Git Commit，Codex 不应自行执行。",
 ].join("\n");
 
-function buildWorkerGuardedPrompt(requestText) {
+function buildReadOnlyGuard(taskText, options = {}) {
+  if (!options.force && !isReadOnlyTaskText(taskText)) {
+    return null;
+  }
+
+  return [
+    "【只读任务锁死】",
+    "read_only_mode: true",
+    "任务正文出现只读 / 不修改 / 禁止 git add / 禁止 commit / 禁止 push 指令。",
+    "Codex 只能读取、分析、静态验证并汇报结果。",
+    "Codex 不得修改任何文件，不得调用 apply_patch，不得执行会写入工作区的命令。",
+    "Worker 将跳过 preflight 写入、Git 同步、git add、git commit、git push 和本地预览恢复。",
+  ].join("\n");
+}
+
+function buildWorkerGuardedPrompt(requestText, options = {}) {
   const taskText = String(requestText || "").trim();
   const taskDomain = classifyWorkerTaskDomain(taskText);
+  const readOnlyGuard = buildReadOnlyGuard(taskText, {
+    force: options.readOnlyMode === true,
+  });
   const domainGuard = isAutomationSystemTask(taskText)
     ? [
         "【自动化系统任务边界】",
@@ -632,6 +767,8 @@ function buildWorkerGuardedPrompt(requestText) {
   return [
     CODEX_GIT_OPERATION_GUARD,
     "",
+    readOnlyGuard,
+    readOnlyGuard ? "" : null,
     domainGuard,
     "",
     "【原始任务内容】",
@@ -643,7 +780,9 @@ function buildWorkerGuardedPrompt(requestText) {
 }
 
 function buildCodexPrompt(job) {
-  return buildWorkerGuardedPrompt(job?.request_text || "");
+  return buildWorkerGuardedPrompt(job?.request_text || "", {
+    readOnlyMode: isReadOnlyTask(job),
+  });
 }
 
 function buildCodexRepairPrompt(job, error, attempt) {
@@ -665,7 +804,10 @@ function buildCodexRepairPrompt(job, error, attempt) {
       "",
       "【原始任务】",
       taskText,
-    ].join("\n")
+    ].join("\n"),
+    {
+      readOnlyMode: isReadOnlyTask(job),
+    }
   );
 }
 
@@ -715,6 +857,19 @@ function classifyFailure(error) {
       keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
       suggestion:
         "重新执行对应失败批次的最小修复任务；必须产生任务要求的文件变更，或明确报告阻塞原因，禁止空跑成功。",
+      recommendBossApproval: true,
+    };
+  }
+
+  if (
+    error?.code === READ_ONLY_MODE_VIOLATION ||
+    errorText.includes(READ_ONLY_MODE_VIOLATION)
+  ) {
+    return {
+      stage: "read_only_mode 验收",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion:
+        "只读任务不得产生文件变更；保留现场给人工确认，重新执行时必须继续使用 read_only_mode，禁止 git add/commit/push。",
       recommendBossApproval: true,
     };
   }
@@ -871,6 +1026,18 @@ function buildSkippedAutomationPreviewReport() {
   };
 }
 
+function buildSkippedReadOnlyPreviewReport() {
+  return {
+    ok: true,
+    skipped: true,
+    removedCaches: [],
+    routeFiles: [],
+    staticChecks: [],
+    note:
+      "read_only_mode task: skipped local preview recovery and route checks to avoid filesystem writes.",
+  };
+}
+
 function buildGithubPushStatus(pushResult) {
   if (!pushResult) {
     return "未生成";
@@ -882,11 +1049,13 @@ function buildGithubPushStatus(pushResult) {
 }
 
 async function runCodexWithRetries(job) {
-  const prompts = [
-    () => buildCodexPrompt(job),
-    (error) => buildCodexRepairPrompt(job, error, 2),
-    (error) => buildCodexRepairPrompt(job, error, 3),
-  ];
+  const prompts = isReadOnlyTask(job)
+    ? [() => buildCodexPrompt(job)]
+    : [
+        () => buildCodexPrompt(job),
+        (error) => buildCodexRepairPrompt(job, error, 2),
+        (error) => buildCodexRepairPrompt(job, error, 3),
+      ];
   const failures = [];
 
   for (let index = 0; index < prompts.length; index += 1) {
@@ -928,6 +1097,17 @@ async function commitGitTask(job) {
   const taskChangedEntries = await getTaskChangedEntries();
   const taskChangedPaths = getStatusPaths(taskChangedEntries);
   assertTaskGoalApplied(job, taskChangedPaths);
+
+  if (isReadOnlyTask(job)) {
+    return {
+      committed: false,
+      commitSha: null,
+      message: "read_only_mode=true，跳过 Git add/commit",
+      summary: "read_only_mode=true; no files changed",
+      filesChanged: [],
+      readOnlyMode: true,
+    };
+  }
 
   if (!GIT_AUTO_COMMIT) {
     return {
@@ -1432,41 +1612,81 @@ async function pollOnce() {
   );
   console.log(`任务内容：${job.request_text}`);
 
+  const readOnlyMode = isReadOnlyTask(job);
   const stopHeartbeat = startHeartbeat(job.id, attemptId);
   let gitCheckpoint = null;
 
   try {
-    await updateProgress(
-      job.id,
-      10,
-      "Worker 启动前自检",
-      "正在停止残留进程、清理缓存并检查 Git 状态"
-    );
+    if (readOnlyMode) {
+      await updateProgress(
+        job.id,
+        10,
+        "Worker 只读自检",
+        "read_only_mode=true；只检查 Git 状态，不清理缓存、不还原生成文件"
+      );
 
-    const preflightResult = await runPreflight(PROJECT_DIR);
+      await runGit(["rev-parse", "--is-inside-work-tree"]);
+      await assertCleanWorktreeBeforeCodex();
 
-    await updateProgress(
-      job.id,
-      15,
-      "Worker 自检完成",
-      formatPreflightResult(preflightResult)
-    );
+      await updateProgress(
+        job.id,
+        15,
+        "只读自检完成",
+        "Git 工作区干净；已跳过会写入工作区的 preflight"
+      );
 
-    await updateProgress(
-      job.id,
-      20,
-      "同步 Git",
-      "正在同步 Git 仓库"
-    );
+      await updateProgress(
+        job.id,
+        20,
+        "跳过 Git 同步",
+        "read_only_mode=true；未执行 git fetch/switch/pull"
+      );
 
-    gitCheckpoint = await prepareGitTask();
+      gitCheckpoint = {
+        enabled: false,
+        baseCommit: null,
+        readOnlyMode: true,
+      };
 
-    await updateProgress(
-      job.id,
-      30,
-      "Git 同步完成",
-      "本地分支已与远程分支同步"
-    );
+      await updateProgress(
+        job.id,
+        30,
+        "Git 同步已跳过",
+        "read_only_mode=true；Worker 不会修改本地分支"
+      );
+    } else {
+      await updateProgress(
+        job.id,
+        10,
+        "Worker 启动前自检",
+        "正在停止残留进程、清理缓存并检查 Git 状态"
+      );
+
+      const preflightResult = await runPreflight(PROJECT_DIR);
+
+      await updateProgress(
+        job.id,
+        15,
+        "Worker 自检完成",
+        formatPreflightResult(preflightResult)
+      );
+
+      await updateProgress(
+        job.id,
+        20,
+        "同步 Git",
+        "正在同步 Git 仓库"
+      );
+
+      gitCheckpoint = await prepareGitTask();
+
+      await updateProgress(
+        job.id,
+        30,
+        "Git 同步完成",
+        "本地分支已与远程分支同步"
+      );
+    }
 
     await updateProgress(
       job.id,
@@ -1486,7 +1706,16 @@ async function pollOnce() {
 
     let previewReport = null;
 
-    if (WORKER_PREVIEW_SMOKE && isAutomationSystemTask(getJobText(job))) {
+    if (readOnlyMode) {
+      previewReport = buildSkippedReadOnlyPreviewReport();
+
+      await updateProgress(
+        job.id,
+        70,
+        "跳过本地预览诊断",
+        "read_only_mode=true；不执行会写入工作区的本地预览恢复"
+      );
+    } else if (WORKER_PREVIEW_SMOKE && isAutomationSystemTask(getJobText(job))) {
       previewReport = buildSkippedAutomationPreviewReport();
 
       await updateProgress(
@@ -1524,12 +1753,18 @@ async function pollOnce() {
         : gitResult.message
     );
 
-    let pushResult = {
-      pushed: false,
-      message: "没有新提交，无需推送",
-    };
+    let pushResult = readOnlyMode
+      ? {
+          pushed: false,
+          message: "read_only_mode=true，跳过 GitHub 推送",
+          readOnlyMode: true,
+        }
+      : {
+          pushed: false,
+          message: "没有新提交，无需推送",
+        };
 
-    if (gitResult.committed) {
+    if (!readOnlyMode && gitResult.committed) {
       await updateProgress(
         job.id,
         90,
@@ -1556,10 +1791,13 @@ async function pollOnce() {
       "",
       "Worker / task status:",
       "Worker execution: succeeded",
-      gitResult.filesChanged?.length
+      readOnlyMode
+        ? "Task goal: completed_read_only_no_file_changes"
+        : gitResult.filesChanged?.length
         ? "Task goal: completed_with_file_changes"
         : "Task goal: completed_no_file_change_required",
       `task_domain: ${classifyWorkerTaskDomain(getJobText(job))}`,
+      `read_only_mode: ${readOnlyMode ? "true" : "false"}`,
       "",
       formatPreviewReport(previewReport),
       "",
@@ -1602,19 +1840,27 @@ async function pollOnce() {
         validation_results: [
           "Codex 执行：通过",
           "Worker 执行：通过",
-          gitResult.filesChanged?.length
+          readOnlyMode
+            ? "任务目标验收：通过（read_only_mode，无文件变更）"
+            : gitResult.filesChanged?.length
             ? "任务目标验收：通过（已产生文件变更）"
             : "任务目标验收：通过（任务不要求文件变更）",
           `任务分类：${classifyWorkerTaskDomain(getJobText(job))}`,
+          `read_only_mode：${readOnlyMode ? "true" : "false"}`,
           ...getPreviewValidationLines(previewReport),
-          gitResult.committed
+          gitResult.readOnlyMode
+            ? "Git 自动备份：跳过（read_only_mode=true）"
+            : gitResult.committed
             ? `Git 自动备份：通过（${gitResult.commitSha}）`
             : `Git 自动备份：warning（${gitResult.message}）`,
-          pushResult.pushed
+          pushResult.readOnlyMode
+            ? "GitHub 推送：跳过（read_only_mode=true）"
+            : pushResult.pushed
             ? `GitHub 推送：通过（${pushResult.remote}/${pushResult.branch}）`
             : `GitHub 推送：warning（${pushResult.message}）`,
         ],
         github_push_status: buildGithubPushStatus(pushResult),
+        read_only_mode: readOnlyMode,
         git_commit_sha:
           gitResult.commitSha || null,
         deploy_status:
@@ -1684,10 +1930,12 @@ async function pollOnce() {
         project_dir: PROJECT_DIR,
         error_code: errorCode,
         files_changed: failureChangedPaths,
+        read_only_mode: readOnlyMode,
         validation_results: [
           "Worker 执行：已进入失败上报链路",
           `失败阶段：${classifyFailure(error).stage}`,
           errorCode ? `错误代码：${errorCode}` : "错误代码：未提供",
+          `read_only_mode：${readOnlyMode ? "true" : "false"}`,
           `关键错误：${classifyFailure(error).keyError}`.slice(0, 600),
           `当前 HEAD：${currentHead}`,
           rollbackMessage.trim() || "Git 回滚：未提供",
@@ -1745,6 +1993,7 @@ if (require.main === module) {
 
 module.exports = {
   NO_FIX_APPLIED,
+  READ_ONLY_MODE_VIOLATION,
   assertTaskGoalApplied,
   assertCleanWorktreeBeforeCodex,
   buildCodexPrompt,
@@ -1756,6 +2005,8 @@ module.exports = {
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
   getTaskChangedPaths,
+  isReadOnlyTask,
+  isReadOnlyTaskText,
   main,
   prepareGitTask,
   rollbackGitTask,

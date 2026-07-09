@@ -25,12 +25,16 @@ const {
 
 const {
   NO_FIX_APPLIED,
+  READ_ONLY_MODE_VIOLATION,
   assertTaskGoalApplied,
+  buildCodexPrompt,
   buildFailureReport,
   buildWorkerGuardedPrompt,
   classifyWorkerTaskDomain,
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
+  isReadOnlyTask,
+  isReadOnlyTaskText,
 } = require("../local_worker");
 
 const workerRoot = path.resolve(__dirname, "..");
@@ -304,6 +308,100 @@ test("NO_FIX_APPLIED task goal validation", async (t) => {
       ),
       ["docs/projects/reusable-assets.md"]
     );
+  });
+});
+
+test("read_only_mode task lock", async (t) => {
+  await t.test("detects explicit read-only task text", () => {
+    assert.equal(
+      isReadOnlyTaskText("本任务只读，不修改文件，禁止 git add，禁止 git commit，禁止 git push。"),
+      true
+    );
+  });
+
+  await t.test("detects explicit read_only_mode field", () => {
+    assert.equal(
+      isReadOnlyTask({
+        request_text: "检查 Worker 状态并汇报。",
+        payload: {
+          read_only_mode: true,
+        },
+      }),
+      true
+    );
+  });
+
+  await t.test("does not treat the standard Codex git guard as task read-only", () => {
+    assert.equal(
+      isReadOnlyTaskText(
+        [
+          "【Windows Worker 强制规则】",
+          "不允许执行 git add。",
+          "不允许执行 git commit。",
+          "不允许执行 git push。",
+          "【原始任务内容】",
+          "修复 infra/windows-worker/local_worker.js 的上报链路。",
+          "【再次强调】",
+          "不允许执行 git add。",
+        ].join("\n")
+      ),
+      false
+    );
+  });
+
+  await t.test("does not lock the worker repair task that implements this rule", () => {
+    assert.equal(
+      isReadOnlyTaskText(
+        "只读任务锁死：任务正文出现“只读 / 不修改 / 禁止 git add / 禁止 commit / 禁止 git push”时，Worker 必须强制 read_only_mode。"
+      ),
+      false
+    );
+  });
+
+  await t.test("allows read-only task with no file changes", () => {
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(
+        {
+          request_text: "本任务只读，不修改文件，只汇报检查结果。",
+        },
+        []
+      )
+    );
+  });
+
+  await t.test("fails read-only task when files changed", () => {
+    assert.throws(
+      () =>
+        assertTaskGoalApplied(
+          {
+            request_text: "本任务只读，不修改文件。",
+          },
+          ["infra/windows-worker/local_worker.js"]
+        ),
+      (error) =>
+        error.code === READ_ONLY_MODE_VIOLATION &&
+        error.message.includes("infra/windows-worker/local_worker.js")
+    );
+  });
+
+  await t.test("adds read-only lock instructions to the Codex prompt", () => {
+    const prompt = buildWorkerGuardedPrompt("本任务只读，不修改文件，只做静态检查。");
+
+    assert.match(prompt, /read_only_mode: true/);
+    assert.match(prompt, /不得调用 apply_patch/);
+    assert.match(prompt, /跳过 preflight 写入/);
+  });
+
+  await t.test("adds read-only prompt instructions for explicit payload flag", () => {
+    const prompt = buildCodexPrompt({
+      request_text: "检查 Worker 状态并汇报。",
+      payload: {
+        read_only_mode: true,
+      },
+    });
+
+    assert.match(prompt, /read_only_mode: true/);
+    assert.match(prompt, /Codex 只能读取、分析、静态验证并汇报结果/);
   });
 });
 
