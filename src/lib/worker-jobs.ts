@@ -33,7 +33,13 @@ const RECORD_ID_KEYS = [
 
 const TERMINAL_WORKER_STATUSES = new Set(["succeeded", "failed"]);
 const WORKER_BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
-const WORKER_FORBIDDEN_SECTION_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden/i;
+const WORKER_BATCH_RELEVANT_LINE_PATTERN =
+  /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
+const WORKER_BATCH_FORBIDDEN_FRAGMENT_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden|不执行/i;
+const WORKER_BATCH_FORBIDDEN_SECTION_HEADING_PATTERN =
+  /^\s*(?:[-*#>\d.、\s]*)?(?:【)?(?:禁止范围|禁止修改|forbidden)(?:】)?\s*[:：]?\s*$/i;
+const WORKER_BATCH_FORBIDDEN_SECTION_EXIT_PATTERN =
+  /标题|title|修复目标|(^|\s)目标\s*[:：]|批准|approved|approval|执行批次|当前执行批次/i;
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
@@ -43,24 +49,59 @@ function readRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function findBatchCodes(text: unknown): string[] {
-  return Array.from(new Set(String(text ?? "").match(WORKER_BATCH_CODE_PATTERN) ?? []));
+  const matches = String(text ?? "").match(WORKER_BATCH_CODE_PATTERN) ?? [];
+  const seen = new Set<string>();
+  const codes: string[] = [];
+
+  for (const match of matches) {
+    const key = match.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    codes.push(match);
+  }
+
+  return codes;
+}
+
+function stripForbiddenBatchFragments(line: string): string {
+  return line.split(WORKER_BATCH_FORBIDDEN_FRAGMENT_PATTERN)[0].trim();
 }
 
 function extractRelevantBatchTextFromRequest(text: unknown): string {
   const lines = String(text ?? "").split(/\r?\n/);
   const chunks: string[] = [];
+  let inForbiddenSection = false;
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index].trim();
-    if (!line || WORKER_FORBIDDEN_SECTION_PATTERN.test(line)) continue;
 
-    if (index === 0 && /^新需求[:：]/.test(line)) {
-      chunks.push(line);
+    if (!line) {
+      inForbiddenSection = false;
       continue;
     }
 
-    if (/标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i.test(line)) {
-      chunks.push(line);
+    const isRelevantLine =
+      (index === 0 && /^新需求[:：]/.test(line)) ||
+      WORKER_BATCH_RELEVANT_LINE_PATTERN.test(line);
+
+    if (WORKER_BATCH_FORBIDDEN_SECTION_HEADING_PATTERN.test(line) && !isRelevantLine) {
+      inForbiddenSection = true;
+      continue;
+    }
+
+    if (inForbiddenSection) {
+      if (!WORKER_BATCH_FORBIDDEN_SECTION_EXIT_PATTERN.test(line)) {
+        continue;
+      }
+      inForbiddenSection = false;
+    }
+
+    if (isRelevantLine) {
+      inForbiddenSection = false;
+      const cleanedLine = stripForbiddenBatchFragments(line);
+      if (cleanedLine) {
+        chunks.push(cleanedLine);
+      }
     }
   }
 

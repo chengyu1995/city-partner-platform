@@ -110,6 +110,13 @@ function sanitizeLogText(text: string): string {
 }
 
 const ROUTE_BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
+const ROUTE_BATCH_RELEVANT_LINE_PATTERN =
+  /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
+const ROUTE_BATCH_FORBIDDEN_FRAGMENT_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden|不执行/i;
+const ROUTE_BATCH_FORBIDDEN_SECTION_HEADING_PATTERN =
+  /^\s*(?:[-*#>\d.、\s]*)?(?:【)?(?:禁止范围|禁止修改|forbidden)(?:】)?\s*[:：]?\s*$/i;
+const ROUTE_BATCH_FORBIDDEN_SECTION_EXIT_PATTERN =
+  /标题|title|修复目标|(^|\s)目标\s*[:：]|批准|approved|approval|执行批次|当前执行批次/i;
 
 function isAutomationSystemRepairDemand(text: string): boolean {
   const normalized = normalizeFeishuTaskText(text);
@@ -162,8 +169,55 @@ function isApprovedExecutionReply(text: string): boolean {
 
 function extractApprovedRepairBatchCode(text: string): string | null {
   if (!isApprovedRepairReply(text)) return null;
-  const match = normalizeFeishuTaskText(text).match(ROUTE_BATCH_CODE_PATTERN);
+  const match = extractRelevantRouteBatchText(normalizeFeishuTaskText(text)).match(
+    ROUTE_BATCH_CODE_PATTERN
+  );
   return match?.[0] ?? null;
+}
+
+function stripForbiddenRouteBatchFragments(line: string): string {
+  return line.split(ROUTE_BATCH_FORBIDDEN_FRAGMENT_PATTERN)[0].trim();
+}
+
+function extractRelevantRouteBatchText(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const chunks: string[] = [];
+  let inForbiddenSection = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+
+    if (!line) {
+      inForbiddenSection = false;
+      continue;
+    }
+
+    const isRelevantLine =
+      (index === 0 && /^新需求[:：]/.test(line)) ||
+      ROUTE_BATCH_RELEVANT_LINE_PATTERN.test(line);
+
+    if (ROUTE_BATCH_FORBIDDEN_SECTION_HEADING_PATTERN.test(line) && !isRelevantLine) {
+      inForbiddenSection = true;
+      continue;
+    }
+
+    if (inForbiddenSection) {
+      if (!ROUTE_BATCH_FORBIDDEN_SECTION_EXIT_PATTERN.test(line)) {
+        continue;
+      }
+      inForbiddenSection = false;
+    }
+
+    if (isRelevantLine) {
+      inForbiddenSection = false;
+      const cleanedLine = stripForbiddenRouteBatchFragments(line);
+      if (cleanedLine) {
+        chunks.push(cleanedLine);
+      }
+    }
+  }
+
+  return chunks.join("\n");
 }
 
 function dispatchTaskMatchesBatch(

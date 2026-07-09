@@ -324,6 +324,23 @@ test("batch extraction and automation routing guards", async (t) => {
     );
   });
 
+  await t.test("extracts BATCH-39 from approval and skips forbidden section batch lines", () => {
+    assert.equal(
+      extractCurrentExecutionBatchCode({
+        title: "",
+        request_text: [
+          "新需求：执行项目总管批准批次",
+          "修复目标：修复 Worker / Codex / 飞书总经理路由和上报链路",
+          "禁止范围",
+          "- 当前批次 BATCH-P3 产品开发任务",
+          "- 当前批次 BATCH-P4 产品开发任务",
+          "老板批准原文：总管 批准执行：仅批准 BATCH-39",
+        ].join("\n"),
+      }),
+      "BATCH-39"
+    );
+  });
+
   await t.test("uses title before forbidden batch mentions", () => {
     assert.equal(
       extractCurrentExecutionBatchCode({

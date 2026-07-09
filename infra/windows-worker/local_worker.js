@@ -323,6 +323,13 @@ const TASK_MUTATION_PATTERN =
 const AUTOMATION_CONTEXT_PATTERN =
   /Worker|Codex|Hermes|飞书|总管|自动化|worker|route|路由|上报|NO_FIX_APPLIED|git_commit_sha|attempt_id/i;
 const FORBIDDEN_SECTION_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden/i;
+const BATCH_RELEVANT_LINE_PATTERN =
+  /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
+const BATCH_FORBIDDEN_FRAGMENT_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden|不执行/i;
+const BATCH_FORBIDDEN_SECTION_HEADING_PATTERN =
+  /^\s*(?:[-*#>\d.、\s]*)?(?:【)?(?:禁止范围|禁止修改|forbidden)(?:】)?\s*[:：]?\s*$/i;
+const BATCH_FORBIDDEN_SECTION_EXIT_PATTERN =
+  /标题|title|修复目标|(^|\s)目标\s*[:：]|批准|approved|approval|执行批次|当前执行批次/i;
 const REQUIRED_FILE_SECTION_PATTERN =
   /输出文件|目标文件|指定文件|必须修改|要求修改|要求新增|要求创建|需要修改|需要新增|请修改|请新增|修复文件|required files?|output files?|target files?/i;
 const ALLOWED_ONLY_SECTION_PATTERN = /允许修改|只允许修改|allowed files?|editable files?/i;
@@ -502,27 +509,61 @@ function assertTaskGoalApplied(job, changedPaths) {
 }
 
 function findBatchCodes(text) {
-  return uniqueSortedPaths(String(text || "").match(BATCH_CODE_PATTERN) || []);
+  const matches = String(text || "").match(BATCH_CODE_PATTERN) || [];
+  const seen = new Set();
+  const codes = [];
+
+  for (const match of matches) {
+    const key = String(match).toUpperCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    codes.push(match);
+  }
+
+  return codes;
+}
+
+function stripForbiddenBatchFragments(line) {
+  return String(line || "").split(BATCH_FORBIDDEN_FRAGMENT_PATTERN)[0].trim();
 }
 
 function extractRelevantBatchTextFromRequest(requestText) {
   const lines = String(requestText || "").split(/\r?\n/);
   const chunks = [];
+  let inForbiddenSection = false;
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index].trim();
 
-    if (!line || FORBIDDEN_SECTION_PATTERN.test(line)) {
+    if (!line) {
+      inForbiddenSection = false;
       continue;
     }
 
-    if (index === 0 && /^新需求[:：]/.test(line)) {
-      chunks.push(line);
+    const isRelevantLine =
+      (index === 0 && /^新需求[:：]/.test(line)) ||
+      BATCH_RELEVANT_LINE_PATTERN.test(line);
+
+    if (BATCH_FORBIDDEN_SECTION_HEADING_PATTERN.test(line) && !isRelevantLine) {
+      inForbiddenSection = true;
       continue;
     }
 
-    if (/标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i.test(line)) {
-      chunks.push(line);
+    if (inForbiddenSection) {
+      if (!BATCH_FORBIDDEN_SECTION_EXIT_PATTERN.test(line)) {
+        continue;
+      }
+      inForbiddenSection = false;
+    }
+
+    if (isRelevantLine) {
+      inForbiddenSection = false;
+      const cleanedLine = stripForbiddenBatchFragments(line);
+      if (cleanedLine) {
+        chunks.push(cleanedLine);
+      }
     }
   }
 
