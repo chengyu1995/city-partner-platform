@@ -37,6 +37,9 @@ const TASK_MUTATION_PATTERN =
 const READ_ONLY_TASK_PATTERN =
   /read[_ -]?only(?:[_ -]?mode)?\s*(?::|=)?\s*(?:true|1|yes|on)?|只读模式|本任务只读|只读执行|只读检查|只读诊断|只读验证|不修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止修改(?:任何)?(?:文件|代码|仓库|项目)?|禁止\s*(?:执行\s*)?(?:git\s+)?(?:add|commit|push)\b/i;
 const QA_BATCH_PATTERN = /\bBATCH-QA(?:-[A-Z0-9]+)*\b/i;
+const BATCH_FIX_PATTERN = /\bBATCH-FIX(?:-[A-Z0-9]+)*\b/i;
+const BATCH_FIX_PRODUCT_SIGNAL_PATTERN =
+  /同城搭子网站|partners|login|profile|page\.tsx|产品页面|首页|发布页|搭子浏览|详情页/i;
 const TASK_MODES = {
   READ_ONLY: "read_only",
   DOCS_WRITE_ALLOWED: "docs_write_allowed",
@@ -152,6 +155,7 @@ export function extractCurrentExecutionBatchCode(
 
 function classifyWorkerTaskDomain(text: unknown): string {
   const value = String(text ?? "");
+  if (isBatchFixProductTaskText(value)) return "city_partner_product";
   if (QA_BATCH_PATTERN.test(value)) return "qa_review";
 
   if (/文档整理|整理文档|归档|governance[_ -]?docs/i.test(value)) return "governance_docs";
@@ -162,6 +166,11 @@ function classifyWorkerTaskDomain(text: unknown): string {
   if (/运营|运维|发布|部署|上线|监控|operations?|ops|release|deploy/i.test(value)) return "operations";
 
   return "general";
+}
+
+function isBatchFixProductTaskText(text: unknown): boolean {
+  const value = String(text ?? "");
+  return BATCH_FIX_PATTERN.test(value) && BATCH_FIX_PRODUCT_SIGNAL_PATTERN.test(value);
 }
 
 function isSafePostgrestFilterValue(value: string): boolean {
@@ -410,6 +419,7 @@ function inferTaskMode(input: {
   submitted?: unknown;
 }): string {
   const text = [input.demand, input.batchCode].filter(Boolean).join("\n");
+  if (isBatchFixProductTaskText(text)) return TASK_MODES.PRODUCT_WRITE_ALLOWED;
   if (READ_ONLY_BATCH_PATTERN.test(text) || taskDeclaresReadOnly(text)) return TASK_MODES.READ_ONLY;
   if (
     DOCS_WRITE_TASK_PATTERN.test(text) ||

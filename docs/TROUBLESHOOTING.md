@@ -82,6 +82,7 @@ Known fingerprints:
 - `INCOMPLETE_QA_REPORT`: `BATCH-QA-*` returned only status/diff or missed required QA report sections.
 - `QA_REPORT_FIELD_MATCH_TOO_STRICT`: QA report content was present, but field matching was too strict and caused `INCOMPLETE_QA_REPORT`.
 - `QA_REPORT_NATURAL_LANGUAGE_MATCH_UNSTABLE`: QA report natural language was complete but unstable to match; prefer `QA_REPORT_FIELDS`.
+- `BATCH_FIX_PRODUCT_MISROUTED_TO_AUTOMATION`: `BATCH-FIX-*` product repair was misrouted to automation/docs mode and changed system files instead of product pages.
 
 Escalation:
 

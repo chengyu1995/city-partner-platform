@@ -26,6 +26,7 @@ const {
 const {
   NO_FIX_APPLIED,
   OUT_OF_SCOPE_BUSINESS_CHANGE,
+  OUT_OF_SCOPE_SYSTEM_CHANGE,
   READ_ONLY_MODE_VIOLATION,
   TASK_MODE_MISMATCH,
   MISSING_REQUIRED_DOCS,
@@ -700,6 +701,58 @@ test("read_only_mode task lock", async (t) => {
     assert.throws(
       () => assertTaskGoalApplied(job, ["src/app/partners/page.tsx"]),
       (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
+  await t.test("BATCH-FIX product repair stays product even with QA docs and lint wording", () => {
+    const productJob = {
+      request_text: [
+        "BATCH-FIX-01 fix 同城搭子网站 partners login profile page.tsx 产品页面。",
+        "Also read QA-05, docs, run npm run lint and tsc validation.",
+        "Do not modify Worker or Tencent Cloud system files.",
+      ].join("\n"),
+    };
+
+    assert.equal(classifyWorkerTaskDomain(productJob.request_text), "city_partner_product");
+    assert.equal(getTaskMode(productJob), TASK_MODES.PRODUCT_WRITE_ALLOWED);
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(productJob, ["src/app/partners/page.tsx"])
+    );
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(productJob, ["docs/projects/city-partner-website.md"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(productJob, ["infra/windows-worker/local_worker.js"]),
+      (error) => error.code === OUT_OF_SCOPE_SYSTEM_CHANGE
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(productJob, ["docs/projects/feishu-gm-automation.md"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
+  await t.test("task mode priorities keep GM QA and BATCH-37 classifications stable", () => {
+    assert.equal(
+      getTaskMode({
+        request_text: "BATCH-GM-STABILIZE-09 fix Worker and Gateway routing.",
+      }),
+      TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED
+    );
+    assert.equal(
+      getTaskMode({
+        request_text: "BATCH-QA-06 project_domain=qa_review read_only_mode=true",
+      }),
+      TASK_MODES.READ_ONLY
+    );
+    assert.equal(
+      classifyWorkerTaskDomain("BATCH-QA-06 project_domain=qa_review"),
+      "qa_review"
+    );
+    assert.equal(
+      getTaskMode({
+        request_text: "BATCH-37-DOCS-04 task_mode=docs_write_allowed update docs/**",
+      }),
+      TASK_MODES.DOCS_WRITE_ALLOWED
     );
   });
 

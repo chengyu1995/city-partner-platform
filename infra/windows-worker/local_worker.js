@@ -323,6 +323,7 @@ function readString(value) {
 const NO_FIX_APPLIED = "NO_FIX_APPLIED";
 const READ_ONLY_MODE_VIOLATION = "READ_ONLY_MODE_VIOLATION";
 const OUT_OF_SCOPE_BUSINESS_CHANGE = "OUT_OF_SCOPE_BUSINESS_CHANGE";
+const OUT_OF_SCOPE_SYSTEM_CHANGE = "OUT_OF_SCOPE_SYSTEM_CHANGE";
 const TASK_MODE_MISMATCH = "TASK_MODE_MISMATCH";
 const MISSING_REQUIRED_DOCS = "MISSING_REQUIRED_DOCS";
 const INSUFFICIENT_DOC_OUTPUT = "INSUFFICIENT_DOC_OUTPUT";
@@ -351,6 +352,9 @@ const AUTOMATION_WRITE_TASK_PATTERN =
   /\bBATCH-44\b|\bBATCH-45A\b|automation_system_write_allowed|Worker|Windows Worker|Gateway|worker-api|worker_api|feishu_gateway|project-director|project director|project-director-console|worker-jobs|local_worker|git-safety/i;
 const PRODUCT_WRITE_TASK_PATTERN =
   /product_write_allowed|产品开发|业务页面开发|同城搭子.*(?:页面|产品|业务)/i;
+const BATCH_FIX_PATTERN = /\bBATCH-FIX(?:-[A-Z0-9]+)*\b/i;
+const BATCH_FIX_PRODUCT_SIGNAL_PATTERN =
+  /同城搭子网站|partners|login|profile|page\.tsx|产品页面|首页|发布页|搭子浏览|详情页/i;
 const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const FORCED_READ_ONLY_BATCH_PATTERN =
   /\bBATCH-QA(?:-[A-Z0-9]+)*\b|\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
@@ -513,6 +517,18 @@ const AUTOMATION_WRITE_ALLOWED_PATHS = [
   "docs/projects/feishu-group-routing.md",
 ];
 const PRODUCT_WRITE_ALLOWED_PREFIXES = ["src/app"];
+const BATCH_FIX_PRODUCT_ALLOWED_PATHS = [
+  "src/app",
+  "docs/NEXT_TASK_CARD.md",
+  "docs/projects/city-partner-website.md",
+];
+const SYSTEM_CHANGE_FORBIDDEN_PATHS = [
+  "infra/windows-worker",
+  "src/lib/worker-jobs.ts",
+  "src/app/api/feishu",
+  "src/lib/project-director-console.ts",
+  "work/tencent-cloud",
+];
 const BUSINESS_PAGE_PREFIXES = [
   "app/page.tsx",
   "app/post",
@@ -547,6 +563,8 @@ const FAILURE_FINGERPRINTS = {
     "QA report content was present, but field matching was too strict and caused INCOMPLETE_QA_REPORT.",
   QA_REPORT_NATURAL_LANGUAGE_MATCH_UNSTABLE:
     "QA report natural language was complete but unstable to match; prefer QA_REPORT_FIELDS.",
+  BATCH_FIX_PRODUCT_MISROUTED_TO_AUTOMATION:
+    "BATCH-FIX product repair was misrouted to automation/docs_write_allowed and changed system files instead of product pages.",
 };
 
 function getJobText(job) {
@@ -722,6 +740,10 @@ function getTaskModeFromText(text) {
   const raw = String(text || "");
   const batchCode = extractCurrentExecutionBatchCode({ request_text: raw });
 
+  if (isBatchFixProductTaskText(raw)) {
+    return TASK_MODES.PRODUCT_WRITE_ALLOWED;
+  }
+
   if (FORCED_READ_ONLY_BATCH_PATTERN.test(raw)) {
     return TASK_MODES.READ_ONLY;
   }
@@ -830,6 +852,28 @@ function createOutOfScopeBusinessChangeError(message, details = {}) {
   return error;
 }
 
+function createOutOfScopeSystemChangeError(message, details = {}) {
+  const outOfScopePaths = uniqueSortedPaths(details.outOfScopePaths || []);
+  const error = new Error(
+    [
+      OUT_OF_SCOPE_SYSTEM_CHANGE,
+      message,
+      details.taskMode ? `task_mode: ${details.taskMode}` : null,
+      outOfScopePaths.length
+        ? `out_of_scope_system_paths: ${outOfScopePaths.join(", ")}`
+        : "out_of_scope_system_paths: none",
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
+
+  error.code = OUT_OF_SCOPE_SYSTEM_CHANGE;
+  error.failureStage = "product task system-scope validation";
+  error.outOfScopePaths = outOfScopePaths;
+  error.taskMode = details.taskMode || null;
+  return error;
+}
+
 function createTaskModeMismatchError(message, details = {}) {
   const error = new Error(
     [
@@ -875,6 +919,19 @@ function isProductWriteAllowedPath(filePath) {
   return pathMatchesPrefix(filePath, PRODUCT_WRITE_ALLOWED_PREFIXES);
 }
 
+function isBatchFixProductTaskText(text) {
+  const raw = String(text || "");
+  return BATCH_FIX_PATTERN.test(raw) && BATCH_FIX_PRODUCT_SIGNAL_PATTERN.test(raw);
+}
+
+function isBatchFixProductAllowedPath(filePath) {
+  return pathMatchesPrefix(filePath, BATCH_FIX_PRODUCT_ALLOWED_PATHS);
+}
+
+function isSystemChangeForbiddenPath(filePath) {
+  return pathMatchesPrefix(filePath, SYSTEM_CHANGE_FORBIDDEN_PATHS);
+}
+
 function normalizeFailureMemory(memory) {
   return memory && typeof memory === "object" && !Array.isArray(memory)
     ? { ...memory }
@@ -914,6 +971,10 @@ function recordFailureMemory(memory, fingerprint, batchCode, now = new Date().to
 
 function classifyWorkerTaskDomain(requestText) {
   const text = String(requestText || "");
+
+  if (isBatchFixProductTaskText(text)) {
+    return "city_partner_product";
+  }
 
   if (QA_BATCH_PATTERN.test(text)) {
     return "qa_review";
@@ -1276,9 +1337,12 @@ function assertTaskGoalApplied(job, changedPaths) {
     return;
   }
 
-  const blockedSafetyPaths = normalizedChangedPaths.filter(
-    (filePath) => isBusinessPagePath(filePath) || isDatabaseOrEnvPath(filePath)
-  );
+  const blockedSafetyPaths =
+    taskMode === TASK_MODES.PRODUCT_WRITE_ALLOWED
+      ? []
+      : normalizedChangedPaths.filter(
+          (filePath) => isBusinessPagePath(filePath) || isDatabaseOrEnvPath(filePath)
+        );
 
   if (blockedSafetyPaths.length > 0) {
     throw createOutOfScopeBusinessChangeError(
@@ -1388,18 +1452,44 @@ function assertTaskGoalApplied(job, changedPaths) {
   }
 
   if (taskMode === TASK_MODES.PRODUCT_WRITE_ALLOWED) {
-    const outOfScopePaths = normalizedChangedPaths.filter(
-      (filePath) => !isProductWriteAllowedPath(filePath) && !isDocsWriteAllowedPath(filePath)
-    );
+    if (isBatchFixProductTaskText(requestText)) {
+      const systemPaths = normalizedChangedPaths.filter(isSystemChangeForbiddenPath);
+      if (systemPaths.length > 0) {
+        throw createOutOfScopeSystemChangeError(
+          "BATCH-FIX product repair forbids Worker, Gateway, director, Tencent Cloud, or automation-system file changes.",
+          {
+            taskMode,
+            outOfScopePaths: systemPaths,
+          }
+        );
+      }
 
-    if (outOfScopePaths.length > 0) {
-      throw createOutOfScopeBusinessChangeError(
-        "product_write_allowed only permits product or docs files.",
-        {
-          taskMode,
-          outOfScopePaths,
-        }
+      const outOfScopeProductPaths = normalizedChangedPaths.filter(
+        (filePath) => !isBatchFixProductAllowedPath(filePath)
       );
+      if (outOfScopeProductPaths.length > 0) {
+        throw createOutOfScopeBusinessChangeError(
+          "BATCH-FIX product repair only permits src/app/** and approved product docs.",
+          {
+            taskMode,
+            outOfScopePaths: outOfScopeProductPaths,
+          }
+        );
+      }
+    } else {
+      const outOfScopePaths = normalizedChangedPaths.filter(
+        (filePath) => !isProductWriteAllowedPath(filePath) && !isDocsWriteAllowedPath(filePath)
+      );
+
+      if (outOfScopePaths.length > 0) {
+        throw createOutOfScopeBusinessChangeError(
+          "product_write_allowed only permits product or docs files.",
+          {
+            taskMode,
+            outOfScopePaths,
+          }
+        );
+      }
     }
   }
 
@@ -1739,16 +1829,23 @@ function classifyFailure(error) {
   if (
     error?.code === "BUSINESS_PAGE_BOUNDARY_VIOLATION" ||
     error?.code === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+    error?.code === OUT_OF_SCOPE_SYSTEM_CHANGE ||
     error?.code === TASK_MODE_MISMATCH ||
     error?.code === MISSING_REQUIRED_DOCS ||
     error?.code === INSUFFICIENT_DOC_OUTPUT ||
-    errorText.includes(OUT_OF_SCOPE_BUSINESS_CHANGE)
+    errorText.includes(OUT_OF_SCOPE_BUSINESS_CHANGE) ||
+    errorText.includes(OUT_OF_SCOPE_SYSTEM_CHANGE)
   ) {
     return {
-      stage: "自动化任务范围边界检查",
+      stage:
+        error?.code === OUT_OF_SCOPE_SYSTEM_CHANGE
+          ? "产品任务系统文件边界检查"
+          : "自动化任务范围边界检查",
       keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
       suggestion:
-        "撤回业务页面改动，只保留 Worker / Codex / report / heartbeat 相关允许文件；如确需改业务页面，必须由老板单独批准对应产品开发批次。",
+        error?.code === OUT_OF_SCOPE_SYSTEM_CHANGE
+          ? "撤回 Worker / Gateway / 总管 / 腾讯云中转等系统文件改动，只保留 BATCH-FIX 产品修复允许范围内的 src/app/** 和批准产品文档。"
+          : "撤回业务页面改动，只保留 Worker / Codex / report / heartbeat 相关允许文件；如确需改业务页面，必须由老板单独批准对应产品开发批次。",
       recommendBossApproval: true,
     };
   }
@@ -2914,6 +3011,7 @@ async function pollOnce() {
         insufficient_doc_output: errorCode === INSUFFICIENT_DOC_OUTPUT,
         out_of_scope_business_change:
           errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+          errorCode === OUT_OF_SCOPE_SYSTEM_CHANGE ||
           errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION",
         validation_results: [
           "Worker 执行：已进入失败上报链路",
@@ -2930,6 +3028,7 @@ async function pollOnce() {
               : errorCode === TASK_MODE_MISMATCH
               ? "succeeded_until_task_mode_validation"
               : errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+                errorCode === OUT_OF_SCOPE_SYSTEM_CHANGE ||
                 errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION"
               ? "succeeded_until_scope_validation"
               : "failed"
@@ -2948,6 +3047,7 @@ async function pollOnce() {
               : errorCode === TASK_MODE_MISMATCH
               ? "failed_task_mode_mismatch"
               : errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+                errorCode === OUT_OF_SCOPE_SYSTEM_CHANGE ||
                 errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION"
               ? "failed_out_of_scope_business_change"
               : "failed"
@@ -2976,6 +3076,7 @@ async function pollOnce() {
           `insufficient_doc_output: ${errorCode === INSUFFICIENT_DOC_OUTPUT ? "yes" : "no"}`,
           `Out-of-scope business change: ${
             errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+            errorCode === OUT_OF_SCOPE_SYSTEM_CHANGE ||
             errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION"
               ? "yes"
               : "no"
@@ -3042,6 +3143,7 @@ module.exports = {
   NO_FIX_APPLIED,
   READ_ONLY_MODE_VIOLATION,
   OUT_OF_SCOPE_BUSINESS_CHANGE,
+  OUT_OF_SCOPE_SYSTEM_CHANGE,
   TASK_MODE_MISMATCH,
   MISSING_REQUIRED_DOCS,
   INSUFFICIENT_DOC_OUTPUT,

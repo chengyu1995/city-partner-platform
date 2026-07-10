@@ -124,6 +124,14 @@
 - To avoid natural-language matching drift, QA reports must end with `QA_REPORT_FIELDS` machine fields: `current_usable_features`, `current_fix_needed`, `homepage_verdict`, `partners_verdict`, `post_verdict`, `local_draft_review_verdict`, `login_profile_warning`, `dev_team_next_step`, `qa_team_next_step`, `ops_team_join`, and `next_batch`.
 - When `QA_REPORT_FIELDS` is present, the Worker validates those structured fields first. Natural-language semantic matching is only a fallback for older reports without the machine field block.
 
+## BATCH-GM-STABILIZE-09 BATCH-FIX product routing
+
+- `BATCH-FIX-*` with product signals such as `同城搭子网站`, `partners`, `login`, `profile`, `page.tsx`, `产品页面`, `首页`, `发布页`, `搭子浏览`, or `详情页` is forced to `project_domain=city_partner_product`, `task_mode=product_write_allowed`, and `read_only_mode=false`.
+- Product BATCH-FIX tasks are not reclassified as `automation_system_write_allowed` or `docs_write_allowed` just because the request mentions QA, docs, lint, tsc, Worker validation, or acceptance checks.
+- Allowed scope is `src/app/**`, `docs/NEXT_TASK_CARD.md`, and `docs/projects/city-partner-website.md`.
+- Forbidden scope includes `infra/windows-worker/**`, `src/lib/worker-jobs.ts`, `src/app/api/feishu/**`, `src/lib/project-director-console.ts`, Tencent Cloud relay files, env, and database files.
+- If a BATCH-FIX product task changes Worker, gateway, director, or Tencent/system files, the Worker fails with `OUT_OF_SCOPE_SYSTEM_CHANGE`.
+
 ## BATCH-GM-STABILIZE-03 docs task priority and cloud terminal guard
 
 - `BATCH-37-DOCS-*` and `BATCH-37-FIX` resolve to `docs_write_allowed` with `read_only_mode=false`; stale outer `read_only_mode=true` flags do not demote them to read-only.
