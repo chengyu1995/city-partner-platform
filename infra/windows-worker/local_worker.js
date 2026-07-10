@@ -336,6 +336,9 @@ const TASK_MODES = {
   PRODUCT_WRITE_ALLOWED: "product_write_allowed",
 };
 
+const PRODUCT_WRITE_ALLOWED_SCOPE_TEXT =
+  "src/app/**, docs/NEXT_TASK_CARD.md, docs/projects/city-partner-website.md";
+
 const TASK_MUTATION_PATTERN =
   /修复|新增|更新|补齐|建立|修改|改动|创建|写入|补充|fix|repair|add|create|update|modify|patch|implement/i;
 const READ_ONLY_TASK_PATTERN =
@@ -1677,14 +1680,57 @@ function buildQaReviewGuard(taskText) {
   ].join("\n");
 }
 
+function buildProductWriteGuard(taskText, taskMode) {
+  if (taskMode !== TASK_MODES.PRODUCT_WRITE_ALLOWED) {
+    return null;
+  }
+
+  const isBatchFixProduct = isBatchFixProductTaskText(taskText);
+  return [
+    "【产品修复写入授权】",
+    "project_domain: city_partner_product",
+    "task_mode: product_write_allowed",
+    "read_only_mode: false",
+    "can_write_files: true",
+    `allowed_scope: ${PRODUCT_WRITE_ALLOWED_SCOPE_TEXT}`,
+    isBatchFixProduct
+      ? "BATCH-FIX 产品修复批次已清除历史 read_only/QA/docs 残留文本，允许修改 allowed_scope 内产品文件。"
+      : "产品修复任务允许在批准范围内修改产品文件。",
+    "forbidden_scope: infra/windows-worker/**, src/lib/worker-jobs.ts, src/app/api/feishu/**, src/lib/project-director-console.ts, work/tencent-cloud/**, .env, database, deploy",
+    "不得修改 Worker / 腾讯云中转 / 数据库 / env / deploy。",
+  ].join("\n");
+}
+
+function sanitizeProductTaskTextForPrompt(taskText, taskMode) {
+  if (taskMode !== TASK_MODES.PRODUCT_WRITE_ALLOWED) {
+    return taskText;
+  }
+
+  return String(taskText || "")
+    .split(/\r?\n/)
+    .filter(
+      (line) =>
+        !/只读任务锁死|read_only_mode\s*[:=]\s*true|不得修改任何文件|不修改任何文件|只执行\s*git\s*status|只执行\s*git\s*diff|only\s+git\s+status|only\s+git\s+diff/i.test(
+          line
+        )
+    )
+    .join("\n")
+    .trim();
+}
+
 function buildWorkerGuardedPrompt(requestText, options = {}) {
   const taskText = String(requestText || "").trim();
   const taskDomain = classifyWorkerTaskDomain(taskText);
   const taskMode = options.taskMode || getTaskModeFromText(taskText) || TASK_MODES.READ_ONLY;
-  const readOnlyGuard = buildReadOnlyGuard(taskText, {
-    force: options.readOnlyMode === true || taskMode === TASK_MODES.READ_ONLY,
-  });
+  const promptTaskText = sanitizeProductTaskTextForPrompt(taskText, taskMode);
+  const readOnlyGuard =
+    taskMode === TASK_MODES.READ_ONLY
+      ? buildReadOnlyGuard(taskText, {
+          force: options.readOnlyMode === true || taskMode === TASK_MODES.READ_ONLY,
+        })
+      : null;
   const qaReviewGuard = buildQaReviewGuard(taskText);
+  const productWriteGuard = buildProductWriteGuard(taskText, taskMode);
   const domainGuard = isAutomationSystemTask(taskText)
     ? [
         "【自动化系统任务边界】",
@@ -1702,17 +1748,20 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
     readOnlyGuard ? "" : null,
     qaReviewGuard,
     qaReviewGuard ? "" : null,
+    productWriteGuard,
+    productWriteGuard ? "" : null,
     domainGuard,
     "",
     "【统一任务模式】",
     `task_mode: ${taskMode}`,
     `read_only_mode: ${taskMode === TASK_MODES.READ_ONLY ? "true" : "false"}`,
+    `can_write_files: ${taskMode === TASK_MODES.READ_ONLY ? "false" : "true"}`,
     "docs_write_allowed: only docs/** may change.",
     "automation_system_write_allowed: only approved automation-system files may change.",
-    "product_write_allowed: only separately approved product batches may change src/app product pages.",
+    `product_write_allowed: may change ${PRODUCT_WRITE_ALLOWED_SCOPE_TEXT}.`,
     "",
     "【原始任务内容】",
-    taskText,
+    promptTaskText,
     "",
     "【再次强调】",
     CODEX_GIT_OPERATION_GUARD,

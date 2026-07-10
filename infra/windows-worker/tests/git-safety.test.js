@@ -707,14 +707,29 @@ test("read_only_mode task lock", async (t) => {
   await t.test("BATCH-FIX product repair stays product even with QA docs and lint wording", () => {
     const productJob = {
       request_text: [
-        "BATCH-FIX-01 fix 同城搭子网站 partners login profile page.tsx 产品页面。",
+        "BATCH-FIX-02 fix 同城搭子网站 partners login profile page.tsx 产品页面。",
         "Also read QA-05, docs, run npm run lint and tsc validation.",
+        "read_only_mode=true",
+        "只读任务锁死",
+        "不修改任何文件",
+        "只执行 git status / git diff",
         "Do not modify Worker or Tencent Cloud system files.",
       ].join("\n"),
     };
 
     assert.equal(classifyWorkerTaskDomain(productJob.request_text), "city_partner_product");
     assert.equal(getTaskMode(productJob), TASK_MODES.PRODUCT_WRITE_ALLOWED);
+    assert.equal(isReadOnlyTask(productJob), false);
+    const prompt = buildCodexPrompt(productJob);
+    assert.match(prompt, /project_domain: city_partner_product/);
+    assert.match(prompt, /task_mode: product_write_allowed/);
+    assert.match(prompt, /read_only_mode: false/);
+    assert.match(prompt, /can_write_files: true/);
+    assert.match(prompt, /allowed_scope: src\/app\/\*\*/);
+    assert.doesNotMatch(prompt, /只读任务锁死/);
+    assert.doesNotMatch(prompt, /不修改任何文件/);
+    assert.doesNotMatch(prompt, /只执行 git status/);
+    assert.doesNotMatch(prompt, /只执行 git diff/);
     assert.doesNotThrow(() =>
       assertTaskGoalApplied(productJob, ["src/app/partners/page.tsx"])
     );
