@@ -39,7 +39,7 @@ const READ_ONLY_TASK_PATTERN =
 const QA_BATCH_PATTERN = /\bBATCH-QA(?:-[A-Z0-9]+)*\b/i;
 const BATCH_FIX_PATTERN = /\bBATCH-FIX(?:-[A-Z0-9]+)*\b/i;
 const BATCH_FIX_PRODUCT_SIGNAL_PATTERN =
-  /同城搭子网站|partners|login|profile|page\.tsx|产品页面|首页|发布页|搭子浏览|详情页/i;
+  /同城搭子网站|partners|\/partners|\/post|login|profile|page\.tsx|src\/app|产品页面|产品修复|QA\s*发现|首页|发布页|搭子浏览|详情页|product\s+repair|product\s+page/i;
 const TASK_MODES = {
   READ_ONLY: "read_only",
   DOCS_WRITE_ALLOWED: "docs_write_allowed",

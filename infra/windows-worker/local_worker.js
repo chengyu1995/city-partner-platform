@@ -358,7 +358,7 @@ const PRODUCT_WRITE_TASK_PATTERN =
   /product_write_allowed|产品开发|业务页面开发|同城搭子.*(?:页面|产品|业务)/i;
 const BATCH_FIX_PATTERN = /\bBATCH-FIX(?:-[A-Z0-9]+)*\b/i;
 const BATCH_FIX_PRODUCT_SIGNAL_PATTERN =
-  /同城搭子网站|partners|login|profile|page\.tsx|产品页面|首页|发布页|搭子浏览|详情页/i;
+  /同城搭子网站|partners|\/partners|\/post|login|profile|page\.tsx|src\/app|产品页面|产品修复|QA\s*发现|首页|发布页|搭子浏览|详情页|product\s+repair|product\s+page/i;
 const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const FORCED_READ_ONLY_BATCH_PATTERN =
   /\bBATCH-QA(?:-[A-Z0-9]+)*\b|\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
@@ -569,6 +569,8 @@ const FAILURE_FINGERPRINTS = {
     "QA report natural language was complete but unstable to match; prefer QA_REPORT_FIELDS.",
   BATCH_FIX_PRODUCT_MISROUTED_TO_AUTOMATION:
     "BATCH-FIX product repair was misrouted to automation/docs_write_allowed and changed system files instead of product pages.",
+  BATCH_FIX_PRODUCT_MISCLASSIFIED_AS_AUTOMATION_SYSTEM:
+    "BATCH-FIX product repair was classified as automation_system during the new-demand classification stage.",
   ORIGINAL_BATCH_CONTEXT_MISSING:
     "Approved execution referenced a BATCH-FIX batch without carrying the original product repair request.",
 };
@@ -864,7 +866,10 @@ function getTaskMode(job) {
     const text = getJobText(job);
     const textMode = getTaskModeFromText(text);
 
-    if (FORCED_READ_ONLY_BATCH_PATTERN.test(text)) {
+    if (
+      textMode !== TASK_MODES.PRODUCT_WRITE_ALLOWED &&
+      FORCED_READ_ONLY_BATCH_PATTERN.test(text)
+    ) {
       return TASK_MODES.READ_ONLY;
     }
 

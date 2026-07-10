@@ -127,6 +127,7 @@
 ## BATCH-GM-STABILIZE-09 BATCH-FIX product routing
 
 - `BATCH-FIX-*` with product signals such as `同城搭子网站`, `partners`, `login`, `profile`, `page.tsx`, `产品页面`, `首页`, `发布页`, `搭子浏览`, or `详情页` is forced to `project_domain=city_partner_product`, `task_mode=product_write_allowed`, and `read_only_mode=false`.
+- New-demand classification must also treat `src/app`, `/partners`, `/post`, `产品修复`, and `QA 发现` as product signals. Forbidden-scope words such as Worker, Tencent Cloud, worker-jobs, feishu gateway, env, database, or deploy must not override the current `BATCH-FIX-*` identity.
 - Product BATCH-FIX tasks are not reclassified as `automation_system_write_allowed` or `docs_write_allowed` just because the request mentions QA, docs, lint, tsc, Worker validation, or acceptance checks.
 - Allowed scope is `src/app/**`, `docs/NEXT_TASK_CARD.md`, and `docs/projects/city-partner-website.md`.
 - Forbidden scope includes `infra/windows-worker/**`, `src/lib/worker-jobs.ts`, `src/app/api/feishu/**`, `src/lib/project-director-console.ts`, Tencent Cloud relay files, env, and database files.

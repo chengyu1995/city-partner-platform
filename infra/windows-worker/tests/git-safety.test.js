@@ -748,6 +748,26 @@ test("read_only_mode task lock", async (t) => {
     );
   });
 
+  await t.test("BATCH-FIX new demand classification ignores forbidden system scope words", () => {
+    const requestText = [
+      "新需求：BATCH-FIX-04 产品修复",
+      "项目名称：同城搭子网站",
+      "QA 发现：修复 /partners，修复 /partners/[id]，修复 login/profile Link lint。",
+      "允许修改：src/app/**",
+      "禁止修改：Worker / 腾讯云 / worker-jobs / feishu gateway / src/app/api/feishu / env / 数据库 / 部署。",
+      "背景：BATCH-GM-STABILIZE-11、BATCH-QA-05、BATCH-P3、BATCH-P4 都只是背景，不是当前执行批次。",
+    ].join("\n");
+
+    assert.equal(classifyWorkerTaskDomain(requestText), "city_partner_product");
+    assert.equal(getTaskMode({ request_text: requestText }), TASK_MODES.PRODUCT_WRITE_ALLOWED);
+    assert.equal(isReadOnlyTask({ request_text: requestText }), false);
+    const prompt = buildCodexPrompt({ request_text: requestText });
+    assert.match(prompt, /project_domain: city_partner_product/);
+    assert.match(prompt, /task_mode: product_write_allowed/);
+    assert.match(prompt, /read_only_mode: false/);
+    assert.match(prompt, /allowed_scope: src\/app\/\*\*/);
+  });
+
   await t.test("BATCH-FIX approved execution requires original product request context", () => {
     const originalRequest = [
       "新需求：BATCH-FIX-03 修复同城搭子网站 partners/login/profile/page.tsx 产品页面。",
