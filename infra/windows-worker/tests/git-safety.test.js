@@ -27,6 +27,7 @@ const {
   NO_FIX_APPLIED,
   OUT_OF_SCOPE_BUSINESS_CHANGE,
   OUT_OF_SCOPE_SYSTEM_CHANGE,
+  ORIGINAL_BATCH_CONTEXT_MISSING,
   READ_ONLY_MODE_VIOLATION,
   TASK_MODE_MISMATCH,
   MISSING_REQUIRED_DOCS,
@@ -34,6 +35,7 @@ const {
   INCOMPLETE_QA_REPORT,
   TASK_MODES,
   assertGitOperationAllowed,
+  assertOriginalBatchContextAvailable,
   assertQaTaskOutcome,
   assertTaskGoalApplied,
   buildCodexPrompt,
@@ -744,6 +746,40 @@ test("read_only_mode task lock", async (t) => {
       () => assertTaskGoalApplied(productJob, ["docs/projects/feishu-gm-automation.md"]),
       (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
     );
+  });
+
+  await t.test("BATCH-FIX approved execution requires original product request context", () => {
+    const originalRequest = [
+      "新需求：BATCH-FIX-03 修复同城搭子网站 partners/login/profile/page.tsx 产品页面。",
+      "目标：最小修复 partners、login、profile 页面。",
+      "验证：可运行 tsc 和 lint，但不得修改 Worker。",
+    ].join("\n");
+    const approvedJob = {
+      request_text: "新需求：执行项目总管批准批次 BATCH-FIX-03",
+      payload: {
+        approved_batch: "BATCH-FIX-03",
+        original_request_text: originalRequest,
+      },
+    };
+    const shellOnlyJob = {
+      request_text: "新需求：执行项目总管批准批次 BATCH-FIX-03",
+      payload: {
+        approved_batch: "BATCH-FIX-03",
+      },
+    };
+
+    assert.equal(
+      classifyWorkerTaskDomain([approvedJob.request_text, originalRequest].join("\n")),
+      "city_partner_product"
+    );
+    assert.equal(getTaskMode(approvedJob), TASK_MODES.PRODUCT_WRITE_ALLOWED);
+    assert.equal(isReadOnlyTask(approvedJob), false);
+    assert.doesNotThrow(() => assertOriginalBatchContextAvailable(approvedJob));
+    assert.throws(
+      () => assertOriginalBatchContextAvailable(shellOnlyJob),
+      (error) => error.code === ORIGINAL_BATCH_CONTEXT_MISSING
+    );
+    assert.equal(getTaskMode(shellOnlyJob), TASK_MODES.READ_ONLY);
   });
 
   await t.test("task mode priorities keep GM QA and BATCH-37 classifications stable", () => {

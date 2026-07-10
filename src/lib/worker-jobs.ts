@@ -572,8 +572,21 @@ export function buildProjectDirectorWorkerReport(input: {
     readString(input.job?.request_text) ??
     readString(input.job?.prompt) ??
     null;
+  const jobPayload = readRecord(input.job?.payload);
+  const jobResult = readRecord(input.job?.result);
+  const taskTextForClassification = [
+    demand,
+    readString(jobPayload?.original_request_text),
+    readString(jobPayload?.originalRequestText),
+    readString(jobResult?.original_request_text),
+    readString(jobResult?.originalRequestText),
+    readString(input.job?.title),
+    readString(input.job?.job_type),
+  ]
+    .filter(Boolean)
+    .join("\n");
   const taskDomain = classifyWorkerTaskDomain(
-    [demand, readString(input.job?.title), readString(input.job?.job_type)].filter(Boolean).join("\n")
+    taskTextForClassification
   );
   const jobId = readString(input.job?.id) ?? readString(input.job?.job_id);
   const statusTitle =
@@ -587,11 +600,9 @@ export function buildProjectDirectorWorkerReport(input: {
   const completionItems = input.status === "failed" ? [] : extractCompletionItems(summary);
   const safetyBoundary = buildSafetyBoundary(filesChanged, input.deployStatus);
   const sanitizedError = input.errorText ? sanitizeReportText(input.errorText) : "";
-  const jobPayload = readRecord(input.job?.payload);
-  const jobResult = readRecord(input.job?.result);
   const combinedReportText = [summary, sanitizedError, ...validation].join("\n");
   const taskMode = inferTaskMode({
-    demand,
+    demand: taskTextForClassification || demand,
     batchCode,
     jobPayload,
     jobResult,

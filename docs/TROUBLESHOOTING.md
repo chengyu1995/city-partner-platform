@@ -84,6 +84,7 @@ Known fingerprints:
 - `QA_REPORT_NATURAL_LANGUAGE_MATCH_UNSTABLE`: QA report natural language was complete but unstable to match; prefer `QA_REPORT_FIELDS`.
 - `BATCH_FIX_PRODUCT_MISROUTED_TO_AUTOMATION`: `BATCH-FIX-*` product repair was misrouted to automation/docs mode and changed system files instead of product pages.
 - `PRODUCT_WRITE_PROMPT_POLLUTED_BY_READ_ONLY_LOCK`: product repair was already `product_write_allowed`, but the Codex prompt still contained a read-only lock and caused `NO_FIX_APPLIED`.
+- `ORIGINAL_BATCH_CONTEXT_MISSING`: approved BATCH-FIX execution did not carry the original `新需求：BATCH-FIX-*` full request text.
 
 Escalation:
 

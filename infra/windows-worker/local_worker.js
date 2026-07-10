@@ -324,6 +324,7 @@ const NO_FIX_APPLIED = "NO_FIX_APPLIED";
 const READ_ONLY_MODE_VIOLATION = "READ_ONLY_MODE_VIOLATION";
 const OUT_OF_SCOPE_BUSINESS_CHANGE = "OUT_OF_SCOPE_BUSINESS_CHANGE";
 const OUT_OF_SCOPE_SYSTEM_CHANGE = "OUT_OF_SCOPE_SYSTEM_CHANGE";
+const ORIGINAL_BATCH_CONTEXT_MISSING = "ORIGINAL_BATCH_CONTEXT_MISSING";
 const TASK_MODE_MISMATCH = "TASK_MODE_MISMATCH";
 const MISSING_REQUIRED_DOCS = "MISSING_REQUIRED_DOCS";
 const INSUFFICIENT_DOC_OUTPUT = "INSUFFICIENT_DOC_OUTPUT";
@@ -568,6 +569,8 @@ const FAILURE_FINGERPRINTS = {
     "QA report natural language was complete but unstable to match; prefer QA_REPORT_FIELDS.",
   BATCH_FIX_PRODUCT_MISROUTED_TO_AUTOMATION:
     "BATCH-FIX product repair was misrouted to automation/docs_write_allowed and changed system files instead of product pages.",
+  ORIGINAL_BATCH_CONTEXT_MISSING:
+    "Approved execution referenced a BATCH-FIX batch without carrying the original product repair request.",
 };
 
 function getJobText(job) {
@@ -578,18 +581,71 @@ function getJobText(job) {
     readString(job?.request_text),
     readString(job?.prompt),
     readString(job?.description),
+    readString(job?.original_request_text),
+    readString(job?.originalRequestText),
     readString(job?.approved_batch),
     readString(job?.current_batch),
     readString(job?.batch_code),
     readString(payload?.approved_batch),
     readString(payload?.current_batch),
     readString(payload?.batch_code),
+    readString(payload?.original_request_text),
+    readString(payload?.originalRequestText),
     readString(result?.approved_batch),
     readString(result?.current_batch),
     readString(result?.batch_code),
+    readString(result?.original_request_text),
+    readString(result?.originalRequestText),
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function hasOriginalRequestContext(job) {
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const result = job && typeof job.result === "object" ? job.result : null;
+  return Boolean(
+    readString(job?.original_request_text) ||
+      readString(job?.originalRequestText) ||
+      readString(payload?.original_request_text) ||
+      readString(payload?.originalRequestText) ||
+      readString(result?.original_request_text) ||
+      readString(result?.originalRequestText)
+  );
+}
+
+function isApprovedExecutionShellText(text) {
+  const raw = String(text || "");
+  return /执行项目总管批准批次\s+BATCH-FIX(?:-[A-Z0-9]+)*|批准执行[:：].*BATCH-FIX(?:-[A-Z0-9]+)*|仅批准\s+BATCH-FIX(?:-[A-Z0-9]+)*/i.test(raw);
+}
+
+function createOriginalBatchContextMissingError(job) {
+  const batchCode = getJobBatchCode(job) || "BATCH-FIX-*";
+  const error = new Error(
+    [
+      ORIGINAL_BATCH_CONTEXT_MISSING,
+      `${batchCode} approval shell is missing original_request_text; refusing to execute or infer automation_system.`,
+      "Worker task must carry the original 新需求：BATCH-XXX full text before Codex runs.",
+      `approved_batch: ${batchCode}`,
+    ].join("\n")
+  );
+  error.code = ORIGINAL_BATCH_CONTEXT_MISSING;
+  error.failureStage = "approved batch context validation";
+  return error;
+}
+
+function assertOriginalBatchContextAvailable(job) {
+  const text = [job?.request_text, job?.prompt, job?.description].filter(Boolean).join("\n");
+  const batchCode = getJobBatchCode(job);
+  if (
+    batchCode &&
+    BATCH_FIX_PATTERN.test(batchCode) &&
+    isApprovedExecutionShellText(text) &&
+    !hasOriginalRequestContext(job) &&
+    !isBatchFixProductTaskText(text)
+  ) {
+    throw createOriginalBatchContextMissingError(job);
+  }
 }
 
 function taskRequiresFileChanges(requestText) {
@@ -1879,20 +1935,26 @@ function classifyFailure(error) {
     error?.code === "BUSINESS_PAGE_BOUNDARY_VIOLATION" ||
     error?.code === OUT_OF_SCOPE_BUSINESS_CHANGE ||
     error?.code === OUT_OF_SCOPE_SYSTEM_CHANGE ||
+    error?.code === ORIGINAL_BATCH_CONTEXT_MISSING ||
     error?.code === TASK_MODE_MISMATCH ||
     error?.code === MISSING_REQUIRED_DOCS ||
     error?.code === INSUFFICIENT_DOC_OUTPUT ||
     errorText.includes(OUT_OF_SCOPE_BUSINESS_CHANGE) ||
-    errorText.includes(OUT_OF_SCOPE_SYSTEM_CHANGE)
+    errorText.includes(OUT_OF_SCOPE_SYSTEM_CHANGE) ||
+    errorText.includes(ORIGINAL_BATCH_CONTEXT_MISSING)
   ) {
     return {
       stage:
-        error?.code === OUT_OF_SCOPE_SYSTEM_CHANGE
+        error?.code === ORIGINAL_BATCH_CONTEXT_MISSING
+          ? "原始批次上下文缺失"
+          : error?.code === OUT_OF_SCOPE_SYSTEM_CHANGE
           ? "产品任务系统文件边界检查"
           : "自动化任务范围边界检查",
       keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
       suggestion:
-        error?.code === OUT_OF_SCOPE_SYSTEM_CHANGE
+        error?.code === ORIGINAL_BATCH_CONTEXT_MISSING
+          ? "拒绝创建或执行缺少原始需求全文的 BATCH-FIX 任务；必须由总管查询并携带 original_request_text 后重新入队。"
+          : error?.code === OUT_OF_SCOPE_SYSTEM_CHANGE
           ? "撤回 Worker / Gateway / 总管 / 腾讯云中转等系统文件改动，只保留 BATCH-FIX 产品修复允许范围内的 src/app/** 和批准产品文档。"
           : "撤回业务页面改动，只保留 Worker / Codex / report / heartbeat 相关允许文件；如确需改业务页面，必须由老板单独批准对应产品开发批次。",
       recommendBossApproval: true,
@@ -2686,6 +2748,8 @@ async function pollOnce() {
   let gitCheckpoint = null;
 
   try {
+    assertOriginalBatchContextAvailable(job);
+
     if (readOnlyMode) {
       await updateProgress(
         job.id,
@@ -3074,6 +3138,8 @@ async function pollOnce() {
               ? "succeeded_until_read_only_validation"
               : errorCode === INCOMPLETE_QA_REPORT
               ? "succeeded_until_qa_report_validation"
+              : errorCode === ORIGINAL_BATCH_CONTEXT_MISSING
+              ? "failed_before_codex_original_context_missing"
               : errorCode === TASK_MODE_MISMATCH
               ? "succeeded_until_task_mode_validation"
               : errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
@@ -3093,6 +3159,8 @@ async function pollOnce() {
               ? "failed_read_only_mode_violation"
               : errorCode === INCOMPLETE_QA_REPORT
               ? "failed_incomplete_qa_report"
+              : errorCode === ORIGINAL_BATCH_CONTEXT_MISSING
+              ? "failed_original_batch_context_missing"
               : errorCode === TASK_MODE_MISMATCH
               ? "failed_task_mode_mismatch"
               : errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
@@ -3111,6 +3179,7 @@ async function pollOnce() {
           `No-op run: ${errorCode === NO_FIX_APPLIED ? "yes" : "no"}`,
           `Task mode mismatch: ${errorCode === TASK_MODE_MISMATCH ? "yes" : "no"}`,
           `Incomplete QA report: ${errorCode === INCOMPLETE_QA_REPORT ? "yes" : "no"}`,
+          `Original batch context missing: ${errorCode === ORIGINAL_BATCH_CONTEXT_MISSING ? "yes" : "no"}`,
           `missing_qa_report_fields: ${
             error?.missingQaReportFields?.length
               ? error.missingQaReportFields.join(", ")
@@ -3193,6 +3262,7 @@ module.exports = {
   READ_ONLY_MODE_VIOLATION,
   OUT_OF_SCOPE_BUSINESS_CHANGE,
   OUT_OF_SCOPE_SYSTEM_CHANGE,
+  ORIGINAL_BATCH_CONTEXT_MISSING,
   TASK_MODE_MISMATCH,
   MISSING_REQUIRED_DOCS,
   INSUFFICIENT_DOC_OUTPUT,
@@ -3200,6 +3270,7 @@ module.exports = {
   FAILURE_FINGERPRINTS,
   TASK_MODES,
   assertTaskGoalApplied,
+  assertOriginalBatchContextAvailable,
   assertQaReportComplete,
   assertQaTaskOutcome,
   assertGitOperationAllowed,

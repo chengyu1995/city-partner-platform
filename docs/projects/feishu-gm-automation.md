@@ -132,6 +132,7 @@
 - Forbidden scope includes `infra/windows-worker/**`, `src/lib/worker-jobs.ts`, `src/app/api/feishu/**`, `src/lib/project-director-console.ts`, Tencent Cloud relay files, env, and database files.
 - If a BATCH-FIX product task changes Worker, gateway, director, or Tencent/system files, the Worker fails with `OUT_OF_SCOPE_SYSTEM_CHANGE`.
 - `product_write_allowed` prompts must clear stale read-only residue. BATCH-FIX product prompts must show `read_only_mode=false`, `can_write_files=true`, and the product allowed scope, and must not include the read-only lock, `不修改任何文件`, or `只执行 git status / git diff`.
+- Approved execution for `BATCH-FIX-*` must look up and carry the original `新需求：BATCH-FIX-*` full request text. If the original context is missing, Tencent Cloud and the Windows Worker must fail with `ORIGINAL_BATCH_CONTEXT_MISSING` instead of creating or executing an automation-system shell task.
 
 ## BATCH-GM-STABILIZE-03 docs task priority and cloud terminal guard
 
