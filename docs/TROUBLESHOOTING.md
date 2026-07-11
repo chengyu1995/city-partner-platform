@@ -86,6 +86,7 @@ Known fingerprints:
 - `BATCH_FIX_PRODUCT_MISCLASSIFIED_AS_AUTOMATION_SYSTEM`: `BATCH-FIX-*` product repair was classified as `automation_system` during the new-demand classification stage.
 - `EXPLICIT_TASK_MODE_OVERRIDDEN`: boss-provided `project_domain` / `task_mode` / `read_only_mode` fields were overwritten by automatic routing, historical failed-job fields, or inferred docs/product scope. First occurrence is warning, second is duplicate warning, third and later must be blocked.
 - `PRODUCT_WRITE_PROMPT_POLLUTED_BY_READ_ONLY_LOCK`: product repair was already `product_write_allowed`, but the Codex prompt still contained a read-only lock and caused `NO_FIX_APPLIED`.
+- `BUSINESS_PAGE_BOUNDARY_VIOLATION`: automation/docs/read-only tasks touched frozen product pages. This must not be raised for `city_partner_product` + `product_write_allowed` changes inside `src/app/**`; product tasks remain blocked from Worker, gateway, env, and database files.
 - `ORIGINAL_BATCH_CONTEXT_MISSING`: approved BATCH-FIX execution did not carry the original `新需求：BATCH-FIX-*` full request text.
 
 Escalation:

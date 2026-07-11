@@ -2507,9 +2507,11 @@ async function commitGitTask(job) {
     };
   }
 
-  validateAutomationTaskBoundaries(taskChangedPaths, {
-    requestText: job?.request_text || job?.prompt || "",
-  });
+  if (taskMode !== TASK_MODES.PRODUCT_WRITE_ALLOWED) {
+    validateAutomationTaskBoundaries(taskChangedPaths, {
+      requestText: job?.request_text || job?.prompt || "",
+    });
+  }
 
   const stagedPaths = await stageTaskPaths(taskChangedPaths, taskChangedEntries);
   assertTaskGoalApplied(job, stagedPaths);

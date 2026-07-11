@@ -726,6 +726,10 @@ test("read_only_mode task lock", async (t) => {
       () => assertTaskGoalApplied(job, ["src/app/page.tsx"]),
       (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
     );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["src/app/partners/page.tsx"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
   });
 
   await t.test("automation_system_write_allowed requires automation diff and blocks product pages", () => {
@@ -776,6 +780,14 @@ test("read_only_mode task lock", async (t) => {
       assertTaskGoalApplied(productJob, ["src/app/partners/page.tsx"])
     );
     assert.doesNotThrow(() =>
+      assertTaskGoalApplied(productJob, ["src/app/partners/[id]/page.tsx"])
+    );
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(productJob, [
+        "src/app/partners/[id]/LocalDraftPartnerDetail.tsx",
+      ])
+    );
+    assert.doesNotThrow(() =>
       assertTaskGoalApplied(productJob, ["docs/projects/city-partner-website.md"])
     );
     assert.throws(
@@ -785,6 +797,15 @@ test("read_only_mode task lock", async (t) => {
     assert.throws(
       () => assertTaskGoalApplied(productJob, ["docs/projects/feishu-gm-automation.md"]),
       (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+
+    const workerSource = fs.readFileSync(
+      path.join(workerRoot, "local_worker.js"),
+      "utf8"
+    );
+    assert.match(
+      workerSource,
+      /if \(taskMode !== TASK_MODES\.PRODUCT_WRITE_ALLOWED\) \{\s*validateAutomationTaskBoundaries/
     );
   });
 
