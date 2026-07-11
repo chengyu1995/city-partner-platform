@@ -419,41 +419,53 @@ function inferTaskMode(input: {
   submitted?: unknown;
 }): string {
   const text = [input.demand, input.batchCode].filter(Boolean).join("\n");
-  if (isBatchFixProductTaskText(text)) return TASK_MODES.PRODUCT_WRITE_ALLOWED;
-  if (READ_ONLY_BATCH_PATTERN.test(text) || taskDeclaresReadOnly(text)) return TASK_MODES.READ_ONLY;
-  if (
-    DOCS_WRITE_TASK_PATTERN.test(text) ||
-    (DOCS_WRITE_TARGET_PATTERN.test(text) && TASK_MUTATION_PATTERN.test(text))
-  ) {
-    return TASK_MODES.DOCS_WRITE_ALLOWED;
-  }
-  if (
-    /BATCH-44|BATCH-45A|automation_system_write_allowed/i.test(text) ||
-    (AUTOMATION_WRITE_TASK_PATTERN.test(text) && TASK_MUTATION_PATTERN.test(text))
-  ) {
-    return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
-  }
-  if (input.batchCode && /^BATCH-P\d+$/i.test(input.batchCode)) return TASK_MODES.PRODUCT_WRITE_ALLOWED;
 
-  const submittedMode = readTaskModeField(
+  // Forced read-only batches must outrank stale/polluted task_mode fields.
+  // REPORT_FORCED_READ_ONLY_BEFORE_FIELD_MODE
+  if (input.batchCode && READ_ONLY_BATCH_PATTERN.test(input.batchCode)) {
+    return TASK_MODES.READ_ONLY;
+  }
+  if (READ_ONLY_BATCH_PATTERN.test(text) || taskDeclaresReadOnly(text)) {
+    return TASK_MODES.READ_ONLY;
+  }
+
+  // Product repair batches must stay product even when QA/docs/system words appear in the prompt.
+  if (isBatchFixProductTaskText(text)) {
+    return TASK_MODES.PRODUCT_WRITE_ALLOWED;
+  }
+
+  // Explicit task mode is trusted only after forced read-only and product batch identity checks.
+  const fieldMode = readTaskModeField(
     input.submitted,
     input.jobPayload?.task_mode,
     input.jobPayload?.taskMode,
     input.jobResult?.task_mode,
     input.jobResult?.taskMode
   );
-  if (submittedMode) return submittedMode;
+  if (fieldMode) return fieldMode;
+
+  const explicitTextModeMatch = text.match(/\btask[_\s-]*mode\s*[:=]\s*[`'"“”]?([a-z_]+)[`'"“”]?/i);
+  const explicitTextMode = explicitTextModeMatch ? explicitTextModeMatch[1].toLowerCase() : null;
+  if (explicitTextMode && Object.values(TASK_MODES).includes(explicitTextMode as typeof TASK_MODES[keyof typeof TASK_MODES])) {
+    return explicitTextMode;
+  }
 
   if (
-    [
-      input.submitted,
-      input.jobPayload?.read_only_mode,
-      input.jobPayload?.readOnlyMode,
-      input.jobResult?.read_only_mode,
-      input.jobResult?.readOnlyMode,
-    ].some(readBooleanFlag)
+    DOCS_WRITE_TASK_PATTERN.test(text) ||
+    (DOCS_WRITE_TARGET_PATTERN.test(text) && TASK_MUTATION_PATTERN.test(text))
   ) {
-    return TASK_MODES.READ_ONLY;
+    return TASK_MODES.DOCS_WRITE_ALLOWED;
+  }
+
+  if (
+    /BATCH-44|BATCH-45A|automation_system_write_allowed/i.test(text) ||
+    (AUTOMATION_WRITE_TASK_PATTERN.test(text) && TASK_MUTATION_PATTERN.test(text))
+  ) {
+    return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
+  }
+
+  if (input.batchCode && /^BATCH-P\d+$/i.test(input.batchCode)) {
+    return TASK_MODES.PRODUCT_WRITE_ALLOWED;
   }
 
   return TASK_MODES.READ_ONLY;

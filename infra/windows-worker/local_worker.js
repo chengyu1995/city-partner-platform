@@ -575,33 +575,40 @@ const FAILURE_FINGERPRINTS = {
     "Approved execution referenced a BATCH-FIX batch without carrying the original product repair request.",
 };
 
+function readTextValue(value) {
+  if (value == null) return "";
+  if (Array.isArray(value)) {
+    return value.map(readTextValue).filter(Boolean).join("\n");
+  }
+  if (typeof value === "object") {
+    return Object.values(value).map(readTextValue).filter(Boolean).join("\n");
+  }
+  return String(value);
+}
+
 function getJobText(job) {
   const payload = job && typeof job.payload === "object" ? job.payload : null;
   const result = job && typeof job.result === "object" ? job.result : null;
+
   return [
-    readString(job?.title),
-    readString(job?.request_text),
-    readString(job?.prompt),
-    readString(job?.description),
-    readString(job?.original_request_text),
-    readString(job?.originalRequestText),
-    readString(job?.approved_batch),
-    readString(job?.current_batch),
-    readString(job?.batch_code),
-    readString(payload?.approved_batch),
-    readString(payload?.current_batch),
-    readString(payload?.batch_code),
-    readString(payload?.original_request_text),
-    readString(payload?.originalRequestText),
-    readString(result?.approved_batch),
-    readString(result?.current_batch),
-    readString(result?.batch_code),
-    readString(result?.original_request_text),
-    readString(result?.originalRequestText),
-  ]
-    .filter(Boolean)
-    .join("\n");
+    job?.request_text,
+    job?.requestText,
+    job?.demand,
+    job?.title,
+    job?.name,
+    payload?.request_text,
+    payload?.requestText,
+    payload?.original_request_text,
+    payload?.originalRequestText,
+    payload?.demand,
+    payload?.title,
+    result?.request_text,
+    result?.requestText,
+    result?.original_request_text,
+    result?.originalRequestText,
+  ].map(readTextValue).filter(Boolean).join("\n");
 }
+
 
 function hasOriginalRequestContext(job) {
   const payload = job && typeof job.payload === "object" ? job.payload : null;
@@ -801,6 +808,12 @@ function getTaskModeFromText(text) {
   const raw = String(text || "");
   const batchCode = extractCurrentExecutionBatchCode({ request_text: raw });
 
+  const explicitModeMatch = raw.match(/\btask[_\s-]*mode\s*[:=]\s*[`'"“”]?([a-z_]+)[`'"“”]?/i);
+  const explicitTextMode = explicitModeMatch ? explicitModeMatch[1].toLowerCase() : null;
+  if (explicitTextMode && Object.values(TASK_MODES).includes(explicitTextMode)) {
+    return explicitTextMode;
+  }
+
   if (isBatchFixProductTaskText(raw)) {
     return TASK_MODES.PRODUCT_WRITE_ALLOWED;
   }
@@ -861,9 +874,116 @@ function readTaskModeField(job) {
   return null;
 }
 
+
+function readBatchCodeField(job) {
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const result = job && typeof job.result === "object" ? job.result : null;
+  const candidates = [
+    job?.approved_batch,
+    job?.approvedBatch,
+    job?.batch_code,
+    job?.batchCode,
+    payload?.approved_batch,
+    payload?.approvedBatch,
+    payload?.batch_code,
+    payload?.batchCode,
+    result?.approved_batch,
+    result?.approvedBatch,
+    result?.batch_code,
+    result?.batchCode,
+  ];
+
+  for (const candidate of candidates) {
+    const value = readString(candidate);
+    if (!value) continue;
+    const match = value.match(/\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/i);
+    if (match) return match[0].toUpperCase();
+  }
+
+  return null;
+}
+
 function getTaskMode(job) {
   try {
+    // Highest priority: BATCH-FIX product repair must stay product_write_allowed.
+    // BATCH_FIX_PRODUCT_OUTRANKS_READ_ONLY_AND_FORBIDDEN_WORDS
+    const productModeText = readTextValue([
+      job?.request_text,
+      job?.requestText,
+      job?.demand,
+      job?.title,
+      job?.name,
+      job?.payload?.request_text,
+      job?.payload?.requestText,
+      job?.payload?.original_request_text,
+      job?.payload?.originalRequestText,
+      job?.payload?.demand,
+      job?.payload?.title,
+    ]);
+
+    if (
+      /\bBATCH-FIX(?:-[A-Z0-9]+)*\b/i.test(productModeText) &&
+      /(同城搭子|city_partner_product|product_write_allowed|产品修复|首批阻断|QA-05|\/partners|\/post|login|profile|src\/app)/i.test(productModeText)
+    ) {
+      return TASK_MODES.PRODUCT_WRITE_ALLOWED;
+    }
+
+    // Hard guard: current QA/read-only request_text must outrank stale payload.task_mode.
+    // BATCH_QA_REQUEST_TEXT_OUTRANKS_PAYLOAD_TASK_MODE
+    const directRequestText = readTextValue([
+      job?.request_text,
+      job?.requestText,
+      job?.payload?.request_text,
+      job?.payload?.requestText,
+      job?.payload?.original_request_text,
+      job?.payload?.originalRequestText,
+    ]);
+    const requestTextHead = Array.isArray(job?.request_text)
+      ? String(job.request_text[0] || "")
+      : String(job?.request_text || job?.requestText || "");
+    const directBatchCode =
+      requestTextHead.match(/\bBATCH-QA(?:-[A-Z0-9]+)?\b/i)?.[0] ||
+      requestTextHead.match(/\bBATCH-43\b/i)?.[0] ||
+      requestTextHead.match(/\bBATCH-GM-SMOKE(?:-\d+)?\b/i)?.[0] ||
+      null;
+
+    if (directBatchCode && FORCED_READ_ONLY_BATCH_PATTERN.test(directBatchCode)) {
+      return TASK_MODES.READ_ONLY;
+    }
+
+    // BATCH-FIX product repair must stay product even when the text mentions system/worker forbidden scopes.
+    // BATCH_FIX_PRODUCT_REQUEST_TEXT_OUTRANKS_READ_ONLY_DEFAULT
+    if (/\bBATCH-FIX(?:-[A-Z0-9]+)*\b/i.test(directRequestText) && isBatchFixProductTaskText(directRequestText)) {
+      return TASK_MODES.PRODUCT_WRITE_ALLOWED;
+    }
+
     const text = getJobText(job);
+    const fieldBatchCode = readBatchCodeField(job);
+    const textBatchCode = extractCurrentExecutionBatchCode({ request_text: text });
+    const currentBatchCode = fieldBatchCode || textBatchCode;
+
+    // 当前真实批次最高优先级，防止历史 task_mode 污染。
+    // CURRENT_BATCH_IDENTITY_OUTRANKS_TASK_MODE
+    if (currentBatchCode && FORCED_READ_ONLY_BATCH_PATTERN.test(currentBatchCode)) {
+      return TASK_MODES.READ_ONLY;
+    }
+
+    if (currentBatchCode && /^BATCH-GM-STABILIZE(?:-|$)/i.test(currentBatchCode)) {
+      return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
+    }
+
+    const explicitMode = readTaskModeField(job);
+    if (explicitMode) {
+      if (explicitMode !== TASK_MODES.READ_ONLY && hasReadOnlyField(job)) {
+        throw createTaskModeMismatchError(
+          "A write-allowed task was locked by read_only_mode=true before it could satisfy its goal.",
+          { taskMode: explicitMode }
+        );
+      }
+
+      return explicitMode;
+    }
+
     const textMode = getTaskModeFromText(text);
 
     if (
@@ -873,15 +993,8 @@ function getTaskMode(job) {
       return TASK_MODES.READ_ONLY;
     }
 
-    if (textMode !== TASK_MODES.READ_ONLY) {
-      if (textMode) {
-        return textMode;
-      }
-    }
-
-    const explicitMode = readTaskModeField(job);
-    if (explicitMode) {
-      return explicitMode;
+    if (textMode && textMode !== TASK_MODES.READ_ONLY) {
+      return textMode;
     }
 
     if (hasReadOnlyField(job)) {
@@ -893,6 +1006,7 @@ function getTaskMode(job) {
     return TASK_MODES.READ_ONLY;
   }
 }
+
 
 function createOutOfScopeBusinessChangeError(message, details = {}) {
   const outOfScopePaths = uniqueSortedPaths(details.outOfScopePaths || []);
