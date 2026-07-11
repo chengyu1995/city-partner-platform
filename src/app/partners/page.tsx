@@ -35,6 +35,10 @@ function hrefWith(params: { city?: string; category?: string }) {
   return text ? `/partners?${text}` : "/partners";
 }
 
+function partnerDetailHref(id: string) {
+  return `/partners/${encodeURIComponent(id)}`;
+}
+
 function filterItems(items: LocalPostDraft[], city: string, category: string) {
   return items.filter((item) => {
     const cityOk = city === "全部" || item.city === city;
@@ -84,7 +88,8 @@ function PartnerCard({ item, isLocal }: { item: LocalPostDraft; isLocal?: boolea
 
       <div className="mt-5 flex flex-wrap gap-3">
         <Link
-          href={`/partners/${item.id}`}
+          href={partnerDetailHref(item.id)}
+          aria-label={`查看 ${item.title} 详情`}
           className="inline-flex min-h-11 items-center rounded-2xl bg-emerald-500 px-5 text-sm font-black text-white hover:bg-emerald-600"
         >
           查看

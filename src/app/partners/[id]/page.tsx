@@ -32,6 +32,14 @@ type DetailPost = {
   created_at: string;
 };
 
+function decodePartnerId(id: string) {
+  try {
+    return decodeURIComponent(id);
+  } catch {
+    return id;
+  }
+}
+
 async function getDetailPost(id: string): Promise<DetailPost | null> {
   const post = await getPartnerPost(id);
   if (post) return post;
@@ -54,7 +62,8 @@ async function getDetailPost(id: string): Promise<DetailPost | null> {
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
-  const { id } = await params;
+  const { id: rawId } = await params;
+  const id = decodePartnerId(rawId);
   const post = await getDetailPost(id);
   if (!post) return { title: "搭子详情 - 同城搭子" };
   const cat = PARTNER_CATEGORIES.find((c) => c.key === post.category);
@@ -71,7 +80,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 }
 
 export default async function PartnerDetailPage({ params }: Props) {
-  const { id } = await params;
+  const { id: rawId } = await params;
+  const id = decodePartnerId(rawId);
   const post = await getDetailPost(id);
   if (!post) return <LocalDraftDetail id={id} />;
 
