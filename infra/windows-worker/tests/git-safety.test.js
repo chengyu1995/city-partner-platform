@@ -471,6 +471,35 @@ test("NO_FIX_APPLIED task goal validation", async (t) => {
       (error) => error.code === NO_FIX_APPLIED
     );
   });
+
+  await t.test("BATCH-FIX product changes do not treat scope declarations as required_paths", () => {
+    const productJob = {
+      request_text: [
+        "BATCH-FIX-06",
+        "project_domain=city_partner_product",
+        "task_mode=product_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=src/app/**, docs/NEXT_TASK_CARD.md, docs/projects/city-partner-website.md",
+        "forbidden_scope=infra/windows-worker/**, src/lib/worker-jobs.ts, src/app/api/feishu/**, src/lib/project-director-console.ts",
+        "Fix partners, login, profile product pages for the city partner website.",
+      ].join("\n"),
+    };
+    const changedPaths = [
+      "src/app/partners/page.tsx",
+      "src/app/partners/[id]/page.tsx",
+      "src/app/partners/[id]/LocalDraftDetail.tsx",
+    ];
+
+    assert.deepEqual(extractRequiredChangePaths(productJob.request_text), []);
+    assert.doesNotThrow(() => assertTaskGoalApplied(productJob, changedPaths));
+    assert.throws(
+      () => assertTaskGoalApplied(productJob, []),
+      (error) =>
+        error.code === NO_FIX_APPLIED &&
+        !error.requiredPaths.includes("src/lib/worker-jobs.ts") &&
+        !error.message.includes("src/lib/worker-jobs.ts")
+    );
+  });
 });
 
 test("read_only_mode task lock", async (t) => {

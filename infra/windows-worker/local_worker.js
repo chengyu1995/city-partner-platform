@@ -1314,6 +1314,16 @@ function extractPathLikeTokens(line) {
   return uniqueSortedPaths(tokens);
 }
 
+function isScopeDeclarationLine(line) {
+  return (
+    ALLOWED_ONLY_SECTION_PATTERN.test(line) ||
+    FORBIDDEN_SECTION_PATTERN.test(line) ||
+    /allowed[_\s-]*scope|forbidden[_\s-]*scope|允许(?:修改|范围)|禁止(?:修改|范围)|不得修改|不修改|do\s+not\s+(?:modify|change|touch)|must\s+not\s+(?:modify|change|touch)/i.test(
+      String(line || "")
+    )
+  );
+}
+
 function extractRequiredChangePaths(requestText) {
   const lines = String(requestText || "").split(/\r?\n/);
   const paths = [];
@@ -1328,19 +1338,13 @@ function extractRequiredChangePaths(requestText) {
       continue;
     }
 
-    if (FORBIDDEN_SECTION_PATTERN.test(line)) {
+    if (isScopeDeclarationLine(line)) {
       inRequiredSection = false;
       continue;
     }
 
-    const isAllowedOnlyLine = ALLOWED_ONLY_SECTION_PATTERN.test(line);
-    if (isAllowedOnlyLine) {
-      inRequiredSection = false;
-      continue;
-    }
-
-    const hasRequiredMarker = REQUIRED_FILE_SECTION_PATTERN.test(line) && !isAllowedOnlyLine;
-    const hasMutationInstruction = TASK_MUTATION_PATTERN.test(line) && !isAllowedOnlyLine;
+    const hasRequiredMarker = REQUIRED_FILE_SECTION_PATTERN.test(line);
+    const hasMutationInstruction = TASK_MUTATION_PATTERN.test(line);
     const linePaths = extractPathLikeTokens(line);
 
     if (hasRequiredMarker) {
