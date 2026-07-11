@@ -84,7 +84,7 @@ function PartnerCard({ item, isLocal }: { item: LocalPostDraft; isLocal?: boolea
 
       <div className="mt-5 flex flex-wrap gap-3">
         <Link
-          href={hrefWith({ city: item.city, category: item.category })}
+          href={`/partners/${item.id}`}
           className="inline-flex min-h-11 items-center rounded-2xl bg-emerald-500 px-5 text-sm font-black text-white hover:bg-emerald-600"
         >
           查看

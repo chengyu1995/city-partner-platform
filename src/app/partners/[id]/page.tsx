@@ -2,14 +2,15 @@
  * 搭子详情页
  */
 import Link from "next/link";
-import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 import { getPartnerPost } from "@/lib/db";
+import { mockPartnerPosts } from "@/lib/mock-partners";
 import { PARTNER_CATEGORIES } from "@/types/db";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
 import { ReportButton } from "./ReportButton";
 import { CopyButton } from "./CopyButton";
+import { LocalDraftDetail } from "./LocalDraftDetail";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -18,9 +19,43 @@ interface Props {
   params: Promise<{ id: string }>;
 }
 
+type DetailPost = {
+  id: string;
+  category: string;
+  city: string;
+  title: string;
+  description: string;
+  contact: string;
+  host_name: string;
+  starts_at: string | null;
+  starts_at_label?: string;
+  created_at: string;
+};
+
+async function getDetailPost(id: string): Promise<DetailPost | null> {
+  const post = await getPartnerPost(id);
+  if (post) return post;
+
+  const mockPost = mockPartnerPosts.find((item) => item.id === id);
+  if (!mockPost) return null;
+
+  return {
+    id: mockPost.id,
+    category: mockPost.category,
+    city: mockPost.city,
+    title: mockPost.title,
+    description: mockPost.description,
+    contact: "联系方式暂不公开",
+    host_name: mockPost.hostName,
+    starts_at: null,
+    starts_at_label: mockPost.startsAt,
+    created_at: mockPost.createdAt,
+  };
+}
+
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { id } = await params;
-  const post = await getPartnerPost(id);
+  const post = await getDetailPost(id);
   if (!post) return { title: "搭子详情 - 同城搭子" };
   const cat = PARTNER_CATEGORIES.find((c) => c.key === post.category);
   return {
@@ -37,13 +72,16 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 
 export default async function PartnerDetailPage({ params }: Props) {
   const { id } = await params;
-  const post = await getPartnerPost(id);
-  if (!post) notFound();
+  const post = await getDetailPost(id);
+  if (!post) return <LocalDraftDetail id={id} />;
 
   const meta = PARTNER_CATEGORIES.find((c) => c.key === post.category) ?? {
     emoji: "📌",
     color: "from-slate-500 to-slate-400",
   };
+  const startsAtText = post.starts_at
+    ? format(new Date(post.starts_at), "yyyy年M月d日 EEEE HH:mm", { locale: zhCN })
+    : post.starts_at_label;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-violet-50 via-white to-amber-50">
@@ -61,9 +99,7 @@ export default async function PartnerDetailPage({ params }: Props) {
           <h1 className="mt-3 text-2xl font-extrabold sm:text-3xl">{post.title}</h1>
           <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm opacity-90">
             <span>📍 {post.city}</span>
-            {post.starts_at && (
-              <span>🕐 {format(new Date(post.starts_at), "yyyy年M月d日 EEEE HH:mm", { locale: zhCN })}</span>
-            )}
+            {startsAtText ? <span>🕐 {startsAtText}</span> : null}
           </div>
         </div>
 
