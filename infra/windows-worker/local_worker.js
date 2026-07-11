@@ -362,7 +362,8 @@ const BATCH_FIX_PRODUCT_SIGNAL_PATTERN =
 const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const FORCED_READ_ONLY_BATCH_PATTERN =
   /\bBATCH-QA(?:-[A-Z0-9]+)*\b|\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
-const FORBIDDEN_SECTION_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden/i;
+const FORBIDDEN_SECTION_PATTERN =
+  /禁止|不修改|不得|不允许|forbidden(?:[_\s-]*scope)?|do\s+not|don't|must\s+not|not\s+(?:modify|change|read|touch)/i;
 const BATCH_RELEVANT_LINE_PATTERN =
   /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
 const BATCH_FORBIDDEN_FRAGMENT_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden|不执行/i;
@@ -371,8 +372,9 @@ const BATCH_FORBIDDEN_SECTION_HEADING_PATTERN =
 const BATCH_FORBIDDEN_SECTION_EXIT_PATTERN =
   /标题|title|修复目标|(^|\s)目标\s*[:：]|批准|approved|approval|执行批次|当前执行批次/i;
 const REQUIRED_FILE_SECTION_PATTERN =
-  /输出文件|目标文件|指定文件|必须修改|要求修改|要求新增|要求创建|需要修改|需要新增|请修改|请新增|修复文件|required files?|output files?|target files?/i;
-const ALLOWED_ONLY_SECTION_PATTERN = /允许修改|只允许修改|allowed files?|editable files?/i;
+  /输出文件|目标文件|指定文件|修复目标|repair\s+target|必须(?:修改|新增|更新|创建)|要求(?:修改|新增|更新|创建)|需要(?:修改|新增|更新|创建)|请(?:修改|新增|更新|创建)|修复文件|required(?:[_\s-]*(?:changed|change))?[_\s-]*paths?|required files?|output files?|target files?/i;
+const ALLOWED_ONLY_SECTION_PATTERN =
+  /允许修改|只允许修改|allowed(?:[_\s-]*scope| files?)?|editable files?/i;
 const BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
 const DOCS_WRITE_ALLOWED_PREFIXES = ["docs/"];
 const BATCH_37_REQUIRED_DOCS = [
@@ -1206,6 +1208,7 @@ function extractRequiredChangePaths(requestText) {
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
+    const isPathListItem = /^\s*(?:[-*]|\d+[.)、])\s+/.test(rawLine);
 
     if (!line) {
       inRequiredSection = false;
@@ -1218,12 +1221,19 @@ function extractRequiredChangePaths(requestText) {
     }
 
     const isAllowedOnlyLine = ALLOWED_ONLY_SECTION_PATTERN.test(line);
+    if (isAllowedOnlyLine) {
+      inRequiredSection = false;
+      continue;
+    }
+
     const hasRequiredMarker = REQUIRED_FILE_SECTION_PATTERN.test(line) && !isAllowedOnlyLine;
     const hasMutationInstruction = TASK_MUTATION_PATTERN.test(line) && !isAllowedOnlyLine;
     const linePaths = extractPathLikeTokens(line);
 
     if (hasRequiredMarker) {
       inRequiredSection = true;
+    } else if (!isPathListItem) {
+      inRequiredSection = false;
     }
 
     if (linePaths.length > 0 && (inRequiredSection || hasMutationInstruction)) {
@@ -1669,6 +1679,20 @@ function assertTaskGoalApplied(job, changedPaths) {
         );
       }
     }
+
+    if (normalizedChangedPaths.length === 0) {
+      throw createNoFixAppliedError(
+        "product_write_allowed task produced no product/docs diff; refusing succeeded.",
+        {
+          requiredPaths,
+          changedPaths: normalizedChangedPaths,
+          taskDomain,
+          taskMode,
+        }
+      );
+    }
+
+    return;
   }
 
   if (taskRequiresFileChanges(requestText) && normalizedChangedPaths.length === 0) {

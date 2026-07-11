@@ -431,6 +431,43 @@ test("NO_FIX_APPLIED task goal validation", async (t) => {
       ["docs/projects/reusable-assets.md"]
     );
   });
+
+  await t.test("does not extract forbidden scope paths as required paths", () => {
+    const requestText = [
+      "Repair target:",
+      "- docs/projects/city-partner-website.md",
+      "allowed_scope: src/app/**, docs/projects/city-partner-website.md",
+      "forbidden_scope: infra/windows-worker/**, src/lib/worker-jobs.ts, src/app/api/feishu/event/route.ts",
+      "Forbidden scope:",
+      "- infra/windows-worker/local_worker.js",
+      "- src/lib/worker-jobs.ts",
+      "Do not modify src/app/api/feishu/event/route.ts",
+    ].join("\n");
+
+    assert.deepEqual(extractRequiredChangePaths(requestText), [
+      "docs/projects/city-partner-website.md",
+    ]);
+  });
+
+  await t.test("allows product write tasks with non-empty allowed changes", () => {
+    const productJob = {
+      request_text: [
+        "project_domain=city_partner_product",
+        "task_mode=product_write_allowed",
+        "required changed paths:",
+        "- src/app/page.tsx",
+        "forbidden_scope: infra/windows-worker/local_worker.js, src/lib/worker-jobs.ts",
+      ].join("\n"),
+    };
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(productJob, ["src/app/partners/page.tsx"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(productJob, []),
+      (error) => error.code === NO_FIX_APPLIED
+    );
+  });
 });
 
 test("read_only_mode task lock", async (t) => {
