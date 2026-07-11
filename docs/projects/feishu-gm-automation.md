@@ -137,6 +137,8 @@
 
 ## BATCH-GM-STABILIZE-03 docs task priority and cloud terminal guard
 
+- Explicit boss route fields have the highest priority. If the original request says `project_domain=automation_system`, `task_mode=automation_system_write_allowed`, and `read_only_mode=false`, Tencent Cloud and the Windows Worker must preserve those final fields and block with `EXPLICIT_TASK_MODE_OVERRIDDEN` or `EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN` instead of creating or running an overwritten job.
+
 - `BATCH-37-DOCS-*` and `BATCH-37-FIX` resolve to `docs_write_allowed` with `read_only_mode=false`; stale outer `read_only_mode=true` flags do not demote them to read-only.
 - A docs task locked by an outer read-only flag fails with `TASK_MODE_MISMATCH` instead of reporting `succeeded`.
 - Docs write tasks must produce a `docs/**` diff or fail with `NO_FIX_APPLIED`.

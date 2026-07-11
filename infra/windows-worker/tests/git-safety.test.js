@@ -30,6 +30,8 @@ const {
   ORIGINAL_BATCH_CONTEXT_MISSING,
   READ_ONLY_MODE_VIOLATION,
   TASK_MODE_MISMATCH,
+  EXPLICIT_TASK_MODE_OVERRIDDEN,
+  EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN,
   MISSING_REQUIRED_DOCS,
   INSUFFICIENT_DOC_OUTPUT,
   INCOMPLETE_QA_REPORT,
@@ -38,6 +40,7 @@ const {
   assertOriginalBatchContextAvailable,
   assertQaTaskOutcome,
   assertTaskGoalApplied,
+  assertExplicitTaskFieldsNotOverridden,
   buildCodexPrompt,
   buildFailureReport,
   buildWorkerGuardedPrompt,
@@ -861,6 +864,39 @@ test("read_only_mode task lock", async (t) => {
         request_text: "BATCH-37-DOCS-04 task_mode=docs_write_allowed update docs/**",
       }),
       TASK_MODES.DOCS_WRITE_ALLOWED
+    );
+  });
+
+  await t.test("explicit automation_system task fields cannot be overridden", () => {
+    const requestText = [
+      "新需求：BATCH-GM-ROUTER-MANUAL-FIX-01",
+      "project_domain=automation_system",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      "正文可能提到 product、docs、database、BATCH-FIX、BATCH-P3、BATCH-P4，但这些都不能覆盖显式字段。",
+    ].join("\n");
+
+    const explicitJob = { request_text: requestText };
+    assert.equal(classifyWorkerTaskDomain(requestText), "automation_system");
+    assert.equal(getTaskMode(explicitJob), TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.doesNotThrow(() => assertExplicitTaskFieldsNotOverridden(explicitJob));
+
+    assert.throws(
+      () =>
+        assertExplicitTaskFieldsNotOverridden({
+          request_text: requestText,
+          payload: { task_mode: "docs_write_allowed" },
+        }),
+      (error) => error.code === EXPLICIT_TASK_MODE_OVERRIDDEN
+    );
+
+    assert.throws(
+      () =>
+        assertExplicitTaskFieldsNotOverridden({
+          request_text: requestText,
+          payload: { project_domain: "product" },
+        }),
+      (error) => error.code === EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN
     );
   });
 

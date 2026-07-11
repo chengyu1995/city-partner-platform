@@ -429,6 +429,13 @@ function inferTaskMode(input: {
     return TASK_MODES.READ_ONLY;
   }
 
+  // Boss-provided task_mode in the original request outranks product/docs/system keyword inference.
+  const explicitTextModeMatch = text.match(/\btask[_\s-]*mode\s*[:=]\s*[`'"“”]?([a-z_]+)[`'"“”]?/i);
+  const explicitTextMode = explicitTextModeMatch ? explicitTextModeMatch[1].toLowerCase() : null;
+  if (explicitTextMode && Object.values(TASK_MODES).includes(explicitTextMode as typeof TASK_MODES[keyof typeof TASK_MODES])) {
+    return explicitTextMode;
+  }
+
   // Product repair batches must stay product even when QA/docs/system words appear in the prompt.
   if (isBatchFixProductTaskText(text)) {
     return TASK_MODES.PRODUCT_WRITE_ALLOWED;
@@ -443,12 +450,6 @@ function inferTaskMode(input: {
     input.jobResult?.taskMode
   );
   if (fieldMode) return fieldMode;
-
-  const explicitTextModeMatch = text.match(/\btask[_\s-]*mode\s*[:=]\s*[`'"“”]?([a-z_]+)[`'"“”]?/i);
-  const explicitTextMode = explicitTextModeMatch ? explicitTextModeMatch[1].toLowerCase() : null;
-  if (explicitTextMode && Object.values(TASK_MODES).includes(explicitTextMode as typeof TASK_MODES[keyof typeof TASK_MODES])) {
-    return explicitTextMode;
-  }
 
   if (
     DOCS_WRITE_TASK_PATTERN.test(text) ||

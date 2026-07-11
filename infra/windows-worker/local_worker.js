@@ -326,6 +326,8 @@ const OUT_OF_SCOPE_BUSINESS_CHANGE = "OUT_OF_SCOPE_BUSINESS_CHANGE";
 const OUT_OF_SCOPE_SYSTEM_CHANGE = "OUT_OF_SCOPE_SYSTEM_CHANGE";
 const ORIGINAL_BATCH_CONTEXT_MISSING = "ORIGINAL_BATCH_CONTEXT_MISSING";
 const TASK_MODE_MISMATCH = "TASK_MODE_MISMATCH";
+const EXPLICIT_TASK_MODE_OVERRIDDEN = "EXPLICIT_TASK_MODE_OVERRIDDEN";
+const EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN = "EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN";
 const MISSING_REQUIRED_DOCS = "MISSING_REQUIRED_DOCS";
 const INSUFFICIENT_DOC_OUTPUT = "INSUFFICIENT_DOC_OUTPUT";
 const INCOMPLETE_QA_REPORT = "INCOMPLETE_QA_REPORT";
@@ -573,6 +575,8 @@ const FAILURE_FINGERPRINTS = {
     "BATCH-FIX product repair was misrouted to automation/docs_write_allowed and changed system files instead of product pages.",
   BATCH_FIX_PRODUCT_MISCLASSIFIED_AS_AUTOMATION_SYSTEM:
     "BATCH-FIX product repair was classified as automation_system during the new-demand classification stage.",
+  EXPLICIT_TASK_MODE_OVERRIDDEN:
+    "Explicit boss task_mode was overwritten by automatic routing or historical job fields.",
   ORIGINAL_BATCH_CONTEXT_MISSING:
     "Approved execution referenced a BATCH-FIX batch without carrying the original product repair request.",
 };
@@ -608,7 +612,71 @@ function getJobText(job) {
     result?.requestText,
     result?.original_request_text,
     result?.originalRequestText,
+    ].map(readTextValue).filter(Boolean).join("\n");
+}
+
+function getExplicitRequestText(job) {
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const result = job && typeof job.result === "object" ? job.result : null;
+
+  return [
+    job?.request_text,
+    job?.requestText,
+    job?.demand,
+    job?.original_request_text,
+    job?.originalRequestText,
+    payload?.request_text,
+    payload?.requestText,
+    payload?.original_request_text,
+    payload?.originalRequestText,
+    payload?.demand,
+    result?.original_request_text,
+    result?.originalRequestText,
   ].map(readTextValue).filter(Boolean).join("\n");
+}
+
+function readExplicitFieldFromText(text, fieldName) {
+  const pattern = new RegExp(
+    `\\b${fieldName.replace(/_/g, "[_\\\\s-]*")}\\s*[:=]\\s*[\\\`'"“”]?([a-z_]+)[\\\`'"“”]?`,
+    "i"
+  );
+  const match = String(text || "").match(pattern);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function readProjectDomainField(job) {
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const result = job && typeof job.result === "object" ? job.result : null;
+  const candidates = [
+    job?.project_domain,
+    job?.projectDomain,
+    payload?.project_domain,
+    payload?.projectDomain,
+    result?.project_domain,
+    result?.projectDomain,
+  ];
+
+  for (const candidate of candidates) {
+    const value = readString(candidate);
+    if (value) return value.toLowerCase();
+  }
+
+  return null;
+}
+
+function createExplicitFieldOverrideError(code, message, details = {}) {
+  const error = new Error(
+    [
+      code,
+      message,
+      details.explicitValue ? `explicit_value: ${details.explicitValue}` : null,
+      details.finalValue ? `final_value: ${details.finalValue}` : null,
+      details.payloadValue ? `payload_value: ${details.payloadValue}` : null,
+    ].filter(Boolean).join("\n")
+  );
+  error.code = code;
+  error.failureStage = "explicit task field override validation";
+  return error;
 }
 
 
@@ -1006,6 +1074,51 @@ function getTaskMode(job) {
     return textMode || TASK_MODES.READ_ONLY;
   } catch (_) {
     return TASK_MODES.READ_ONLY;
+  }
+}
+
+function assertExplicitTaskFieldsNotOverridden(job) {
+  const explicitText = getExplicitRequestText(job);
+  const explicitTaskMode = readExplicitFieldFromText(explicitText, "task_mode");
+  const explicitProjectDomain = readExplicitFieldFromText(explicitText, "project_domain");
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const payloadTaskMode = readTaskModeField({
+    task_mode: payload?.task_mode || payload?.taskMode,
+  });
+  const payloadProjectDomain = readProjectDomainField({ payload });
+  const finalTaskMode = getTaskMode(job);
+  const finalProjectDomain = classifyWorkerTaskDomain(getJobText(job));
+
+  if (
+    explicitTaskMode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED &&
+    (finalTaskMode !== TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED ||
+      (payloadTaskMode && payloadTaskMode !== TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED))
+  ) {
+    throw createExplicitFieldOverrideError(
+      EXPLICIT_TASK_MODE_OVERRIDDEN,
+      "request_text explicitly declares task_mode=automation_system_write_allowed, but final Worker task_mode was overwritten.",
+      {
+        explicitValue: explicitTaskMode,
+        finalValue: finalTaskMode,
+        payloadValue: payloadTaskMode,
+      }
+    );
+  }
+
+  if (
+    explicitProjectDomain === "automation_system" &&
+    (finalProjectDomain !== "automation_system" ||
+      (payloadProjectDomain && payloadProjectDomain !== "automation_system"))
+  ) {
+    throw createExplicitFieldOverrideError(
+      EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN,
+      "request_text explicitly declares project_domain=automation_system, but final Worker project_domain was overwritten.",
+      {
+        explicitValue: explicitProjectDomain,
+        finalValue: finalProjectDomain,
+        payloadValue: payloadProjectDomain,
+      }
+    );
   }
 }
 
@@ -1968,6 +2081,7 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
 }
 
 function buildCodexPrompt(job) {
+  assertExplicitTaskFieldsNotOverridden(job);
   return buildWorkerGuardedPrompt(job?.request_text || "", {
     readOnlyMode: isReadOnlyTask(job),
     taskMode: getTaskMode(job),
@@ -3407,12 +3521,15 @@ module.exports = {
   OUT_OF_SCOPE_SYSTEM_CHANGE,
   ORIGINAL_BATCH_CONTEXT_MISSING,
   TASK_MODE_MISMATCH,
+  EXPLICIT_TASK_MODE_OVERRIDDEN,
+  EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN,
   MISSING_REQUIRED_DOCS,
   INSUFFICIENT_DOC_OUTPUT,
   INCOMPLETE_QA_REPORT,
   FAILURE_FINGERPRINTS,
   TASK_MODES,
   assertTaskGoalApplied,
+  assertExplicitTaskFieldsNotOverridden,
   assertOriginalBatchContextAvailable,
   assertQaReportComplete,
   assertQaTaskOutcome,
