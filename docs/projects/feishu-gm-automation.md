@@ -116,6 +116,7 @@
 ## BATCH-GM-STABILIZE-06 QA read-only review guard
 
 - `BATCH-QA-*` is always `project_domain=qa_review`, `task_mode=read_only`, and `read_only_mode=true`.
+- Explicit QA/read-only fields outrank product repair background text. If a QA task mentions `BATCH-FIX-*`, `partners`, `login`, or `profile` as validation context, Worker must keep `task_mode=read_only` and record the `TASK_MODE_EXPLICIT_READ_ONLY_OVERRIDE` fingerprint instead of inferring `product_write_allowed`.
 - QA tasks may statically read product and documentation files, including `src/app/page.tsx`, `src/app/partners/**`, `src/app/post/**`, `src/app/login/**`, `src/app/profile/**`, `src/lib/db/mock.ts`, `src/types/db.ts`, `docs/**`, `package.json`, `next.config.*`, and `tsconfig.json`.
 - QA tasks still may not modify any file, run `git add`, `git commit`, `git push`, start a dev server, touch database/env files, or deploy.
 - A successful QA task must include a full report with usable features, features needing fixes, homepage acceptance, partners page acceptance, post page acceptance, draft/review flow acceptance, login/profile warnings, development next steps, QA next steps, operations readiness, and the recommended next batch.

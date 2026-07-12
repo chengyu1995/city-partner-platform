@@ -577,6 +577,8 @@ const FAILURE_FINGERPRINTS = {
     "BATCH-FIX product repair was classified as automation_system during the new-demand classification stage.",
   EXPLICIT_TASK_MODE_OVERRIDDEN:
     "Explicit boss task_mode was overwritten by automatic routing or historical job fields.",
+  TASK_MODE_EXPLICIT_READ_ONLY_OVERRIDE:
+    "Explicit read_only task fields overrode product/background wording and forced read_only mode.",
   ORIGINAL_BATCH_CONTEXT_MISSING:
     "Approved execution referenced a BATCH-FIX batch without carrying the original product repair request.",
 };
@@ -807,6 +809,18 @@ function hasReadOnlyFalseField(job) {
   return candidates.some(readBooleanFalseFlag) || taskTextDeclaresReadOnlyFalse(getJobText(job));
 }
 
+function taskTextDeclaresReadOnlyMode(text) {
+  return /\btask[_\s-]*mode\s*[:=]\s*[`'"“”]?read_only[`'"“”]?/i.test(
+    String(text || "")
+  );
+}
+
+function taskTextDeclaresQaReviewDomain(text) {
+  return /\bproject[_\s-]*domain\s*[:=]\s*[`'"“”]?qa_review[`'"“”]?/i.test(
+    String(text || "")
+  );
+}
+
 function hasConflictingReadOnlyLock(job, taskMode) {
   if (
     taskMode !== TASK_MODES.DOCS_WRITE_ALLOWED &&
@@ -975,8 +989,44 @@ function readBatchCodeField(job) {
 
 function getTaskMode(job) {
   try {
-    // Highest priority: BATCH-FIX product repair must stay product_write_allowed.
-    // BATCH_FIX_PRODUCT_OUTRANKS_READ_ONLY_AND_FORBIDDEN_WORDS
+    const directRequestText = readTextValue([
+      job?.request_text,
+      job?.requestText,
+      job?.payload?.request_text,
+      job?.payload?.requestText,
+      job?.payload?.original_request_text,
+      job?.payload?.originalRequestText,
+    ]);
+    const requestTextHead = Array.isArray(job?.request_text)
+      ? String(job.request_text[0] || "")
+      : String(job?.request_text || job?.requestText || "");
+    const requestTextFirstLine = requestTextHead.split(/\r?\n/)[0] || "";
+    const directBatchCode =
+      requestTextFirstLine.match(/\bBATCH-QA(?:-[A-Z0-9]+)?\b/i)?.[0] ||
+      requestTextFirstLine.match(/\bBATCH-43\b/i)?.[0] ||
+      requestTextFirstLine.match(/\bBATCH-GM-SMOKE(?:-\d+)?\b/i)?.[0] ||
+      null;
+    const text = getJobText(job);
+    const explicitMode = readTaskModeField(job);
+
+    if (
+      explicitMode === TASK_MODES.READ_ONLY ||
+      taskTextDeclaresReadOnlyMode(directRequestText) ||
+      taskTextDeclaresReadOnlyMode(text)
+    ) {
+      return TASK_MODES.READ_ONLY;
+    }
+
+    if (
+      (directBatchCode && FORCED_READ_ONLY_BATCH_PATTERN.test(directBatchCode)) ||
+      QA_BATCH_PATTERN.test(requestTextFirstLine) ||
+      (taskTextDeclaresQaReviewDomain(text) && hasReadOnlyField(job))
+    ) {
+      return TASK_MODES.READ_ONLY;
+    }
+
+    // BATCH-FIX product repair must stay product_write_allowed unless the current task explicitly says read_only.
+    // BATCH_FIX_PRODUCT_OUTRANKS_FORBIDDEN_WORDS_BUT_NOT_EXPLICIT_READ_ONLY
     const productModeText = readTextValue([
       job?.request_text,
       job?.requestText,
@@ -995,39 +1045,21 @@ function getTaskMode(job) {
       /\bBATCH-FIX(?:-[A-Z0-9]+)*\b/i.test(productModeText) &&
       /(同城搭子|city_partner_product|product_write_allowed|产品修复|首批阻断|QA-05|\/partners|\/post|login|profile|src\/app)/i.test(productModeText)
     ) {
+      if (hasReadOnlyField(job) && !hasReadOnlyFalseField(job)) {
+        return TASK_MODES.READ_ONLY;
+      }
       return TASK_MODES.PRODUCT_WRITE_ALLOWED;
-    }
-
-    // Hard guard: current QA/read-only request_text must outrank stale payload.task_mode.
-    // BATCH_QA_REQUEST_TEXT_OUTRANKS_PAYLOAD_TASK_MODE
-    const directRequestText = readTextValue([
-      job?.request_text,
-      job?.requestText,
-      job?.payload?.request_text,
-      job?.payload?.requestText,
-      job?.payload?.original_request_text,
-      job?.payload?.originalRequestText,
-    ]);
-    const requestTextHead = Array.isArray(job?.request_text)
-      ? String(job.request_text[0] || "")
-      : String(job?.request_text || job?.requestText || "");
-    const directBatchCode =
-      requestTextHead.match(/\bBATCH-QA(?:-[A-Z0-9]+)?\b/i)?.[0] ||
-      requestTextHead.match(/\bBATCH-43\b/i)?.[0] ||
-      requestTextHead.match(/\bBATCH-GM-SMOKE(?:-\d+)?\b/i)?.[0] ||
-      null;
-
-    if (directBatchCode && FORCED_READ_ONLY_BATCH_PATTERN.test(directBatchCode)) {
-      return TASK_MODES.READ_ONLY;
     }
 
     // BATCH-FIX product repair must stay product even when the text mentions system/worker forbidden scopes.
     // BATCH_FIX_PRODUCT_REQUEST_TEXT_OUTRANKS_READ_ONLY_DEFAULT
     if (/\bBATCH-FIX(?:-[A-Z0-9]+)*\b/i.test(directRequestText) && isBatchFixProductTaskText(directRequestText)) {
+      if (hasReadOnlyField(job) && !hasReadOnlyFalseField(job)) {
+        return TASK_MODES.READ_ONLY;
+      }
       return TASK_MODES.PRODUCT_WRITE_ALLOWED;
     }
 
-    const text = getJobText(job);
     const fieldBatchCode = readBatchCodeField(job);
     const textBatchCode = extractCurrentExecutionBatchCode({ request_text: text });
     const currentBatchCode = fieldBatchCode || textBatchCode;
@@ -1042,7 +1074,6 @@ function getTaskMode(job) {
       return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
     }
 
-    const explicitMode = readTaskModeField(job);
     if (explicitMode) {
       if (explicitMode !== TASK_MODES.READ_ONLY && hasReadOnlyField(job)) {
         throw createTaskModeMismatchError(
@@ -1264,12 +1295,17 @@ function recordFailureMemory(memory, fingerprint, batchCode, now = new Date().to
 
 function classifyWorkerTaskDomain(requestText) {
   const text = String(requestText || "");
+  const firstLine = text.split(/\r?\n/)[0] || "";
+
+  if (taskTextDeclaresQaReviewDomain(text) || QA_BATCH_PATTERN.test(firstLine)) {
+    return "qa_review";
+  }
 
   if (isBatchFixProductTaskText(text)) {
     return "city_partner_product";
   }
 
-  if (QA_BATCH_PATTERN.test(text)) {
+  if (QA_BATCH_PATTERN.test(firstLine)) {
     return "qa_review";
   }
 

@@ -508,7 +508,7 @@ test("read_only_mode task lock", async (t) => {
       request_text: [
         "BATCH-QA-03",
         "task_mode=read_only",
-        "read_only_mode=true",
+        "read_only_mode=false",
         "project_domain=qa_review",
         "allowed_scope=static reads for src/app/page.tsx, src/app/partners/**, src/app/post/**, docs/**",
         "禁止修改文件",
@@ -856,6 +856,57 @@ test("read_only_mode task lock", async (t) => {
     assert.match(prompt, /task_mode: product_write_allowed/);
     assert.match(prompt, /read_only_mode: false/);
     assert.match(prompt, /allowed_scope: src\/app\/\*\*/);
+  });
+
+  await t.test("BATCH-QA explicit read_only outranks BATCH-FIX product background", () => {
+    const qaJob = {
+      request_text: [
+        "BATCH-QA-06 final static QA review",
+        "project_domain=qa_review",
+        "task_mode=read_only",
+        "read_only_mode=true",
+        "验收背景：BATCH-FIX-06 fixed partners pages.",
+        "验收背景：BATCH-FIX-07 fixed login/profile Link lint.",
+        "Please statically read partners/login/profile/page.tsx and docs, run npx tsc and npm run lint.",
+      ].join("\n"),
+      payload: {
+        task_mode: "product_write_allowed",
+      },
+    };
+
+    assert.equal(classifyWorkerTaskDomain(qaJob.request_text), "qa_review");
+    assert.equal(getTaskMode(qaJob), TASK_MODES.READ_ONLY);
+    assert.equal(isReadOnlyTask(qaJob), true);
+    assert.doesNotThrow(() => assertTaskGoalApplied(qaJob, []));
+    assert.throws(
+      () => assertTaskGoalApplied(qaJob, ["src/app/partners/page.tsx"]),
+      (error) => error.code === READ_ONLY_MODE_VIOLATION
+    );
+  });
+
+  await t.test("read_only_mode true prevents product_write_allowed inference from QA background words", () => {
+    const readOnlyJob = {
+      request_text: [
+        "BATCH-QA-07",
+        "project_domain=qa_review",
+        "read_only_mode=true",
+        "Background mentions BATCH-FIX-06, partners, login, profile, product pages.",
+      ].join("\n"),
+    };
+    const productJob = {
+      request_text: [
+        "BATCH-FIX-07",
+        "project_domain=city_partner_product",
+        "task_mode=product_write_allowed",
+        "read_only_mode=false",
+        "Fix login/profile Link lint for the city partner website.",
+      ].join("\n"),
+    };
+
+    assert.equal(getTaskMode(readOnlyJob), TASK_MODES.READ_ONLY);
+    assert.equal(isReadOnlyTask(readOnlyJob), true);
+    assert.equal(getTaskMode(productJob), TASK_MODES.PRODUCT_WRITE_ALLOWED);
+    assert.equal(isReadOnlyTask(productJob), false);
   });
 
   await t.test("BATCH-FIX approved execution requires original product request context", () => {
