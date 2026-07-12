@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, Suspense, useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   consumeHashSession,
@@ -81,12 +82,12 @@ function LoginContent() {
   return (
     <main>
       <header className="site-header">
-        <a className="brand" href="/">
+        <Link className="brand" href="/">
           同城搭子
-        </a>
+        </Link>
         <nav className="nav-links" aria-label="登录导航">
-          <a href="/">返回首页</a>
-          <a href="/profile">个人资料</a>
+          <Link href="/">返回首页</Link>
+          <Link href="/profile">个人资料</Link>
         </nav>
       </header>
 

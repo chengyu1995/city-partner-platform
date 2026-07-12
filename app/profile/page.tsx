@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   clearSession,
@@ -108,9 +109,9 @@ export default function ProfilePage() {
     return (
       <main>
         <header className="site-header">
-          <a className="brand" href="/">
+          <Link className="brand" href="/">
             同城搭子
-          </a>
+          </Link>
         </header>
         <section className="section">正在加载个人资料...</section>
       </main>
@@ -120,11 +121,11 @@ export default function ProfilePage() {
   return (
     <main>
       <header className="site-header">
-        <a className="brand" href="/">
+        <Link className="brand" href="/">
           同城搭子
-        </a>
+        </Link>
         <nav className="nav-links" aria-label="资料页导航">
-          <a href="/">首页</a>
+          <Link href="/">首页</Link>
           <button className="nav-button" onClick={handleLogout} type="button">
             退出登录
           </button>
