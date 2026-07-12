@@ -35,6 +35,7 @@ const {
   MISSING_REQUIRED_DOCS,
   INSUFFICIENT_DOC_OUTPUT,
   INCOMPLETE_QA_REPORT,
+  INCOMPLETE_ARCHITECTURE_REPORT,
   TASK_MODES,
   assertGitOperationAllowed,
   assertOriginalBatchContextAvailable,
@@ -150,6 +151,19 @@ const STRUCTURED_QA_REPORT_MISSING_NEXT_BATCH = [
   "dev_team_next_step: yes",
   "qa_team_next_step: yes",
   "ops_team_join: no",
+].join("\n");
+
+const COMPLETE_ARCHITECTURE_REPORT = [
+  "Architecture inventory conclusion: Worker routing, task mode guards, and reporting paths are mapped.",
+  "Missing modules: architecture-specific read-only report validation was missing.",
+  "Knowledge base status: project docs exist, but automation architecture notes need clearer ownership.",
+  "Automation iteration status: retry and guard loops exist, with validation routing gaps now identified.",
+  "Batch plan: BATCH-ARCH-02 reviews worker intake, BATCH-ARCH-03 reviews routing, BATCH-ARCH-04 reviews prompts, BATCH-ARCH-05 reviews reporting, BATCH-ARCH-06 reviews retries, BATCH-ARCH-07 reviews safety, BATCH-ARCH-08 reviews docs, BATCH-ARCH-09 reviews monitoring, and BATCH-ARCH-10 closes the architecture plan.",
+].join("\n");
+
+const INCOMPLETE_ARCHITECTURE_REPORT_TEXT = [
+  "Architecture inventory conclusion: Worker routing was checked.",
+  "Missing modules: architecture-specific validation was missing.",
 ].join("\n");
 
 function joinedName(...parts) {
@@ -592,6 +606,82 @@ test("read_only_mode task lock", async (t) => {
     assert.throws(
       () => assertQaTaskOutcome(qaJob, ["docs/TROUBLESHOOTING.md"], STRUCTURED_QA_REPORT),
       (error) => error.code === READ_ONLY_MODE_VIOLATION
+    );
+  });
+
+  await t.test("project_domain qa_review requires QA report even without BATCH-QA batch code", () => {
+    const qaDomainJob = {
+      request_text: [
+        "Static product QA review",
+        "project_domain=qa_review",
+        "task_mode=read_only",
+        "read_only_mode=true",
+      ].join("\n"),
+    };
+
+    assert.equal(classifyWorkerTaskDomain(qaDomainJob.request_text), "qa_review");
+    assert.equal(getTaskMode(qaDomainJob), TASK_MODES.READ_ONLY);
+    assert.doesNotThrow(() => assertQaTaskOutcome(qaDomainJob, [], STRUCTURED_QA_REPORT));
+    assert.throws(
+      () => assertQaTaskOutcome(qaDomainJob, [], "Only git status was checked."),
+      (error) => error.code === INCOMPLETE_QA_REPORT
+    );
+  });
+
+  await t.test("BATCH-ARCH read-only uses architecture report validation instead of QA fields", () => {
+    const archJob = {
+      request_text: [
+        "BATCH-ARCH-01 automation architecture inventory",
+        "project_domain=automation_architecture",
+        "task_mode=read_only",
+        "read_only_mode=true",
+        "Background: previous BATCH-QA-05 product QA is not the current batch.",
+      ].join("\n"),
+    };
+
+    assert.equal(classifyWorkerTaskDomain(archJob.request_text), "automation_architecture");
+    assert.equal(getTaskMode(archJob), TASK_MODES.READ_ONLY);
+
+    const prompt = buildCodexPrompt(archJob);
+    assert.doesNotMatch(prompt, /QA_REPORT_FIELDS:/);
+    assert.doesNotMatch(prompt, /INCOMPLETE_QA_REPORT/);
+    assert.match(prompt, /BATCH-ARCH/);
+
+    assert.doesNotThrow(() =>
+      assertQaTaskOutcome(archJob, [], COMPLETE_ARCHITECTURE_REPORT)
+    );
+    assert.throws(
+      () => assertQaTaskOutcome(archJob, [], INCOMPLETE_ARCHITECTURE_REPORT_TEXT),
+      (error) =>
+        error.code === INCOMPLETE_ARCHITECTURE_REPORT &&
+        !error.message.includes(INCOMPLETE_QA_REPORT)
+    );
+    assert.throws(
+      () =>
+        assertQaTaskOutcome(
+          archJob,
+          ["infra/windows-worker/local_worker.js"],
+          COMPLETE_ARCHITECTURE_REPORT
+        ),
+      (error) => error.code === READ_ONLY_MODE_VIOLATION
+    );
+  });
+
+  await t.test("plain read-only tasks with QA background do not require product QA fields", () => {
+    const plainReadOnlyJob = {
+      request_text: [
+        "Worker status read-only check",
+        "task_mode=read_only",
+        "read_only_mode=true",
+        "Background: previous BATCH-QA-05 already completed product QA.",
+      ].join("\n"),
+    };
+
+    assert.equal(getTaskMode(plainReadOnlyJob), TASK_MODES.READ_ONLY);
+    const prompt = buildCodexPrompt(plainReadOnlyJob);
+    assert.doesNotMatch(prompt, /QA_REPORT_FIELDS:/);
+    assert.doesNotThrow(() =>
+      assertQaTaskOutcome(plainReadOnlyJob, [], "Read-only worker status checked.")
     );
   });
 

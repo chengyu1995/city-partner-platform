@@ -331,6 +331,7 @@ const EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN = "EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN";
 const MISSING_REQUIRED_DOCS = "MISSING_REQUIRED_DOCS";
 const INSUFFICIENT_DOC_OUTPUT = "INSUFFICIENT_DOC_OUTPUT";
 const INCOMPLETE_QA_REPORT = "INCOMPLETE_QA_REPORT";
+const INCOMPLETE_ARCHITECTURE_REPORT = "INCOMPLETE_ARCHITECTURE_REPORT";
 
 const TASK_MODES = {
   READ_ONLY: "read_only",
@@ -349,6 +350,7 @@ const READ_ONLY_TASK_PATTERN =
 const READ_ONLY_POLICY_IMPLEMENTATION_PATTERN =
   /只读任务锁死|强制\s*read[_ -]?only[_ -]?mode|read[_ -]?only(?:[_ -]?mode)?.*(?:lock|guard)/i;
 const QA_BATCH_PATTERN = /\bBATCH-QA(?:-[A-Z0-9]+)*\b/i;
+const ARCH_BATCH_PATTERN = /\bBATCH-ARCH(?:-[A-Z0-9]+)*\b/i;
 const AUTOMATION_CONTEXT_PATTERN =
   /Worker|Codex|Hermes|飞书|总管|自动化|worker|worker_api|feishu_gateway|route|路由|上报|NO_FIX_APPLIED|READ_ONLY_MODE_VIOLATION|git_commit_sha|attempt_id/i;
 const DOCS_WRITE_TASK_PATTERN =
@@ -515,6 +517,34 @@ const QA_REPORT_MACHINE_FIELDS = [
     pattern: /^BATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*$/i,
   },
 ];
+const ARCHITECTURE_REPORT_REQUIRED_FIELDS = [
+  {
+    key: "architecture_inventory_conclusion",
+    label: "架构盘点结论",
+    pattern: /架构盘点结论|architecture (?:inventory|review|audit) conclusion/i,
+  },
+  {
+    key: "missing_modules",
+    label: "缺失模块清单",
+    pattern: /缺失模块清单|missing modules?/i,
+  },
+  {
+    key: "knowledge_base_status",
+    label: "知识库现状判断",
+    pattern: /知识库现状判断|knowledge base (?:status|assessment)/i,
+  },
+  {
+    key: "automation_iteration_status",
+    label: "自动迭代能力现状判断",
+    pattern: /自动迭代能力现状判断|automation iteration (?:status|capability|assessment)/i,
+  },
+  {
+    key: "batch_arch_plan",
+    label: "BATCH-ARCH-02 到 BATCH-ARCH-10 的分批计划",
+    pattern:
+      /BATCH-ARCH-02[\s\S]*BATCH-ARCH-10|BATCH-ARCH-10[\s\S]*BATCH-ARCH-02|BATCH-ARCH-02[\s\S]*分批计划|分批计划[\s\S]*BATCH-ARCH-02/i,
+  },
+];
 const AUTOMATION_WRITE_ALLOWED_PATHS = [
   "infra/windows-worker",
   "src/lib/worker-jobs.ts",
@@ -640,10 +670,15 @@ function getExplicitRequestText(job) {
 function readExplicitFieldFromText(text, fieldName) {
   const pattern = new RegExp(
     `\\b${fieldName.replace(/_/g, "[_\\\\s-]*")}\\s*[:=]\\s*[\\\`'"“”]?([a-z_]+)[\\\`'"“”]?`,
-    "i"
+    "gi"
   );
-  const match = String(text || "").match(pattern);
+  const matches = [...String(text || "").matchAll(pattern)];
+  const match = matches[matches.length - 1];
   return match ? match[1].toLowerCase() : null;
+}
+
+function readProjectDomainFromText(text) {
+  return readExplicitFieldFromText(extractOriginalTaskBody(text), "project_domain");
 }
 
 function readProjectDomainField(job) {
@@ -810,15 +845,11 @@ function hasReadOnlyFalseField(job) {
 }
 
 function taskTextDeclaresReadOnlyMode(text) {
-  return /\btask[_\s-]*mode\s*[:=]\s*[`'"“”]?read_only[`'"“”]?/i.test(
-    String(text || "")
-  );
+  return readExplicitFieldFromText(extractOriginalTaskBody(text), "task_mode") === TASK_MODES.READ_ONLY;
 }
 
 function taskTextDeclaresQaReviewDomain(text) {
-  return /\bproject[_\s-]*domain\s*[:=]\s*[`'"“”]?qa_review[`'"“”]?/i.test(
-    String(text || "")
-  );
+  return readProjectDomainFromText(text) === "qa_review";
 }
 
 function hasConflictingReadOnlyLock(job, taskMode) {
@@ -890,10 +921,9 @@ function pathMatchesPrefix(filePath, prefixes) {
 
 function getTaskModeFromText(text) {
   const raw = String(text || "");
-  const batchCode = extractCurrentExecutionBatchCode({ request_text: raw });
+  const batchCode = getCurrentBatchCodeFromText(raw);
 
-  const explicitModeMatch = raw.match(/\btask[_\s-]*mode\s*[:=]\s*[`'"“”]?([a-z_]+)[`'"“”]?/i);
-  const explicitTextMode = explicitModeMatch ? explicitModeMatch[1].toLowerCase() : null;
+  const explicitTextMode = readExplicitFieldFromText(extractOriginalTaskBody(raw), "task_mode");
   if (explicitTextMode && Object.values(TASK_MODES).includes(explicitTextMode)) {
     return explicitTextMode;
   }
@@ -902,7 +932,7 @@ function getTaskModeFromText(text) {
     return TASK_MODES.PRODUCT_WRITE_ALLOWED;
   }
 
-  if (FORCED_READ_ONLY_BATCH_PATTERN.test(raw)) {
+  if (batchCode && FORCED_READ_ONLY_BATCH_PATTERN.test(batchCode)) {
     return TASK_MODES.READ_ONLY;
   }
 
@@ -997,15 +1027,6 @@ function getTaskMode(job) {
       job?.payload?.original_request_text,
       job?.payload?.originalRequestText,
     ]);
-    const requestTextHead = Array.isArray(job?.request_text)
-      ? String(job.request_text[0] || "")
-      : String(job?.request_text || job?.requestText || "");
-    const requestTextFirstLine = requestTextHead.split(/\r?\n/)[0] || "";
-    const directBatchCode =
-      requestTextFirstLine.match(/\bBATCH-QA(?:-[A-Z0-9]+)?\b/i)?.[0] ||
-      requestTextFirstLine.match(/\bBATCH-43\b/i)?.[0] ||
-      requestTextFirstLine.match(/\bBATCH-GM-SMOKE(?:-\d+)?\b/i)?.[0] ||
-      null;
     const text = getJobText(job);
     const explicitMode = readTaskModeField(job);
 
@@ -1018,8 +1039,7 @@ function getTaskMode(job) {
     }
 
     if (
-      (directBatchCode && FORCED_READ_ONLY_BATCH_PATTERN.test(directBatchCode)) ||
-      QA_BATCH_PATTERN.test(requestTextFirstLine) ||
+      isQaReviewTask(job) ||
       (taskTextDeclaresQaReviewDomain(text) && hasReadOnlyField(job))
     ) {
       return TASK_MODES.READ_ONLY;
@@ -1060,9 +1080,7 @@ function getTaskMode(job) {
       return TASK_MODES.PRODUCT_WRITE_ALLOWED;
     }
 
-    const fieldBatchCode = readBatchCodeField(job);
-    const textBatchCode = extractCurrentExecutionBatchCode({ request_text: text });
-    const currentBatchCode = fieldBatchCode || textBatchCode;
+    const currentBatchCode = getCurrentBatchCode(job);
 
     // 当前真实批次最高优先级，防止历史 task_mode 污染。
     // CURRENT_BATCH_IDENTITY_OUTRANKS_TASK_MODE
@@ -1089,7 +1107,8 @@ function getTaskMode(job) {
 
     if (
       textMode !== TASK_MODES.PRODUCT_WRITE_ALLOWED &&
-      FORCED_READ_ONLY_BATCH_PATTERN.test(text)
+      currentBatchCode &&
+      FORCED_READ_ONLY_BATCH_PATTERN.test(currentBatchCode)
     ) {
       return TASK_MODES.READ_ONLY;
     }
@@ -1295,9 +1314,25 @@ function recordFailureMemory(memory, fingerprint, batchCode, now = new Date().to
 
 function classifyWorkerTaskDomain(requestText) {
   const text = String(requestText || "");
-  const firstLine = text.split(/\r?\n/)[0] || "";
+  const declaredProjectDomain = readProjectDomainFromText(text);
+  const currentBatchCode = getCurrentBatchCodeFromText(text);
 
-  if (taskTextDeclaresQaReviewDomain(text) || QA_BATCH_PATTERN.test(firstLine)) {
+  if (declaredProjectDomain) {
+    if (declaredProjectDomain === "qa_review") {
+      return "qa_review";
+    }
+    if (declaredProjectDomain === "automation_system") {
+      return "automation_system";
+    }
+    if (declaredProjectDomain === "automation_architecture") {
+      return "automation_architecture";
+    }
+    if (declaredProjectDomain === "city_partner_product") {
+      return "city_partner_product";
+    }
+  }
+
+  if (currentBatchCode && QA_BATCH_PATTERN.test(currentBatchCode)) {
     return "qa_review";
   }
 
@@ -1305,8 +1340,8 @@ function classifyWorkerTaskDomain(requestText) {
     return "city_partner_product";
   }
 
-  if (QA_BATCH_PATTERN.test(firstLine)) {
-    return "qa_review";
+  if (currentBatchCode && ARCH_BATCH_PATTERN.test(currentBatchCode)) {
+    return "automation_architecture";
   }
 
   if (/文档整理|整理文档|归档|governance[_ -]?docs/i.test(text)) {
@@ -1529,6 +1564,52 @@ function createReadOnlyModeViolationError(changedPaths) {
   return error;
 }
 
+function getEffectiveProjectDomain(job) {
+  const explicitText = getExplicitRequestText(job);
+  const explicitDomain = readProjectDomainFromText(explicitText || getJobText(job));
+  return explicitDomain || readProjectDomainField(job);
+}
+
+function isQaReviewTask(job) {
+  const domain = getEffectiveProjectDomain(job);
+  if (domain) {
+    return domain === "qa_review";
+  }
+
+  const batchCode = getCurrentBatchCode(job);
+  return Boolean(batchCode && QA_BATCH_PATTERN.test(batchCode));
+}
+
+function isArchitectureReviewTask(job) {
+  const domain = getEffectiveProjectDomain(job);
+  if (domain) {
+    return domain === "automation_architecture";
+  }
+
+  const batchCode = getCurrentBatchCode(job);
+  return Boolean(batchCode && ARCH_BATCH_PATTERN.test(batchCode));
+}
+
+function isQaReviewTaskText(taskText) {
+  const domain = readProjectDomainFromText(taskText);
+  if (domain) {
+    return domain === "qa_review";
+  }
+
+  const batchCode = getCurrentBatchCodeFromText(taskText);
+  return Boolean(batchCode && QA_BATCH_PATTERN.test(batchCode));
+}
+
+function isArchitectureReviewTaskText(taskText) {
+  const domain = readProjectDomainFromText(taskText);
+  if (domain) {
+    return domain === "automation_architecture";
+  }
+
+  const batchCode = getCurrentBatchCodeFromText(taskText);
+  return Boolean(batchCode && ARCH_BATCH_PATTERN.test(batchCode));
+}
+
 function parseQaReportFields(reportText) {
   const lines = String(reportText || "").split(/\r?\n/);
   const markerIndex = lines.findIndex((line) =>
@@ -1593,8 +1674,33 @@ function createIncompleteQaReportError(missingFields) {
   return error;
 }
 
+function getMissingArchitectureReportFields(reportText) {
+  const text = String(reportText || "");
+  return ARCHITECTURE_REPORT_REQUIRED_FIELDS.filter((field) => !field.pattern.test(text));
+}
+
+function createIncompleteArchitectureReportError(missingFields) {
+  const missing = (missingFields || []).map((field) => field.label);
+  const error = new Error(
+    [
+      INCOMPLETE_ARCHITECTURE_REPORT,
+      "BATCH-ARCH read-only task must output an architecture inventory report, not a product QA report.",
+      `architecture_report_required_total: ${ARCHITECTURE_REPORT_REQUIRED_FIELDS.length}`,
+      `architecture_report_present: ${ARCHITECTURE_REPORT_REQUIRED_FIELDS.length - missing.length}`,
+      missing.length
+        ? `missing_architecture_report_fields: ${missing.join(", ")}`
+        : "missing_architecture_report_fields: none",
+    ].join("\n")
+  );
+
+  error.code = INCOMPLETE_ARCHITECTURE_REPORT;
+  error.failureStage = "architecture read-only report completeness validation";
+  error.missingArchitectureReportFields = missing;
+  return error;
+}
+
 function assertQaReportComplete(job, reportText) {
-  if (!QA_BATCH_PATTERN.test(getJobText(job))) {
+  if (!isQaReviewTask(job)) {
     return;
   }
 
@@ -1604,8 +1710,23 @@ function assertQaReportComplete(job, reportText) {
   }
 }
 
+function assertArchitectureReportComplete(job, reportText) {
+  if (!isArchitectureReviewTask(job)) {
+    return;
+  }
+
+  const missingFields = getMissingArchitectureReportFields(reportText);
+  if (missingFields.length > 0) {
+    throw createIncompleteArchitectureReportError(missingFields);
+  }
+}
+
 function assertQaTaskOutcome(job, changedPaths, reportText) {
-  if (!QA_BATCH_PATTERN.test(getJobText(job))) {
+  const shouldValidateQaReport = isQaReviewTask(job);
+  const shouldValidateArchitectureReport =
+    getTaskMode(job) === TASK_MODES.READ_ONLY && isArchitectureReviewTask(job);
+
+  if (!shouldValidateQaReport && !shouldValidateArchitectureReport) {
     return;
   }
 
@@ -1614,7 +1735,13 @@ function assertQaTaskOutcome(job, changedPaths, reportText) {
     throw createReadOnlyModeViolationError(normalizedChangedPaths);
   }
 
-  assertQaReportComplete(job, reportText);
+  if (shouldValidateQaReport) {
+    assertQaReportComplete(job, reportText);
+  }
+
+  if (shouldValidateArchitectureReport) {
+    assertArchitectureReportComplete(job, reportText);
+  }
 }
 
 function createReadOnlyGitCommandError(args, details = {}) {
@@ -1953,8 +2080,20 @@ function extractCurrentExecutionBatchCode(job) {
   return requestCodes[0] || null;
 }
 
+function getCurrentBatchCodeFromText(text) {
+  const raw = String(text || "");
+  const firstContentLine = raw.split(/\r?\n/).find((line) => line.trim()) || "";
+  const firstLineCodes = findBatchCodes(stripForbiddenBatchFragments(firstContentLine));
+  const extractedCode = extractCurrentExecutionBatchCode({ request_text: raw });
+  return extractedCode || firstLineCodes[0] || null;
+}
+
+function getCurrentBatchCode(job) {
+  return readBatchCodeField(job) || getCurrentBatchCodeFromText(getJobText(job));
+}
+
 function getJobBatchCode(job) {
-  return extractCurrentExecutionBatchCode(job);
+  return getCurrentBatchCode(job);
 }
 
 const CODEX_GIT_OPERATION_GUARD = [
@@ -2002,7 +2141,7 @@ function buildReadOnlyGuard(taskText, options = {}) {
 }
 
 function buildQaReviewGuard(taskText) {
-  if (!QA_BATCH_PATTERN.test(String(taskText || ""))) {
+  if (!isQaReviewTaskText(taskText)) {
     return null;
   }
 
@@ -2029,6 +2168,21 @@ function buildQaReviewGuard(taskText) {
     "ops_team_join: yes/no",
     "next_batch: BATCH-xxx",
     `failure_code_if_incomplete: ${INCOMPLETE_QA_REPORT}`,
+  ].join("\n");
+}
+
+function buildArchitectureReviewGuard(taskText, taskMode) {
+  if (taskMode !== TASK_MODES.READ_ONLY || !isArchitectureReviewTaskText(taskText)) {
+    return null;
+  }
+
+  return [
+    "【BATCH-ARCH 只读架构盘点规则】",
+    "project_domain: automation_architecture",
+    "task_mode: read_only",
+    "read_only_mode: true",
+    "禁止修改任何文件，禁止 apply_patch，禁止 git add/commit/push，禁止 npm run dev / next dev，禁止数据库、环境变量和部署操作。",
+    "架构盘点报告必须包含：架构盘点结论、缺失模块清单、知识库现状判断、自动迭代能力现状判断、BATCH-ARCH-02 到 BATCH-ARCH-10 的分批计划。",
   ].join("\n");
 }
 
@@ -2082,6 +2236,7 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
         })
       : null;
   const qaReviewGuard = buildQaReviewGuard(taskText);
+  const architectureReviewGuard = buildArchitectureReviewGuard(taskText, taskMode);
   const productWriteGuard = buildProductWriteGuard(taskText, taskMode);
   const domainGuard = isAutomationSystemTask(taskText)
     ? [
@@ -2100,6 +2255,8 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
     readOnlyGuard ? "" : null,
     qaReviewGuard,
     qaReviewGuard ? "" : null,
+    architectureReviewGuard,
+    architectureReviewGuard ? "" : null,
     productWriteGuard,
     productWriteGuard ? "" : null,
     domainGuard,
@@ -3568,6 +3725,7 @@ module.exports = {
   MISSING_REQUIRED_DOCS,
   INSUFFICIENT_DOC_OUTPUT,
   INCOMPLETE_QA_REPORT,
+  INCOMPLETE_ARCHITECTURE_REPORT,
   FAILURE_FINGERPRINTS,
   TASK_MODES,
   assertTaskGoalApplied,
