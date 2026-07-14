@@ -583,6 +583,10 @@ const AUTOMATION_WRITE_ALLOWED_PATHS = [
   "docs/projects/team-routing.md",
   "docs/projects/feishu-group-routing.md",
 ];
+const AUTOMATION_ALLOWED_SCOPE_DOC_PREFIXES = [
+  "docs/architecture/",
+  "docs/projects/",
+];
 const PRODUCT_WRITE_ALLOWED_PREFIXES = ["src/app"];
 const BATCH_FIX_PRODUCT_ALLOWED_PATHS = [
   "src/app",
@@ -597,12 +601,15 @@ const SYSTEM_CHANGE_FORBIDDEN_PATHS = [
   "work/tencent-cloud",
 ];
 const BUSINESS_PAGE_PREFIXES = [
+  "app",
   "app/page.tsx",
   "app/post",
   "app/partners",
   "src/app/page.tsx",
   "src/app/post",
   "src/app/partners",
+  "src/app/login",
+  "src/app/profile",
 ];
 const DATABASE_OR_ENV_PREFIXES = [
   ".env",
@@ -1401,6 +1408,41 @@ function isAutomationWriteAllowedPath(filePath) {
   return pathMatchesPrefix(filePath, AUTOMATION_WRITE_ALLOWED_PATHS);
 }
 
+function isExplicitAutomationAllowedDocPath(filePath) {
+  const normalized = normalizeGitPath(filePath);
+  const fileName = normalized.split("/").pop() || "";
+  return (
+    !normalized.includes("*") &&
+    fileName.includes(".") &&
+    AUTOMATION_ALLOWED_SCOPE_DOC_PREFIXES.some((prefix) => normalized.startsWith(prefix))
+  );
+}
+
+function extractAllowedScopePaths(requestText) {
+  const paths = [];
+  for (const rawLine of String(requestText || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!/(^|[^\w-])allowed[_\s-]*scope\s*[:=]/i.test(line)) {
+      continue;
+    }
+    paths.push(...extractPathLikeTokens(line));
+  }
+  return uniqueSortedPaths(paths);
+}
+
+function isAutomationAllowedByExplicitScope(filePath, requestText) {
+  const normalized = normalizeGitPath(filePath);
+  if (!isExplicitAutomationAllowedDocPath(normalized)) {
+    return false;
+  }
+
+  return extractAllowedScopePaths(requestText).some(
+    (allowedPath) =>
+      isExplicitAutomationAllowedDocPath(allowedPath) &&
+      normalizeGitPath(allowedPath) === normalized
+  );
+}
+
 function isProductWriteAllowedPath(filePath) {
   return pathMatchesPrefix(filePath, PRODUCT_WRITE_ALLOWED_PREFIXES);
 }
@@ -2162,8 +2204,11 @@ function assertTaskGoalApplied(job, changedPaths) {
   }
 
   if (taskMode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED) {
+    const isAllowedAutomationPath = (filePath) =>
+      isAutomationWriteAllowedPath(filePath) ||
+      isAutomationAllowedByExplicitScope(filePath, requestText);
     const outOfScopePaths = normalizedChangedPaths.filter(
-      (filePath) => !isAutomationWriteAllowedPath(filePath)
+      (filePath) => !isAllowedAutomationPath(filePath)
     );
 
     if (outOfScopePaths.length > 0) {
@@ -2176,7 +2221,7 @@ function assertTaskGoalApplied(job, changedPaths) {
       );
     }
 
-    const automationChangedPaths = normalizedChangedPaths.filter(isAutomationWriteAllowedPath);
+    const automationChangedPaths = normalizedChangedPaths.filter(isAllowedAutomationPath);
     if (automationChangedPaths.length === 0) {
       throw createNoFixAppliedError(
         "automation_system_write_allowed task produced no automation-system diff; refusing succeeded.",

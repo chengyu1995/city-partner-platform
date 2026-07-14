@@ -1049,6 +1049,90 @@ test("read_only_mode task lock", async (t) => {
     );
   });
 
+  await t.test("automation_system_write_allowed allows explicitly scoped architecture and project docs", () => {
+    const architectureDocJob = {
+      request_text: [
+        "BATCH-ARCH-06",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, docs/architecture/context-contract.md, docs/projects/feishu-gm-automation.md",
+        "Repair target: docs/architecture/context-contract.md",
+      ].join("\n"),
+    };
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(architectureDocJob, ["docs/architecture/context-contract.md"])
+    );
+
+    const projectDocJob = {
+      request_text: [
+        "BATCH-ARCH-06",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, docs/projects/automation-context-contract.md",
+        "Repair target: docs/projects/automation-context-contract.md",
+      ].join("\n"),
+    };
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(projectDocJob, ["docs/projects/automation-context-contract.md"])
+    );
+  });
+
+  await t.test("automation_system_write_allowed blocks unscoped architecture doc", () => {
+    const job = {
+      request_text: [
+        "BATCH-ARCH-06",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, docs/projects/feishu-gm-automation.md",
+        "Repair target: docs/architecture/context-contract.md",
+      ].join("\n"),
+    };
+
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["docs/architecture/context-contract.md"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes("docs/architecture/context-contract.md")
+    );
+  });
+
+  await t.test("automation_system_write_allowed blocks docs wildcard and product page paths", () => {
+    const wildcardDocsJob = {
+      request_text: [
+        "BATCH-ARCH-06",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, docs/**",
+      ].join("\n"),
+    };
+    const productPageJob = {
+      request_text: [
+        "BATCH-ARCH-06A",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, docs/architecture/context-contract.md",
+      ].join("\n"),
+    };
+
+    assert.throws(
+      () => assertTaskGoalApplied(wildcardDocsJob, ["docs/architecture/context-contract.md"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(productPageJob, ["src/app/login/page.tsx"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes("src/app/login/page.tsx")
+    );
+  });
+
   await t.test("automation_system_write_allowed passes when Worker file changed despite forbidden product context", () => {
     const job = {
       request_text: [
