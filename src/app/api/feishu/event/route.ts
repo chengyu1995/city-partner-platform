@@ -71,7 +71,6 @@ import {
   hasBatch01DispatchRecord,
   hasExistingBatch01Jobs,
   hasRecentAcceptanceFeedbackJob,
-  insertApprovedAgentDispatchJobs,
   insertAcceptanceFeedbackJob,
   insertBatch01ProductPlanningJobs,
   PROJECT_DIRECTOR_DISPATCH_BATCH_RECORD_NAME,
@@ -83,7 +82,11 @@ import {
   buildTaskTreeDraftSummary,
   type ProjectDirectorTaskTreeDraft,
 } from "@/lib/project-director-task-tree";
-import { findRecentDuplicateFeishuJob, normalizeFeishuTaskText } from "@/lib/worker-jobs";
+import {
+  buildWorkerJobPayloadContract,
+  findRecentDuplicateFeishuJob,
+  normalizeFeishuTaskText,
+} from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -724,6 +727,18 @@ async function insertDirectWorkerTask(
   }
 ): Promise<{ jobId: string | null }> {
   const taskDomain = classifyFeishuWorkerTaskDomain(input.requestText);
+  const contractPayload = buildWorkerJobPayloadContract({
+    requestText: input.requestText,
+    originalRequestText: input.rawText,
+    projectDomain: taskDomain,
+    route: "direct_worker_create",
+    workflowStage: "queued",
+    finalReportStatus: "pending",
+    effectiveFinalStatus: "pending",
+    changedFiles: [],
+    pushed: false,
+    deployStatus: null,
+  });
   const row = {
     source: "feishu",
     job_type: taskDomain,
@@ -738,8 +753,9 @@ async function insertDirectWorkerTask(
     feishu_chat_id: input.feishuChatId,
     feishu_user_id: input.feishuUserId,
     payload: {
+      ...contractPayload,
       task_domain: taskDomain,
-      route: "direct_worker_task",
+      route: "direct_worker_create",
       raw_message: input.rawText,
       skip_planning_choice: true,
     },
@@ -752,6 +768,173 @@ async function insertDirectWorkerTask(
 
   if (error) throw new Error(`insert direct worker task failed: ${error.message}`);
   return { jobId: (data?.job_id as string | null | undefined) ?? (data?.id as string | null | undefined) ?? null };
+}
+
+function readTaskScopeItems(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+}
+
+function inferApprovedTaskMode(task: Record<string, any>): string | null {
+  const allowedFiles = readTaskScopeItems(task.allowed_files);
+  if (allowedFiles.length === 0) return null;
+
+  const normalized = allowedFiles.map((file) => file.replace(/\\/g, "/"));
+  if (
+    normalized.some((file) =>
+      file === "infra/windows-worker" ||
+      file.startsWith("infra/windows-worker/") ||
+      file === "src/lib/worker-jobs.ts" ||
+      file.startsWith("src/app/api/feishu/") ||
+      file === "src/app/api/feishu/event/route.ts" ||
+      file === "src/lib/project-director-console.ts" ||
+      file.startsWith("work/tencent-cloud/")
+    )
+  ) {
+    return "automation_system_write_allowed";
+  }
+  if (
+    normalized.some((file) =>
+      file === "src/app" ||
+      file.startsWith("src/app/") ||
+      file === "app" ||
+      file.startsWith("app/") ||
+      file === "docs/NEXT_TASK_CARD.md" ||
+      file === "docs/projects/city-partner-website.md"
+    )
+  ) {
+    return "product_write_allowed";
+  }
+  if (normalized.every((file) => file === "docs" || file.startsWith("docs/"))) {
+    return "docs_write_allowed";
+  }
+
+  return null;
+}
+
+function projectDomainForTaskMode(taskMode: string | null): string | null {
+  if (taskMode === "automation_system_write_allowed") return "automation_system";
+  if (taskMode === "product_write_allowed") return "city_partner_product";
+  if (taskMode === "docs_write_allowed") return "governance_docs";
+  return null;
+}
+
+function isHermesJobsMissingColumnError(error: { message?: string; code?: string } | null): boolean {
+  const message = error?.message ?? "";
+  return error?.code === "PGRST204" || /column .* does not exist/i.test(message);
+}
+
+function extractHermesJobsMissingColumn(error: { message?: string } | null): string | null {
+  const message = error?.message ?? "";
+  const quoted = message.match(/'([^']+)' column/);
+  if (quoted) return quoted[1];
+  const plain = message.match(/column "([^"]+)"/i);
+  return plain ? plain[1] : null;
+}
+
+async function insertHermesRowsWithMissingColumnFallback(
+  supabase: SupabaseClient,
+  rowsInput: Array<Record<string, any>>,
+  failureLabel: string
+): Promise<{ insertedCount: number; skippedColumns: string[] }> {
+  let rows = rowsInput;
+  const skippedColumns: string[] = [];
+
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const { error } = await supabase.from("hermes_jobs").insert(rows);
+    if (!error) return { insertedCount: rows.length, skippedColumns };
+    if (!isHermesJobsMissingColumnError(error)) {
+      throw new Error(`${failureLabel}: ${error.message}`);
+    }
+
+    const missingColumn = extractHermesJobsMissingColumn(error);
+    if (!missingColumn || !rows.some((row) => missingColumn in row)) {
+      throw new Error(`${failureLabel}: ${error.message}`);
+    }
+
+    skippedColumns.push(missingColumn);
+    rows = rows.map((row) => {
+      const next = { ...row };
+      delete next[missingColumn];
+      return next;
+    });
+  }
+
+  throw new Error(`${failureLabel}: too many missing columns`);
+}
+
+async function insertApprovedAgentDispatchJobsWithContract(
+  supabase: SupabaseClient,
+  buildResult: DispatchJobBuildResult
+): Promise<{ insertedCount: number; skippedColumns: string[] }> {
+  const rows = buildResult.tasks.map((task: any, index) => {
+    const requestText = buildResult.requestTexts[index] ?? "";
+    const taskMode = inferApprovedTaskMode(task);
+    const contractPayload = buildWorkerJobPayloadContract({
+      requestText,
+      originalRequestText: requestText,
+      projectDomain: projectDomainForTaskMode(taskMode),
+      taskMode,
+      readOnlyMode: taskMode ? false : null,
+      allowedScope: task.allowed_files,
+      forbiddenScope: task.forbidden_files,
+      route: "approved_execution",
+      approvedBatch: task.dispatch_batch,
+      workflowStage: "execution",
+      finalReportStatus: "pending",
+      effectiveFinalStatus: "pending",
+      changedFiles: [],
+      pushed: false,
+      deployStatus: null,
+    });
+
+    return {
+      source: "agent_dispatch",
+      job_type: "agent_dispatch",
+      job_id: task.task_key,
+      title: task.task_title,
+      description: requestText,
+      priority: task.requires_boss_approval ? 30 : 15,
+      acceptance: readTaskScopeItems(task.acceptance_criteria).join("\n"),
+      branch: null,
+      executor: task.agent_role,
+      repo: "city-partner-platform",
+      prompt: requestText,
+      request_text: requestText,
+      status: "queued",
+      plan_status: "approved",
+      workflow_stage: "execution",
+      claimed_by: null,
+      claimed_at: null,
+      started_at: null,
+      parent_task_id: null,
+      project_id: buildResult.projectTitle,
+      task_code: task.task_key,
+      dispatch_batch: task.dispatch_batch,
+      payload: {
+        ...contractPayload,
+        project_title: buildResult.projectTitle,
+        batch_code: task.dispatch_batch,
+        role: task.agent_role,
+        task_type: task.task_type,
+        task_key: task.task_key,
+        task_title: task.task_title,
+        dependency_keys: task.dependency_keys,
+        allowed_files: task.allowed_files,
+        forbidden_files: task.forbidden_files,
+        acceptance_criteria: task.acceptance_criteria,
+        requires_boss_approval: task.requires_boss_approval,
+        execution_mode: "approved_execution",
+      },
+    };
+  });
+
+  return insertHermesRowsWithMissingColumnFallback(
+    supabase,
+    rows,
+    "insert approved agent dispatch jobs failed"
+  );
 }
 
 export async function POST(req: NextRequest) {
@@ -1381,7 +1564,7 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      const insertResult = await insertApprovedAgentDispatchJobs(supabase, buildResult);
+      const insertResult = await insertApprovedAgentDispatchJobsWithContract(supabase, buildResult);
       const reply = [
         `[Project Director Dispatch] boss_request_id=${approvedTree.boss_request_id}`,
         `[Project Director Dispatch] plan_id=${approvedTree.plan_id}`,

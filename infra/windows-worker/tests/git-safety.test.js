@@ -52,6 +52,7 @@ const {
   isReadOnlyTask,
   isReadOnlyTaskText,
   recordFailureMemory,
+  resolveWorkerJobContract,
 } = require("../local_worker");
 
 const workerRoot = path.resolve(__dirname, "..");
@@ -1216,6 +1217,81 @@ test("read_only_mode task lock", async (t) => {
       () => assertTaskGoalApplied(wildcardOnlyJob, ["docs/architecture/context-contract.md"]),
       (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
     );
+  });
+
+  await t.test("HERMES_WORKER_CONTEXT explicit fields outrank stale payload fields", () => {
+    const originalRequest = [
+      "BATCH-ARCH-06D",
+      "HERMES_WORKER_CONTEXT:",
+      "project_domain=automation_system",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      "allowed_scope=infra/windows-worker/local_worker.js, docs/architecture/context-contract.md",
+      "forbidden_scope=src/app/**, app/**, src/lib/db/**",
+      "route=direct_worker_create",
+      "Do not use docs/NEXT_TASK_CARD.md as the task body.",
+    ].join("\n");
+    const job = {
+      request_text: [
+        "BATCH-ARCH-06D",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/local_worker.js",
+        "forbidden_scope=src/app/**, app/**",
+        `original_request_text_base64=${Buffer.from(originalRequest, "utf8").toString("base64")}`,
+        "This text also says do not modify product pages and do not start dev server.",
+      ].join("\n"),
+      payload: {
+        project_domain: "city_partner_product",
+        task_mode: "read_only",
+        read_only_mode: true,
+        original_request_text: "stale historical payload",
+        route: "historical_route",
+      },
+    };
+
+    const contract = resolveWorkerJobContract(job);
+
+    assert.equal(contract.project_domain, "automation_system");
+    assert.equal(contract.task_mode, TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.equal(contract.read_only_mode, false);
+    assert.equal(contract.route, "direct_worker_create");
+    assert.match(contract.original_request_text, /BATCH-ARCH-06D/);
+    assert.doesNotMatch(contract.original_request_text, /stale historical payload/);
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["infra/windows-worker/local_worker.js"])
+    );
+  });
+
+  await t.test("Codex prompt includes unified worker job payload contract fields", () => {
+    const job = {
+      request_text: [
+        "BATCH-ARCH-06D",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/local_worker.js",
+        "forbidden_scope=src/app/**, app/**",
+        "route=direct_worker_create",
+      ].join("\n"),
+      payload: {
+        route: "direct_worker_create",
+      },
+    };
+    const prompt = buildCodexPrompt(job);
+
+    assert.match(prompt, /\[Worker job payload contract\]/);
+    assert.match(prompt, /project_domain: automation_system/);
+    assert.match(prompt, /task_mode: automation_system_write_allowed/);
+    assert.match(prompt, /read_only_mode: false/);
+    assert.match(prompt, /allowed_scope: infra\/windows-worker\/local_worker\.js/);
+    assert.match(prompt, /route: direct_worker_create/);
+    assert.match(prompt, /changed_files: \[\]/);
+    assert.match(prompt, /git_commit_sha: null/);
+    assert.match(prompt, /pushed: false/);
+    assert.match(prompt, /deploy_status: null/);
   });
 
   await t.test("automation_system_write_allowed passes when Worker file changed despite forbidden product context", () => {

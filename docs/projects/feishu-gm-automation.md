@@ -104,3 +104,20 @@
 - 当前自动化架构任务不得修改 `src/app/page.tsx`、`src/app/partners/**`、`src/app/post/**`。
 - 当前文档任务不得修改 `infra/windows-worker/**`、`work/tencent-cloud/**`、数据库、环境变量、`package.json` 或 `tsconfig.json`。
 - Codex 完成后只汇报修改文件、验证结果、commit 状态和 commit SHA；Git 提交与推送由外层 Worker 自动完成。
+
+## BATCH-ARCH-06D field-contract landing
+
+BATCH-ARCH-06D implements the Worker job payload contract across the automation chain:
+
+- `direct_worker_create` now stores the current request as `original_request_text` and writes the unified payload fields.
+- Approved execution dispatch writes the same fields into `hermes_jobs.payload` without modifying product pages or product planning documents.
+- Worker claim keeps the same payload fields and replaces `attempt_id` with the active claim attempt.
+- Windows Worker prompts include a `[Worker job payload contract]` block so Codex sees the current explicit fields before historical context.
+- Final reports distinguish Worker execution status, task goal status, `original_worker_status`, and `effective_final_status`.
+
+Operational rules:
+
+- Explicit `HERMES_WORKER_CONTEXT` fields outrank payload values, request text inference, automatic classification, and historical context.
+- `original_request_text` must come from the current request or decoded `original_request_text_base64`; it must not be substituted from `docs/NEXT_TASK_CARD.md`, `docs/PROJECT_INDEX.md`, or historical batch docs.
+- `read_only` plus `changed_files=[]` is a valid completed read-only result.
+- Write-allowed tasks that finish with no changed files are `NO_FIX_APPLIED`, even when the raw Worker process exits successfully.

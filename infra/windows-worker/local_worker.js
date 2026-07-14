@@ -1462,7 +1462,7 @@ function isExplicitAutomationAllowedDocPath(filePath) {
 }
 
 const HERMES_CONTEXT_FIELD_PATTERN =
-  /\b(?:project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|route|original_request_text(?:_base64)?)\s*[:=]/i;
+  /\b(?:project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|route|original_request_text(?:_base64)?|approved_batch|attempt_id|workflow_stage|final_report_status|effective_final_status|changed_files|git_commit_sha|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName) {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -1593,6 +1593,256 @@ function extractAllowedScopePaths(requestText) {
     }
   }
   return uniqueSortedPaths(paths);
+}
+
+function normalizeTaskModeValue(value) {
+  const normalized = readString(value)?.toLowerCase();
+  return Object.values(TASK_MODES).includes(normalized) ? normalized : null;
+}
+
+function readNullableBooleanFlag(value) {
+  if (readBooleanFlag(value)) return true;
+  if (readBooleanFalseFlag(value)) return false;
+  return null;
+}
+
+function readStringList(value) {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => typeof item === "string" && item.trim())
+      .map((item) => item.trim());
+  }
+  if (typeof value === "string" && value.trim()) {
+    return value
+      .split(/\r?\n|,/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function readScopeValue(value) {
+  const items = readStringList(value);
+  if (items.length > 0) return items.join(", ");
+  return readString(value);
+}
+
+function readLatestWorkerContextFieldValue(text, fieldName) {
+  const values = expandWorkerContextTexts(text).flatMap((contextText) =>
+    extractWorkerContextFieldValues(contextText, fieldName)
+  );
+  return values.length > 0 ? values[values.length - 1] : null;
+}
+
+function readMergedWorkerContextFieldValue(text, fieldName) {
+  const values = expandWorkerContextTexts(text).flatMap((contextText) =>
+    extractWorkerContextFieldValues(contextText, fieldName)
+  );
+  const uniqueValues = [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+  return uniqueValues.length > 0 ? uniqueValues.join(", ") : null;
+}
+
+function readLatestOriginalRequestTextFromContexts(text) {
+  const values = expandWorkerContextTexts(text).flatMap(extractOriginalRequestTextsFromContext);
+  return values.length > 0 ? values[values.length - 1] : null;
+}
+
+function resolveWorkerJobContract(job, overrides = {}) {
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const result = job && typeof job.result === "object" ? job.result : null;
+  const requestText = readTextValue([
+    job?.request_text,
+    job?.requestText,
+    overrides.requestText,
+  ]);
+  const sourceText = readTextValue([
+    requestText,
+    getJobText(job),
+    overrides.originalRequestText,
+  ]);
+  const originalRequestText =
+    readLatestOriginalRequestTextFromContexts(sourceText) ||
+    readString(overrides.originalRequestText) ||
+    readString(payload?.original_request_text) ||
+    readString(payload?.originalRequestText) ||
+    decodeOriginalRequestTextBase64(payload?.original_request_text_base64) ||
+    decodeOriginalRequestTextBase64(payload?.originalRequestTextBase64) ||
+    readString(job?.original_request_text) ||
+    readString(job?.originalRequestText) ||
+    decodeOriginalRequestTextBase64(job?.original_request_text_base64) ||
+    decodeOriginalRequestTextBase64(job?.originalRequestTextBase64) ||
+    readString(requestText) ||
+    "";
+  const explicitTaskMode =
+    normalizeTaskModeValue(readLatestWorkerContextFieldValue(sourceText, "task_mode")) ||
+    normalizeTaskModeValue(overrides.taskMode) ||
+    normalizeTaskModeValue(payload?.task_mode) ||
+    normalizeTaskModeValue(payload?.taskMode) ||
+    normalizeTaskModeValue(result?.task_mode) ||
+    normalizeTaskModeValue(result?.taskMode);
+  const explicitReadOnlyMode =
+    readNullableBooleanFlag(readLatestWorkerContextFieldValue(sourceText, "read_only_mode")) ??
+    (typeof overrides.readOnlyMode === "boolean" ? overrides.readOnlyMode : null) ??
+    readNullableBooleanFlag(payload?.read_only_mode) ??
+    readNullableBooleanFlag(payload?.readOnlyMode) ??
+    readNullableBooleanFlag(result?.read_only_mode) ??
+    readNullableBooleanFlag(result?.readOnlyMode);
+  const taskMode =
+    explicitReadOnlyMode === true || explicitTaskMode === TASK_MODES.READ_ONLY
+      ? TASK_MODES.READ_ONLY
+      : explicitTaskMode || getTaskMode(job);
+  const resolvedTaskMode = taskMode;
+  const readOnlyMode = explicitReadOnlyMode ?? taskMode === TASK_MODES.READ_ONLY;
+  const projectDomain =
+    readLatestWorkerContextFieldValue(sourceText, "project_domain") ||
+    readString(overrides.projectDomain) ||
+    readString(payload?.project_domain) ||
+    readString(payload?.projectDomain) ||
+    readString(result?.project_domain) ||
+    readString(result?.projectDomain) ||
+    getEffectiveProjectDomain(job) ||
+    classifyWorkerTaskDomain(sourceText);
+  const approvedBatch =
+    readLatestWorkerContextFieldValue(sourceText, "approved_batch") ||
+    readString(overrides.approvedBatch) ||
+    readString(payload?.approved_batch) ||
+    readString(payload?.approvedBatch) ||
+    readString(payload?.batch_code) ||
+    readString(payload?.batchCode) ||
+    getJobBatchCode(job);
+  const changedFiles = uniqueSortedPaths(
+    readStringList(
+      overrides.changedFiles ??
+        payload?.changed_files ??
+        payload?.files_changed ??
+        result?.changed_files ??
+        result?.files_changed
+    )
+  );
+  const pushed =
+    typeof overrides.pushed === "boolean"
+      ? overrides.pushed
+      : readNullableBooleanFlag(readLatestWorkerContextFieldValue(sourceText, "pushed")) ??
+        readNullableBooleanFlag(payload?.pushed) ??
+        readNullableBooleanFlag(result?.pushed) ??
+        false;
+
+  return {
+    project_domain: projectDomain,
+    task_mode: resolvedTaskMode,
+    read_only_mode: readOnlyMode,
+    allowed_scope:
+      readMergedWorkerContextFieldValue(sourceText, "allowed_scope") ||
+      readScopeValue(overrides.allowedScope) ||
+      readScopeValue(payload?.allowed_scope) ||
+      readScopeValue(payload?.allowedScope) ||
+      readScopeValue(payload?.allowed_files) ||
+      readScopeValue(payload?.allowedFiles) ||
+      null,
+    forbidden_scope:
+      readMergedWorkerContextFieldValue(sourceText, "forbidden_scope") ||
+      readScopeValue(overrides.forbiddenScope) ||
+      readScopeValue(payload?.forbidden_scope) ||
+      readScopeValue(payload?.forbiddenScope) ||
+      readScopeValue(payload?.forbidden_files) ||
+      readScopeValue(payload?.forbiddenFiles) ||
+      null,
+    original_request_text: originalRequestText,
+    route:
+      readLatestWorkerContextFieldValue(sourceText, "route") ||
+      readString(overrides.route) ||
+      readString(payload?.route) ||
+      null,
+    payload: payload || null,
+    approved_batch: approvedBatch,
+    attempt_id:
+      readString(overrides.attemptId) ||
+      readLatestWorkerContextFieldValue(sourceText, "attempt_id") ||
+      readString(job?.attempt_id) ||
+      readString(job?.active_attempt_id) ||
+      readString(payload?.attempt_id) ||
+      readString(result?.attempt_id) ||
+      null,
+    workflow_stage:
+      readString(overrides.workflowStage) ||
+      readLatestWorkerContextFieldValue(sourceText, "workflow_stage") ||
+      readString(payload?.workflow_stage) ||
+      readString(result?.workflow_stage) ||
+      null,
+    final_report_status:
+      readString(overrides.finalReportStatus) ||
+      readLatestWorkerContextFieldValue(sourceText, "final_report_status") ||
+      readString(result?.final_report_status) ||
+      null,
+    effective_final_status:
+      readString(overrides.effectiveFinalStatus) ||
+      readLatestWorkerContextFieldValue(sourceText, "effective_final_status") ||
+      readString(result?.effective_final_status) ||
+      null,
+    changed_files: changedFiles,
+    git_commit_sha:
+      readString(overrides.gitCommitSha) ||
+      readLatestWorkerContextFieldValue(sourceText, "git_commit_sha") ||
+      readString(job?.git_commit_sha) ||
+      readString(payload?.git_commit_sha) ||
+      readString(result?.git_commit_sha) ||
+      null,
+    pushed,
+    deploy_status:
+      readString(overrides.deployStatus) ||
+      readLatestWorkerContextFieldValue(sourceText, "deploy_status") ||
+      readString(payload?.deploy_status) ||
+      readString(result?.deploy_status) ||
+      null,
+  };
+}
+
+function formatWorkerJobContractLines(contract, options = {}) {
+  const originalRequestValue = options.includeOriginalRequest === false
+    ? contract.original_request_text
+      ? "[present]"
+      : "null"
+    : contract.original_request_text || "null";
+  return [
+    "[Worker job payload contract]",
+    `project_domain: ${contract.project_domain || "null"}`,
+    `task_mode: ${contract.task_mode || "null"}`,
+    `read_only_mode: ${contract.read_only_mode ? "true" : "false"}`,
+    `allowed_scope: ${contract.allowed_scope || "null"}`,
+    `forbidden_scope: ${contract.forbidden_scope || "null"}`,
+    `original_request_text: ${originalRequestValue}`,
+    `route: ${contract.route || "null"}`,
+    "payload: hermes_jobs.payload",
+    `approved_batch: ${contract.approved_batch || "null"}`,
+    `attempt_id: ${contract.attempt_id || "null"}`,
+    `workflow_stage: ${contract.workflow_stage || "null"}`,
+    `final_report_status: ${contract.final_report_status || "null"}`,
+    `effective_final_status: ${contract.effective_final_status || "null"}`,
+    `changed_files: ${contract.changed_files.length ? contract.changed_files.join(", ") : "[]"}`,
+    `git_commit_sha: ${contract.git_commit_sha || "null"}`,
+    `pushed: ${contract.pushed ? "true" : "false"}`,
+    `deploy_status: ${contract.deploy_status || "null"}`,
+  ];
+}
+
+function buildWorkerReportContractExtra(contract) {
+  return {
+    project_domain: contract.project_domain,
+    task_mode: contract.task_mode,
+    read_only_mode: contract.read_only_mode,
+    allowed_scope: contract.allowed_scope,
+    forbidden_scope: contract.forbidden_scope,
+    original_request_text: contract.original_request_text,
+    route: contract.route,
+    approved_batch: contract.approved_batch,
+    workflow_stage: contract.workflow_stage,
+    final_report_status: contract.final_report_status,
+    effective_final_status: contract.effective_final_status,
+    changed_files: contract.changed_files,
+    git_commit_sha: contract.git_commit_sha,
+    pushed: contract.pushed,
+    deploy_status: contract.deploy_status,
+  };
 }
 
 function isAutomationAllowedByExplicitScope(filePath, requestText) {
@@ -2747,6 +2997,17 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
   const taskText = String(requestText || "").trim();
   const taskDomain = classifyWorkerTaskDomain(taskText);
   const taskMode = options.taskMode || getTaskModeFromText(taskText) || TASK_MODES.READ_ONLY;
+  const contract = options.contract || resolveWorkerJobContract(
+    {
+      request_text: taskText,
+      payload: options.payload || null,
+    },
+    {
+      taskMode,
+      readOnlyMode: options.readOnlyMode,
+      requestText: taskText,
+    }
+  );
   const promptTaskText = sanitizeProductTaskTextForPrompt(taskText, taskMode);
   const readOnlyGuard =
     taskMode === TASK_MODES.READ_ONLY
@@ -2788,6 +3049,8 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
     "automation_system_write_allowed: only approved automation-system files may change.",
     `product_write_allowed: may change ${PRODUCT_WRITE_ALLOWED_SCOPE_TEXT}.`,
     "",
+    ...formatWorkerJobContractLines(contract, { includeOriginalRequest: false }),
+    "",
     "【原始任务内容】",
     promptTaskText,
     "",
@@ -2798,9 +3061,16 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
 
 function buildCodexPrompt(job) {
   assertExplicitTaskFieldsNotOverridden(job);
+  const contract = resolveWorkerJobContract(job, {
+    taskMode: getTaskMode(job),
+    readOnlyMode: isReadOnlyTask(job),
+    workflowStage: "codex_prompt",
+  });
   return buildWorkerGuardedPrompt(job?.request_text || "", {
     readOnlyMode: isReadOnlyTask(job),
     taskMode: getTaskMode(job),
+    payload: job?.payload || null,
+    contract,
   });
 }
 
@@ -3044,11 +3314,24 @@ function buildFailureReport(job, error, context = {}) {
     ? "failed_out_of_scope_business_change"
     : `failed_${errorCode}`;
   const taskMode = getTaskMode(job);
+  const contract = context.contract || resolveWorkerJobContract(job, {
+    taskMode,
+    workflowStage: "failed",
+    finalReportStatus: "failed",
+    effectiveFinalStatus: "failed",
+    changedFiles: filesChanged,
+    gitCommitSha: context.commitSha || null,
+    pushed: false,
+    deployStatus: null,
+  });
 
   return [
     "Codex 任务执行失败",
     `任务编号：${job?.id || "未提供"}`,
     `任务名称：${taskName || "未提供"}`,
+    ...formatWorkerJobContractLines(contract, {
+      includeOriginalRequest: false,
+    }),
     "Worker 执行状态：已完成本地执行链路并进入结果验收",
     `任务目标状态：失败（${errorCode}）`,
     `Worker execution status: ${workerExecutionStatus}`,
@@ -3640,6 +3923,13 @@ async function updateProgress(
 
 async function report(jobId, status, payload, extra = {}) {
   const attemptId = extra.attempt_id || currentAttemptId || null;
+  const normalizedExtra = { ...extra };
+  if (normalizedExtra.changed_files === undefined && normalizedExtra.files_changed !== undefined) {
+    normalizedExtra.changed_files = normalizedExtra.files_changed;
+  }
+  if (normalizedExtra.files_changed === undefined && normalizedExtra.changed_files !== undefined) {
+    normalizedExtra.files_changed = normalizedExtra.changed_files;
+  }
   const body =
     status === "succeeded"
       ? {
@@ -3649,7 +3939,7 @@ async function report(jobId, status, payload, extra = {}) {
           worker_name: WORKER_NAME,
           status,
           result_text: payload,
-          ...extra,
+          ...normalizedExtra,
         }
       : {
           job_id: jobId,
@@ -3658,7 +3948,7 @@ async function report(jobId, status, payload, extra = {}) {
           worker_name: WORKER_NAME,
           status,
           error_text: payload,
-          ...extra,
+          ...normalizedExtra,
         };
 
   const response = await request("/api/worker/report", {
@@ -3895,8 +4185,25 @@ async function pollOnce() {
         : pushResult.message
     );
 
+    const successContract = resolveWorkerJobContract(job, {
+      attemptId,
+      taskMode: taskModeForReport,
+      readOnlyMode,
+      workflowStage: "completed",
+      finalReportStatus: "succeeded",
+      effectiveFinalStatus: "succeeded",
+      changedFiles: gitResult.filesChanged || [],
+      gitCommitSha: gitResult.commitSha || null,
+      pushed: pushResult.pushed,
+      deployStatus: pushResult.pushed ? "pending" : null,
+    });
+
     const finalResult = [
       result,
+      "",
+      ...formatWorkerJobContractLines(successContract, {
+        includeOriginalRequest: false,
+      }),
       "",
       "Worker / task status:",
       "Worker execution: succeeded",
@@ -3962,6 +4269,7 @@ async function pollOnce() {
         attempt_id: attemptId,
         batch_code: getJobBatchCode(job),
         job_created_at: job.created_at || null,
+        ...buildWorkerReportContractExtra(successContract),
         project_name: "同城搭子网站",
         project_dir: PROJECT_DIR,
         files_changed: gitResult.filesChanged || [],
@@ -4064,11 +4372,25 @@ async function pollOnce() {
       "任务执行失败，正在上报错误"
     );
 
+    const failureContract = resolveWorkerJobContract(job, {
+      attemptId,
+      taskMode: taskModeForReport,
+      readOnlyMode,
+      workflowStage: "failed",
+      finalReportStatus: "failed",
+      effectiveFinalStatus: "failed",
+      changedFiles: failureChangedPaths,
+      gitCommitSha: null,
+      pushed: false,
+      deployStatus: null,
+    });
+
     const failureReport = buildFailureReport(job, error, {
       filesChanged: failureChangedPaths,
       uncommittedFiles: failureChangedPaths,
       head: currentHead,
       rollbackMessage,
+      contract: failureContract,
     });
 
     await report(
@@ -4079,6 +4401,7 @@ async function pollOnce() {
         attempt_id: attemptId,
         batch_code: getJobBatchCode(job),
         job_created_at: job.created_at || null,
+        ...buildWorkerReportContractExtra(failureContract),
         project_name: "同城搭子网站",
         project_dir: PROJECT_DIR,
         error_code: errorCode,
@@ -4264,6 +4587,7 @@ module.exports = {
   extractRequiredChangePaths,
   getTaskMode,
   recordFailureMemory,
+  resolveWorkerJobContract,
   getTaskChangedPaths,
   isReadOnlyTask,
   isReadOnlyTaskText,

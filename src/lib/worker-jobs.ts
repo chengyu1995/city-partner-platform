@@ -46,6 +46,25 @@ const TASK_MODES = {
   AUTOMATION_SYSTEM_WRITE_ALLOWED: "automation_system_write_allowed",
   PRODUCT_WRITE_ALLOWED: "product_write_allowed",
 } as const;
+export const WORKER_JOB_CONTRACT_FIELDS = [
+  "project_domain",
+  "task_mode",
+  "read_only_mode",
+  "allowed_scope",
+  "forbidden_scope",
+  "original_request_text",
+  "route",
+  "payload",
+  "approved_batch",
+  "attempt_id",
+  "workflow_stage",
+  "final_report_status",
+  "effective_final_status",
+  "changed_files",
+  "git_commit_sha",
+  "pushed",
+  "deploy_status",
+] as const;
 const DOCS_WRITE_TASK_PATTERN =
   /\bBATCH-37-(?:DOCS(?:-[A-Z0-9]+)*|FIX)\b|docs_write_allowed/i;
 const DOCS_WRITE_TARGET_PATTERN = /\bdocs\//i;
@@ -74,6 +93,164 @@ function readBooleanFlag(value: unknown): boolean {
 
 function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function readBooleanFalseFlag(value: unknown): boolean {
+  if (value === false) return true;
+  if (typeof value === "number") return value === 0;
+  if (typeof value === "string") return /^(false|0|no|off)$/i.test(value.trim());
+  return false;
+}
+
+function readNullableBooleanFlag(value: unknown): boolean | null {
+  if (readBooleanFlag(value)) return true;
+  if (readBooleanFalseFlag(value)) return false;
+  return null;
+}
+
+function normalizeTaskMode(value: unknown): string | null {
+  const text = readString(value)?.toLowerCase();
+  if (!text) return null;
+  return Object.values(TASK_MODES).includes(text as typeof TASK_MODES[keyof typeof TASK_MODES])
+    ? text
+    : null;
+}
+
+function decodeOriginalRequestTextBase64(value: unknown): string | null {
+  const raw = readString(value);
+  if (!raw) return null;
+
+  const compact = raw.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) return null;
+
+  try {
+    const decoded = Buffer.from(compact, "base64").toString("utf8");
+    const encodedAgain = Buffer.from(decoded, "utf8").toString("base64").replace(/=+$/g, "");
+    return encodedAgain === compact.replace(/=+$/g, "") ? decoded.trim() || null : null;
+  } catch {
+    return null;
+  }
+}
+
+const WORKER_CONTEXT_FIELD_PATTERN =
+  /\b(?:project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|original_request_text(?:_base64)?|route|approved_batch|attempt_id|workflow_stage|final_report_status|effective_final_status|changed_files|git_commit_sha|pushed|deploy_status)\s*[:=]/i;
+
+function contextFieldNamePattern(fieldName: string): string {
+  return fieldName.replace(/_/g, "[_\\s-]*");
+}
+
+function decodeEscapedWorkerContextText(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\n");
+}
+
+function stripWorkerContextValue(value: unknown): string {
+  let stripped = String(value ?? "").trim();
+  const first = stripped[0];
+  const last = stripped[stripped.length - 1];
+  if (
+    stripped.length >= 2 &&
+    ((first === "\"" && last === "\"") ||
+      (first === "'" && last === "'") ||
+      (first === "`" && last === "`") ||
+      (first === "“" && last === "”"))
+  ) {
+    stripped = stripped.slice(1, -1).trim();
+  }
+  return stripped;
+}
+
+function extractWorkerContextFieldValues(text: unknown, fieldName: string): string[] {
+  const values: string[] = [];
+  const pattern = new RegExp(
+    `(?:^|[^\\w-])${contextFieldNamePattern(fieldName)}\\s*[:=]\\s*`,
+    "i"
+  );
+
+  for (const rawLine of String(text ?? "").split(/\r?\n/)) {
+    const match = pattern.exec(rawLine);
+    if (!match) continue;
+
+    const rawValue = rawLine.slice(match.index + match[0].length);
+    const decodedValue = decodeEscapedWorkerContextText(rawValue).split(/\r?\n/)[0] ?? "";
+    const nextField = WORKER_CONTEXT_FIELD_PATTERN.exec(decodedValue);
+    values.push(stripWorkerContextValue(nextField ? decodedValue.slice(0, nextField.index) : decodedValue));
+  }
+
+  return values.filter(Boolean);
+}
+
+function extractOriginalRequestTextsFromContext(text: unknown): string[] {
+  const nestedTexts: string[] = [];
+
+  for (const value of extractWorkerContextFieldValues(text, "original_request_text_base64")) {
+    const base64Token = value.match(/[A-Za-z0-9+/=]+/)?.[0] ?? "";
+    const decoded = decodeOriginalRequestTextBase64(base64Token);
+    if (decoded) nestedTexts.push(decoded);
+  }
+
+  for (const value of extractWorkerContextFieldValues(text, "original_request_text")) {
+    const decoded = decodeEscapedWorkerContextText(value).trim();
+    if (decoded) nestedTexts.push(decoded);
+  }
+
+  return nestedTexts;
+}
+
+function expandWorkerContextTexts(text: unknown, seen = new Set<string>(), depth = 0): string[] {
+  if (depth > 5) return [];
+
+  const raw = String(text ?? "");
+  if (!raw.trim()) return [];
+
+  const expanded: string[] = [];
+  const candidates = [raw, decodeEscapedWorkerContextText(raw)];
+
+  for (const candidate of candidates) {
+    const normalizedCandidate = candidate.trim();
+    if (!normalizedCandidate || seen.has(normalizedCandidate)) continue;
+
+    seen.add(normalizedCandidate);
+    expanded.push(normalizedCandidate);
+
+    for (const nestedText of extractOriginalRequestTextsFromContext(normalizedCandidate)) {
+      expanded.push(...expandWorkerContextTexts(nestedText, seen, depth + 1));
+    }
+  }
+
+  return expanded;
+}
+
+function readLatestWorkerContextField(text: unknown, fieldName: string): string | null {
+  const values = expandWorkerContextTexts(text).flatMap((contextText) =>
+    extractWorkerContextFieldValues(contextText, fieldName)
+  );
+  return values.length > 0 ? values[values.length - 1] : null;
+}
+
+function readMergedWorkerContextField(text: unknown, fieldName: string): string | null {
+  const values = expandWorkerContextTexts(text).flatMap((contextText) =>
+    extractWorkerContextFieldValues(contextText, fieldName)
+  );
+  const uniqueValues = Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+  return uniqueValues.length > 0 ? uniqueValues.join(", ") : null;
+}
+
+function readScopeText(value: unknown): string | null {
+  if (Array.isArray(value)) {
+    const items = value.map((item) => readString(item)).filter(Boolean);
+    return items.length > 0 ? items.join(", ") : null;
+  }
+  return readString(value);
+}
+
+function readLatestOriginalRequestText(text: unknown): string | null {
+  const expandedTexts = expandWorkerContextTexts(text);
+  const explicitTexts = expandedTexts.flatMap(extractOriginalRequestTextsFromContext);
+  if (explicitTexts.length > 0) return explicitTexts[explicitTexts.length - 1];
+  return null;
 }
 
 function findBatchCodes(text: unknown): string[] {
@@ -425,10 +602,25 @@ function inferTaskMode(input: {
   if (input.batchCode && READ_ONLY_BATCH_PATTERN.test(input.batchCode)) {
     return TASK_MODES.READ_ONLY;
   }
+  const contractExplicitTextMode =
+    normalizeTaskMode(readLatestWorkerContextField(text, "task_mode")) ??
+    normalizeTaskMode(text.match(/\btask[_\s-]*mode\s*[:=]\s*[`'"“”]?([a-z_]+)[`'"“”]?/i)?.[1]);
+  const contractExplicitReadOnlyMode = readNullableBooleanFlag(
+    readLatestWorkerContextField(text, "read_only_mode") ??
+      text.match(/\bread[_\s-]*only[_\s-]*mode\s*[:=]\s*[`'"“”]?(true|false|1|0|yes|no|on|off)[`'"“”]?/i)?.[1]
+  );
+  if (
+    contractExplicitTextMode &&
+    (contractExplicitReadOnlyMode === true || contractExplicitTextMode === TASK_MODES.READ_ONLY)
+  ) {
+    return TASK_MODES.READ_ONLY;
+  }
+  if (contractExplicitTextMode) {
+    return contractExplicitTextMode;
+  }
   if (READ_ONLY_BATCH_PATTERN.test(text) || taskDeclaresReadOnly(text)) {
     return TASK_MODES.READ_ONLY;
   }
-
   // Boss-provided task_mode in the original request outranks product/docs/system keyword inference.
   const explicitTextModeMatch = text.match(/\btask[_\s-]*mode\s*[:=]\s*[`'"“”]?([a-z_]+)[`'"“”]?/i);
   const explicitTextMode = explicitTextModeMatch ? explicitTextModeMatch[1].toLowerCase() : null;
@@ -542,6 +734,188 @@ function getJobBatchCode(job: JobRecord | null | undefined): string | null {
   return extractCurrentExecutionBatchCode(job);
 }
 
+export function buildWorkerJobPayloadContract(input: {
+  job?: JobRecord | null;
+  requestText?: unknown;
+  payload?: Record<string, unknown> | null;
+  result?: Record<string, unknown> | null;
+  projectDomain?: string | null;
+  taskMode?: string | null;
+  readOnlyMode?: boolean | null;
+  allowedScope?: unknown;
+  forbiddenScope?: unknown;
+  originalRequestText?: string | null;
+  route?: string | null;
+  approvedBatch?: string | null;
+  attemptId?: string | null;
+  workflowStage?: string | null;
+  finalReportStatus?: string | null;
+  effectiveFinalStatus?: string | null;
+  changedFiles?: unknown;
+  gitCommitSha?: string | null;
+  pushed?: boolean | null;
+  deployStatus?: string | null;
+}): Record<string, unknown> {
+  const job = input.job ?? null;
+  const payload = input.payload ?? readRecord(job?.payload);
+  const result = input.result ?? readRecord(job?.result);
+  const requestText = readString(input.requestText) ?? readString(job?.request_text) ?? readString(job?.prompt) ?? "";
+  const sourceText = [
+    requestText,
+    readString(input.originalRequestText),
+    readString(job?.original_request_text),
+    readString(job?.originalRequestText),
+    decodeOriginalRequestTextBase64(job?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(job?.originalRequestTextBase64),
+    readString(payload?.original_request_text),
+    readString(payload?.originalRequestText),
+    decodeOriginalRequestTextBase64(payload?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(payload?.originalRequestTextBase64),
+    readString(result?.original_request_text),
+    readString(result?.originalRequestText),
+    decodeOriginalRequestTextBase64(result?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(result?.originalRequestTextBase64),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const originalRequestText =
+    readLatestOriginalRequestText(sourceText) ??
+    readString(input.originalRequestText) ??
+    readString(payload?.original_request_text) ??
+    readString(payload?.originalRequestText) ??
+    decodeOriginalRequestTextBase64(payload?.original_request_text_base64) ??
+    decodeOriginalRequestTextBase64(payload?.originalRequestTextBase64) ??
+    readString(job?.original_request_text) ??
+    readString(job?.originalRequestText) ??
+    requestText;
+  const explicitTaskMode =
+    normalizeTaskMode(readLatestWorkerContextField(sourceText, "task_mode")) ??
+    normalizeTaskMode(input.taskMode) ??
+    normalizeTaskMode(payload?.task_mode) ??
+    normalizeTaskMode(payload?.taskMode) ??
+    normalizeTaskMode(result?.task_mode) ??
+    normalizeTaskMode(result?.taskMode);
+  const explicitReadOnlyMode =
+    readNullableBooleanFlag(readLatestWorkerContextField(sourceText, "read_only_mode")) ??
+    (typeof input.readOnlyMode === "boolean" ? input.readOnlyMode : null) ??
+    readNullableBooleanFlag(payload?.read_only_mode) ??
+    readNullableBooleanFlag(payload?.readOnlyMode) ??
+    readNullableBooleanFlag(result?.read_only_mode) ??
+    readNullableBooleanFlag(result?.readOnlyMode);
+  const batchCode =
+    readLatestWorkerContextField(sourceText, "approved_batch") ??
+    readString(input.approvedBatch) ??
+    readString(payload?.approved_batch) ??
+    readString(payload?.approvedBatch) ??
+    readString(payload?.batch_code) ??
+    readString(payload?.batchCode) ??
+    getJobBatchCode(job) ??
+    findBatchCodes(sourceText)[0] ??
+    null;
+  const inferredTaskMode = inferTaskMode({
+    demand: [originalRequestText, requestText].filter(Boolean).join("\n"),
+    batchCode,
+    jobPayload: payload,
+    jobResult: result,
+    submitted: input.taskMode,
+  });
+  const taskMode =
+    explicitReadOnlyMode === true || explicitTaskMode === TASK_MODES.READ_ONLY
+      ? TASK_MODES.READ_ONLY
+      : explicitTaskMode ?? inferredTaskMode;
+  const readOnlyMode = explicitReadOnlyMode ?? taskMode === TASK_MODES.READ_ONLY;
+  const projectDomain =
+    readLatestWorkerContextField(sourceText, "project_domain") ??
+    readString(input.projectDomain) ??
+    readString(payload?.project_domain) ??
+    readString(payload?.projectDomain) ??
+    readString(result?.project_domain) ??
+    readString(result?.projectDomain) ??
+    classifyWorkerTaskDomain([originalRequestText, requestText].filter(Boolean).join("\n"));
+  const allowedScope =
+    readMergedWorkerContextField(sourceText, "allowed_scope") ??
+    readScopeText(input.allowedScope) ??
+    readScopeText(payload?.allowed_scope) ??
+    readScopeText(payload?.allowedScope) ??
+    readScopeText(payload?.allowed_files) ??
+    readScopeText(payload?.allowedFiles) ??
+    null;
+  const forbiddenScope =
+    readMergedWorkerContextField(sourceText, "forbidden_scope") ??
+    readScopeText(input.forbiddenScope) ??
+    readScopeText(payload?.forbidden_scope) ??
+    readScopeText(payload?.forbiddenScope) ??
+    readScopeText(payload?.forbidden_files) ??
+    readScopeText(payload?.forbiddenFiles) ??
+    null;
+  const changedFiles = readStringArray(
+    input.changedFiles ??
+      payload?.changed_files ??
+      payload?.files_changed ??
+      result?.changed_files ??
+      result?.files_changed
+  );
+  const gitCommitSha =
+    readString(input.gitCommitSha) ??
+    readLatestWorkerContextField(sourceText, "git_commit_sha") ??
+    readString(payload?.git_commit_sha) ??
+    readString(result?.git_commit_sha) ??
+    readString(job?.git_commit_sha);
+  const pushed =
+    typeof input.pushed === "boolean"
+      ? input.pushed
+      : readNullableBooleanFlag(readLatestWorkerContextField(sourceText, "pushed")) ??
+        readNullableBooleanFlag(payload?.pushed) ??
+        readNullableBooleanFlag(result?.pushed) ??
+        false;
+
+  return {
+    project_domain: projectDomain,
+    task_mode: taskMode,
+    read_only_mode: readOnlyMode,
+    allowed_scope: allowedScope,
+    forbidden_scope: forbiddenScope,
+    original_request_text: originalRequestText,
+    route:
+      readLatestWorkerContextField(sourceText, "route") ??
+      readString(input.route) ??
+      readString(payload?.route) ??
+      null,
+    approved_batch: batchCode,
+    attempt_id:
+      readString(input.attemptId) ??
+      readLatestWorkerContextField(sourceText, "attempt_id") ??
+      readString(payload?.attempt_id) ??
+      readString(result?.attempt_id) ??
+      null,
+    workflow_stage:
+      readString(input.workflowStage) ??
+      readLatestWorkerContextField(sourceText, "workflow_stage") ??
+      readString(payload?.workflow_stage) ??
+      readString(result?.workflow_stage) ??
+      null,
+    final_report_status:
+      readString(input.finalReportStatus) ??
+      readLatestWorkerContextField(sourceText, "final_report_status") ??
+      readString(result?.final_report_status) ??
+      null,
+    effective_final_status:
+      readString(input.effectiveFinalStatus) ??
+      readLatestWorkerContextField(sourceText, "effective_final_status") ??
+      readString(result?.effective_final_status) ??
+      null,
+    changed_files: changedFiles,
+    git_commit_sha: gitCommitSha ?? null,
+    pushed,
+    deploy_status:
+      readString(input.deployStatus) ??
+      readLatestWorkerContextField(sourceText, "deploy_status") ??
+      readString(payload?.deploy_status) ??
+      readString(result?.deploy_status) ??
+      null,
+  };
+}
+
 export function buildProjectDirectorWorkerReport(input: {
   job: JobRecord | null;
   workerId: string;
@@ -567,14 +941,17 @@ export function buildProjectDirectorWorkerReport(input: {
   const filesChanged =
     submittedFilesChanged.length > 0
       ? submittedFilesChanged
-      : readStringArray(readRecord(input.job?.result)?.files_changed);
+      : readStringArray(
+          readRecord(input.job?.result)?.changed_files ??
+            readRecord(input.job?.result)?.files_changed
+        );
   const submittedValidationResults = readStringArray(input.validationResults);
   const validation = [
     ...(submittedValidationResults.length > 0 ? submittedValidationResults : []),
     `build=${input.buildPassed === undefined || input.buildPassed === null ? "未提供" : input.buildPassed ? "通过" : "失败"}`,
     `test=${input.testPassed === undefined || input.testPassed === null ? "未提供" : input.testPassed ? "通过" : "失败"}`,
   ];
-  const needsBossConfirmation = input.status === "succeeded";
+  let needsBossConfirmation = input.status === "succeeded";
   const summary =
     input.resultText?.trim() ||
     input.output?.trim() ||
@@ -587,12 +964,30 @@ export function buildProjectDirectorWorkerReport(input: {
     null;
   const jobPayload = readRecord(input.job?.payload);
   const jobResult = readRecord(input.job?.result);
+  const contract = buildWorkerJobPayloadContract({
+    job: input.job,
+    requestText: demand ?? input.job?.request_text,
+    payload: jobPayload,
+    result: jobResult,
+    attemptId: input.attemptId,
+    workflowStage: input.status === "succeeded" ? "completed" : input.status === "failed" ? "failed" : input.status,
+    finalReportStatus: input.status,
+    changedFiles: input.filesChanged,
+    gitCommitSha: input.gitCommitSha,
+    pushed: isGithubPushSuccess(input.githubPushStatus ?? null),
+    deployStatus: input.deployStatus,
+  });
   const taskTextForClassification = [
+    readString(contract.original_request_text),
     demand,
     readString(jobPayload?.original_request_text),
     readString(jobPayload?.originalRequestText),
+    decodeOriginalRequestTextBase64(jobPayload?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(jobPayload?.originalRequestTextBase64),
     readString(jobResult?.original_request_text),
     readString(jobResult?.originalRequestText),
+    decodeOriginalRequestTextBase64(jobResult?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(jobResult?.originalRequestTextBase64),
     readString(input.job?.title),
     readString(input.job?.job_type),
   ]
@@ -623,7 +1018,12 @@ export function buildProjectDirectorWorkerReport(input: {
   });
   const readOnlyMode = taskMode === TASK_MODES.READ_ONLY;
   const readOnlyViolation = reportTextHasReadOnlyViolation(combinedReportText);
-  const noFixApplied = reportTextHasNoFixApplied(combinedReportText);
+  const writeAllowedNoFixApplied =
+    input.status === "succeeded" &&
+    taskMode !== TASK_MODES.READ_ONLY &&
+    filesChanged.length === 0;
+  const noFixApplied =
+    reportTextHasNoFixApplied(combinedReportText) || writeAllowedNoFixApplied;
   const outOfScopeBusinessChange = reportTextHasOutOfScope(combinedReportText);
   const failedTaskGoal = reportTextHasFailedTaskGoal(combinedReportText);
   const requiredDocsTotal = readDiagnosticLine(combinedReportText, "required_docs_total") ?? "0";
@@ -635,7 +1035,7 @@ export function buildProjectDirectorWorkerReport(input: {
   const noOpRun =
     noFixApplied ||
     (input.status === "succeeded" &&
-      taskRequiresFileChanges(demand) &&
+      taskRequiresFileChanges(taskTextForClassification || demand) &&
       filesChanged.length === 0 &&
       !gitCommitSha);
   const committed = Boolean(gitCommitSha);
@@ -650,6 +1050,7 @@ export function buildProjectDirectorWorkerReport(input: {
       : input.status === "succeeded"
         ? "succeeded"
         : input.status;
+  needsBossConfirmation = effectiveFinalStatus === "succeeded";
   const failureStage = input.status === "failed"
     ? readDiagnosticLine(sanitizedError, "失败阶段") ?? "未提供"
     : null;
@@ -672,19 +1073,21 @@ export function buildProjectDirectorWorkerReport(input: {
             ? "succeeded"
             : input.status;
   const taskGoalStatus =
-    input.status === "succeeded"
-      ? "completed"
-      : readOnlyViolation
-        ? "failed_read_only_mode_violation"
-        : noFixApplied
-          ? "failed_no_fix_applied"
-          : outOfScopeBusinessChange
-            ? "failed_out_of_scope_business_change"
-          : failedTaskGoal
-            ? "failed"
-          : input.status === "failed"
-            ? "failed"
-            : "running";
+    readOnlyViolation
+      ? "failed_read_only_mode_violation"
+      : noFixApplied
+        ? "failed_no_fix_applied"
+        : outOfScopeBusinessChange
+          ? "failed_out_of_scope_business_change"
+        : failedTaskGoal
+          ? "failed"
+        : input.status === "succeeded"
+          ? readOnlyMode && filesChanged.length === 0
+            ? "completed_read_only_no_file_changes"
+            : "completed"
+        : input.status === "failed"
+          ? "failed"
+          : "running";
 
   const data = {
     job_id: jobId,
@@ -699,10 +1102,20 @@ export function buildProjectDirectorWorkerReport(input: {
     attempt_id: input.attemptId,
     status: input.status,
     original_worker_status: input.status,
+    final_report_status: input.status,
     effective_final_status: effectiveFinalStatus,
     status_title: statusTitle,
+    project_domain: readString(contract.project_domain),
     task_domain: taskDomain,
     task_mode: taskMode,
+    allowed_scope: contract.allowed_scope,
+    forbidden_scope: contract.forbidden_scope,
+    original_request_text: contract.original_request_text,
+    route: contract.route,
+    payload: jobPayload ?? null,
+    approved_batch: contract.approved_batch ?? batchCode,
+    workflow_stage:
+      input.status === "succeeded" ? "completed" : input.status === "failed" ? "failed" : input.status,
     worker_execution_status: workerExecutionStatus,
     task_goal_status: taskGoalStatus,
     read_only_mode: readOnlyMode,
@@ -718,10 +1131,13 @@ export function buildProjectDirectorWorkerReport(input: {
     committed,
     pushed,
     what_changed: sanitizeReportText(summary),
+    changed_files: filesChanged,
     files_changed: filesChanged,
     validation_result: validation,
+    git_commit_sha: gitCommitSha ?? null,
     commit_hash: gitCommitSha ?? null,
     github_push_status: githubPushStatus,
+    deploy_status: input.deployStatus ?? null,
     safety_boundary: safetyBoundary,
     needs_boss_confirmation: needsBossConfirmation,
     next_step: needsBossConfirmation
@@ -748,6 +1164,20 @@ export function buildProjectDirectorWorkerReport(input: {
     `Original worker status: ${input.status}`,
     `Effective final status: ${effectiveFinalStatus}`,
     `Task mode: ${taskMode}`,
+    `project_domain: ${placeholder(readString(contract.project_domain))}`,
+    `task_mode: ${taskMode}`,
+    `read_only_mode: ${readOnlyMode ? "true" : "false"}`,
+    `allowed_scope: ${placeholder(readString(contract.allowed_scope))}`,
+    `forbidden_scope: ${placeholder(readString(contract.forbidden_scope))}`,
+    `route: ${placeholder(readString(contract.route))}`,
+    `approved_batch: ${placeholder(readString(contract.approved_batch) ?? batchCode)}`,
+    `workflow_stage: ${data.workflow_stage}`,
+    `final_report_status: ${input.status}`,
+    `effective_final_status: ${effectiveFinalStatus}`,
+    `changed_files: ${filesChanged.length ? filesChanged.join(", ") : "[]"}`,
+    `git_commit_sha: ${gitCommitSha ?? "null"}`,
+    `pushed: ${pushed ? "true" : "false"}`,
+    `deploy_status: ${input.deployStatus ?? "null"}`,
     `Worker execution status: ${workerExecutionStatus}`,
     `Task goal status: ${taskGoalStatus}`,
     `Read-only mode: ${readOnlyMode ? "yes" : "no"}`,
@@ -811,8 +1241,18 @@ export function buildAttemptPayload(
   }
 ): Record<string, unknown> {
   const payload = readRecord(job?.payload) ?? {};
+  const contract = buildWorkerJobPayloadContract({
+    job,
+    requestText: job?.request_text,
+    payload,
+    attemptId: attempt.attempt_id,
+    workflowStage: "execution",
+    finalReportStatus: null,
+    effectiveFinalStatus: "running",
+  });
   return {
     ...payload,
+    ...contract,
     attempt_id: attempt.attempt_id,
     active_attempt: {
       ...(readRecord(payload.active_attempt) ?? {}),

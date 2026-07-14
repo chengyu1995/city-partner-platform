@@ -86,3 +86,38 @@
 - `allowed_scope=docs/architecture/**, docs/NEXT_TASK_CARD.md, docs/projects/feishu-gm-automation.md`
 - `route=direct_worker_create`
 - Codex 只修改指定文档，不执行 Git commit、push、部署或本地 dev server。
+
+## BATCH-ARCH-06D implementation note
+
+BATCH-ARCH-06D moves the contract from documentation into the Worker execution chain.
+
+Implemented contract fields:
+
+- `project_domain`
+- `task_mode`
+- `read_only_mode`
+- `allowed_scope`
+- `forbidden_scope`
+- `original_request_text`
+- `route`
+- `payload`
+- `approved_batch`
+- `attempt_id`
+- `workflow_stage`
+- `final_report_status`
+- `effective_final_status`
+- `changed_files`
+- `git_commit_sha`
+- `pushed`
+- `deploy_status`
+
+Resolution order is explicit `HERMES_WORKER_CONTEXT`, then structured job `payload`, then current `request_text` or `original_request_text`, then automatic classification. `docs/NEXT_TASK_CARD.md`, `docs/PROJECT_INDEX.md`, and historical batch documents must not replace `original_request_text`.
+
+`read_only` tasks may finish with `changed_files=[]` without `NO_FIX_APPLIED`. Any write-allowed task (`docs_write_allowed`, `automation_system_write_allowed`, or `product_write_allowed`) that reports success with no changed files must be treated as `NO_FIX_APPLIED`, and `effective_final_status` must become `failed`.
+
+Final reports must show all four status layers separately:
+
+- Worker execution status
+- Task goal status
+- `original_worker_status`
+- `effective_final_status`
