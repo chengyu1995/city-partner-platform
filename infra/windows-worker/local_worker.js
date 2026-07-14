@@ -366,6 +366,8 @@ const BATCH_FIX_PRODUCT_SIGNAL_PATTERN =
 const READ_ONLY_BATCH_PATTERN = /\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const FORCED_READ_ONLY_BATCH_PATTERN =
   /\bBATCH-QA(?:-[A-Z0-9]+)*\b|\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
+const ARCHITECTURE_SMOKE_REPORT_TASK_PATTERN =
+  /\bSMOKE\b|ARCH_REPORT_FIELDS|架构烟测|烟测/i;
 const FORBIDDEN_SECTION_PATTERN =
   /禁止|不修改|不得|不允许|forbidden(?:[_\s-]*scope)?|do\s+not|don't|must\s+not|not\s+(?:modify|change|read|touch)/i;
 const BATCH_RELEVANT_LINE_PATTERN =
@@ -543,6 +545,33 @@ const ARCHITECTURE_REPORT_REQUIRED_FIELDS = [
     label: "BATCH-ARCH-02 到 BATCH-ARCH-10 的分批计划",
     pattern:
       /BATCH-ARCH-02[\s\S]*BATCH-ARCH-10|BATCH-ARCH-10[\s\S]*BATCH-ARCH-02|BATCH-ARCH-02[\s\S]*分批计划|分批计划[\s\S]*BATCH-ARCH-02/i,
+  },
+];
+const ARCH_REPORT_MACHINE_FIELDS = [
+  {
+    key: "final_report_status",
+    label: "final_report_status",
+    pattern: /^succeeded$/i,
+  },
+  {
+    key: "no_fix_applied",
+    label: "no_fix_applied",
+    pattern: /^false$/i,
+  },
+  {
+    key: "read_only_violation",
+    label: "read_only_violation",
+    pattern: /^false$/i,
+  },
+  {
+    key: "task_mode_mismatch",
+    label: "task_mode_mismatch",
+    pattern: /^false$/i,
+  },
+  {
+    key: "out_of_scope_business_change",
+    label: "out_of_scope_business_change",
+    pattern: /^false$/i,
   },
 ];
 const AUTOMATION_WRITE_ALLOWED_PATHS = [
@@ -1773,6 +1802,18 @@ function isArchitectureReviewTaskText(taskText) {
   return Boolean(batchCode && ARCH_BATCH_PATTERN.test(batchCode));
 }
 
+function isArchitectureSmokeReportTaskText(taskText) {
+  return ARCHITECTURE_SMOKE_REPORT_TASK_PATTERN.test(String(taskText || ""));
+}
+
+function isArchitectureSmokeReportTask(job) {
+  if (!isArchitectureReviewTask(job)) {
+    return false;
+  }
+
+  return isArchitectureSmokeReportTaskText(getExplicitRequestText(job));
+}
+
 function parseQaReportFields(reportText) {
   const lines = String(reportText || "").split(/\r?\n/);
   const markerIndex = lines.findIndex((line) =>
@@ -1799,8 +1840,41 @@ function parseQaReportFields(reportText) {
   return fields;
 }
 
+function parseArchitectureReportFields(reportText) {
+  const lines = String(reportText || "").split(/\r?\n/);
+  const markerIndex = lines.findIndex((line) =>
+    /^\s*ARCH_REPORT_FIELDS\s*:?\s*$/i.test(line)
+  );
+
+  if (markerIndex < 0) {
+    return null;
+  }
+
+  const fields = new Map();
+  for (const line of lines.slice(markerIndex + 1)) {
+    const match = line.match(/^\s*([a-z_]+)\s*[:=]\s*(\S.*?)\s*$/i);
+    if (!match) {
+      continue;
+    }
+
+    const key = match[1].toLowerCase();
+    if (ARCH_REPORT_MACHINE_FIELDS.some((field) => field.key === key)) {
+      fields.set(key, match[2].trim());
+    }
+  }
+
+  return fields;
+}
+
 function getMissingMachineQaReportFields(fields) {
   return QA_REPORT_MACHINE_FIELDS.filter((field) => {
+    const value = fields?.get(field.key);
+    return !value || !field.pattern.test(value);
+  });
+}
+
+function getMissingMachineArchitectureReportFields(fields) {
+  return ARCH_REPORT_MACHINE_FIELDS.filter((field) => {
     const value = fields?.get(field.key);
     return !value || !field.pattern.test(value);
   });
@@ -1842,6 +1916,11 @@ function getMissingArchitectureReportFields(reportText) {
   return ARCHITECTURE_REPORT_REQUIRED_FIELDS.filter((field) => !field.pattern.test(text));
 }
 
+function getMissingArchitectureSmokeReportFields(reportText) {
+  const machineFields = parseArchitectureReportFields(reportText);
+  return getMissingMachineArchitectureReportFields(machineFields);
+}
+
 function createIncompleteArchitectureReportError(missingFields) {
   const missing = (missingFields || []).map((field) => field.label);
   const error = new Error(
@@ -1862,6 +1941,26 @@ function createIncompleteArchitectureReportError(missingFields) {
   return error;
 }
 
+function createIncompleteArchitectureSmokeReportError(missingFields) {
+  const missing = (missingFields || []).map((field) => field.label);
+  const error = new Error(
+    [
+      INCOMPLETE_ARCHITECTURE_REPORT,
+      "Architecture smoke read-only task must output complete ARCH_REPORT_FIELDS.",
+      `architecture_report_required_total: ${ARCH_REPORT_MACHINE_FIELDS.length}`,
+      `architecture_report_present: ${ARCH_REPORT_MACHINE_FIELDS.length - missing.length}`,
+      missing.length
+        ? `missing_architecture_report_fields: ${missing.join(", ")}`
+        : "missing_architecture_report_fields: none",
+    ].join("\n")
+  );
+
+  error.code = INCOMPLETE_ARCHITECTURE_REPORT;
+  error.failureStage = "architecture smoke read-only report fields validation";
+  error.missingArchitectureReportFields = missing;
+  return error;
+}
+
 function assertQaReportComplete(job, reportText) {
   if (!isQaReviewTask(job)) {
     return;
@@ -1878,9 +1977,14 @@ function assertArchitectureReportComplete(job, reportText) {
     return;
   }
 
-  const missingFields = getMissingArchitectureReportFields(reportText);
+  const isSmokeReportTask = isArchitectureSmokeReportTask(job);
+  const missingFields = isSmokeReportTask
+    ? getMissingArchitectureSmokeReportFields(reportText)
+    : getMissingArchitectureReportFields(reportText);
   if (missingFields.length > 0) {
-    throw createIncompleteArchitectureReportError(missingFields);
+    throw isSmokeReportTask
+      ? createIncompleteArchitectureSmokeReportError(missingFields)
+      : createIncompleteArchitectureReportError(missingFields);
   }
 }
 
@@ -2360,6 +2464,25 @@ function buildQaReviewGuard(taskText) {
 function buildArchitectureReviewGuard(taskText, taskMode) {
   if (taskMode !== TASK_MODES.READ_ONLY || !isArchitectureReviewTaskText(taskText)) {
     return null;
+  }
+
+  if (isArchitectureSmokeReportTaskText(taskText)) {
+    return [
+      "【BATCH-ARCH 架构烟测只读验收规则】",
+      "project_domain: automation_architecture",
+      "task_mode: read_only",
+      "read_only_mode: true",
+      "禁止修改任何文件，禁止 apply_patch，禁止 git add/commit/push，禁止 npm run dev / next dev，禁止数据库、环境变量和部署操作。",
+      "架构烟测报告只校验 ARCH_REPORT_FIELDS，不要求完整架构盘点 5 个中文标题。",
+      "报告末尾必须输出固定机器字段：",
+      "ARCH_REPORT_FIELDS:",
+      "final_report_status: succeeded",
+      "no_fix_applied: false",
+      "read_only_violation: false",
+      "task_mode_mismatch: false",
+      "out_of_scope_business_change: false",
+      `failure_code_if_incomplete: ${INCOMPLETE_ARCHITECTURE_REPORT}`,
+    ].join("\n");
   }
 
   return [

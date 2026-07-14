@@ -166,6 +166,15 @@ const INCOMPLETE_ARCHITECTURE_REPORT_TEXT = [
   "Missing modules: architecture-specific validation was missing.",
 ].join("\n");
 
+const STRUCTURED_ARCH_SMOKE_REPORT = [
+  "ARCH_REPORT_FIELDS:",
+  "final_report_status=succeeded",
+  "no_fix_applied=false",
+  "read_only_violation=false",
+  "task_mode_mismatch=false",
+  "out_of_scope_business_change=false",
+].join("\n");
+
 function joinedName(...parts) {
   return parts.join("_");
 }
@@ -759,6 +768,83 @@ test("read_only_mode task lock", async (t) => {
         ),
       (error) => error.code === READ_ONLY_MODE_VIOLATION
     );
+  });
+
+  await t.test("automation architecture smoke accepts complete ARCH_REPORT_FIELDS", () => {
+    const archSmokeJob = {
+      request_text: [
+        "BATCH-GM-FINAL-GUARD-02-SMOKE-01",
+        "project_domain=automation_architecture",
+        "task_mode=read_only",
+        "read_only_mode=true",
+        "Smoke task: validate ARCH_REPORT_FIELDS only.",
+      ].join("\n"),
+    };
+
+    assert.equal(
+      classifyWorkerTaskDomain(archSmokeJob.request_text),
+      "automation_architecture"
+    );
+    assert.equal(getTaskMode(archSmokeJob), TASK_MODES.READ_ONLY);
+
+    const prompt = buildCodexPrompt(archSmokeJob);
+    assert.match(prompt, /ARCH_REPORT_FIELDS:/);
+    assert.doesNotMatch(prompt, /BATCH-ARCH-02 到 BATCH-ARCH-10/);
+    assert.doesNotThrow(() =>
+      assertQaTaskOutcome(archSmokeJob, [], STRUCTURED_ARCH_SMOKE_REPORT)
+    );
+    assert.throws(
+      () => assertQaTaskOutcome(archSmokeJob, [], INCOMPLETE_ARCHITECTURE_REPORT_TEXT),
+      (error) =>
+        error.code === INCOMPLETE_ARCHITECTURE_REPORT &&
+        error.message.includes("final_report_status")
+    );
+  });
+
+  await t.test("formal BATCH-ARCH inventory still requires the five report titles", () => {
+    const archInventoryJob = {
+      request_text: [
+        "BATCH-ARCH-04 automation architecture inventory",
+        "project_domain=automation_architecture",
+        "task_mode=read_only",
+        "read_only_mode=true",
+      ].join("\n"),
+    };
+
+    const prompt = buildCodexPrompt(archInventoryJob);
+    assert.doesNotMatch(prompt, /ARCH_REPORT_FIELDS:/);
+    assert.match(prompt, /BATCH-ARCH-02 到 BATCH-ARCH-10/);
+    assert.throws(
+      () => assertQaTaskOutcome(archInventoryJob, [], STRUCTURED_ARCH_SMOKE_REPORT),
+      (error) =>
+        error.code === INCOMPLETE_ARCHITECTURE_REPORT &&
+        error.message.includes("架构盘点结论") &&
+        error.message.includes("缺失模块清单") &&
+        error.message.includes("知识库现状判断") &&
+        error.message.includes("自动迭代能力现状判断") &&
+        error.message.includes("BATCH-ARCH-02 到 BATCH-ARCH-10 的分批计划")
+    );
+  });
+
+  await t.test("QA read-only still requires QA_REPORT_FIELDS", () => {
+    const qaJob = {
+      request_text: [
+        "BATCH-QA-06",
+        "project_domain=qa_review",
+        "task_mode=read_only",
+        "read_only_mode=true",
+      ].join("\n"),
+    };
+
+    const prompt = buildCodexPrompt(qaJob);
+    assert.match(prompt, /QA_REPORT_FIELDS:/);
+    assert.throws(
+      () => assertQaTaskOutcome(qaJob, [], STRUCTURED_ARCH_SMOKE_REPORT),
+      (error) =>
+        error.code === INCOMPLETE_QA_REPORT &&
+        error.message.includes("missing_qa_report_fields")
+    );
+    assert.doesNotThrow(() => assertQaTaskOutcome(qaJob, [], STRUCTURED_QA_REPORT));
   });
 
   await t.test("plain read-only tasks with QA background do not require product QA fields", () => {
