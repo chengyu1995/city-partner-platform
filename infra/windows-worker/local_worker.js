@@ -320,6 +320,29 @@ function readString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+function decodeOriginalRequestTextBase64(value) {
+  const raw = readString(value);
+  if (!raw) return "";
+
+  const compact = raw.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) {
+    return "";
+  }
+
+  try {
+    const decoded = Buffer.from(compact, "base64").toString("utf8");
+    const encodedAgain = Buffer.from(decoded, "utf8")
+      .toString("base64")
+      .replace(/=+$/g, "");
+    if (encodedAgain !== compact.replace(/=+$/g, "")) {
+      return "";
+    }
+    return decoded.trim();
+  } catch (_) {
+    return "";
+  }
+}
+
 const NO_FIX_APPLIED = "NO_FIX_APPLIED";
 const READ_ONLY_MODE_VIOLATION = "READ_ONLY_MODE_VIOLATION";
 const OUT_OF_SCOPE_BUSINESS_CHANGE = "OUT_OF_SCOPE_BUSINESS_CHANGE";
@@ -670,16 +693,24 @@ function getJobText(job) {
     job?.demand,
     job?.title,
     job?.name,
+    job?.original_request_text,
+    job?.originalRequestText,
+    decodeOriginalRequestTextBase64(job?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(job?.originalRequestTextBase64),
     payload?.request_text,
     payload?.requestText,
     payload?.original_request_text,
     payload?.originalRequestText,
+    decodeOriginalRequestTextBase64(payload?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(payload?.originalRequestTextBase64),
     payload?.demand,
     payload?.title,
     result?.request_text,
     result?.requestText,
     result?.original_request_text,
     result?.originalRequestText,
+    decodeOriginalRequestTextBase64(result?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(result?.originalRequestTextBase64),
     ].map(readTextValue).filter(Boolean).join("\n");
 }
 
@@ -693,13 +724,19 @@ function getExplicitRequestText(job) {
     job?.demand,
     job?.original_request_text,
     job?.originalRequestText,
+    decodeOriginalRequestTextBase64(job?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(job?.originalRequestTextBase64),
     payload?.request_text,
     payload?.requestText,
     payload?.original_request_text,
     payload?.originalRequestText,
+    decodeOriginalRequestTextBase64(payload?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(payload?.originalRequestTextBase64),
     payload?.demand,
     result?.original_request_text,
     result?.originalRequestText,
+    decodeOriginalRequestTextBase64(result?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(result?.originalRequestTextBase64),
   ].map(readTextValue).filter(Boolean).join("\n");
 }
 
@@ -780,15 +817,21 @@ function getExplicitTextCandidates(job) {
     job?.demand,
     job?.original_request_text,
     job?.originalRequestText,
+    decodeOriginalRequestTextBase64(job?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(job?.originalRequestTextBase64),
     payload?.request_text,
     payload?.requestText,
     payload?.original_request_text,
     payload?.originalRequestText,
+    decodeOriginalRequestTextBase64(payload?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(payload?.originalRequestTextBase64),
     payload?.demand,
     result?.request_text,
     result?.requestText,
     result?.original_request_text,
     result?.originalRequestText,
+    decodeOriginalRequestTextBase64(result?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(result?.originalRequestTextBase64),
   ].map(readTextValue).filter(Boolean);
 }
 
@@ -1418,14 +1461,136 @@ function isExplicitAutomationAllowedDocPath(filePath) {
   );
 }
 
-function extractAllowedScopePaths(requestText) {
-  const paths = [];
-  for (const rawLine of String(requestText || "").split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!/(^|[^\w-])allowed[_\s-]*scope\s*[:=]/i.test(line)) {
+const HERMES_CONTEXT_FIELD_PATTERN =
+  /\b(?:project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|route|original_request_text(?:_base64)?)\s*[:=]/i;
+
+function contextFieldNamePattern(fieldName) {
+  return fieldName.replace(/_/g, "[_\\s-]*");
+}
+
+function decodeEscapedWorkerContextText(value) {
+  return String(value || "")
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\n");
+}
+
+function stripWorkerContextValue(value) {
+  let stripped = String(value || "").trim();
+  const first = stripped[0];
+  const last = stripped[stripped.length - 1];
+  if (
+    stripped.length >= 2 &&
+    ((first === '"' && last === '"') ||
+      (first === "'" && last === "'") ||
+      (first === "`" && last === "`") ||
+      (first === "“" && last === "”"))
+  ) {
+    stripped = stripped.slice(1, -1).trim();
+  }
+  return stripped;
+}
+
+function extractWorkerContextFieldValues(text, fieldName) {
+  const values = [];
+  const pattern = new RegExp(
+    `(?:^|[^\\w-])${contextFieldNamePattern(fieldName)}\\s*[:=]\\s*`,
+    "i"
+  );
+
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const match = pattern.exec(rawLine);
+    if (!match) {
       continue;
     }
-    paths.push(...extractPathLikeTokens(line));
+
+    values.push(stripWorkerContextValue(rawLine.slice(match.index + match[0].length)));
+  }
+
+  return values.filter(Boolean);
+}
+
+function extractOriginalRequestTextsFromContext(text) {
+  const nestedTexts = [];
+
+  for (const value of extractWorkerContextFieldValues(
+    text,
+    "original_request_text_base64"
+  )) {
+    const base64Token = value.match(/[A-Za-z0-9+/=]+/)?.[0] || "";
+    const decoded = decodeOriginalRequestTextBase64(base64Token);
+    if (decoded) {
+      nestedTexts.push(decoded);
+    }
+  }
+
+  for (const value of extractWorkerContextFieldValues(text, "original_request_text")) {
+    const decoded = decodeEscapedWorkerContextText(value).trim();
+    if (decoded) {
+      nestedTexts.push(decoded);
+    }
+  }
+
+  return nestedTexts;
+}
+
+function expandWorkerContextTexts(text, seen = new Set(), depth = 0) {
+  if (depth > 5) {
+    return [];
+  }
+
+  const raw = String(text || "");
+  if (!raw.trim()) {
+    return [];
+  }
+
+  const expanded = [];
+  const candidates = [raw, decodeEscapedWorkerContextText(raw)];
+
+  for (const candidate of candidates) {
+    const normalizedCandidate = candidate.trim();
+    if (!normalizedCandidate || seen.has(normalizedCandidate)) {
+      continue;
+    }
+
+    seen.add(normalizedCandidate);
+    expanded.push(normalizedCandidate);
+
+    for (const nestedText of extractOriginalRequestTextsFromContext(normalizedCandidate)) {
+      expanded.push(...expandWorkerContextTexts(nestedText, seen, depth + 1));
+    }
+  }
+
+  return expanded;
+}
+
+function extractAllowedScopeValueFromLine(line) {
+  const pattern = new RegExp(
+    `(?:^|[^\\w-])${contextFieldNamePattern("allowed_scope")}\\s*[:=]\\s*`,
+    "i"
+  );
+  const match = pattern.exec(line);
+  if (!match) {
+    return null;
+  }
+
+  const rawValue = line.slice(match.index + match[0].length);
+  const decodedValue = decodeEscapedWorkerContextText(rawValue).split(/\r?\n/)[0] || "";
+  const nextField = HERMES_CONTEXT_FIELD_PATTERN.exec(decodedValue);
+  const value = nextField ? decodedValue.slice(0, nextField.index) : decodedValue;
+  return stripWorkerContextValue(value);
+}
+
+function extractAllowedScopePaths(requestText) {
+  const paths = [];
+  for (const contextText of expandWorkerContextTexts(requestText)) {
+    for (const rawLine of contextText.split(/\r?\n/)) {
+      const value = extractAllowedScopeValueFromLine(rawLine.trim());
+      if (!value) {
+        continue;
+      }
+      paths.push(...extractPathLikeTokens(value));
+    }
   }
   return uniqueSortedPaths(paths);
 }

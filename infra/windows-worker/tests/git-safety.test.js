@@ -1133,6 +1133,91 @@ test("read_only_mode task lock", async (t) => {
     );
   });
 
+  await t.test("automation_system_write_allowed merges multiple HERMES contexts", () => {
+    const job = {
+      request_text: [
+        "BATCH-ARCH-06C",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, docs/architecture/context-contract.md, docs/projects/feishu-gm-automation.md",
+        "forbidden_scope=docs/**, app/**, src/app/**, src/types/db.ts",
+        "",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, docs/projects/feishu-gm-automation.md",
+        "forbidden_scope=docs/**, app/**, src/app/**, src/types/db.ts",
+      ].join("\n"),
+    };
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/architecture/context-contract.md"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["docs/architecture/other.md"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes("docs/architecture/other.md")
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["app/page.tsx"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes("app/page.tsx")
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["src/app/page.tsx"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes("src/app/page.tsx")
+    );
+  });
+
+  await t.test("automation_system_write_allowed merges base64 original request context", () => {
+    const originalRequest = [
+      "BATCH-ARCH-06C",
+      "HERMES_WORKER_CONTEXT:",
+      "project_domain=automation_system",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      "allowed_scope=infra/windows-worker/**, docs/architecture/context-contract.md, docs/projects/feishu-gm-automation.md",
+      "forbidden_scope=docs/**, app/**, src/app/**, src/types/db.ts",
+    ].join("\n");
+    const job = {
+      request_text: [
+        "BATCH-ARCH-06C",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, docs/projects/feishu-gm-automation.md",
+        "forbidden_scope=docs/**, app/**, src/app/**, src/types/db.ts",
+        `original_request_text_base64=${Buffer.from(originalRequest, "utf8").toString("base64")}`,
+      ].join("\n"),
+    };
+    const wildcardOnlyJob = {
+      request_text: [
+        "BATCH-ARCH-06C",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, docs/**",
+        "forbidden_scope=docs/**, app/**, src/app/**",
+      ].join("\n"),
+    };
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/architecture/context-contract.md"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(wildcardOnlyJob, ["docs/architecture/context-contract.md"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
   await t.test("automation_system_write_allowed passes when Worker file changed despite forbidden product context", () => {
     const job = {
       request_text: [
