@@ -2,167 +2,105 @@
 
 ## 项目定位
 
-该项目是同城搭子网站的自动化执行系统，负责接收飞书需求、进入项目总管 planning、等待老板批准、分发 Worker/Codex 执行任务，并把结果按项目总管模板回报。
+该项目是同城搭子平台的自动化执行系统，负责接收飞书需求、进入项目总经理 planning、等待老板批准、分发 Worker/Codex 执行任务，并把结果按项目总经理模板回报。
 
-本档案只整理系统资料，不修改自动化代码、不触发 Worker 任务、不调用 GitHub 写入接口。
+本文档只记录自动化架构和协作规则，不授权修改产品页面、数据库、环境变量或腾讯云运行文件。
 
 ## 核心链路
 
 ```text
 飞书需求
-  -> 飞书总经理模式 / 项目总管
-  -> planning_only 任务树
-  -> 老板查看计划或修改计划
-  -> 总管 批准执行
+  -> 飞书入口 / 项目总经理
+  -> planning 或 direct worker create
+  -> 老板批准执行
   -> Worker API 任务队列
   -> Windows Worker 领取任务
-  -> Codex 修改文件
-  -> 外层 Worker 负责 Git 提交和推送
-  -> Worker report
-  -> 飞书项目总管报告
+  -> Codex 修改允许范围文件
+  -> 外层 Worker 负责 Git commit / push
+  -> Worker final report
+  -> 飞书项目总经理报告
+  -> 文档型知识库沉淀
 ```
 
-## 模块分类
+## 当前统一字段
 
-| 模块 | 说明 | 主要资料 |
+字段契约以 `docs/architecture/context-contract.md` 为准。所有入口和报告层必须使用同一组字段：
+
+- `project_domain`
+- `task_mode`
+- `read_only_mode`
+- `allowed_scope`
+- `forbidden_scope`
+- `original_request_text`
+- `route`
+- `payload`
+- `approved_batch`
+- `attempt_id`
+- `worker_stage`
+- `final_report_status`
+- `effective_final_status`
+- `changed_files`
+- `git_commit_sha`
+- `pushed`
+- `deploy_status`
+
+字段优先级规则：显式 HERMES_WORKER_CONTEXT > payload > request_text/original_request_text > 自动分类 > 历史上下文。
+
+只读任务规则：read_only 任务 changed_files=[] 是正常状态，不得触发 NO_FIX_APPLIED。
+
+写入任务规则：write_allowed 任务必须产生允许范围内变更，否则触发 NO_FIX_APPLIED。
+
+## 模块分工
+
+| 模块 | 职责 | 禁止事项 |
 | --- | --- | --- |
-| 飞书总经理模式 | 识别需求、命令、验收反馈和老板选择。 | `docs/ops/project-director-mode.md`、`docs/ops/project-director-production-mode.md` |
-| 腾讯云 feishu-gateway | 接收飞书事件和中转 Worker API。 | `docs/WORKER_ARCHITECTURE.md`、`docs/ops/cloud-feishu-gateway-choice-routing-fix.md` |
-| worker-api | 提供 Worker 领取任务、上报进度和终态报告的接口。 | `src/app/api/worker/*`、`docs/ops/worker-final-report-template.md` |
-| Windows Worker | 本地领取任务并调用 Codex。 | `infra/windows-worker/README.md` |
-| Codex 执行链路 | 只负责文件修改和结果汇报，Git 由外层 Worker 处理。 | `infra/windows-worker/README.md` |
-| Hermes / Agent 调度 | 拆分任务、生成 Agent 任务树和批准执行计划。 | `docs/ops/agent-dispatch-architecture.md` |
-| 老板控制台命令 | 状态、帮助、暂停、恢复、批准执行、Agent 状态。 | `docs/ops/boss-feishu-command-guide.md`、`docs/ops/agent-status-dashboard.md` |
-| Worker 安全检查 | attempt_id、终态幂等、Git 安全、密钥脱敏。 | `docs/upgrade/batch-17-project-director-loop.md`、`infra/windows-worker/README.md` |
-| 批次批准解析 | A/B 选择、修改计划、批准建议优先于普通需求。 | `docs/product/batch-22-choice-routing-notes.md` |
-| 飞书回报模板 | 成功/失败终态统一项目总管报告。 | `docs/ops/worker-final-report-template.md` |
+| 飞书入口 | 接收需求、保留原始正文、识别 route、创建 planning 或 Worker job | 不用历史批次覆盖当前任务正文 |
+| 项目总经理 | 生成计划、等待批准、明确 approved batch 和任务模式 | 不跳过老板批准直接执行产品任务 |
+| Worker API | 保存 payload、分发任务、接收 heartbeat/progress/final report | 不信任缺失关键字段的写入任务 |
+| Windows Worker | 领取任务、生成 Codex prompt、执行静态校验、上报结果 | 不执行未批准范围，不在 read-only 下写入 |
+| Codex | 只修改任务允许范围内文件并汇报验证结果 | 不创建分支，不 commit，不 push，不部署，不启动 dev server |
+| 外层 Worker | 根据验收目标处理 Git commit/push 并补充 SHA 状态 | 不让 Codex 代替 Git 操作 |
+| 最终报告层 | 计算 `effective_final_status`，区分 Worker 成功和任务目标完成 | 不只凭 `status=succeeded` 判定成功 |
+| 文档型知识库 | 沉淀项目知识、架构知识、失败记忆、决策、批次、Agent 分工和下一步计划 | 不作为当前任务正文的替代来源 |
 
-## 当前有效规则
+## BATCH-ARCH-05 记录
 
-- 普通网站需求不直接进入 Codex。
-- `选 A`、`选 B`、`批准建议`、`修改计划：xxx` 只进入 planning，不创建执行任务。
-- 只有 `总管 批准执行` 可以进入 approved execution。
-- Worker 领取任务后必须使用匹配的 `attempt_id` 上报 heartbeat、progress 和 report。
-- succeeded/failed 终态必须幂等，不允许后续报告覆盖。
-- Codex 不执行 Git 提交、推送、建分支或 GitHub 写入。
+任务性质：
 
-## 相关批次
+- 自动化架构文档与 schema 设计任务。
+- 不是产品开发任务。
+- 不是系统代码修复任务。
+- 不修改 Worker 代码。
+- 不修改腾讯云运行文件。
+- 不修改产品页面。
 
-| 批次 | 内容 |
-| --- | --- |
-| BATCH-17 | 建立项目总管任务分发与老板验收闭环。 |
-| BATCH-18 | 静态全链路验收。 |
-| BATCH-20 | 运营前系统硬化和控制台命令优先级。 |
-| BATCH-22 choice routing | 修复 A/B 选择和修改计划路由顺序。 |
-| BATCH-27 | Worker 完成后飞书项目总管报告模板。 |
+本批产物：
 
-## 禁止范围
+- `docs/architecture/context-contract.md`
+- `docs/architecture/knowledge-base-schema.md`
+- `docs/architecture/iteration-loop.md`
+- `docs/NEXT_TASK_CARD.md`
+- `docs/projects/feishu-gm-automation.md`
 
-- 不直接输出或执行产品规划。
-- 不绕过老板批准创建 Worker/Codex 执行任务。
-- 不记录真实 token、secret、service key。
-- 不修改生产环境变量。
-- 不修改数据库。
-- 不部署生产。
-- 不删除旧备份文件。
+本批结论：
 
-## BATCH-38A 空跑防护规则
+- 采用文档型知识库。
+- 当前不接数据库。
+- 当前不接向量库。
+- `original_request_text` 是 approved execution 的关键字段，不得用 `NEXT_TASK_CARD`、`PROJECT_INDEX` 或历史批次文档替代。
+- `effective_final_status` 必须由最终报告层重算。
 
-- Worker 执行成功不等于任务目标完成；最终报告必须同时区分 `Worker execution` 和 `Task goal`。
-- 如果任务正文要求修复、新增、更新、补齐、建立或修改，但 Codex 结束后没有任何文件变更，Worker 必须上报 failed。
-- 该失败统一使用 `NO_FIX_APPLIED`，并进入失败报告和验证结果，不允许作为 Git warning 后继续 succeeded。
-- 如果任务明确要求修改指定文件，而变更文件没有命中任何指定文件，也必须按 `NO_FIX_APPLIED` failed。
-- 当前执行批次只从标题、修复目标和批准语句提取；禁止从“禁止范围”中的 BATCH-P3、BATCH-P4 或历史批次文字提取当前批次。
-- `总管 批准修复` 等价进入 `总管 批准执行` 链路，但只能执行对应失败批次的最小修复任务；找不到匹配批次时不得分发其他批次。
-- 自动化系统修复任务归类为 `automation_system`，不得把同城搭子产品页面、首批城市、首批分类、访客浏览、本地草稿或待审核流程作为完成依据。
-- 文档整理、测试审核和运营类任务分别归类为 `governance_docs`、`qa_review` 和 `operations`。
+## 后续批次顺序
 
-## BATCH-38A 腾讯云同步记录
+1. BATCH-ARCH-06：字段契约落地到 job payload。
+2. BATCH-ARCH-07：Windows Worker 与 Codex prompt 字段保护。
+3. BATCH-ARCH-08：最终报告层有效终态统一。
+4. BATCH-ARCH-09：文档型知识库目录与索引。
+5. BATCH-ARCH-10：端到端静态验收与交接。
 
-- 已同步腾讯云 `/home/ubuntu/city-partner-agent/worker_api.js`：云端 Worker report 会把变更型任务的空跑 succeeded 改判为 failed，并在错误文本中写入 `NO_FIX_APPLIED`、`Worker execution` 和 `Task goal`。
-- 已同步腾讯云 `/home/ubuntu/city-partner-agent/feishu_gateway_canonical.js`：`总管 批准修复` 进入批准执行链路；批次只从标题、修复目标和批准语句提取；自动化、文档、测试、运营任务不会套用同城搭子产品上下文。
-- 腾讯云备份文件：`worker_api.js.bak.batch38a-20260709104241`、`feishu_gateway_canonical.js.bak.batch38a-20260709104241`。
-- 腾讯云 PM2 已重启 `worker-api` 和 `feishu-gateway`；未修改远端 `.env`、数据库、Vercel 配置，也未执行部署。
+## 有效边界
 
-## BATCH-42A read-only and cloud fallback
-
-- Windows Worker now keeps a process-level read-only Git write lock. When `read_only_mode=true`, `git add`, `git commit`, and `git push` are refused with `READ_ONLY_MODE_VIOLATION`.
-- A read-only task that leaves any Git diff fails during task-goal validation with `READ_ONLY_MODE_VIOLATION`; the failure report lists changed files and does not use `completed_with_warning`.
-- Final reports include separate fields for Worker execution status, task goal status, read-only violation, no-op run, committed, and pushed.
-- Tencent Cloud `/home/ubuntu/city-partner-agent/worker_api.js` now coerces a reported `succeeded` terminal report to `failed` when `read_only_mode=true` but `files_changed`, `git_commit_sha`, or a successful push is present.
-- Tencent Cloud `worker_api.js` still coerces mutation-task empty reports to `failed` with `NO_FIX_APPLIED`.
-- Tencent Cloud `/home/ubuntu/city-partner-agent/feishu_gateway_canonical.js` keeps `总管 批准修复` on the approved-execution path, extracts the current batch only from title/repair/approval text, and keeps `governance_docs`, `automation_system`, `qa_review`, and `operations` separate from city-partner product context.
-- Tencent Cloud backups for this batch: `worker_api.js.bak.batch42a-20260709120234`, `feishu_gateway_canonical.js.bak.batch42a-20260709120234`.
-
-## BATCH-GM-STABILIZE-01 task_mode and final-status guard
-
-- Unified task modes are `read_only`, `docs_write_allowed`, `automation_system_write_allowed`, and `product_write_allowed`.
-- `BATCH-43` is `read_only`; any diff, commit SHA, or successful push fails with `READ_ONLY_MODE_VIOLATION`.
-- `BATCH-37-FIX` and governance-doc tasks are `docs_write_allowed`, even if an older `read_only_mode=true` flag is present.
-- `BATCH-44`, `BATCH-45A`, Worker, Gateway, Codex, Hermes, route, and report fixes are `automation_system_write_allowed`, even if an older `read_only_mode=true` flag is present.
-- Effective final status is failed when `READ_ONLY_MODE_VIOLATION`, `OUT_OF_SCOPE_BUSINESS_CHANGE`, `NO_FIX_APPLIED`, failed task-goal status, or read-only Git side effects are present.
-- Tencent Cloud `worker_api.js` recomputes `effective_final_status` from the report payload instead of trusting `body.status=succeeded`.
-- Tencent Cloud `feishu_gateway_canonical.js` preserves `original_request_text`, `approved_batch`, `task_mode`, `read_only_mode`, `allowed_scope`, `forbidden_scope`, `task_goal`, and `project_domain` in Worker request text.
-- Tencent Cloud backups for this stabilization: `worker_api.js.bak.gm-stabilize-20260709163919`, `feishu_gateway_canonical.js.bak.gm-stabilize-20260709163919`.
-
-## BATCH-GM-STABILIZE-02 smoke-test mode guard
-
-- `BATCH-GM-SMOKE-*` is always `read_only`; it is a final validation smoke test and may not write files.
-- `docs_write_allowed` is limited to `BATCH-37-FIX`, explicit `docs_write_allowed`, or mutation requests that name a `docs/` path.
-- `automation_system_write_allowed` is limited to explicit Worker, Gateway, worker-api, project-director, worker-jobs, local_worker, or git-safety repair tasks.
-- When task-mode inference cannot resolve a write mode, the Worker conservatively falls back to `read_only`.
-- `pollOnce` reports use the scoped `taskModeForReport` value so success and failure report paths cannot throw `taskMode is not defined`.
-
-## BATCH-GM-STABILIZE-06 QA read-only review guard
-
-- `BATCH-QA-*` is always `project_domain=qa_review`, `task_mode=read_only`, and `read_only_mode=true`.
-- Explicit QA/read-only fields outrank product repair background text. If a QA task mentions `BATCH-FIX-*`, `partners`, `login`, or `profile` as validation context, Worker must keep `task_mode=read_only` and record the `TASK_MODE_EXPLICIT_READ_ONLY_OVERRIDE` fingerprint instead of inferring `product_write_allowed`.
-- QA tasks may statically read product and documentation files, including `src/app/page.tsx`, `src/app/partners/**`, `src/app/post/**`, `src/app/login/**`, `src/app/profile/**`, `src/lib/db/mock.ts`, `src/types/db.ts`, `docs/**`, `package.json`, `next.config.*`, and `tsconfig.json`.
-- QA tasks still may not modify any file, run `git add`, `git commit`, `git push`, start a dev server, touch database/env files, or deploy.
-- A successful QA task must include a full report with usable features, features needing fixes, homepage acceptance, partners page acceptance, post page acceptance, draft/review flow acceptance, login/profile warnings, development next steps, QA next steps, operations readiness, and the recommended next batch.
-- If the QA report is missing any required field, the Worker fails the task with `INCOMPLETE_QA_REPORT`. A no-diff complete QA report succeeds and must not trigger `NO_FIX_APPLIED`.
-- QA report field matching accepts semantic equivalents and grouped headings. For example, `开发团队：`, `测试审核团队：`, and `运营团队：暂不建议加入` satisfy the corresponding next-step and operations-readiness sections.
-- To avoid natural-language matching drift, QA reports must end with `QA_REPORT_FIELDS` machine fields: `current_usable_features`, `current_fix_needed`, `homepage_verdict`, `partners_verdict`, `post_verdict`, `local_draft_review_verdict`, `login_profile_warning`, `dev_team_next_step`, `qa_team_next_step`, `ops_team_join`, and `next_batch`.
-- When `QA_REPORT_FIELDS` is present, the Worker validates those structured fields first. Natural-language semantic matching is only a fallback for older reports without the machine field block.
-
-## BATCH-GM-STABILIZE-09 BATCH-FIX product routing
-
-- `BATCH-FIX-*` with product signals such as `同城搭子网站`, `partners`, `login`, `profile`, `page.tsx`, `产品页面`, `首页`, `发布页`, `搭子浏览`, or `详情页` is forced to `project_domain=city_partner_product`, `task_mode=product_write_allowed`, and `read_only_mode=false`.
-- New-demand classification must also treat `src/app`, `/partners`, `/post`, `产品修复`, and `QA 发现` as product signals. Forbidden-scope words such as Worker, Tencent Cloud, worker-jobs, feishu gateway, env, database, or deploy must not override the current `BATCH-FIX-*` identity.
-- Product BATCH-FIX tasks are not reclassified as `automation_system_write_allowed` or `docs_write_allowed` just because the request mentions QA, docs, lint, tsc, Worker validation, or acceptance checks.
-- Allowed scope is `src/app/**`, `docs/NEXT_TASK_CARD.md`, and `docs/projects/city-partner-website.md`.
-- Forbidden scope includes `infra/windows-worker/**`, `src/lib/worker-jobs.ts`, `src/app/api/feishu/**`, `src/lib/project-director-console.ts`, Tencent Cloud relay files, env, and database files.
-- If a BATCH-FIX product task changes Worker, gateway, director, or Tencent/system files, the Worker fails with `OUT_OF_SCOPE_SYSTEM_CHANGE`.
-- `product_write_allowed` product tasks may modify `src/app/**` without triggering the automation-system frozen business page guard; `automation_system_write_allowed`, `docs_write_allowed`, and `read_only` tasks still block `src/app/page.tsx`, `src/app/partners/**`, and `src/app/post/**`.
-- `product_write_allowed` prompts must clear stale read-only residue. BATCH-FIX product prompts must show `read_only_mode=false`, `can_write_files=true`, and the product allowed scope, and must not include the read-only lock, `不修改任何文件`, or `只执行 git status / git diff`.
-- Approved execution for `BATCH-FIX-*` must look up and carry the original `新需求：BATCH-FIX-*` full request text. If the original context is missing, Tencent Cloud and the Windows Worker must fail with `ORIGINAL_BATCH_CONTEXT_MISSING` instead of creating or executing an automation-system shell task.
-
-## BATCH-GM-STABILIZE-03 docs task priority and cloud terminal guard
-
-- Explicit boss route fields have the highest priority. If the original request says `project_domain=automation_system`, `task_mode=automation_system_write_allowed`, and `read_only_mode=false`, Tencent Cloud and the Windows Worker must preserve those final fields and block with `EXPLICIT_TASK_MODE_OVERRIDDEN` or `EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN` instead of creating or running an overwritten job.
-
-- `BATCH-37-DOCS-*` and `BATCH-37-FIX` resolve to `docs_write_allowed` with `read_only_mode=false`; stale outer `read_only_mode=true` flags do not demote them to read-only.
-- A docs task locked by an outer read-only flag fails with `TASK_MODE_MISMATCH` instead of reporting `succeeded`.
-- Docs write tasks must produce a `docs/**` diff or fail with `NO_FIX_APPLIED`.
-- Tencent Cloud `worker_api.js` scans the full JSON report body before accepting `succeeded`; unfinished task-goal text, `TASK_MODE_MISMATCH`, read-only locks, and known failure codes coerce `effective_final_status=failed`.
-- Tencent Cloud `feishu_gateway_canonical.js` emits `approved_batch`, `task_mode=docs_write_allowed`, `read_only_mode=false`, `allowed_scope=docs/**`, `forbidden_scope`, and `original_request_text` for `BATCH-37-DOCS-*`.
-
-## BATCH-37-DOCS-02 approved docs execution
-
-- Approval source: `总管 批准执行：仅批准 BATCH-37-DOCS-02`.
-- Task classification: `automation_system`; task mode: `docs_write_allowed`; read-only mode: `false`.
-- Allowed scope: `docs/**` only. Forbidden scope remains `src/app/**`, `src/lib/db/mock.ts`, `src/types/db.ts`, env, database, worker, and Tencent Cloud files.
-- Completion requires a real `docs/**` diff. If no documentation change is produced, task-goal validation must fail with `NO_FIX_APPLIED`.
-- Final reporting must separate Worker execution status from task goal status, and must explicitly report `NO_FIX_APPLIED`, `READ_ONLY_MODE_VIOLATION`, read-only violation, empty run, committed, and pushed fields.
-- This batch does not validate city-partner product pages, product batches, first-city/category content, guest browsing, local drafts, or pending-review flows.
-
-## BATCH-37-DOCS-03 approved docs execution
-
-- Approval source: `总管 批准执行：仅批准 BATCH-37-DOCS-03`.
-- Task classification: `automation_system`; task mode: `docs_write_allowed`; read-only mode: `false`.
-- Allowed scope: `docs/**` only. Forbidden scope remains `src/app/**`, `src/lib/db/mock.ts`, `src/types/db.ts`, env, database, worker, and Tencent Cloud files.
-- Current batch identity must come only from the task title, repair goal, and approval statement. BATCH-P3, BATCH-P4, and historical batch names in forbidden or reference text must not override `BATCH-37-DOCS-03`.
-- Completion requires a real `docs/**` diff. If no documentation change is produced, task-goal validation must fail with `NO_FIX_APPLIED`.
-- Final reporting must separate Worker execution status from task goal status, and must explicitly report modified files, task classification, Worker execution status, task goal status, `NO_FIX_APPLIED`, `READ_ONLY_MODE_VIOLATION`, read-only violation, empty run, committed, pushed, and validation results.
-- Worker success alone is not completion proof. Task-goal status is complete only when the approved docs-only scope produced a documentation diff and no read-only or out-of-scope violation is present.
-- This batch does not validate city-partner product pages, product batches, first-city/category content, guest browsing, local drafts, or pending-review flows.
+- 当前自动化架构任务不得修改 `/`、`/partners`、`/post` 业务页面。
+- 当前自动化架构任务不得修改 `src/app/page.tsx`、`src/app/partners/**`、`src/app/post/**`。
+- 当前文档任务不得修改 `infra/windows-worker/**`、`work/tencent-cloud/**`、数据库、环境变量、`package.json` 或 `tsconfig.json`。
+- Codex 完成后只汇报修改文件、验证结果、commit 状态和 commit SHA；Git 提交与推送由外层 Worker 自动完成。
