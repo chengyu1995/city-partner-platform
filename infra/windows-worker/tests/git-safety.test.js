@@ -515,6 +515,31 @@ test("NO_FIX_APPLIED task goal validation", async (t) => {
     );
   });
 
+  await t.test("BATCH-GM-WRITE-GUARD accepts Worker validator diffs", () => {
+    const requestText = [
+      "BATCH-GM-WRITE-GUARD-01",
+      "project_domain=automation_system",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      "Repair target:",
+      "- infra/windows-worker/local_worker.js",
+      "- infra/windows-worker/tests/git-safety.test.js",
+      "The task text mentions read_only guard behavior but is an automation write repair.",
+    ].join("\n");
+
+    const job = { title: "BATCH-GM-WRITE-GUARD-01", request_text: requestText };
+
+    assert.equal(getTaskMode(job), TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["infra/windows-worker/local_worker.js"])
+    );
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, [
+        "infra/windows-worker/tests/git-safety.test.js",
+      ])
+    );
+  });
+
   await t.test("drops required paths that conflict with forbidden scope during validation", () => {
     const job = {
       request_text: [
@@ -1160,23 +1185,52 @@ test("read_only_mode task lock", async (t) => {
     assert.equal(getTaskMode(explicitJob), TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
     assert.doesNotThrow(() => assertExplicitTaskFieldsNotOverridden(explicitJob));
 
-    assert.throws(
-      () =>
-        assertExplicitTaskFieldsNotOverridden({
-          request_text: requestText,
-          payload: { task_mode: "docs_write_allowed" },
-        }),
-      (error) => error.code === EXPLICIT_TASK_MODE_OVERRIDDEN
+    assert.doesNotThrow(() =>
+      assertExplicitTaskFieldsNotOverridden({
+        request_text: requestText,
+        payload: { task_mode: "docs_write_allowed" },
+      })
     );
 
-    assert.throws(
-      () =>
-        assertExplicitTaskFieldsNotOverridden({
-          request_text: requestText,
-          payload: { project_domain: "product" },
-        }),
-      (error) => error.code === EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN
+    assert.doesNotThrow(() =>
+      assertExplicitTaskFieldsNotOverridden({
+        request_text: requestText,
+        payload: { project_domain: "product" },
+      })
     );
+  });
+
+  await t.test("explicit automation_system write fields outrank read-only keywords and stale context", () => {
+    const requestText = [
+      "BATCH-GM-SMOKE-01",
+      "project_domain=automation_system",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      "The body mentions read_only guards, read_only_mode, do not modify, and forbidden git add.",
+      "Historical text may mention product, docs, database, BATCH-FIX, BATCH-P3, or BATCH-P4.",
+    ].join("\n");
+
+    const explicitJob = {
+      request_text: requestText,
+      payload: {
+        task_mode: "read_only",
+        project_domain: "qa_review",
+        read_only_mode: true,
+      },
+      result: {
+        task_mode: "read_only",
+        read_only_mode: true,
+      },
+    };
+
+    assert.equal(classifyWorkerTaskDomain(requestText), "automation_system");
+    assert.equal(getTaskMode(explicitJob), TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.equal(isReadOnlyTask(explicitJob), false);
+    assert.doesNotThrow(() => assertExplicitTaskFieldsNotOverridden(explicitJob));
+
+    const prompt = buildCodexPrompt(explicitJob);
+    assert.match(prompt, /task_mode: automation_system_write_allowed/);
+    assert.match(prompt, /read_only_mode: false/);
   });
 
   await t.test("failure report paths do not reference an undefined taskMode", () => {
@@ -1252,6 +1306,21 @@ test("read_only_mode task lock", async (t) => {
         []
       )
     );
+  });
+
+  await t.test("explicit read_only task with empty changed_files succeeds", () => {
+    const readOnlyJob = {
+      request_text: [
+        "BATCH-ARCH-READONLY-01",
+        "project_domain=automation_architecture",
+        "task_mode=read_only",
+        "read_only_mode=true",
+        "Static architecture inventory only.",
+      ].join("\n"),
+    };
+
+    assert.equal(getTaskMode(readOnlyJob), TASK_MODES.READ_ONLY);
+    assert.doesNotThrow(() => assertTaskGoalApplied(readOnlyJob, []));
   });
 
   await t.test("fails read-only task when files changed", () => {

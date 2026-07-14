@@ -677,6 +677,39 @@ function readExplicitFieldFromText(text, fieldName) {
   return match ? match[1].toLowerCase() : null;
 }
 
+function readExplicitTaskModeFromText(text) {
+  const taskMode = readExplicitFieldFromText(extractOriginalTaskBody(text), "task_mode");
+  return Object.values(TASK_MODES).includes(taskMode) ? taskMode : null;
+}
+
+function readExplicitBooleanFieldFromText(text, fieldName) {
+  const pattern = new RegExp(
+    `\\b${fieldName.replace(/_/g, "[_\\\\s-]*")}\\s*[:=]\\s*[\\\`'"“”]?(true|false|1|0|yes|no|on|off)[\\\`'"“”]?`,
+    "gi"
+  );
+  const matches = [...String(text || "").matchAll(pattern)];
+  const match = matches[matches.length - 1];
+  if (!match) {
+    return null;
+  }
+
+  const value = match[1];
+  if (readBooleanFlag(value)) {
+    return true;
+  }
+  if (readBooleanFalseFlag(value)) {
+    return false;
+  }
+  return null;
+}
+
+function readExplicitReadOnlyModeFromText(text) {
+  return readExplicitBooleanFieldFromText(
+    extractOriginalTaskBody(text),
+    "read_only_mode"
+  );
+}
+
 function readProjectDomainFromText(text) {
   return readExplicitFieldFromText(extractOriginalTaskBody(text), "project_domain");
 }
@@ -699,6 +732,70 @@ function readProjectDomainField(job) {
   }
 
   return null;
+}
+
+function getExplicitTextCandidates(job) {
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const result = job && typeof job.result === "object" ? job.result : null;
+
+  return [
+    job?.request_text,
+    job?.requestText,
+    job?.demand,
+    job?.original_request_text,
+    job?.originalRequestText,
+    payload?.request_text,
+    payload?.requestText,
+    payload?.original_request_text,
+    payload?.originalRequestText,
+    payload?.demand,
+    result?.request_text,
+    result?.requestText,
+    result?.original_request_text,
+    result?.originalRequestText,
+  ].map(readTextValue).filter(Boolean);
+}
+
+function readExplicitTextTaskContext(job) {
+  const context = {
+    taskMode: null,
+    projectDomain: null,
+    readOnlyMode: null,
+  };
+
+  for (const text of getExplicitTextCandidates(job)) {
+    if (!context.taskMode) {
+      context.taskMode = readExplicitTaskModeFromText(text);
+    }
+    if (!context.projectDomain) {
+      context.projectDomain = readProjectDomainFromText(text);
+    }
+    if (context.readOnlyMode === null) {
+      context.readOnlyMode = readExplicitReadOnlyModeFromText(text);
+    }
+
+    if (
+      context.taskMode &&
+      context.projectDomain &&
+      context.readOnlyMode !== null
+    ) {
+      break;
+    }
+  }
+
+  return context;
+}
+
+function resolveTaskModeFromExplicitTextContext(context) {
+  if (
+    context.taskMode &&
+    (context.readOnlyMode === true ||
+      context.taskMode === TASK_MODES.READ_ONLY)
+  ) {
+    return TASK_MODES.READ_ONLY;
+  }
+
+  return context.taskMode || null;
 }
 
 function createExplicitFieldOverrideError(code, message, details = {}) {
@@ -820,9 +917,7 @@ function readBooleanFalseFlag(value) {
 }
 
 function taskTextDeclaresReadOnlyFalse(text) {
-  return /read[_ -]?only[_ -]?mode\s*[:=]\s*(false|0|no|off)\b|read_only_mode=false/i.test(
-    String(text || "")
-  );
+  return readExplicitReadOnlyModeFromText(text) === false;
 }
 
 function hasReadOnlyFalseField(job) {
@@ -845,7 +940,7 @@ function hasReadOnlyFalseField(job) {
 }
 
 function taskTextDeclaresReadOnlyMode(text) {
-  return readExplicitFieldFromText(extractOriginalTaskBody(text), "task_mode") === TASK_MODES.READ_ONLY;
+  return readExplicitTaskModeFromText(text) === TASK_MODES.READ_ONLY;
 }
 
 function taskTextDeclaresQaReviewDomain(text) {
@@ -923,8 +1018,17 @@ function getTaskModeFromText(text) {
   const raw = String(text || "");
   const batchCode = getCurrentBatchCodeFromText(raw);
 
-  const explicitTextMode = readExplicitFieldFromText(extractOriginalTaskBody(raw), "task_mode");
-  if (explicitTextMode && Object.values(TASK_MODES).includes(explicitTextMode)) {
+  const explicitTextMode = readExplicitTaskModeFromText(raw);
+  const explicitReadOnlyMode = readExplicitReadOnlyModeFromText(raw);
+  if (
+    explicitTextMode &&
+    (explicitReadOnlyMode === true ||
+      explicitTextMode === TASK_MODES.READ_ONLY)
+  ) {
+    return TASK_MODES.READ_ONLY;
+  }
+
+  if (explicitTextMode) {
     return explicitTextMode;
   }
 
@@ -1028,6 +1132,13 @@ function getTaskMode(job) {
       job?.payload?.originalRequestText,
     ]);
     const text = getJobText(job);
+    const explicitTextMode = resolveTaskModeFromExplicitTextContext(
+      readExplicitTextTaskContext(job)
+    );
+    if (explicitTextMode) {
+      return explicitTextMode;
+    }
+
     const explicitMode = readTaskModeField(job);
 
     if (
@@ -1093,7 +1204,11 @@ function getTaskMode(job) {
     }
 
     if (explicitMode) {
-      if (explicitMode !== TASK_MODES.READ_ONLY && hasReadOnlyField(job)) {
+      if (
+        explicitMode !== TASK_MODES.READ_ONLY &&
+        hasReadOnlyField(job) &&
+        !hasReadOnlyFalseField(job)
+      ) {
         throw createTaskModeMismatchError(
           "A write-allowed task was locked by read_only_mode=true before it could satisfy its goal.",
           { taskMode: explicitMode }
@@ -1128,21 +1243,21 @@ function getTaskMode(job) {
 }
 
 function assertExplicitTaskFieldsNotOverridden(job) {
-  const explicitText = getExplicitRequestText(job);
-  const explicitTaskMode = readExplicitFieldFromText(explicitText, "task_mode");
-  const explicitProjectDomain = readExplicitFieldFromText(explicitText, "project_domain");
+  const explicitTextContext = readExplicitTextTaskContext(job);
+  const explicitTaskMode = explicitTextContext.taskMode;
+  const explicitProjectDomain = explicitTextContext.projectDomain;
   const payload = job && typeof job.payload === "object" ? job.payload : null;
   const payloadTaskMode = readTaskModeField({
     task_mode: payload?.task_mode || payload?.taskMode,
   });
   const payloadProjectDomain = readProjectDomainField({ payload });
   const finalTaskMode = getTaskMode(job);
-  const finalProjectDomain = classifyWorkerTaskDomain(getJobText(job));
+  const finalProjectDomain =
+    getEffectiveProjectDomain(job) || classifyWorkerTaskDomain(getJobText(job));
 
   if (
     explicitTaskMode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED &&
-    (finalTaskMode !== TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED ||
-      (payloadTaskMode && payloadTaskMode !== TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED))
+    finalTaskMode !== TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED
   ) {
     throw createExplicitFieldOverrideError(
       EXPLICIT_TASK_MODE_OVERRIDDEN,
@@ -1157,8 +1272,7 @@ function assertExplicitTaskFieldsNotOverridden(job) {
 
   if (
     explicitProjectDomain === "automation_system" &&
-    (finalProjectDomain !== "automation_system" ||
-      (payloadProjectDomain && payloadProjectDomain !== "automation_system"))
+    finalProjectDomain !== "automation_system"
   ) {
     throw createExplicitFieldOverrideError(
       EXPLICIT_PROJECT_DOMAIN_OVERRIDDEN,
@@ -1615,8 +1729,7 @@ function createReadOnlyModeViolationError(changedPaths) {
 }
 
 function getEffectiveProjectDomain(job) {
-  const explicitText = getExplicitRequestText(job);
-  const explicitDomain = readProjectDomainFromText(explicitText || getJobText(job));
+  const explicitDomain = readExplicitTextTaskContext(job).projectDomain;
   return explicitDomain || readProjectDomainField(job);
 }
 
