@@ -483,6 +483,38 @@ test("NO_FIX_APPLIED task goal validation", async (t) => {
     ]);
   });
 
+  await t.test("BATCH-ARCH-03C smoke ignores forbidden src app scope and accepts worker diffs", () => {
+    const requestText = [
+      "BATCH-ARCH-03C-SMOKE-01",
+      "project_domain=automation_system",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      "Repair target:",
+      "- infra/windows-worker/local_worker.js",
+      "- infra/windows-worker/tests/git-safety.test.js",
+      "forbidden_scope: src/app/**, app/**, docs/**, src/lib/**",
+      "Do not modify src/app/page.tsx or src/app/partners/page.tsx.",
+    ].join("\n");
+
+    assert.deepEqual(extractRequiredChangePaths(requestText), [
+      "infra/windows-worker/local_worker.js",
+      "infra/windows-worker/tests/git-safety.test.js",
+    ]);
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(
+        { title: "BATCH-ARCH-03C-SMOKE-01", request_text: requestText },
+        ["infra/windows-worker/local_worker.js"]
+      )
+    );
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(
+        { title: "BATCH-ARCH-03C-SMOKE-01", request_text: requestText },
+        ["infra/windows-worker/tests/git-safety.test.js"]
+      )
+    );
+  });
+
   await t.test("drops required paths that conflict with forbidden scope during validation", () => {
     const job = {
       request_text: [
