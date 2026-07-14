@@ -1389,7 +1389,7 @@ function isScopeDeclarationLine(line) {
   return (
     ALLOWED_ONLY_SECTION_PATTERN.test(line) ||
     FORBIDDEN_SECTION_PATTERN.test(line) ||
-    /allowed[_\s-]*scope|forbidden[_\s-]*scope|允许(?:修改|范围)|禁止(?:修改|范围)|不得修改|不修改|do\s+not\s+(?:modify|change|touch)|must\s+not\s+(?:modify|change|touch)/i.test(
+    /allowed[_\s-]*scope|forbidden[_\s-]*scope|允许(?:修改|范围)|禁止(?:修改|范围)|不得修改|不修改|不要(?:修改|读取|读|碰)|背景(?:说明)?|do\s+not\s+(?:modify|change|touch|read)|must\s+not\s+(?:modify|change|touch|read)/i.test(
       String(line || "")
     )
   );
@@ -1430,6 +1430,56 @@ function extractRequiredChangePaths(requestText) {
   }
 
   return uniqueSortedPaths(paths);
+}
+
+function extractForbiddenChangePaths(requestText) {
+  const paths = [];
+  for (const rawLine of String(requestText || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!FORBIDDEN_SECTION_PATTERN.test(line) && !/forbidden[_\s-]*scope|禁止|不得|不修改|不要(?:修改|读取|读|碰)|do\s+not|must\s+not/i.test(line)) {
+      continue;
+    }
+    paths.push(...extractPathLikeTokens(line));
+  }
+  return uniqueSortedPaths(paths);
+}
+
+function isProductAppPath(filePath) {
+  const normalized = normalizeGitPath(filePath);
+  return normalized === "app" ||
+    normalized === "src/app" ||
+    normalized.startsWith("app/") ||
+    normalized.startsWith("src/app/");
+}
+
+function pathConflictsWithForbiddenPath(requiredPath, forbiddenPath) {
+  return requestedPathMatchesChangedPath(requiredPath, forbiddenPath) ||
+    requestedPathMatchesChangedPath(forbiddenPath, requiredPath);
+}
+
+function filterRequiredChangePathsForTask(requiredPaths, requestText, taskMode) {
+  const forbiddenPaths = extractForbiddenChangePaths(requestText);
+  const kept = [];
+
+  for (const requiredPath of uniqueSortedPaths(requiredPaths)) {
+    if (taskMode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED && isProductAppPath(requiredPath)) {
+      console.warn(`required_path_dropped_product_path: ${requiredPath}`);
+      continue;
+    }
+
+    if (
+      forbiddenPaths.some((forbiddenPath) =>
+        pathConflictsWithForbiddenPath(requiredPath, forbiddenPath)
+      )
+    ) {
+      console.warn(`required_path_dropped_forbidden: ${requiredPath}`);
+      continue;
+    }
+
+    kept.push(requiredPath);
+  }
+
+  return uniqueSortedPaths(kept);
 }
 
 function requestedPathMatchesChangedPath(requestedPath, changedPath) {
@@ -1787,7 +1837,11 @@ function assertTaskGoalApplied(job, changedPaths) {
   const requestText = getJobText(job);
   const taskDomain = classifyWorkerTaskDomain(requestText);
   const taskMode = getTaskMode(job);
-  const requiredPaths = extractRequiredChangePaths(requestText);
+  const requiredPaths = filterRequiredChangePathsForTask(
+    extractRequiredChangePaths(requestText),
+    requestText,
+    taskMode
+  );
   const normalizedChangedPaths = uniqueSortedPaths(changedPaths || []);
 
   if (hasConflictingReadOnlyLock(job, taskMode)) {
@@ -1917,6 +1971,25 @@ function assertTaskGoalApplied(job, changedPaths) {
         }
       );
     }
+
+    const missingRequiredPaths = getMissingRequiredChangePaths(
+      requiredPaths,
+      normalizedChangedPaths
+    );
+
+    if (requiredPaths.length > 0 && missingRequiredPaths.length === requiredPaths.length) {
+      throw createNoFixAppliedError(
+        "任务要求修改指定文件，但 Codex 没有修改任何指定文件；禁止上报 succeeded。",
+        {
+          requiredPaths,
+          changedPaths: normalizedChangedPaths,
+          taskDomain,
+          taskMode,
+        }
+      );
+    }
+
+    return;
   }
 
   if (taskMode === TASK_MODES.PRODUCT_WRITE_ALLOWED) {

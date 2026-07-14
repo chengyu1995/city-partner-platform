@@ -466,6 +466,43 @@ test("NO_FIX_APPLIED task goal validation", async (t) => {
     ]);
   });
 
+  await t.test("does not extract product paths from forbidden or background text", () => {
+    const requestText = [
+      "BATCH-ARCH-03C",
+      "task_mode=automation_system_write_allowed",
+      "Repair target:",
+      "- infra/windows-worker/local_worker.js",
+      "forbidden_scope: src/app/**, app/**, src/lib/db/**",
+      "禁止修改 src/app/partners/page.tsx",
+      "不要读取 app/login/page.tsx",
+      "背景说明：src/app/profile/page.tsx appeared in a QA report.",
+    ].join("\n");
+
+    assert.deepEqual(extractRequiredChangePaths(requestText), [
+      "infra/windows-worker/local_worker.js",
+    ]);
+  });
+
+  await t.test("drops required paths that conflict with forbidden scope during validation", () => {
+    const job = {
+      request_text: [
+        "BATCH-ARCH-03C",
+        "task_mode=automation_system_write_allowed",
+        "required changed paths:",
+        "- src/lib/worker-jobs.ts",
+        "forbidden_scope: src/lib/worker-jobs.ts, src/app/**",
+        "Repair Worker validator.",
+      ].join("\n"),
+    };
+
+    assert.throws(
+      () => assertTaskGoalApplied(job, []),
+      (error) =>
+        error.code === NO_FIX_APPLIED &&
+        !error.requiredPaths.includes("src/lib/worker-jobs.ts")
+    );
+  });
+
   await t.test("allows product write tasks with non-empty allowed changes", () => {
     const productJob = {
       request_text: [
@@ -866,6 +903,25 @@ test("read_only_mode task lock", async (t) => {
     assert.throws(
       () => assertTaskGoalApplied(job, ["src/app/partners/page.tsx"]),
       (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
+  await t.test("automation_system_write_allowed passes when Worker file changed despite forbidden product context", () => {
+    const job = {
+      request_text: [
+        "BATCH-ARCH-03C",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "Repair target:",
+        "- infra/windows-worker/local_worker.js",
+        "forbidden_scope: src/app/**, app/**, docs/**",
+        "禁止修改 src/app/partners/page.tsx",
+        "Do not modify app/login/page.tsx or app/profile/page.tsx.",
+      ].join("\n"),
+    };
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["infra/windows-worker/local_worker.js"])
     );
   });
 
