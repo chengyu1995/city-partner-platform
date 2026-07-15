@@ -611,6 +611,15 @@ const AUTOMATION_ALLOWED_SCOPE_DOC_PREFIXES = [
   "docs/architecture/",
   "docs/projects/",
 ];
+const AUTOMATION_ALLOWED_SCOPE_DOC_FILES = [
+  "docs/BATCH_LOG.md",
+  "docs/ACCEPTANCE_LOG.md",
+  "docs/NEXT_TASK_CARD.md",
+];
+const AUTOMATION_ALLOWED_SCOPE_WILDCARDS = [
+  "infra/windows-worker/**",
+  "docs/architecture/**",
+];
 const PRODUCT_WRITE_ALLOWED_PREFIXES = ["src/app"];
 const BATCH_FIX_PRODUCT_ALLOWED_PATHS = [
   "src/app",
@@ -1463,7 +1472,8 @@ function isExplicitAutomationAllowedDocPath(filePath) {
   return (
     !normalized.includes("*") &&
     fileName.includes(".") &&
-    AUTOMATION_ALLOWED_SCOPE_DOC_PREFIXES.some((prefix) => normalized.startsWith(prefix))
+    (AUTOMATION_ALLOWED_SCOPE_DOC_PREFIXES.some((prefix) => normalized.startsWith(prefix)) ||
+      AUTOMATION_ALLOWED_SCOPE_DOC_FILES.includes(normalized))
   );
 }
 
@@ -2218,15 +2228,42 @@ function buildWorkerReportContractExtra(contract) {
 
 function isAutomationAllowedByExplicitScope(filePath, requestText) {
   const normalized = normalizeGitPath(filePath);
-  if (!isExplicitAutomationAllowedDocPath(normalized)) {
+
+  return extractAllowedScopePaths(requestText).some(
+    (allowedPath) => automationAllowedScopePathMatches(allowedPath, normalized)
+  );
+}
+
+function automationAllowedScopePathMatches(allowedPath, filePath) {
+  const normalizedAllowed = normalizeGitPath(allowedPath);
+  const normalizedFile = normalizeGitPath(filePath);
+
+  if (!normalizedAllowed || normalizedAllowed === "docs/**") {
     return false;
   }
 
-  return extractAllowedScopePaths(requestText).some(
-    (allowedPath) =>
-      isExplicitAutomationAllowedDocPath(allowedPath) &&
-      normalizeGitPath(allowedPath) === normalized
-  );
+  if (normalizedAllowed.endsWith("/**")) {
+    if (!AUTOMATION_ALLOWED_SCOPE_WILDCARDS.includes(normalizedAllowed)) {
+      return false;
+    }
+
+    const prefix = normalizedAllowed.slice(0, -3);
+    return normalizedFile === prefix || normalizedFile.startsWith(`${prefix}/`);
+  }
+
+  if (normalizedAllowed.includes("*")) {
+    return false;
+  }
+
+  if (isAutomationWriteAllowedPath(normalizedAllowed)) {
+    return normalizedFile === normalizedAllowed;
+  }
+
+  if (isExplicitAutomationAllowedDocPath(normalizedAllowed)) {
+    return normalizedFile === normalizedAllowed;
+  }
+
+  return false;
 }
 
 function buildNormalizedScopeText(contract) {

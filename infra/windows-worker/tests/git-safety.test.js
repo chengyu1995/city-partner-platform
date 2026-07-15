@@ -1084,6 +1084,150 @@ test("read_only_mode task lock", async (t) => {
     );
   });
 
+  function createBatchArch08aScopeJob() {
+    const allowedScope = [
+      "infra/windows-worker/local_worker.js",
+      "infra/windows-worker/tests/git-safety.test.js",
+      "src/lib/worker-jobs.ts",
+      "src/app/api/feishu/event/route.ts",
+      "docs/architecture/final-report-schema.md",
+      "docs/architecture/iteration-loop.md",
+      "docs/projects/feishu-gm-automation.md",
+      "docs/BATCH_LOG.md",
+      "docs/ACCEPTANCE_LOG.md",
+      "docs/NEXT_TASK_CARD.md",
+    ].join(", ");
+    const job = {
+      request_text: [
+        "BATCH-ARCH-08A",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        `allowed_scope=${allowedScope}`,
+        "forbidden_scope=app/**, src/app/page.tsx, src/app/partners/**, src/app/post/**, src/app/login/**, src/app/profile/**, src/lib/db/**, src/types/db.ts, work/tencent-cloud/**, .env, database, deploy, tencent-cloud runtime files, package.json, tsconfig.json",
+      ].join("\n"),
+    };
+
+    return { allowedScope, job };
+  }
+
+  await t.test("automation_system_write_allowed honors explicit BATCH-ARCH-08A scope docs", () => {
+    const { allowedScope, job } = createBatchArch08aScopeJob();
+    const contract = resolveWorkerJobContract(job);
+
+    assert.equal(contract.allowed_scope, allowedScope);
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/BATCH_LOG.md"])
+    );
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/ACCEPTANCE_LOG.md"])
+    );
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/NEXT_TASK_CARD.md"])
+    );
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, [
+        "docs/BATCH_LOG.md",
+        "docs/ACCEPTANCE_LOG.md",
+        "docs/NEXT_TASK_CARD.md",
+      ])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["docs/UNKNOWN.md"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes("docs/UNKNOWN.md")
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["src/app/page.tsx"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes("src/app/page.tsx")
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, [".env"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes(".env")
+    );
+  });
+
+  await t.test("BATCH-ARCH-08A allows explicit docs/BATCH_LOG.md", () => {
+    const { job } = createBatchArch08aScopeJob();
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/BATCH_LOG.md"])
+    );
+  });
+
+  await t.test("BATCH-ARCH-08A allows explicit docs/ACCEPTANCE_LOG.md", () => {
+    const { job } = createBatchArch08aScopeJob();
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/ACCEPTANCE_LOG.md"])
+    );
+  });
+
+  await t.test("BATCH-ARCH-08A allows explicit docs/NEXT_TASK_CARD.md", () => {
+    const { job } = createBatchArch08aScopeJob();
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/NEXT_TASK_CARD.md"])
+    );
+  });
+
+  await t.test("BATCH-ARCH-08A blocks unscoped docs/UNKNOWN.md", () => {
+    const { job } = createBatchArch08aScopeJob();
+
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["docs/UNKNOWN.md"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes("docs/UNKNOWN.md")
+    );
+  });
+
+  await t.test("BATCH-ARCH-08A still blocks src/app/page.tsx", () => {
+    const { job } = createBatchArch08aScopeJob();
+
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["src/app/page.tsx"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes("src/app/page.tsx")
+    );
+  });
+
+  await t.test("BATCH-ARCH-08A still blocks .env", () => {
+    const { job } = createBatchArch08aScopeJob();
+
+    assert.throws(
+      () => assertTaskGoalApplied(job, [".env"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.message.includes(".env")
+    );
+  });
+
+  await t.test("automation_system_write_allowed allows explicit architecture wildcard only", () => {
+    const architectureWildcardJob = {
+      request_text: [
+        "BATCH-ARCH-08A",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, docs/architecture/**",
+      ].join("\n"),
+    };
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(architectureWildcardJob, [
+        "docs/architecture/final-report-schema.md",
+      ])
+    );
+  });
+
   await t.test("automation_system_write_allowed blocks unscoped architecture doc", () => {
     const job = {
       request_text: [
