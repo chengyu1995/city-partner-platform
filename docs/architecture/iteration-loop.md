@@ -91,3 +91,16 @@
 ## 下一批入口
 
 下一批从 BATCH-ARCH-06 开始。BATCH-ARCH-06 的前置条件是本批 5 个目标文档存在，并且 `git diff --name-only` 只出现允许范围文件。
+
+## BATCH-ARCH-09 Final-State Loop
+
+BATCH-ARCH-09 updates the loop from a report-only chain into a stable terminal-state loop:
+
+1. Windows Worker builds one normalized final result.
+2. Final report fields, failure memory, terminal index, and iteration suggestion all read that normalized result.
+3. Failure memory records only true task failures: test failure, TypeScript failure, out-of-scope change, context reconstruction failure, commit failure, and push failure.
+4. Feishu rate limits, Feishu send failures, missing `bitable_record_id`, bitable sync failures, duplicate reports, and ordinary progress report failures are non-task reporting failures. They do not change `effective_final_status` and do not write failure memory.
+5. Terminal index entries are keyed by `job_id::approved_batch` and store `job_id`, `approved_batch`, `effective_final_status`, `failure_code`, `git_commit_sha`, `next_batch`, and `completed_at`.
+6. Duplicate final reports are idempotent and must not write duplicate failure memory, duplicate terminal index entries, duplicate final notifications, or a changed terminal state.
+7. `next_batch` is preserved in the normalized result and terminal index. A succeeded BATCH-ARCH-09 result should point to `BATCH-ARCH-10`.
+8. Automatic iteration suggestions follow the terminal state: succeeded continues to `next_batch`, failed creates the smallest repair batch from `failure_code` and `failure_stage`, and cancelled creates no repair batch.

@@ -52,3 +52,15 @@ BATCH-ARCH-06：字段契约落地到 job payload。
 3. BATCH-ARCH-08：最终报告层有效终态统一。
 4. BATCH-ARCH-09：文档型知识库目录与索引。
 5. BATCH-ARCH-10：端到端静态验收与交接。
+
+## BATCH-ARCH-10 Handoff
+
+Source: BATCH-ARCH-09 normalized final result.
+
+Next batch: `BATCH-ARCH-10`
+
+Goal:
+
+- Validate the end-to-end static field flow from Feishu intake to Worker payload, Windows Worker final report, failure memory, terminal index, and automatic iteration suggestion.
+- Confirm `effective_final_status`, `failure_code`, `failure_stage`, `git_commit_sha`, `next_batch`, and `completed_at` are consistent across the chain.
+- Do not start a dev server, open a browser, deploy, change product pages, change database files, or change Tencent Cloud runtime files.

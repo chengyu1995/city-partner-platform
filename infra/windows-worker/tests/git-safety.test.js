@@ -45,6 +45,7 @@ const {
   assertExplicitTaskFieldsNotOverridden,
   buildCodexPrompt,
   buildFailureReport,
+  buildAutoIterationSuggestion,
   buildWorkerGuardedPrompt,
   classifyWorkerTaskDomain,
   extractCurrentExecutionBatchCode,
@@ -53,7 +54,10 @@ const {
   isReadOnlyTask,
   isReadOnlyTaskText,
   normalizeWorkerContext,
+  normalizeWorkerFinalResult,
+  recordFailureMemoryForFinalResult,
   recordFailureMemory,
+  recordTerminalJobIndex,
   resolveWorkerJobContract,
 } = require("../local_worker");
 
@@ -2130,6 +2134,133 @@ test("failure memory blocks after three repeated fingerprints", () => {
   assert.equal(result.blocked, true);
   assert.equal(result.entry.count, 3);
   assert.match(result.entry.suggested_guard, /BATCH-QA/);
+});
+
+test("BATCH-ARCH-09 terminal final result rules", async (t) => {
+  await t.test("true test failure writes failure memory", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-test-failed" },
+      approvedBatch: "BATCH-ARCH-09",
+      status: "failed",
+      effectiveFinalStatus: "failed",
+      errorText: "node --test infra/windows-worker/tests/git-safety.test.js failed",
+      completedAt: "2026-07-15T00:00:00.000Z",
+    });
+    const memoryResult = recordFailureMemoryForFinalResult({}, finalResult, "2026-07-15T00:01:00.000Z");
+
+    assert.equal(finalResult.failure_code, "TEST_FAILED");
+    assert.equal(memoryResult.status, "recorded");
+    assert.equal(memoryResult.recorded, true);
+    assert.equal(memoryResult.entry.failure_code, "TEST_FAILED");
+  });
+
+  await t.test("Feishu rate limit does not write failure memory or terminal failure", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-feishu-rate" },
+      approvedBatch: "BATCH-ARCH-09",
+      status: "failed",
+      effectiveFinalStatus: "failed",
+      errorText: "Feishu HTTP 429 rate limit while sending final report",
+    });
+    const memoryResult = recordFailureMemoryForFinalResult({}, finalResult);
+
+    assert.equal(finalResult.effective_final_status, "running");
+    assert.equal(finalResult.failure_code, null);
+    assert.equal(memoryResult.status, "skipped_non_terminal");
+    assert.equal(memoryResult.recorded, false);
+  });
+
+  await t.test("missing bitable_record_id does not write failure memory", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-no-bitable" },
+      approvedBatch: "BATCH-ARCH-09",
+      status: "failed",
+      effectiveFinalStatus: "failed",
+      errorText: "bitable_record_id missing; feishu_sync=skipped_no_record_id",
+    });
+    const memoryResult = recordFailureMemoryForFinalResult({}, finalResult);
+
+    assert.equal(finalResult.effective_final_status, "running");
+    assert.equal(memoryResult.recorded, false);
+  });
+
+  await t.test("duplicate report does not duplicate terminal index or failure memory", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-duplicate-report" },
+      approvedBatch: "BATCH-ARCH-09",
+      status: "failed",
+      effectiveFinalStatus: "failed",
+      errorText: "tsc --noEmit failed",
+      completedAt: "2026-07-15T00:02:00.000Z",
+    });
+
+    const firstIndex = recordTerminalJobIndex({}, finalResult);
+    const secondIndex = recordTerminalJobIndex(firstIndex.index, finalResult);
+    const firstMemory = recordFailureMemoryForFinalResult({}, finalResult);
+    const secondMemory = recordFailureMemoryForFinalResult(firstMemory.memory, finalResult);
+
+    assert.equal(firstIndex.status, "recorded");
+    assert.equal(secondIndex.status, "duplicate");
+    assert.equal(secondIndex.idempotent, true);
+    assert.equal(Object.keys(secondIndex.index).length, 1);
+    assert.equal(firstMemory.status, "recorded");
+    assert.equal(secondMemory.status, "duplicate");
+    assert.equal(secondMemory.idempotent, true);
+  });
+
+  await t.test("succeeded final result saves next_batch", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-succeeded" },
+      approvedBatch: "BATCH-ARCH-09",
+      status: "succeeded",
+      effectiveFinalStatus: "succeeded",
+      resultText: "next_batch: BATCH-ARCH-10",
+      gitCommitSha: "abc123",
+      completedAt: "2026-07-15T00:03:00.000Z",
+    });
+    const indexResult = recordTerminalJobIndex({}, finalResult);
+
+    assert.equal(finalResult.next_batch, "BATCH-ARCH-10");
+    assert.equal(indexResult.entry.next_batch, "BATCH-ARCH-10");
+    assert.deepEqual(buildAutoIterationSuggestion(finalResult), {
+      action: "continue",
+      next_batch: "BATCH-ARCH-10",
+      reason: "succeeded_next_batch",
+    });
+  });
+
+  await t.test("failed final result saves failure_code", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-ts-failed" },
+      approvedBatch: "BATCH-ARCH-09",
+      status: "failed",
+      effectiveFinalStatus: "failed",
+      errorText: "npx tsc --noEmit --incremental false TypeScript check failed",
+      completedAt: "2026-07-15T00:04:00.000Z",
+    });
+    const indexResult = recordTerminalJobIndex({}, finalResult);
+
+    assert.equal(finalResult.failure_code, "TYPESCRIPT_FAILED");
+    assert.equal(indexResult.entry.failure_code, "TYPESCRIPT_FAILED");
+  });
+
+  await t.test("cancelled final result does not generate repair suggestion", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-cancelled" },
+      approvedBatch: "BATCH-ARCH-09",
+      status: "cancelled",
+      effectiveFinalStatus: "cancelled",
+      completedAt: "2026-07-15T00:05:00.000Z",
+    });
+    const memoryResult = recordFailureMemoryForFinalResult({}, finalResult);
+
+    assert.equal(finalResult.failure_memory_status, "skipped_cancelled");
+    assert.equal(memoryResult.recorded, false);
+    assert.deepEqual(buildAutoIterationSuggestion(finalResult), {
+      action: "none",
+      reason: "cancelled",
+    });
+  });
 });
 
 test("path normalization and path-set comparison", async (t) => {

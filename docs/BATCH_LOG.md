@@ -53,3 +53,13 @@
 - `docs/projects/feishu-gm-automation.md`
 - `docs/projects/ops-config.md`
 - `docs/projects/archive.md`
+
+## BATCH-ARCH-09
+
+- Domain: automation_system.
+- Scope: Worker final report, failure memory, terminal index, next_batch persistence, and automatic iteration suggestion loop.
+- Status: implemented in allowed automation files only.
+- Result: normalized final result now feeds final reports, failure memory, terminal indexing, and iteration suggestions.
+- Failure-memory rule: write only true task failures; skip Feishu rate limits, Feishu send failures, missing `bitable_record_id`, bitable sync failures, duplicate reports, and ordinary progress report failures.
+- Terminal index key: `job_id::approved_batch`.
+- Next batch: `BATCH-ARCH-10`.

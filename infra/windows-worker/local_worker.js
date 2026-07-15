@@ -682,6 +682,51 @@ const FAILURE_FINGERPRINTS = {
     "Approved execution referenced a BATCH-FIX batch without carrying the original product repair request.",
 };
 
+const TRUE_TASK_FAILURE_CODES = new Set([
+  "TEST_FAILED",
+  "TYPESCRIPT_FAILED",
+  "OUT_OF_SCOPE_CHANGE",
+  "CONTEXT_RECONSTRUCT_FAILED",
+  "GIT_COMMIT_FAILED",
+  "GIT_PUSH_FAILED",
+]);
+
+const NON_TASK_FAILURE_CODES = new Set([
+  "FEISHU_RATE_LIMIT",
+  "FEISHU_SEND_FAILED",
+  "BITABLE_RECORD_MISSING",
+  "BITABLE_SYNC_FAILED",
+  "DUPLICATE_REPORT",
+  "PROGRESS_REPORT_FAILED",
+]);
+
+const NON_TASK_FAILURE_PATTERNS = [
+  {
+    code: "FEISHU_RATE_LIMIT",
+    pattern: /(?:feishu|飞书|bitable|多维表).*(?:rate|limit|429|限流)|(?:HTTP\s*)?429|too many requests/i,
+  },
+  {
+    code: "FEISHU_SEND_FAILED",
+    pattern: /(?:feishu|飞书).*(?:send|发送).*(?:fail|failed|失败)|飞书发送失败/i,
+  },
+  {
+    code: "BITABLE_RECORD_MISSING",
+    pattern: /bitable_record_id.*(?:missing|null|缺失)|(?:missing|缺失).*bitable_record_id|skipped_no_record_id/i,
+  },
+  {
+    code: "BITABLE_SYNC_FAILED",
+    pattern: /(?:bitable|多维表).*(?:sync|同步).*(?:fail|failed|失败)|feishu-worker-sync.*failed/i,
+  },
+  {
+    code: "DUPLICATE_REPORT",
+    pattern: /duplicate report|terminal_job_report_ignored|idempotent.*report|重复\s*report|重复上报/i,
+  },
+  {
+    code: "PROGRESS_REPORT_FAILED",
+    pattern: /progress.*(?:report|上报).*(?:fail|failed|失败)|任务进度上报失败|\/api\/worker\/progress/i,
+  },
+];
+
 function readTextValue(value) {
   if (value == null) return "";
   if (Array.isArray(value)) {
@@ -1478,7 +1523,7 @@ function isExplicitAutomationAllowedDocPath(filePath) {
 }
 
 const HERMES_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|route|original_request_text(?:_base64)?|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|changed_files|git_commit_sha|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|route|original_request_text(?:_base64)?|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName) {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -1663,8 +1708,12 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "workflow_stage",
   "final_report_status",
   "effective_final_status",
+  "failure_code",
+  "failure_stage",
   "changed_files",
   "git_commit_sha",
+  "next_batch",
+  "completed_at",
   "pushed",
   "deploy_status",
 ];
@@ -1892,8 +1941,12 @@ function readPayloadContextField(payload, fieldName) {
     worker_stage: ["worker_stage", "workerStage", "workflow_stage", "workflowStage"],
     final_report_status: ["final_report_status", "finalReportStatus"],
     effective_final_status: ["effective_final_status", "effectiveFinalStatus"],
+    failure_code: ["failure_code", "failureCode", "error_code", "errorCode"],
+    failure_stage: ["failure_stage", "failureStage"],
     changed_files: ["changed_files", "changedFiles", "files_changed", "filesChanged"],
     git_commit_sha: ["git_commit_sha", "gitCommitSha"],
+    next_batch: ["next_batch", "nextBatch"],
+    completed_at: ["completed_at", "completedAt"],
     pushed: ["pushed"],
     deploy_status: ["deploy_status", "deployStatus"],
   };
@@ -2132,11 +2185,28 @@ function normalizeWorkerContext(job, overrides = {}) {
       readString(overrides.effectiveFinalStatus) ||
       readString(readPriorityField("effective_final_status")) ||
       null,
+    failure_code:
+      readString(overrides.failureCode) ||
+      readString(readPriorityField("failure_code")) ||
+      null,
+    failure_stage:
+      readString(overrides.failureStage) ||
+      readString(readPriorityField("failure_stage")) ||
+      null,
     changed_files: changedFiles,
     git_commit_sha:
       readString(overrides.gitCommitSha) ||
       readString(readPriorityField("git_commit_sha")) ||
       readString(job?.git_commit_sha) ||
+      null,
+    next_batch:
+      readString(overrides.nextBatch) ||
+      readString(readPriorityField("next_batch")) ||
+      null,
+    completed_at:
+      readString(overrides.completedAt) ||
+      readString(readPriorityField("completed_at")) ||
+      readString(job?.completed_at) ||
       null,
     pushed,
     deploy_status:
@@ -2194,8 +2264,12 @@ function formatWorkerJobContractLines(contract, options = {}) {
     `workflow_stage: ${contract.workflow_stage || "null"}`,
     `final_report_status: ${contract.final_report_status || "null"}`,
     `effective_final_status: ${contract.effective_final_status || "null"}`,
+    `failure_code: ${contract.failure_code || "null"}`,
+    `failure_stage: ${contract.failure_stage || "null"}`,
     `changed_files: ${contract.changed_files.length ? contract.changed_files.join(", ") : "[]"}`,
     `git_commit_sha: ${contract.git_commit_sha || "null"}`,
+    `next_batch: ${contract.next_batch || "null"}`,
+    `completed_at: ${contract.completed_at || "null"}`,
     `pushed: ${contract.pushed ? "true" : "false"}`,
     `deploy_status: ${contract.deploy_status || "null"}`,
     `context_warnings: ${contract.context_warnings?.length ? contract.context_warnings.join("; ") : "[]"}`,
@@ -2219,8 +2293,12 @@ function buildWorkerReportContractExtra(contract) {
     workflow_stage: contract.workflow_stage,
     final_report_status: contract.final_report_status,
     effective_final_status: contract.effective_final_status,
+    failure_code: contract.failure_code,
+    failure_stage: contract.failure_stage,
     changed_files: contract.changed_files,
     git_commit_sha: contract.git_commit_sha,
+    next_batch: contract.next_batch,
+    completed_at: contract.completed_at,
     pushed: contract.pushed,
     deploy_status: contract.deploy_status,
   };
@@ -2330,6 +2408,400 @@ function recordFailureMemory(memory, fingerprint, batchCode, now = new Date().to
     entry,
     status,
     blocked: status === "blocked",
+  };
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function readStructuredResultField(content, fieldName) {
+  const pattern = new RegExp(
+    `^\\s*${escapeRegExp(fieldName).replace(/_/g, "[_\\s-]*")}\\s*[:=：]\\s*(.*?)\\s*$`,
+    "i"
+  );
+
+  for (const rawLine of String(content || "").split(/\r?\n/)) {
+    const match = rawLine.match(pattern);
+    if (match && match[1].trim()) {
+      return match[1].trim();
+    }
+  }
+
+  return null;
+}
+
+function normalizeTerminalStatus(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (["success", "succeeded", "completed", "complete"].includes(text)) return "succeeded";
+  if (["fail", "failed", "error"].includes(text)) return "failed";
+  if (["cancel", "cancelled", "canceled"].includes(text)) return "cancelled";
+  if (["queued", "pending"].includes(text)) return "queued";
+  if (["running", "in_progress"].includes(text)) return "running";
+  return null;
+}
+
+function normalizeFailureCodeValue(value) {
+  const text = String(value || "").trim();
+  if (!text || /^null|none|n\/a$/i.test(text)) {
+    return null;
+  }
+
+  const code = text
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .replace(/[^A-Za-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toUpperCase();
+  const aliases = {
+    TEST_FAILURE: "TEST_FAILED",
+    TESTS_FAILED: "TEST_FAILED",
+    NODE_TEST_FAILED: "TEST_FAILED",
+    TSC_FAILED: "TYPESCRIPT_FAILED",
+    TYPESCRIPT_CHECK_FAILED: "TYPESCRIPT_FAILED",
+    TYPECHECK_FAILED: "TYPESCRIPT_FAILED",
+    OUT_OF_SCOPE_BUSINESS_CHANGE: "OUT_OF_SCOPE_CHANGE",
+    OUT_OF_SCOPE_SYSTEM_CHANGE: "OUT_OF_SCOPE_CHANGE",
+    BUSINESS_PAGE_BOUNDARY_VIOLATION: "OUT_OF_SCOPE_CHANGE",
+    CONTEXT_FAILED: "CONTEXT_RECONSTRUCT_FAILED",
+    ORIGINAL_BATCH_CONTEXT_MISSING: "CONTEXT_RECONSTRUCT_FAILED",
+    COMMIT_FAILED: "GIT_COMMIT_FAILED",
+    PUSH_FAILED: "GIT_PUSH_FAILED",
+  };
+
+  return aliases[code] || code;
+}
+
+function classifyNonTaskFailureCode(text) {
+  const raw = String(text || "");
+  for (const item of NON_TASK_FAILURE_PATTERNS) {
+    if (item.pattern.test(raw)) {
+      return item.code;
+    }
+  }
+  return null;
+}
+
+function classifyFailureCodeFromText(text) {
+  const raw = String(text || "");
+  const nonTaskFailureCode = classifyNonTaskFailureCode(raw);
+  if (nonTaskFailureCode) return nonTaskFailureCode;
+  if (/node\s+--test|tests?\s+failed|test\s+failure|测试失败/i.test(raw)) {
+    return "TEST_FAILED";
+  }
+  if (/typescript|tsc|typecheck|TypeScript\s+检查失败/i.test(raw)) {
+    return "TYPESCRIPT_FAILED";
+  }
+  if (
+    /OUT_OF_SCOPE|BUSINESS_PAGE_BOUNDARY_VIOLATION|越界修改|范围边界|context_reconstruct_failed\s*[:=：]\s*true/i.test(
+      raw
+    )
+  ) {
+    return /context_reconstruct_failed\s*[:=：]\s*true/i.test(raw)
+      ? "CONTEXT_RECONSTRUCT_FAILED"
+      : "OUT_OF_SCOPE_CHANGE";
+  }
+  if (/ORIGINAL_BATCH_CONTEXT_MISSING|上下文恢复失败|context.*(?:missing|failed|缺失|失败)/i.test(raw)) {
+    return "CONTEXT_RECONSTRUCT_FAILED";
+  }
+  if (/git\s+commit|commit\s+失败|commit failed/i.test(raw)) {
+    return "GIT_COMMIT_FAILED";
+  }
+  if (/git\s+push|push\s+失败|push failed/i.test(raw)) {
+    return "GIT_PUSH_FAILED";
+  }
+  return null;
+}
+
+function isTrueTaskFailureCode(code) {
+  return TRUE_TASK_FAILURE_CODES.has(normalizeFailureCodeValue(code));
+}
+
+function isNonTaskFailureCode(code) {
+  return NON_TASK_FAILURE_CODES.has(normalizeFailureCodeValue(code));
+}
+
+function extractNextBatchFromText(text) {
+  const explicit = readStructuredResultField(text, "next_batch");
+  const match = String(explicit || text || "").match(/\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/i);
+  return match ? match[0].toUpperCase() : null;
+}
+
+function inferNextBatchFromBatchCode(batchCode) {
+  const text = String(batchCode || "").trim();
+  const match = text.match(/^(BATCH-[A-Z]+-)(\d+)$/i);
+  if (!match) return null;
+  const nextNumber = String(Number(match[2]) + 1).padStart(match[2].length, "0");
+  return `${match[1].toUpperCase()}${nextNumber}`;
+}
+
+function buildFailureMemoryStatus(finalResult) {
+  const status = normalizeTerminalStatus(finalResult?.effective_final_status);
+  const failureCode = normalizeFailureCodeValue(finalResult?.failure_code);
+  if (status === "succeeded") return "skipped_success";
+  if (status === "cancelled") return "skipped_cancelled";
+  if (status !== "failed") return "skipped_non_terminal";
+  if (!failureCode || isNonTaskFailureCode(failureCode)) return "skipped_non_task_failure";
+  return isTrueTaskFailureCode(failureCode) ? "recordable" : "skipped_non_task_failure";
+}
+
+function normalizeWorkerFinalResult(input = {}) {
+  const job = input.job || {};
+  const error = input.error || null;
+  const errorText = error instanceof Error ? error.message : String(error || "");
+  const analysis = error ? classifyFailure(error) : null;
+  const reportText = [
+    input.resultText,
+    input.errorText,
+    input.payload,
+    errorText,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const requestedStatus =
+    input.effective_final_status ||
+    input.effectiveFinalStatus ||
+    readStructuredResultField(reportText, "effective_final_status") ||
+    input.status ||
+    input.final_report_status ||
+    input.finalReportStatus;
+  const nonTaskFailureCode = classifyNonTaskFailureCode(reportText);
+  const effectiveFinalStatus =
+    normalizeTerminalStatus(requestedStatus) === "failed" && nonTaskFailureCode
+      ? normalizeTerminalStatus(input.previousEffectiveFinalStatus) || "running"
+      : normalizeTerminalStatus(requestedStatus) || "running";
+  const approvedBatch =
+    readString(input.approved_batch) ||
+    readString(input.approvedBatch) ||
+    readStructuredResultField(reportText, "approved_batch") ||
+    getJobBatchCode(job) ||
+    null;
+  const rawFailureCode =
+    input.failure_code ||
+    input.failureCode ||
+    readStructuredResultField(reportText, "failure_code") ||
+    readStructuredResultField(reportText, "error_code") ||
+    (effectiveFinalStatus === "failed" ? error?.code : null) ||
+    (effectiveFinalStatus === "failed" ? classifyFailureCodeFromText(reportText) : null);
+  const failureCode =
+    effectiveFinalStatus === "failed"
+      ? normalizeFailureCodeValue(rawFailureCode) ||
+        normalizeFailureCodeValue(classifyFailureCodeFromText(reportText))
+      : null;
+  const failureStage =
+    effectiveFinalStatus === "failed"
+      ? readString(input.failure_stage) ||
+        readString(input.failureStage) ||
+        readStructuredResultField(reportText, "failure_stage") ||
+        readStructuredResultField(reportText, "失败阶段") ||
+        error?.failureStage ||
+        analysis?.stage ||
+        null
+      : null;
+  const nextBatch =
+    readString(input.next_batch) ||
+    readString(input.nextBatch) ||
+    extractNextBatchFromText(reportText) ||
+    (effectiveFinalStatus === "succeeded" ? inferNextBatchFromBatchCode(approvedBatch) : null);
+
+  const finalResult = {
+    job_id:
+      readString(input.job_id) ||
+      readString(input.jobId) ||
+      readString(job.id) ||
+      readString(job.job_id) ||
+      null,
+    approved_batch: approvedBatch,
+    final_report_status:
+      normalizeTerminalStatus(input.final_report_status || input.finalReportStatus || input.status) ||
+      null,
+    effective_final_status: effectiveFinalStatus,
+    failure_code: failureCode,
+    failure_stage: failureStage,
+    git_commit_sha:
+      readString(input.git_commit_sha) ||
+      readString(input.gitCommitSha) ||
+      readString(job.git_commit_sha) ||
+      null,
+    next_batch: nextBatch,
+    completed_at:
+      readString(input.completed_at) ||
+      readString(input.completedAt) ||
+      readString(job.completed_at) ||
+      null,
+  };
+
+  return {
+    ...finalResult,
+    failure_memory_status: buildFailureMemoryStatus(finalResult),
+    terminal_index: buildTerminalJobIndex(finalResult),
+    auto_iteration_suggestion: buildAutoIterationSuggestion(finalResult),
+  };
+}
+
+function buildTerminalJobIndex(finalResult) {
+  return {
+    job_id: finalResult?.job_id || null,
+    approved_batch: finalResult?.approved_batch || null,
+    effective_final_status: finalResult?.effective_final_status || null,
+    failure_code: finalResult?.failure_code || null,
+    git_commit_sha: finalResult?.git_commit_sha || null,
+    next_batch: finalResult?.next_batch || null,
+    completed_at: finalResult?.completed_at || null,
+  };
+}
+
+function buildTerminalIndexKey(finalResult) {
+  return [
+    finalResult?.job_id || "unknown-job",
+    finalResult?.approved_batch || "unknown-batch",
+  ].join("::");
+}
+
+function isTerminalFinalResult(finalResult) {
+  return ["succeeded", "failed", "cancelled"].includes(
+    normalizeTerminalStatus(finalResult?.effective_final_status)
+  );
+}
+
+function recordTerminalJobIndex(index, finalResult) {
+  const normalizedIndex = normalizeFailureMemory(index);
+  const normalizedFinalResult = normalizeWorkerFinalResult(finalResult);
+  if (!isTerminalFinalResult(normalizedFinalResult)) {
+    return {
+      index: normalizedIndex,
+      entry: null,
+      status: "skipped_non_terminal",
+      idempotent: false,
+    };
+  }
+
+  const key = buildTerminalIndexKey(normalizedFinalResult);
+  const existing = normalizedIndex[key] || null;
+  if (existing) {
+    return {
+      index: normalizedIndex,
+      entry: existing,
+      status: "duplicate",
+      idempotent: true,
+    };
+  }
+
+  const entry = buildTerminalJobIndex(normalizedFinalResult);
+  return {
+    index: {
+      ...normalizedIndex,
+      [key]: entry,
+    },
+    entry,
+    status: "recorded",
+    idempotent: false,
+  };
+}
+
+function recordFailureMemoryForFinalResult(memory, finalResult, now = new Date().toISOString()) {
+  const normalizedMemory = normalizeFailureMemory(memory);
+  const normalizedFinalResult = normalizeWorkerFinalResult(finalResult);
+  const memoryStatus = buildFailureMemoryStatus(normalizedFinalResult);
+
+  if (memoryStatus !== "recordable") {
+    return {
+      memory: normalizedMemory,
+      entry: null,
+      status: memoryStatus,
+      recorded: false,
+      idempotent: false,
+    };
+  }
+
+  const eventKey = buildTerminalIndexKey(normalizedFinalResult);
+  const events = normalizeFailureMemory(normalizedMemory.__task_failure_events);
+  const existing = events[eventKey] || null;
+
+  if (existing) {
+    return {
+      memory: normalizedMemory,
+      entry: existing,
+      status: "duplicate",
+      recorded: false,
+      idempotent: true,
+    };
+  }
+
+  const entry = {
+    job_id: normalizedFinalResult.job_id,
+    approved_batch: normalizedFinalResult.approved_batch,
+    effective_final_status: normalizedFinalResult.effective_final_status,
+    failure_code: normalizedFinalResult.failure_code,
+    failure_stage: normalizedFinalResult.failure_stage,
+    git_commit_sha: normalizedFinalResult.git_commit_sha,
+    completed_at: normalizedFinalResult.completed_at,
+    recorded_at: now,
+  };
+
+  return {
+    memory: {
+      ...normalizedMemory,
+      __task_failure_events: {
+        ...events,
+        [eventKey]: entry,
+      },
+    },
+    entry,
+    status: "recorded",
+    recorded: true,
+    idempotent: false,
+  };
+}
+
+function buildAutoIterationSuggestion(finalResult) {
+  const normalized = {
+    ...finalResult,
+    effective_final_status: normalizeTerminalStatus(finalResult?.effective_final_status),
+    failure_code: normalizeFailureCodeValue(finalResult?.failure_code),
+  };
+
+  if (normalized.effective_final_status === "succeeded") {
+    return normalized.next_batch
+      ? {
+          action: "continue",
+          next_batch: normalized.next_batch,
+          reason: "succeeded_next_batch",
+        }
+      : {
+          action: "none",
+          reason: "succeeded_without_next_batch",
+        };
+  }
+
+  if (normalized.effective_final_status === "failed") {
+    if (!isTrueTaskFailureCode(normalized.failure_code)) {
+      return {
+        action: "none",
+        reason: "non_task_failure",
+      };
+    }
+
+    return {
+      action: "repair",
+      suggested_batch: normalized.approved_batch
+        ? `${normalized.approved_batch}-FIX`
+        : "BATCH-REPAIR",
+      failure_code: normalized.failure_code,
+      failure_stage: normalized.failure_stage || null,
+      reason: "minimal_repair_batch",
+    };
+  }
+
+  if (normalized.effective_final_status === "cancelled") {
+    return {
+      action: "none",
+      reason: "cancelled",
+    };
+  }
+
+  return {
+    action: "none",
+    reason: "non_terminal",
   };
 }
 
@@ -3767,6 +4239,18 @@ function buildFailureReport(job, error, context = {}) {
     pushed: false,
     deployStatus: null,
   });
+  const normalizedFinalResult = normalizeWorkerFinalResult({
+    job,
+    status: "failed",
+    finalReportStatus: "failed",
+    effectiveFinalStatus: contract.effective_final_status || "failed",
+    failureCode: contract.failure_code,
+    failureStage: contract.failure_stage,
+    error,
+    gitCommitSha: contract.git_commit_sha,
+    nextBatch: contract.next_batch,
+    completedAt: contract.completed_at,
+  });
 
   return [
     "Codex 任务执行失败",
@@ -3780,7 +4264,11 @@ function buildFailureReport(job, error, context = {}) {
     `Worker execution status: ${workerExecutionStatus}`,
     `Task goal status: ${taskGoalStatus}`,
     `task_mode: ${taskMode}`,
-    "effective_final_status: failed",
+    `effective_final_status: ${contract.effective_final_status || normalizedFinalResult.effective_final_status}`,
+    `failure_memory_status: ${normalizedFinalResult.failure_memory_status}`,
+    `failure_code: ${normalizedFinalResult.failure_code || "null"}`,
+    `failure_stage: ${normalizedFinalResult.failure_stage || "null"}`,
+    `next_batch: ${normalizedFinalResult.next_batch || "null"}`,
     `Read-only violation: ${readOnlyViolation ? "yes" : "no"}`,
     `No-op run: ${noFixApplied ? "yes" : "no"}`,
     `Task mode mismatch: ${taskModeMismatch ? "yes" : "no"}`,
@@ -4632,6 +5120,19 @@ async function pollOnce() {
         : pushResult.message
     );
 
+    const completedAt = new Date().toISOString();
+    const normalizedFinalResult = normalizeWorkerFinalResult({
+      job,
+      status: "succeeded",
+      finalReportStatus: "succeeded",
+      effectiveFinalStatus: "succeeded",
+      resultText: result,
+      approvedBatch: getJobBatchCode(job),
+      gitCommitSha: gitResult.commitSha || null,
+      nextBatch: extractNextBatchFromText(result),
+      completedAt,
+    });
+
     const successContract = resolveWorkerJobContract(job, {
       attemptId,
       taskMode: taskModeForReport,
@@ -4639,9 +5140,13 @@ async function pollOnce() {
       workerStage: "completed",
       workflowStage: "completed",
       finalReportStatus: "succeeded",
-      effectiveFinalStatus: "succeeded",
+      effectiveFinalStatus: normalizedFinalResult.effective_final_status,
+      failureCode: normalizedFinalResult.failure_code,
+      failureStage: normalizedFinalResult.failure_stage,
       changedFiles: gitResult.filesChanged || [],
       gitCommitSha: gitResult.commitSha || null,
+      nextBatch: normalizedFinalResult.next_batch,
+      completedAt: normalizedFinalResult.completed_at,
       pushed: pushResult.pushed,
       deployStatus: pushResult.pushed ? "pending" : null,
     });
@@ -4681,6 +5186,10 @@ async function pollOnce() {
       }`,
       `committed: ${gitResult.committed ? "true" : "false"}`,
       `pushed: ${pushResult.pushed ? "true" : "false"}`,
+      `failure_memory_status: ${normalizedFinalResult.failure_memory_status}`,
+      `failure_code: ${normalizedFinalResult.failure_code || "null"}`,
+      `next_batch: ${normalizedFinalResult.next_batch || "null"}`,
+      `completed_at: ${normalizedFinalResult.completed_at || "null"}`,
       "",
       formatPreviewReport(previewReport),
       "",
@@ -4740,6 +5249,9 @@ async function pollOnce() {
           `read_only_mode：${readOnlyMode ? "true" : "false"}`,
           "original_worker_status: succeeded",
           "effective_final_status: succeeded",
+          `failure_memory_status: ${normalizedFinalResult.failure_memory_status}`,
+          `failure_code: ${normalizedFinalResult.failure_code || "null"}`,
+          `next_batch: ${normalizedFinalResult.next_batch || "null"}`,
           "Read-only violation: no",
           "NO_FIX_APPLIED: no",
           "OUT_OF_SCOPE_BUSINESS_CHANGE: no",
@@ -4766,7 +5278,14 @@ async function pollOnce() {
         read_only_mode: readOnlyMode,
         task_mode: taskModeForReport,
         original_worker_status: "succeeded",
-        effective_final_status: "succeeded",
+        effective_final_status: normalizedFinalResult.effective_final_status,
+        failure_memory_status: normalizedFinalResult.failure_memory_status,
+        failure_code: normalizedFinalResult.failure_code,
+        failure_stage: normalizedFinalResult.failure_stage,
+        terminal_index: normalizedFinalResult.terminal_index,
+        auto_iteration_suggestion: normalizedFinalResult.auto_iteration_suggestion,
+        next_batch: normalizedFinalResult.next_batch,
+        completed_at: normalizedFinalResult.completed_at,
         no_fix_applied: false,
         read_only_mode_violation: false,
         out_of_scope_business_change: false,
@@ -4820,6 +5339,19 @@ async function pollOnce() {
       "任务执行失败，正在上报错误"
     );
 
+    const completedAt = new Date().toISOString();
+    const normalizedFinalResult = normalizeWorkerFinalResult({
+      job,
+      status: "failed",
+      finalReportStatus: "failed",
+      effectiveFinalStatus: "failed",
+      error,
+      errorText: error instanceof Error ? error.message : String(error),
+      approvedBatch: getJobBatchCode(job),
+      gitCommitSha: null,
+      completedAt,
+    });
+
     const failureContract = resolveWorkerJobContract(job, {
       attemptId,
       taskMode: taskModeForReport,
@@ -4827,9 +5359,13 @@ async function pollOnce() {
       workerStage: "failed",
       workflowStage: "failed",
       finalReportStatus: "failed",
-      effectiveFinalStatus: "failed",
+      effectiveFinalStatus: normalizedFinalResult.effective_final_status,
+      failureCode: normalizedFinalResult.failure_code,
+      failureStage: normalizedFinalResult.failure_stage,
       changedFiles: failureChangedPaths,
       gitCommitSha: null,
+      nextBatch: normalizedFinalResult.next_batch,
+      completedAt: normalizedFinalResult.completed_at,
       pushed: false,
       deployStatus: null,
     });
@@ -4858,7 +5394,7 @@ async function pollOnce() {
         read_only_mode: readOnlyMode,
         task_mode: taskModeForReport,
         original_worker_status: "failed",
-        effective_final_status: "failed",
+        effective_final_status: normalizedFinalResult.effective_final_status,
         no_fix_applied: errorCode === NO_FIX_APPLIED,
         read_only_mode_violation: errorCode === READ_ONLY_MODE_VIOLATION,
         task_mode_mismatch: errorCode === TASK_MODE_MISMATCH,
@@ -4921,7 +5457,10 @@ async function pollOnce() {
           `task_mode: ${taskModeForReport}`,
           `read_only_mode：${readOnlyMode ? "true" : "false"}`,
           "original_worker_status: failed",
-          "effective_final_status: failed",
+          `effective_final_status: ${normalizedFinalResult.effective_final_status}`,
+          `failure_memory_status: ${normalizedFinalResult.failure_memory_status}`,
+          `failure_code: ${normalizedFinalResult.failure_code || "null"}`,
+          `next_batch: ${normalizedFinalResult.next_batch || "null"}`,
           `Read-only violation: ${errorCode === READ_ONLY_MODE_VIOLATION ? "yes" : "no"}`,
           `No-op run: ${errorCode === NO_FIX_APPLIED ? "yes" : "no"}`,
           `Task mode mismatch: ${errorCode === TASK_MODE_MISMATCH ? "yes" : "no"}`,
@@ -4954,6 +5493,13 @@ async function pollOnce() {
           "本地预览：未启动 dev server / 浏览器",
         ],
         github_push_status: "失败任务未推送",
+        failure_memory_status: normalizedFinalResult.failure_memory_status,
+        failure_code: normalizedFinalResult.failure_code,
+        failure_stage: normalizedFinalResult.failure_stage,
+        terminal_index: normalizedFinalResult.terminal_index,
+        auto_iteration_suggestion: normalizedFinalResult.auto_iteration_suggestion,
+        next_batch: normalizedFinalResult.next_batch,
+        completed_at: normalizedFinalResult.completed_at,
         git_commit_sha: null,
         deploy_status: null,
       }
@@ -5029,6 +5575,8 @@ module.exports = {
   assertCleanWorktreeBeforeCodex,
   buildCodexPrompt,
   buildFailureReport,
+  buildAutoIterationSuggestion,
+  buildTerminalJobIndex,
   buildWorkerGuardedPrompt,
   classifyWorkerTaskDomain,
   classifyFailure,
@@ -5036,8 +5584,12 @@ module.exports = {
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
   getTaskMode,
+  isTrueTaskFailureCode,
   normalizeWorkerContext,
+  normalizeWorkerFinalResult,
+  recordFailureMemoryForFinalResult,
   recordFailureMemory,
+  recordTerminalJobIndex,
   resolveWorkerJobContract,
   getTaskChangedPaths,
   isReadOnlyTask,

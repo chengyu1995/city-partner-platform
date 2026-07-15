@@ -149,3 +149,29 @@ When two `HERMES_WORKER_CONTEXT` blocks appear, the Worker selects one preferred
 If explicit context is missing, the Worker emits `CONTEXT_MISSING_WARNING` and records `context_source` as `payload`, `original_request_text`, `request_text`, or `automatic_classification`. It must not silently convert the task to product writing or read-only mode.
 
 Final Feishu reports must include the normalized context fields alongside files changed, validation results, commit SHA, and push status. Codex still does not perform Git writes; commit and push remain owned by the outer Worker.
+
+## BATCH-ARCH-09 Terminal Result And Iteration Loop
+
+BATCH-ARCH-09 adds a normalized terminal result contract for Worker final reports. The Project Director report must include:
+
+- `effective_final_status`
+- `failure_memory_status`
+- `failure_code`
+- `failure_stage`
+- `terminal_index`
+- `git_commit_sha`
+- `pushed`
+- `next_batch`
+- `completed_at`
+
+Failure memory is written only for true task failures: test failure, TypeScript failure, out-of-scope change, context reconstruction failure, commit failure, and push failure. Feishu rate limits, Feishu send failures, missing `bitable_record_id`, bitable sync failures, duplicate final reports, and ordinary progress report failures are reporting-layer problems and must not create task failure memory or rewrite the task terminal state.
+
+Terminal reports are idempotent by `job_id::approved_batch`. A duplicate report returns the stored terminal entry and must not send another final report, write another terminal index entry, or write another failure-memory entry.
+
+Automatic iteration reads the normalized result:
+
+- `succeeded`: continue with the saved `next_batch`.
+- `failed`: create the smallest repair batch from `failure_code` and `failure_stage`.
+- `cancelled`: do not create a repair batch.
+
+The next architecture batch after BATCH-ARCH-09 is `BATCH-ARCH-10`.

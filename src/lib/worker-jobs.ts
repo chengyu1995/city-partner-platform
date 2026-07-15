@@ -31,7 +31,7 @@ const RECORD_ID_KEYS = [
   "recordId",
 ];
 
-const TERMINAL_WORKER_STATUSES = new Set(["succeeded", "failed"]);
+const TERMINAL_WORKER_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
 const TASK_MUTATION_PATTERN =
   /修复|新增|更新|补齐|建立|修改|改动|创建|写入|补充|fix|repair|add|create|update|modify|patch|implement/i;
 const READ_ONLY_TASK_PATTERN =
@@ -63,8 +63,12 @@ export const WORKER_JOB_CONTRACT_FIELDS = [
   "workflow_stage",
   "final_report_status",
   "effective_final_status",
+  "failure_code",
+  "failure_stage",
   "changed_files",
   "git_commit_sha",
+  "next_batch",
+  "completed_at",
   "pushed",
   "deploy_status",
 ] as const;
@@ -77,6 +81,48 @@ const AUTOMATION_WRITE_TASK_PATTERN =
 const READ_ONLY_BATCH_PATTERN =
   /\bBATCH-QA(?:-[A-Z0-9]+)*\b|\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const WORKER_BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
+const TRUE_TASK_FAILURE_CODES = new Set([
+  "TEST_FAILED",
+  "TYPESCRIPT_FAILED",
+  "OUT_OF_SCOPE_CHANGE",
+  "CONTEXT_RECONSTRUCT_FAILED",
+  "GIT_COMMIT_FAILED",
+  "GIT_PUSH_FAILED",
+]);
+const NON_TASK_FAILURE_CODES = new Set([
+  "FEISHU_RATE_LIMIT",
+  "FEISHU_SEND_FAILED",
+  "BITABLE_RECORD_MISSING",
+  "BITABLE_SYNC_FAILED",
+  "DUPLICATE_REPORT",
+  "PROGRESS_REPORT_FAILED",
+]);
+const NON_TASK_FAILURE_PATTERNS = [
+  {
+    code: "FEISHU_RATE_LIMIT",
+    pattern: /(?:feishu|飞书|bitable|多维表).*(?:rate|limit|429|限流)|(?:HTTP\s*)?429|too many requests/i,
+  },
+  {
+    code: "FEISHU_SEND_FAILED",
+    pattern: /(?:feishu|飞书).*(?:send|发送).*(?:fail|failed|失败)|飞书发送失败/i,
+  },
+  {
+    code: "BITABLE_RECORD_MISSING",
+    pattern: /bitable_record_id.*(?:missing|null|缺失)|(?:missing|缺失).*bitable_record_id|skipped_no_record_id/i,
+  },
+  {
+    code: "BITABLE_SYNC_FAILED",
+    pattern: /(?:bitable|多维表).*(?:sync|同步).*(?:fail|failed|失败)|feishu-worker-sync.*failed/i,
+  },
+  {
+    code: "DUPLICATE_REPORT",
+    pattern: /duplicate report|terminal_job_report_ignored|idempotent.*report|重复\s*report|重复上报/i,
+  },
+  {
+    code: "PROGRESS_REPORT_FAILED",
+    pattern: /progress.*(?:report|上报).*(?:fail|failed|失败)|任务进度上报失败|\/api\/worker\/progress/i,
+  },
+];
 const WORKER_BATCH_RELEVANT_LINE_PATTERN =
   /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
 const WORKER_BATCH_FORBIDDEN_FRAGMENT_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden|不执行/i;
@@ -137,7 +183,7 @@ function decodeOriginalRequestTextBase64(value: unknown): string | null {
 }
 
 const WORKER_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|original_request_text(?:_base64)?|route|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|changed_files|git_commit_sha|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|original_request_text(?:_base64)?|route|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName: string): string {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -274,8 +320,12 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "workflow_stage",
   "final_report_status",
   "effective_final_status",
+  "failure_code",
+  "failure_stage",
   "changed_files",
   "git_commit_sha",
+  "next_batch",
+  "completed_at",
   "pushed",
   "deploy_status",
 ];
@@ -482,8 +532,12 @@ function readPayloadContextField(
     worker_stage: ["worker_stage", "workerStage", "workflow_stage", "workflowStage"],
     final_report_status: ["final_report_status", "finalReportStatus"],
     effective_final_status: ["effective_final_status", "effectiveFinalStatus"],
+    failure_code: ["failure_code", "failureCode", "error_code", "errorCode"],
+    failure_stage: ["failure_stage", "failureStage"],
     changed_files: ["changed_files", "changedFiles", "files_changed", "filesChanged"],
     git_commit_sha: ["git_commit_sha", "gitCommitSha"],
+    next_batch: ["next_batch", "nextBatch"],
+    completed_at: ["completed_at", "completedAt"],
     pushed: ["pushed"],
     deploy_status: ["deploy_status", "deployStatus"],
   };
@@ -781,12 +835,298 @@ function truncateText(value: string, maxLength: number): string {
 }
 
 function readDiagnosticLine(content: string, label: string): string | null {
-  const line = content
-    .split(/\r?\n/)
-    .find((item) => item.trim().startsWith(`${label}：`) || item.trim().startsWith(`${label}:`));
+  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/_/g, "[_\\s-]*");
+  const pattern = new RegExp(`^\\s*${escapedLabel}\\s*[:=：]\\s*(.*?)\\s*$`, "i");
+  const line = content.split(/\r?\n/).find((item) => pattern.test(item.trim()));
 
   if (!line) return null;
-  return line.replace(new RegExp(`^\\s*${label}[：:]\\s*`), "").trim() || null;
+  const match = line.match(pattern);
+  return match?.[1]?.trim() || null;
+}
+
+function normalizeTerminalStatus(value: unknown): "queued" | "running" | "succeeded" | "failed" | "cancelled" | null {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (["success", "succeeded", "completed", "complete"].includes(text)) return "succeeded";
+  if (["fail", "failed", "error"].includes(text)) return "failed";
+  if (["cancel", "cancelled", "canceled"].includes(text)) return "cancelled";
+  if (["queued", "pending"].includes(text)) return "queued";
+  if (["running", "in_progress"].includes(text)) return "running";
+  return null;
+}
+
+function normalizeFailureCodeValue(value: unknown): string | null {
+  const text = readString(value);
+  if (!text || /^(null|none|n\/a)$/i.test(text)) return null;
+  const code = text
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .replace(/[^A-Za-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toUpperCase();
+  const aliases: Record<string, string> = {
+    TEST_FAILURE: "TEST_FAILED",
+    TESTS_FAILED: "TEST_FAILED",
+    NODE_TEST_FAILED: "TEST_FAILED",
+    TSC_FAILED: "TYPESCRIPT_FAILED",
+    TYPESCRIPT_CHECK_FAILED: "TYPESCRIPT_FAILED",
+    TYPECHECK_FAILED: "TYPESCRIPT_FAILED",
+    OUT_OF_SCOPE_BUSINESS_CHANGE: "OUT_OF_SCOPE_CHANGE",
+    OUT_OF_SCOPE_SYSTEM_CHANGE: "OUT_OF_SCOPE_CHANGE",
+    BUSINESS_PAGE_BOUNDARY_VIOLATION: "OUT_OF_SCOPE_CHANGE",
+    CONTEXT_FAILED: "CONTEXT_RECONSTRUCT_FAILED",
+    ORIGINAL_BATCH_CONTEXT_MISSING: "CONTEXT_RECONSTRUCT_FAILED",
+    COMMIT_FAILED: "GIT_COMMIT_FAILED",
+    PUSH_FAILED: "GIT_PUSH_FAILED",
+  };
+  return aliases[code] ?? code;
+}
+
+function classifyNonTaskFailureCode(text: unknown): string | null {
+  const raw = String(text ?? "");
+  for (const item of NON_TASK_FAILURE_PATTERNS) {
+    if (item.pattern.test(raw)) return item.code;
+  }
+  return null;
+}
+
+function classifyFailureCodeFromText(text: unknown): string | null {
+  const raw = String(text ?? "");
+  const nonTaskFailureCode = classifyNonTaskFailureCode(raw);
+  if (nonTaskFailureCode) return nonTaskFailureCode;
+  if (/node\s+--test|tests?\s+failed|test\s+failure|测试失败/i.test(raw)) return "TEST_FAILED";
+  if (/typescript|tsc|typecheck|TypeScript\s+检查失败/i.test(raw)) return "TYPESCRIPT_FAILED";
+  if (/context_reconstruct_failed\s*[:=：]\s*true|ORIGINAL_BATCH_CONTEXT_MISSING|上下文恢复失败|context.*(?:missing|failed|缺失|失败)/i.test(raw)) {
+    return "CONTEXT_RECONSTRUCT_FAILED";
+  }
+  if (/OUT_OF_SCOPE|BUSINESS_PAGE_BOUNDARY_VIOLATION|越界修改|范围边界/i.test(raw)) return "OUT_OF_SCOPE_CHANGE";
+  if (/git\s+commit|commit\s+失败|commit failed/i.test(raw)) return "GIT_COMMIT_FAILED";
+  if (/git\s+push|push\s+失败|push failed/i.test(raw)) return "GIT_PUSH_FAILED";
+  return null;
+}
+
+export function isTrueTaskFailureCode(code: unknown): boolean {
+  const normalized = normalizeFailureCodeValue(code);
+  return Boolean(normalized && TRUE_TASK_FAILURE_CODES.has(normalized));
+}
+
+function isNonTaskFailureCode(code: unknown): boolean {
+  const normalized = normalizeFailureCodeValue(code);
+  return Boolean(normalized && NON_TASK_FAILURE_CODES.has(normalized));
+}
+
+function extractNextBatchFromText(text: unknown): string | null {
+  const explicit = readDiagnosticLine(String(text ?? ""), "next_batch");
+  const match = String(explicit ?? text ?? "").match(/\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/i);
+  return match ? match[0].toUpperCase() : null;
+}
+
+function inferNextBatchFromBatchCode(batchCode: string | null): string | null {
+  const match = String(batchCode ?? "").trim().match(/^(BATCH-[A-Z]+-)(\d+)$/i);
+  if (!match) return null;
+  return `${match[1].toUpperCase()}${String(Number(match[2]) + 1).padStart(match[2].length, "0")}`;
+}
+
+export function buildTerminalJobIndex(finalResult: Record<string, unknown>): Record<string, unknown> {
+  return {
+    job_id: readString(finalResult.job_id),
+    approved_batch: readString(finalResult.approved_batch),
+    effective_final_status: readString(finalResult.effective_final_status),
+    failure_code: readString(finalResult.failure_code),
+    git_commit_sha: readString(finalResult.git_commit_sha),
+    next_batch: readString(finalResult.next_batch),
+    completed_at: readString(finalResult.completed_at),
+  };
+}
+
+function buildFailureMemoryStatus(finalResult: Record<string, unknown>): string {
+  const status = normalizeTerminalStatus(finalResult.effective_final_status);
+  const failureCode = normalizeFailureCodeValue(finalResult.failure_code);
+  if (status === "succeeded") return "skipped_success";
+  if (status === "cancelled") return "skipped_cancelled";
+  if (status !== "failed") return "skipped_non_terminal";
+  if (!failureCode || isNonTaskFailureCode(failureCode)) return "skipped_non_task_failure";
+  return isTrueTaskFailureCode(failureCode) ? "recordable" : "skipped_non_task_failure";
+}
+
+export function buildAutoIterationSuggestion(finalResult: Record<string, unknown>): Record<string, unknown> {
+  const status = normalizeTerminalStatus(finalResult.effective_final_status);
+  const failureCode = normalizeFailureCodeValue(finalResult.failure_code);
+  if (status === "succeeded") {
+    const nextBatch = readString(finalResult.next_batch);
+    return nextBatch
+      ? { action: "continue", next_batch: nextBatch, reason: "succeeded_next_batch" }
+      : { action: "none", reason: "succeeded_without_next_batch" };
+  }
+  if (status === "failed") {
+    if (!isTrueTaskFailureCode(failureCode)) {
+      return { action: "none", reason: "non_task_failure" };
+    }
+    const approvedBatch = readString(finalResult.approved_batch);
+    return {
+      action: "repair",
+      suggested_batch: approvedBatch ? `${approvedBatch}-FIX` : "BATCH-REPAIR",
+      failure_code: failureCode,
+      failure_stage: readString(finalResult.failure_stage),
+      reason: "minimal_repair_batch",
+    };
+  }
+  if (status === "cancelled") return { action: "none", reason: "cancelled" };
+  return { action: "none", reason: "non_terminal" };
+}
+
+export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
+  job?: JobRecord | null;
+  job_id?: string | null;
+  approved_batch?: string | null;
+  status?: string | null;
+  finalReportStatus?: string | null;
+  final_report_status?: string | null;
+  effectiveFinalStatus?: string | null;
+  effective_final_status?: string | null;
+  previousEffectiveFinalStatus?: string | null;
+  resultText?: string | null;
+  errorText?: string | null;
+  failureCode?: string | null;
+  failure_code?: string | null;
+  failureStage?: string | null;
+  failure_stage?: string | null;
+  gitCommitSha?: string | null;
+  git_commit_sha?: string | null;
+  nextBatch?: string | null;
+  next_batch?: string | null;
+  completedAt?: string | null;
+  completed_at?: string | null;
+  approvedBatch?: string | null;
+}): Record<string, unknown> {
+  const job = input.job ?? null;
+  const jobResult = readRecord(job?.result);
+  const projectDirectorReport = readRecord(jobResult?.project_director_report);
+  const reportText = [input.resultText, input.errorText].filter(Boolean).join("\n");
+  const requestedStatus =
+    input.effectiveFinalStatus ??
+    input.effective_final_status ??
+    readString(projectDirectorReport?.effective_final_status) ??
+    readDiagnosticLine(reportText, "effective_final_status") ??
+    input.status ??
+    input.final_report_status ??
+    input.finalReportStatus;
+  const nonTaskFailureCode = classifyNonTaskFailureCode(reportText);
+  const effectiveFinalStatus =
+    normalizeTerminalStatus(requestedStatus) === "failed" && nonTaskFailureCode
+      ? normalizeTerminalStatus(input.previousEffectiveFinalStatus) ?? "running"
+      : normalizeTerminalStatus(requestedStatus) ?? "running";
+  const approvedBatch =
+    readString(input.approvedBatch) ??
+    readString(input.approved_batch) ??
+    readString(projectDirectorReport?.approved_batch) ??
+    getJobBatchCode(job);
+  const failureCode =
+    effectiveFinalStatus === "failed"
+      ? normalizeFailureCodeValue(
+          input.failureCode ??
+            input.failure_code ??
+            readString(projectDirectorReport?.failure_code) ??
+            readDiagnosticLine(reportText, "failure_code") ??
+            readDiagnosticLine(reportText, "error_code") ??
+            classifyFailureCodeFromText(reportText)
+        )
+      : null;
+  const failureStage =
+    effectiveFinalStatus === "failed"
+      ? readString(input.failureStage) ??
+        readString(input.failure_stage) ??
+        readString(projectDirectorReport?.failure_stage) ??
+        readDiagnosticLine(reportText, "failure_stage") ??
+        readDiagnosticLine(reportText, "失败阶段")
+      : null;
+  const nextBatch =
+    readString(input.nextBatch) ??
+    readString(input.next_batch) ??
+    readString(projectDirectorReport?.next_batch) ??
+    extractNextBatchFromText(reportText) ??
+    (effectiveFinalStatus === "succeeded" ? inferNextBatchFromBatchCode(approvedBatch) : null);
+  const finalResult = {
+    job_id: readString(input.job_id) ?? readString(job?.id) ?? readString(job?.job_id),
+    approved_batch: approvedBatch,
+    final_report_status: normalizeTerminalStatus(input.final_report_status ?? input.finalReportStatus ?? input.status),
+    effective_final_status: effectiveFinalStatus,
+    failure_code: failureCode,
+    failure_stage: failureStage,
+    git_commit_sha:
+      readString(input.gitCommitSha) ??
+      readString(input.git_commit_sha) ??
+      readString(projectDirectorReport?.git_commit_sha) ??
+      readString(job?.git_commit_sha),
+    next_batch: nextBatch,
+    completed_at:
+      readString(input.completedAt) ??
+      readString(input.completed_at) ??
+      readString(projectDirectorReport?.completed_at) ??
+      readString(job?.completed_at),
+  };
+  return {
+    ...finalResult,
+    failure_memory_status: buildFailureMemoryStatus(finalResult),
+    terminal_index: buildTerminalJobIndex(finalResult),
+    auto_iteration_suggestion: buildAutoIterationSuggestion(finalResult),
+  };
+}
+
+function terminalIndexKey(finalResult: Record<string, unknown>): string {
+  return `${readString(finalResult.job_id) ?? "unknown-job"}::${readString(finalResult.approved_batch) ?? "unknown-batch"}`;
+}
+
+export function recordTerminalJobIndex(
+  index: Record<string, unknown> | null | undefined,
+  finalResult: Record<string, unknown>
+): { index: Record<string, unknown>; entry: Record<string, unknown> | null; status: string; idempotent: boolean } {
+  const nextIndex = index && typeof index === "object" ? { ...index } : {};
+  const normalizedFinalResult = normalizeWorkerFinalResult(finalResult);
+  const status = normalizeTerminalStatus(normalizedFinalResult.effective_final_status);
+  if (!["succeeded", "failed", "cancelled"].includes(status ?? "")) {
+    return { index: nextIndex, entry: null, status: "skipped_non_terminal", idempotent: false };
+  }
+  const key = terminalIndexKey(normalizedFinalResult);
+  const existing = readRecord(nextIndex[key]);
+  if (existing) return { index: nextIndex, entry: existing, status: "duplicate", idempotent: true };
+  const entry = buildTerminalJobIndex(normalizedFinalResult);
+  return { index: { ...nextIndex, [key]: entry }, entry, status: "recorded", idempotent: false };
+}
+
+export function recordFailureMemoryForFinalResult(
+  memory: Record<string, unknown> | null | undefined,
+  finalResult: Record<string, unknown>,
+  now = new Date().toISOString()
+): { memory: Record<string, unknown>; entry: Record<string, unknown> | null; status: string; recorded: boolean; idempotent: boolean } {
+  const nextMemory = memory && typeof memory === "object" ? { ...memory } : {};
+  const normalizedFinalResult = normalizeWorkerFinalResult(finalResult);
+  const memoryStatus = buildFailureMemoryStatus(normalizedFinalResult);
+  if (memoryStatus !== "recordable") {
+    return { memory: nextMemory, entry: null, status: memoryStatus, recorded: false, idempotent: false };
+  }
+  const key = terminalIndexKey(normalizedFinalResult);
+  const events = readRecord(nextMemory.__task_failure_events) ?? {};
+  const existing = readRecord(events[key]);
+  if (existing) {
+    return { memory: nextMemory, entry: existing, status: "duplicate", recorded: false, idempotent: true };
+  }
+  const entry = {
+    ...buildTerminalJobIndex(normalizedFinalResult),
+    failure_stage: readString(normalizedFinalResult.failure_stage),
+    recorded_at: now,
+  };
+  return {
+    memory: {
+      ...nextMemory,
+      __task_failure_events: {
+        ...events,
+        [key]: entry,
+      },
+    },
+    entry,
+    status: "recorded",
+    recorded: true,
+    idempotent: false,
+  };
 }
 
 function isActionableEngineeringFailure(errorText: string): boolean {
@@ -1030,8 +1370,12 @@ export function buildWorkerJobPayloadContract(input: {
   workflowStage?: string | null;
   finalReportStatus?: string | null;
   effectiveFinalStatus?: string | null;
+  failureCode?: string | null;
+  failureStage?: string | null;
   changedFiles?: unknown;
   gitCommitSha?: string | null;
+  nextBatch?: string | null;
+  completedAt?: string | null;
   pushed?: boolean | null;
   deployStatus?: string | null;
 }): Record<string, unknown> {
@@ -1209,8 +1553,25 @@ export function buildWorkerJobPayloadContract(input: {
       readString(input.effectiveFinalStatus) ??
       readString(readPriorityField("effective_final_status")) ??
       null,
+    failure_code:
+      readString(input.failureCode) ??
+      readString(readPriorityField("failure_code")) ??
+      null,
+    failure_stage:
+      readString(input.failureStage) ??
+      readString(readPriorityField("failure_stage")) ??
+      null,
     changed_files: changedFiles,
     git_commit_sha: gitCommitSha ?? null,
+    next_batch:
+      readString(input.nextBatch) ??
+      readString(readPriorityField("next_batch")) ??
+      null,
+    completed_at:
+      readString(input.completedAt) ??
+      readString(readPriorityField("completed_at")) ??
+      readString(job?.completed_at) ??
+      null,
     pushed,
     deploy_status:
       readString(input.deployStatus) ??
@@ -1223,7 +1584,7 @@ export function buildProjectDirectorWorkerReport(input: {
   job: JobRecord | null;
   workerId: string;
   attemptId: string | null;
-  status: "queued" | "running" | "succeeded" | "failed";
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
   projectName?: string | null;
   projectDir?: string | null;
   resultText?: string | null;
@@ -1337,7 +1698,7 @@ export function buildProjectDirectorWorkerReport(input: {
       !gitCommitSha);
   const committed = Boolean(gitCommitSha);
   const pushed = isGithubPushSuccess(githubPushStatus);
-  const effectiveFinalStatus =
+  const legacyEffectiveFinalStatus =
     readOnlyViolation ||
     noFixApplied ||
     outOfScopeBusinessChange ||
@@ -1347,14 +1708,46 @@ export function buildProjectDirectorWorkerReport(input: {
       : input.status === "succeeded"
         ? "succeeded"
         : input.status;
+  const rawFailureStage = input.status === "failed"
+    ? readDiagnosticLine(sanitizedError, "failure_stage") ??
+      readDiagnosticLine(sanitizedError, "失败阶段") ??
+      "not_provided"
+    : legacyEffectiveFinalStatus === "failed"
+      ? "task_goal_validation"
+      : null;
+  const normalizedFinalResult = normalizeWorkerFinalResult({
+    job: input.job,
+    status: input.status,
+    finalReportStatus: input.status,
+    effectiveFinalStatus: legacyEffectiveFinalStatus,
+    resultText: summary,
+    errorText: sanitizedError,
+    failureCode: legacyEffectiveFinalStatus === "failed" ? classifyFailureCodeFromText(combinedReportText) : null,
+    failureStage: rawFailureStage,
+    gitCommitSha,
+    nextBatch: extractNextBatchFromText(combinedReportText),
+    completedAt: input.status === "succeeded" || input.status === "failed"
+      ? new Date().toISOString()
+      : null,
+    approvedBatch: readString(contract.approved_batch) ?? batchCode,
+  });
+  const effectiveFinalStatus = readString(normalizedFinalResult.effective_final_status) ?? legacyEffectiveFinalStatus;
+  const failureCode = readString(normalizedFinalResult.failure_code);
+  const nextBatch = readString(normalizedFinalResult.next_batch);
+  const failureMemoryStatus = readString(normalizedFinalResult.failure_memory_status) ?? "skipped_non_terminal";
+  const terminalIndex =
+    readRecord(normalizedFinalResult.terminal_index) ?? buildTerminalJobIndex(normalizedFinalResult);
+  const autoIterationSuggestion =
+    readRecord(normalizedFinalResult.auto_iteration_suggestion) ??
+    buildAutoIterationSuggestion(normalizedFinalResult);
   needsBossConfirmation = effectiveFinalStatus === "succeeded";
-  const failureStage = input.status === "failed"
+  const failureStage = effectiveFinalStatus === "failed"
     ? readDiagnosticLine(sanitizedError, "失败阶段") ?? "未提供"
     : null;
-  const keyError = input.status === "failed"
+  const keyError = effectiveFinalStatus === "failed"
     ? readDiagnosticLine(sanitizedError, "关键错误") ?? truncateText(sanitizedError, 500)
     : null;
-  const failureSuggestion = input.status === "failed"
+  const failureSuggestion = effectiveFinalStatus === "failed"
     ? buildFailureNextStep(sanitizedError)
     : null;
   const workerExecutionStatus =
@@ -1385,6 +1778,13 @@ export function buildProjectDirectorWorkerReport(input: {
         : input.status === "failed"
           ? "failed"
           : "running";
+  const iterationNextStep = needsBossConfirmation
+    ? nextBatch
+      ? `Continue with ${nextBatch}.`
+      : "Succeeded; no next_batch was provided."
+    : readString(autoIterationSuggestion.suggested_batch)
+      ? `Create minimal repair batch ${autoIterationSuggestion.suggested_batch} for ${failureCode ?? "unknown_failure"}.`
+      : failureSuggestion ?? "No automatic repair batch is generated for this terminal state.";
 
   const data = {
     job_id: jobId,
@@ -1401,6 +1801,12 @@ export function buildProjectDirectorWorkerReport(input: {
     original_worker_status: input.status,
     final_report_status: input.status,
     effective_final_status: effectiveFinalStatus,
+    failure_memory_status: failureMemoryStatus,
+    failure_code: failureCode,
+    terminal_index: terminalIndex,
+    next_batch: nextBatch,
+    completed_at: readString(normalizedFinalResult.completed_at),
+    auto_iteration_suggestion: autoIterationSuggestion,
     status_title: statusTitle,
     context_source: readString(contract.context_source),
     context_reconstruct_failed: Boolean(contract.context_reconstruct_failed),
@@ -1441,9 +1847,7 @@ export function buildProjectDirectorWorkerReport(input: {
     deploy_status: input.deployStatus ?? null,
     safety_boundary: safetyBoundary,
     needs_boss_confirmation: needsBossConfirmation,
-    next_step: needsBossConfirmation
-      ? "可以进入下一批次；如本批次影响关键链路，请老板验收后再继续。"
-      : failureSuggestion ?? "需要老板查看失败原因后决定是否重试、扩大修改范围或调整需求。",
+    next_step: iterationNextStep,
     failure_stage: failureStage,
     key_error: keyError,
     repair_suggestion: failureSuggestion,
@@ -1478,6 +1882,10 @@ export function buildProjectDirectorWorkerReport(input: {
     `workflow_stage: ${data.workflow_stage}`,
     `final_report_status: ${input.status}`,
     `effective_final_status: ${effectiveFinalStatus}`,
+    `failure_memory_status: ${failureMemoryStatus}`,
+    `failure_code: ${failureCode ?? "null"}`,
+    `next_batch: ${nextBatch ?? "null"}`,
+    `completed_at: ${readString(normalizedFinalResult.completed_at) ?? "null"}`,
     `changed_files: ${filesChanged.length ? filesChanged.join(", ") : "[]"}`,
     `git_commit_sha: ${gitCommitSha ?? "null"}`,
     `pushed: ${pushed ? "true" : "false"}`,
@@ -1800,7 +2208,19 @@ function readNestedRecordId(value: unknown): string | null {
   return null;
 }
 
+function isStoredTerminalJobRecord(value: unknown): boolean {
+  const record = readRecord(value);
+  if (!record) return false;
+  if (!isTerminalWorkerStatus(record.status)) return false;
+  const result = readRecord(record.result);
+  return Boolean(result?.project_director_report_text || result?.project_director_report);
+}
+
 export function getBitableRecordId(...sources: unknown[]): string | null {
+  if (sources.length === 2 && isStoredTerminalJobRecord(sources[1])) {
+    return null;
+  }
+
   for (const source of sources) {
     const direct = readNestedRecordId(source);
     if (direct) return direct;

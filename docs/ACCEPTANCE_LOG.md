@@ -34,3 +34,12 @@
 - BATCH-22 项目治理整理可通过静态文件存在性和变更范围验收。
 - 本批不验收同城搭子网站页面 UI、运行效果、数据库、生产部署或飞书 live 回调。
 - 同城搭子网站下一步建议先开 BATCH-P3 静态验收/补齐任务；若老板确认 P3 已验收，再开 BATCH-P4。
+
+## BATCH-ARCH-09 Acceptance
+
+- Worker regression test: `node --test infra/windows-worker/tests/git-safety.test.js` passes with at least 166 tests and 0 failures.
+- TypeScript check: `npx tsc --noEmit --incremental false` passes.
+- Failure memory: true task failures are recordable; Feishu and bitable reporting failures are skipped.
+- Terminal idempotency: duplicate reports do not duplicate failure memory or terminal index entries.
+- `next_batch`: succeeded BATCH-ARCH-09 results preserve `BATCH-ARCH-10`.
+- Cancelled final results do not generate repair suggestions.
