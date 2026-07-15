@@ -121,3 +121,31 @@ Operational rules:
 - `original_request_text` must come from the current request or decoded `original_request_text_base64`; it must not be substituted from `docs/NEXT_TASK_CARD.md`, `docs/PROJECT_INDEX.md`, or historical batch docs.
 - `read_only` plus `changed_files=[]` is a valid completed read-only result.
 - Write-allowed tasks that finish with no changed files are `NO_FIX_APPLIED`, even when the raw Worker process exits successfully.
+
+## BATCH-ARCH-07 normalized context flow
+
+BATCH-ARCH-07 consolidates Worker context handling into one normalized context object. Windows Worker, Codex prompt generation, scope validation, task-goal validation, and final reporting must use the same normalized values.
+
+The normalized context carries:
+
+- `context_source`
+- `context_reconstruct_failed`
+- `project_domain`
+- `task_mode`
+- `read_only_mode`
+- `allowed_scope`
+- `forbidden_scope`
+- `original_request_text`
+- `route`
+- `payload`
+- `approved_batch`
+- `attempt_id`
+- `worker_stage`
+
+Context priority is fixed: explicit `HERMES_WORKER_CONTEXT`, structured payload, `original_request_text`, `request_text`, automatic classification, then historical context. Explicit context fields must not be overwritten by batch names, body keywords, historical tasks, default values, or report text.
+
+When two `HERMES_WORKER_CONTEXT` blocks appear, the Worker selects one preferred block and does not concatenate scopes. Decoded `original_request_text_base64` may restore the original Chinese demand text, but nested scope fields do not broaden the selected `allowed_scope`.
+
+If explicit context is missing, the Worker emits `CONTEXT_MISSING_WARNING` and records `context_source` as `payload`, `original_request_text`, `request_text`, or `automatic_classification`. It must not silently convert the task to product writing or read-only mode.
+
+Final Feishu reports must include the normalized context fields alongside files changed, validation results, commit SHA, and push status. Codex still does not perform Git writes; commit and push remain owned by the outer Worker.

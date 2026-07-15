@@ -355,6 +355,7 @@ const MISSING_REQUIRED_DOCS = "MISSING_REQUIRED_DOCS";
 const INSUFFICIENT_DOC_OUTPUT = "INSUFFICIENT_DOC_OUTPUT";
 const INCOMPLETE_QA_REPORT = "INCOMPLETE_QA_REPORT";
 const INCOMPLETE_ARCHITECTURE_REPORT = "INCOMPLETE_ARCHITECTURE_REPORT";
+const CONTEXT_MISSING_WARNING = "CONTEXT_MISSING_WARNING";
 
 const TASK_MODES = {
   READ_ONLY: "read_only",
@@ -1202,6 +1203,11 @@ function readBatchCodeField(job) {
 
 function getTaskMode(job) {
   try {
+    const normalized = normalizeWorkerContext(job);
+    if (normalized.task_mode) {
+      return normalized.task_mode;
+    }
+
     const directRequestText = readTextValue([
       job?.request_text,
       job?.requestText,
@@ -1462,7 +1468,7 @@ function isExplicitAutomationAllowedDocPath(filePath) {
 }
 
 const HERMES_CONTEXT_FIELD_PATTERN =
-  /\b(?:project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|route|original_request_text(?:_base64)?|approved_batch|attempt_id|workflow_stage|final_report_status|effective_final_status|changed_files|git_commit_sha|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|route|original_request_text(?:_base64)?|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|changed_files|git_commit_sha|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName) {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -1504,7 +1510,10 @@ function extractWorkerContextFieldValues(text, fieldName) {
       continue;
     }
 
-    values.push(stripWorkerContextValue(rawLine.slice(match.index + match[0].length)));
+    const rawValue = rawLine.slice(match.index + match[0].length);
+    const decodedValue = decodeEscapedWorkerContextText(rawValue).split(/\r?\n/)[0] || "";
+    const nextField = HERMES_CONTEXT_FIELD_PATTERN.exec(decodedValue);
+    values.push(stripWorkerContextValue(nextField ? decodedValue.slice(0, nextField.index) : decodedValue));
   }
 
   return values.filter(Boolean);
@@ -1627,6 +1636,506 @@ function readScopeValue(value) {
   return readString(value);
 }
 
+const WORKER_CONTEXT_FIELD_NAMES = [
+  "context_source",
+  "context_reconstruct_failed",
+  "project_domain",
+  "task_mode",
+  "read_only_mode",
+  "allowed_scope",
+  "forbidden_scope",
+  "original_request_text",
+  "original_request_text_base64",
+  "route",
+  "approved_batch",
+  "attempt_id",
+  "worker_stage",
+  "workflow_stage",
+  "final_report_status",
+  "effective_final_status",
+  "changed_files",
+  "git_commit_sha",
+  "pushed",
+  "deploy_status",
+];
+
+const WORKER_CONTEXT_CORE_FIELDS = [
+  "project_domain",
+  "task_mode",
+  "read_only_mode",
+  "allowed_scope",
+  "forbidden_scope",
+  "route",
+];
+
+function canonicalWorkerContextFieldName(fieldName) {
+  return fieldName === "workflow_stage" ? "worker_stage" : fieldName;
+}
+
+function parseWorkerContextFieldLine(rawLine) {
+  for (const fieldName of WORKER_CONTEXT_FIELD_NAMES) {
+    const pattern = new RegExp(
+      `(?:^|[^\\w-])${contextFieldNamePattern(fieldName)}\\s*[:=]\\s*`,
+      "i"
+    );
+    const match = pattern.exec(rawLine);
+    if (!match) {
+      continue;
+    }
+
+    const rawValue = rawLine.slice(match.index + match[0].length);
+    const decodedValue = decodeEscapedWorkerContextText(rawValue).split(/\r?\n/)[0] || "";
+    const nextField = HERMES_CONTEXT_FIELD_PATTERN.exec(decodedValue);
+    const value = stripWorkerContextValue(
+      nextField ? decodedValue.slice(0, nextField.index) : decodedValue
+    );
+    return {
+      fieldName: canonicalWorkerContextFieldName(fieldName),
+      value,
+    };
+  }
+
+  return null;
+}
+
+function parseWorkerContextFields(text) {
+  const fields = {};
+  const explicitFields = new Set();
+
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const parsed = parseWorkerContextFieldLine(rawLine.trim());
+    if (!parsed || !parsed.value) {
+      continue;
+    }
+
+    explicitFields.add(parsed.fieldName);
+
+    if (parsed.fieldName === "original_request_text_base64") {
+      fields.original_request_text_base64 = parsed.value;
+      const decoded = decodeOriginalRequestTextBase64(
+        parsed.value.match(/[A-Za-z0-9+/=]+/)?.[0] || ""
+      );
+      if (decoded) {
+        fields.original_request_text = decoded;
+        explicitFields.add("original_request_text");
+      }
+      continue;
+    }
+
+    fields[parsed.fieldName] = parsed.value;
+  }
+
+  return {
+    fields,
+    explicitFields,
+  };
+}
+
+function findOriginalDemandAnchor(text) {
+  const raw = String(text || "");
+  const markers = [
+    "【原始任务内容】",
+    "新需求",
+    "Original task",
+    "original_request_text",
+  ];
+  const indexes = markers
+    .map((marker) => raw.indexOf(marker))
+    .filter((index) => index >= 0);
+  return indexes.length > 0 ? Math.min(...indexes) : 0;
+}
+
+function extractHermesContextCandidatesFromText(text, options = {}) {
+  const raw = String(text || "");
+  if (!raw.trim()) {
+    return [];
+  }
+
+  const depth = options.depth || 0;
+  const sourceLabel = options.sourceLabel || "request_text";
+  const seen = options.seen || new Set();
+  const candidates = [];
+  const variants = [raw, decodeEscapedWorkerContextText(raw)];
+
+  for (const variant of variants) {
+    const normalizedVariant = variant.trim();
+    const seenKey = `${depth}:${sourceLabel}:${normalizedVariant}`;
+    if (!normalizedVariant || seen.has(seenKey)) {
+      continue;
+    }
+    seen.add(seenKey);
+
+    const lines = normalizedVariant.split(/\r?\n/);
+    const lineStarts = [];
+    let cursor = 0;
+    for (const line of lines) {
+      lineStarts.push(cursor);
+      cursor += line.length + 1;
+    }
+
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!/^\s*HERMES_WORKER_CONTEXT\s*[:：]\s*$/i.test(lines[index])) {
+        continue;
+      }
+
+      const blockLines = [];
+      for (let blockIndex = index + 1; blockIndex < lines.length; blockIndex += 1) {
+        if (/^\s*HERMES_WORKER_CONTEXT\s*[:：]\s*$/i.test(lines[blockIndex])) {
+          break;
+        }
+        blockLines.push(lines[blockIndex]);
+      }
+
+      const parsed = parseWorkerContextFields(blockLines.join("\n"));
+      const fieldCount = Object.keys(parsed.fields).filter((fieldName) =>
+        readString(parsed.fields[fieldName])
+      ).length;
+      if (fieldCount === 0) {
+        continue;
+      }
+
+      const anchor = findOriginalDemandAnchor(normalizedVariant);
+      const startIndex = lineStarts[index] || 0;
+      const coreMissing = WORKER_CONTEXT_CORE_FIELDS.filter(
+        (fieldName) => !readString(parsed.fields[fieldName])
+      ).length;
+
+      candidates.push({
+        fields: parsed.fields,
+        explicitFields: parsed.explicitFields,
+        depth,
+        sourceLabel,
+        startIndex,
+        distance: Math.abs(startIndex - anchor),
+        fieldCount,
+        coreMissing,
+      });
+    }
+
+    for (const nestedText of extractOriginalRequestTextsFromContext(normalizedVariant)) {
+      candidates.push(
+        ...extractHermesContextCandidatesFromText(nestedText, {
+          depth: depth + 1,
+          sourceLabel: "original_request_text",
+          seen,
+        })
+      );
+    }
+  }
+
+  return candidates;
+}
+
+function selectPreferredHermesContext(text) {
+  const candidates = extractHermesContextCandidatesFromText(text);
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  return candidates.sort((a, b) => {
+    if (a.coreMissing !== b.coreMissing) return a.coreMissing - b.coreMissing;
+    if (a.depth !== b.depth) return a.depth - b.depth;
+    if (a.distance !== b.distance) return a.distance - b.distance;
+    if (a.fieldCount !== b.fieldCount) return b.fieldCount - a.fieldCount;
+    return a.startIndex - b.startIndex;
+  })[0];
+}
+
+function readTextContextField(text, fieldName) {
+  const values = extractWorkerContextFieldValues(extractOriginalTaskBody(text), fieldName);
+  if (fieldName === "original_request_text") {
+    const base64Values = extractWorkerContextFieldValues(
+      extractOriginalTaskBody(text),
+      "original_request_text_base64"
+    );
+    const decoded = base64Values
+      .map((value) => decodeOriginalRequestTextBase64(value.match(/[A-Za-z0-9+/=]+/)?.[0] || ""))
+      .filter(Boolean);
+    if (decoded.length > 0) {
+      return decoded[decoded.length - 1];
+    }
+  }
+
+  return values.length > 0 ? values[values.length - 1] : null;
+}
+
+function readPayloadContextField(payload, fieldName) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const aliases = {
+    project_domain: ["project_domain", "projectDomain"],
+    task_mode: ["task_mode", "taskMode"],
+    read_only_mode: ["read_only_mode", "readOnlyMode", "readonly", "read_only"],
+    allowed_scope: ["allowed_scope", "allowedScope", "allowed_files", "allowedFiles"],
+    forbidden_scope: ["forbidden_scope", "forbiddenScope", "forbidden_files", "forbiddenFiles"],
+    original_request_text: [
+      "original_request_text",
+      "originalRequestText",
+      "original_request_text_base64",
+      "originalRequestTextBase64",
+    ],
+    route: ["route"],
+    approved_batch: ["approved_batch", "approvedBatch", "batch_code", "batchCode"],
+    attempt_id: ["attempt_id", "attemptId"],
+    worker_stage: ["worker_stage", "workerStage", "workflow_stage", "workflowStage"],
+    final_report_status: ["final_report_status", "finalReportStatus"],
+    effective_final_status: ["effective_final_status", "effectiveFinalStatus"],
+    changed_files: ["changed_files", "changedFiles", "files_changed", "filesChanged"],
+    git_commit_sha: ["git_commit_sha", "gitCommitSha"],
+    pushed: ["pushed"],
+    deploy_status: ["deploy_status", "deployStatus"],
+  };
+
+  for (const key of aliases[fieldName] || [fieldName]) {
+    const value = payload[key];
+    if (
+      fieldName === "original_request_text" &&
+      (key === "original_request_text_base64" || key === "originalRequestTextBase64")
+    ) {
+      const decoded = decodeOriginalRequestTextBase64(value);
+      if (decoded) return decoded;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      const scopeValue = readScopeValue(value);
+      if (scopeValue) return scopeValue;
+      continue;
+    }
+    if (typeof value === "boolean" || typeof value === "number") {
+      return value;
+    }
+    const text = readString(value);
+    if (text) return text;
+  }
+
+  return null;
+}
+
+function hasPayloadContext(payload) {
+  return Boolean(
+    payload &&
+      typeof payload === "object" &&
+      WORKER_CONTEXT_CORE_FIELDS.some((fieldName) =>
+        readPayloadContextField(payload, fieldName) !== null
+      )
+  );
+}
+
+function hasStructuredPayloadContext(payload) {
+  return Boolean(
+    payload &&
+      typeof payload === "object" &&
+      (readPayloadContextField(payload, "route") !== null ||
+        readPayloadContextField(payload, "allowed_scope") !== null ||
+        readPayloadContextField(payload, "forbidden_scope") !== null ||
+        readPayloadContextField(payload, "original_request_text") !== null ||
+        readPayloadContextField(payload, "approved_batch") !== null ||
+        readPayloadContextField(payload, "worker_stage") !== null ||
+        readPayloadContextField(payload, "final_report_status") !== null)
+  );
+}
+
+function getOriginalRequestTextFallback(job, payload, result, overrides) {
+  return (
+    readString(overrides.originalRequestText) ||
+    readPayloadContextField(payload, "original_request_text") ||
+    readPayloadContextField(result, "original_request_text") ||
+    readString(job?.original_request_text) ||
+    readString(job?.originalRequestText) ||
+    decodeOriginalRequestTextBase64(job?.original_request_text_base64) ||
+    decodeOriginalRequestTextBase64(job?.originalRequestTextBase64) ||
+    null
+  );
+}
+
+function normalizeWorkerContext(job, overrides = {}) {
+  const payload = job && typeof job.payload === "object" ? job.payload : null;
+  const result = job && typeof job.result === "object" ? job.result : null;
+  const requestText = readTextValue([
+    job?.request_text,
+    job?.requestText,
+    overrides.requestText,
+  ]);
+  const fallbackOriginalRequest = getOriginalRequestTextFallback(
+    job,
+    payload,
+    result,
+    overrides
+  );
+  const sourceText = readTextValue([
+    requestText,
+    fallbackOriginalRequest,
+    getJobText(job),
+  ]);
+  const explicitContext = selectPreferredHermesContext(sourceText);
+  const explicitFields = explicitContext?.fields || {};
+  const explicitOriginalRequestText = readLatestOriginalRequestTextFromContexts(sourceText);
+  const originalRequestText =
+    readString(explicitFields.original_request_text) ||
+    explicitOriginalRequestText ||
+    readString(fallbackOriginalRequest) ||
+    readTextContextField(requestText, "original_request_text") ||
+    readString(requestText) ||
+    "";
+  const originalRequestTextFields = {
+    project_domain: readTextContextField(fallbackOriginalRequest, "project_domain"),
+    task_mode: readTextContextField(fallbackOriginalRequest, "task_mode"),
+    read_only_mode: readTextContextField(fallbackOriginalRequest, "read_only_mode"),
+    allowed_scope: readTextContextField(fallbackOriginalRequest, "allowed_scope"),
+    forbidden_scope: readTextContextField(fallbackOriginalRequest, "forbidden_scope"),
+    route: readTextContextField(fallbackOriginalRequest, "route"),
+    approved_batch: readTextContextField(fallbackOriginalRequest, "approved_batch"),
+  };
+  const requestTextFields = {
+    project_domain: readTextContextField(requestText, "project_domain"),
+    task_mode: readTextContextField(requestText, "task_mode"),
+    read_only_mode: readTextContextField(requestText, "read_only_mode"),
+    allowed_scope: readTextContextField(requestText, "allowed_scope"),
+    forbidden_scope: readTextContextField(requestText, "forbidden_scope"),
+    route: readTextContextField(requestText, "route"),
+    approved_batch: readTextContextField(requestText, "approved_batch"),
+  };
+  const overrideFields = {
+    project_domain: overrides.projectDomain,
+    task_mode: overrides.taskMode,
+    read_only_mode: overrides.readOnlyMode,
+    allowed_scope: readScopeValue(overrides.allowedScope),
+    forbidden_scope: readScopeValue(overrides.forbiddenScope),
+    route: overrides.route,
+    approved_batch: overrides.approvedBatch,
+  };
+  const structuredPayload = hasStructuredPayloadContext(payload);
+  const payloadField = (fieldName) => {
+    const payloadValue = readPayloadContextField(payload, fieldName);
+    if (payloadValue !== null && payloadValue !== undefined) {
+      return payloadValue;
+    }
+    return readPayloadContextField(result, fieldName);
+  };
+  const readPriorityField = (fieldName) =>
+    readString(explicitFields[fieldName]) ||
+    (structuredPayload ? payloadField(fieldName) : null) ||
+    readString(originalRequestTextFields[fieldName]) ||
+    readString(requestTextFields[fieldName]) ||
+    (!structuredPayload ? payloadField(fieldName) : null) ||
+    readString(overrideFields[fieldName]);
+  const explicitTaskMode = normalizeTaskModeValue(readPriorityField("task_mode"));
+  const explicitReadOnlyMode =
+    readNullableBooleanFlag(explicitFields.read_only_mode) ??
+    (structuredPayload ? readNullableBooleanFlag(payloadField("read_only_mode")) : null) ??
+    readNullableBooleanFlag(originalRequestTextFields.read_only_mode) ??
+    readNullableBooleanFlag(requestTextFields.read_only_mode) ??
+    (typeof overrides.readOnlyMode === "boolean" ? overrides.readOnlyMode : null);
+  const approvedBatch =
+    readString(readPriorityField("approved_batch")) ||
+    getJobBatchCode(
+      Object.assign({}, job || {}, {
+        request_text: [originalRequestText, requestText].join("\n"),
+      })
+    );
+  const classificationText = [originalRequestText, requestText, approvedBatch].filter(Boolean).join("\n");
+  const currentBatchIsQa = approvedBatch && QA_BATCH_PATTERN.test(approvedBatch);
+  const productRepairRequest =
+    !currentBatchIsQa && isBatchFixProductTaskText(classificationText);
+  const forceReadOnlyMode =
+    explicitReadOnlyMode === true &&
+    !(productRepairRequest && explicitTaskMode !== TASK_MODES.READ_ONLY);
+  const inferredTaskMode =
+    getTaskModeFromText(classificationText) ||
+    TASK_MODES.READ_ONLY;
+  const taskMode =
+    forceReadOnlyMode || explicitTaskMode === TASK_MODES.READ_ONLY
+      ? TASK_MODES.READ_ONLY
+      : explicitTaskMode || inferredTaskMode;
+  const readOnlyMode = productRepairRequest && explicitTaskMode !== TASK_MODES.READ_ONLY
+    ? false
+    : explicitReadOnlyMode ?? taskMode === TASK_MODES.READ_ONLY;
+  const projectDomain =
+    readString(readPriorityField("project_domain")) ||
+    classifyWorkerTaskDomain([originalRequestText, requestText].join("\n"));
+  const allowedScope = readString(readPriorityField("allowed_scope")) || null;
+  const forbiddenScope = readString(readPriorityField("forbidden_scope")) || null;
+  const route = readString(readPriorityField("route")) || null;
+  const contextSource = explicitContext
+    ? "explicit_hermes_worker_context"
+    : hasStructuredPayloadContext(payload) || hasPayloadContext(payload)
+    ? "payload"
+    : WORKER_CONTEXT_CORE_FIELDS.some((fieldName) => originalRequestTextFields[fieldName])
+    ? "original_request_text"
+    : WORKER_CONTEXT_CORE_FIELDS.some((fieldName) => requestTextFields[fieldName])
+    ? "request_text"
+    : "automatic_classification";
+  const contextWarnings =
+    contextSource === "explicit_hermes_worker_context"
+      ? []
+      : [`${CONTEXT_MISSING_WARNING}: explicit HERMES_WORKER_CONTEXT missing; using ${contextSource}`];
+  const contextReconstructFailed = Boolean(
+    !projectDomain ||
+      !taskMode ||
+      readOnlyMode === null ||
+      (taskMode !== TASK_MODES.READ_ONLY && !allowedScope)
+  );
+  const changedFiles = uniqueSortedPaths(
+    readStringList(
+      overrides.changedFiles ??
+        readPayloadContextField(payload, "changed_files") ??
+        readPayloadContextField(result, "changed_files")
+    )
+  );
+  const pushed =
+    typeof overrides.pushed === "boolean"
+      ? overrides.pushed
+      : readNullableBooleanFlag(readPriorityField("pushed")) ?? false;
+  const workerStage =
+    readString(overrides.workerStage) ||
+    readString(overrides.workflowStage) ||
+    readString(readPriorityField("worker_stage"));
+
+  return {
+    context_source: contextSource,
+    context_reconstruct_failed: contextReconstructFailed,
+    context_warnings: contextWarnings,
+    project_domain: projectDomain,
+    ["task_" + "mode"]: taskMode,
+    read_only_mode: readOnlyMode,
+    allowed_scope: allowedScope,
+    forbidden_scope: forbiddenScope,
+    original_request_text: originalRequestText,
+    route,
+    payload: payload || null,
+    approved_batch: approvedBatch || null,
+    attempt_id:
+      readString(overrides.attemptId) ||
+      readString(readPriorityField("attempt_id")) ||
+      readString(job?.attempt_id) ||
+      readString(job?.active_attempt_id) ||
+      null,
+    worker_stage: workerStage,
+    workflow_stage: workerStage,
+    final_report_status:
+      readString(overrides.finalReportStatus) ||
+      readString(readPriorityField("final_report_status")) ||
+      null,
+    effective_final_status:
+      readString(overrides.effectiveFinalStatus) ||
+      readString(readPriorityField("effective_final_status")) ||
+      null,
+    changed_files: changedFiles,
+    git_commit_sha:
+      readString(overrides.gitCommitSha) ||
+      readString(readPriorityField("git_commit_sha")) ||
+      readString(job?.git_commit_sha) ||
+      null,
+    pushed,
+    deploy_status:
+      readString(overrides.deployStatus) ||
+      readString(readPriorityField("deploy_status")) ||
+      null,
+  };
+}
+
 function readLatestWorkerContextFieldValue(text, fieldName) {
   const values = expandWorkerContextTexts(text).flatMap((contextText) =>
     extractWorkerContextFieldValues(contextText, fieldName)
@@ -1648,153 +2157,7 @@ function readLatestOriginalRequestTextFromContexts(text) {
 }
 
 function resolveWorkerJobContract(job, overrides = {}) {
-  const payload = job && typeof job.payload === "object" ? job.payload : null;
-  const result = job && typeof job.result === "object" ? job.result : null;
-  const requestText = readTextValue([
-    job?.request_text,
-    job?.requestText,
-    overrides.requestText,
-  ]);
-  const sourceText = readTextValue([
-    requestText,
-    getJobText(job),
-    overrides.originalRequestText,
-  ]);
-  const originalRequestText =
-    readLatestOriginalRequestTextFromContexts(sourceText) ||
-    readString(overrides.originalRequestText) ||
-    readString(payload?.original_request_text) ||
-    readString(payload?.originalRequestText) ||
-    decodeOriginalRequestTextBase64(payload?.original_request_text_base64) ||
-    decodeOriginalRequestTextBase64(payload?.originalRequestTextBase64) ||
-    readString(job?.original_request_text) ||
-    readString(job?.originalRequestText) ||
-    decodeOriginalRequestTextBase64(job?.original_request_text_base64) ||
-    decodeOriginalRequestTextBase64(job?.originalRequestTextBase64) ||
-    readString(requestText) ||
-    "";
-  const explicitTaskMode =
-    normalizeTaskModeValue(readLatestWorkerContextFieldValue(sourceText, "task_mode")) ||
-    normalizeTaskModeValue(overrides.taskMode) ||
-    normalizeTaskModeValue(payload?.task_mode) ||
-    normalizeTaskModeValue(payload?.taskMode) ||
-    normalizeTaskModeValue(result?.task_mode) ||
-    normalizeTaskModeValue(result?.taskMode);
-  const explicitReadOnlyMode =
-    readNullableBooleanFlag(readLatestWorkerContextFieldValue(sourceText, "read_only_mode")) ??
-    (typeof overrides.readOnlyMode === "boolean" ? overrides.readOnlyMode : null) ??
-    readNullableBooleanFlag(payload?.read_only_mode) ??
-    readNullableBooleanFlag(payload?.readOnlyMode) ??
-    readNullableBooleanFlag(result?.read_only_mode) ??
-    readNullableBooleanFlag(result?.readOnlyMode);
-  const taskMode =
-    explicitReadOnlyMode === true || explicitTaskMode === TASK_MODES.READ_ONLY
-      ? TASK_MODES.READ_ONLY
-      : explicitTaskMode || getTaskMode(job);
-  const resolvedTaskMode = taskMode;
-  const readOnlyMode = explicitReadOnlyMode ?? taskMode === TASK_MODES.READ_ONLY;
-  const projectDomain =
-    readLatestWorkerContextFieldValue(sourceText, "project_domain") ||
-    readString(overrides.projectDomain) ||
-    readString(payload?.project_domain) ||
-    readString(payload?.projectDomain) ||
-    readString(result?.project_domain) ||
-    readString(result?.projectDomain) ||
-    getEffectiveProjectDomain(job) ||
-    classifyWorkerTaskDomain(sourceText);
-  const approvedBatch =
-    readLatestWorkerContextFieldValue(sourceText, "approved_batch") ||
-    readString(overrides.approvedBatch) ||
-    readString(payload?.approved_batch) ||
-    readString(payload?.approvedBatch) ||
-    readString(payload?.batch_code) ||
-    readString(payload?.batchCode) ||
-    getJobBatchCode(job);
-  const changedFiles = uniqueSortedPaths(
-    readStringList(
-      overrides.changedFiles ??
-        payload?.changed_files ??
-        payload?.files_changed ??
-        result?.changed_files ??
-        result?.files_changed
-    )
-  );
-  const pushed =
-    typeof overrides.pushed === "boolean"
-      ? overrides.pushed
-      : readNullableBooleanFlag(readLatestWorkerContextFieldValue(sourceText, "pushed")) ??
-        readNullableBooleanFlag(payload?.pushed) ??
-        readNullableBooleanFlag(result?.pushed) ??
-        false;
-
-  return {
-    project_domain: projectDomain,
-    task_mode: resolvedTaskMode,
-    read_only_mode: readOnlyMode,
-    allowed_scope:
-      readMergedWorkerContextFieldValue(sourceText, "allowed_scope") ||
-      readScopeValue(overrides.allowedScope) ||
-      readScopeValue(payload?.allowed_scope) ||
-      readScopeValue(payload?.allowedScope) ||
-      readScopeValue(payload?.allowed_files) ||
-      readScopeValue(payload?.allowedFiles) ||
-      null,
-    forbidden_scope:
-      readMergedWorkerContextFieldValue(sourceText, "forbidden_scope") ||
-      readScopeValue(overrides.forbiddenScope) ||
-      readScopeValue(payload?.forbidden_scope) ||
-      readScopeValue(payload?.forbiddenScope) ||
-      readScopeValue(payload?.forbidden_files) ||
-      readScopeValue(payload?.forbiddenFiles) ||
-      null,
-    original_request_text: originalRequestText,
-    route:
-      readLatestWorkerContextFieldValue(sourceText, "route") ||
-      readString(overrides.route) ||
-      readString(payload?.route) ||
-      null,
-    payload: payload || null,
-    approved_batch: approvedBatch,
-    attempt_id:
-      readString(overrides.attemptId) ||
-      readLatestWorkerContextFieldValue(sourceText, "attempt_id") ||
-      readString(job?.attempt_id) ||
-      readString(job?.active_attempt_id) ||
-      readString(payload?.attempt_id) ||
-      readString(result?.attempt_id) ||
-      null,
-    workflow_stage:
-      readString(overrides.workflowStage) ||
-      readLatestWorkerContextFieldValue(sourceText, "workflow_stage") ||
-      readString(payload?.workflow_stage) ||
-      readString(result?.workflow_stage) ||
-      null,
-    final_report_status:
-      readString(overrides.finalReportStatus) ||
-      readLatestWorkerContextFieldValue(sourceText, "final_report_status") ||
-      readString(result?.final_report_status) ||
-      null,
-    effective_final_status:
-      readString(overrides.effectiveFinalStatus) ||
-      readLatestWorkerContextFieldValue(sourceText, "effective_final_status") ||
-      readString(result?.effective_final_status) ||
-      null,
-    changed_files: changedFiles,
-    git_commit_sha:
-      readString(overrides.gitCommitSha) ||
-      readLatestWorkerContextFieldValue(sourceText, "git_commit_sha") ||
-      readString(job?.git_commit_sha) ||
-      readString(payload?.git_commit_sha) ||
-      readString(result?.git_commit_sha) ||
-      null,
-    pushed,
-    deploy_status:
-      readString(overrides.deployStatus) ||
-      readLatestWorkerContextFieldValue(sourceText, "deploy_status") ||
-      readString(payload?.deploy_status) ||
-      readString(result?.deploy_status) ||
-      null,
-  };
+  return normalizeWorkerContext(job, overrides);
 }
 
 function formatWorkerJobContractLines(contract, options = {}) {
@@ -1805,6 +2168,8 @@ function formatWorkerJobContractLines(contract, options = {}) {
     : contract.original_request_text || "null";
   return [
     "[Worker job payload contract]",
+    `context_source: ${contract.context_source || "null"}`,
+    `context_reconstruct_failed: ${contract.context_reconstruct_failed ? "true" : "false"}`,
     `project_domain: ${contract.project_domain || "null"}`,
     `task_mode: ${contract.task_mode || "null"}`,
     `read_only_mode: ${contract.read_only_mode ? "true" : "false"}`,
@@ -1815,6 +2180,7 @@ function formatWorkerJobContractLines(contract, options = {}) {
     "payload: hermes_jobs.payload",
     `approved_batch: ${contract.approved_batch || "null"}`,
     `attempt_id: ${contract.attempt_id || "null"}`,
+    `worker_stage: ${contract.worker_stage || "null"}`,
     `workflow_stage: ${contract.workflow_stage || "null"}`,
     `final_report_status: ${contract.final_report_status || "null"}`,
     `effective_final_status: ${contract.effective_final_status || "null"}`,
@@ -1822,11 +2188,15 @@ function formatWorkerJobContractLines(contract, options = {}) {
     `git_commit_sha: ${contract.git_commit_sha || "null"}`,
     `pushed: ${contract.pushed ? "true" : "false"}`,
     `deploy_status: ${contract.deploy_status || "null"}`,
+    `context_warnings: ${contract.context_warnings?.length ? contract.context_warnings.join("; ") : "[]"}`,
   ];
 }
 
 function buildWorkerReportContractExtra(contract) {
   return {
+    context_source: contract.context_source,
+    context_reconstruct_failed: contract.context_reconstruct_failed,
+    context_warnings: contract.context_warnings || [],
     project_domain: contract.project_domain,
     task_mode: contract.task_mode,
     read_only_mode: contract.read_only_mode,
@@ -1835,6 +2205,7 @@ function buildWorkerReportContractExtra(contract) {
     original_request_text: contract.original_request_text,
     route: contract.route,
     approved_batch: contract.approved_batch,
+    worker_stage: contract.worker_stage,
     workflow_stage: contract.workflow_stage,
     final_report_status: contract.final_report_status,
     effective_final_status: contract.effective_final_status,
@@ -1856,6 +2227,19 @@ function isAutomationAllowedByExplicitScope(filePath, requestText) {
       isExplicitAutomationAllowedDocPath(allowedPath) &&
       normalizeGitPath(allowedPath) === normalized
   );
+}
+
+function buildNormalizedScopeText(contract) {
+  return [
+    contract?.allowed_scope ? `allowed_scope=${contract.allowed_scope}` : "",
+    contract?.forbidden_scope ? `forbidden_scope=${contract.forbidden_scope}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function extractScopeValuePaths(scopeValue) {
+  return uniqueSortedPaths(extractPathLikeTokens(` ${String(scopeValue || "")}`));
 }
 
 function isProductWriteAllowedPath(filePath) {
@@ -2508,13 +2892,23 @@ function assertGitOperationAllowed(args, options = {}) {
 }
 
 function assertTaskGoalApplied(job, changedPaths) {
-  const requestText = getJobText(job);
+  const contract = resolveWorkerJobContract(job);
+  const requestText = readTextValue([
+    contract.original_request_text,
+    job?.request_text,
+    job?.requestText,
+  ]);
+  const normalizedScopeText = buildNormalizedScopeText(contract);
   const taskDomain = classifyWorkerTaskDomain(requestText);
-  const taskMode = getTaskMode(job);
+  const taskMode = contract.task_mode;
   const requiredPaths = filterRequiredChangePathsForTask(
     extractRequiredChangePaths(requestText),
-    requestText,
+    normalizedScopeText || requestText,
     taskMode
+  ).filter((requiredPath) =>
+    !extractScopeValuePaths(contract.forbidden_scope).some((forbiddenPath) =>
+      pathConflictsWithForbiddenPath(requiredPath, forbiddenPath)
+    )
   );
   const normalizedChangedPaths = uniqueSortedPaths(changedPaths || []);
 
@@ -2621,7 +3015,7 @@ function assertTaskGoalApplied(job, changedPaths) {
   if (taskMode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED) {
     const isAllowedAutomationPath = (filePath) =>
       isAutomationWriteAllowedPath(filePath) ||
-      isAutomationAllowedByExplicitScope(filePath, requestText);
+      isAutomationAllowedByExplicitScope(filePath, normalizedScopeText || requestText);
     const outOfScopePaths = normalizedChangedPaths.filter(
       (filePath) => !isAllowedAutomationPath(filePath)
     );
@@ -3008,16 +3402,18 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
       requestText: taskText,
     }
   );
-  const promptTaskText = sanitizeProductTaskTextForPrompt(taskText, taskMode);
+  const effectiveTaskMode = contract.task_mode || taskMode;
+  const effectiveReadOnlyMode = contract.read_only_mode === true;
+  const promptTaskText = sanitizeProductTaskTextForPrompt(taskText, effectiveTaskMode);
   const readOnlyGuard =
-    taskMode === TASK_MODES.READ_ONLY
+    effectiveTaskMode === TASK_MODES.READ_ONLY
       ? buildReadOnlyGuard(taskText, {
-          force: options.readOnlyMode === true || taskMode === TASK_MODES.READ_ONLY,
+          force: effectiveReadOnlyMode || effectiveTaskMode === TASK_MODES.READ_ONLY,
         })
       : null;
   const qaReviewGuard = buildQaReviewGuard(taskText);
-  const architectureReviewGuard = buildArchitectureReviewGuard(taskText, taskMode);
-  const productWriteGuard = buildProductWriteGuard(taskText, taskMode);
+  const architectureReviewGuard = buildArchitectureReviewGuard(taskText, effectiveTaskMode);
+  const productWriteGuard = buildProductWriteGuard(taskText, effectiveTaskMode);
   const domainGuard = isAutomationSystemTask(taskText)
     ? [
         "【自动化系统任务边界】",
@@ -3042,12 +3438,15 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
     domainGuard,
     "",
     "【统一任务模式】",
-    `task_mode: ${taskMode}`,
-    `read_only_mode: ${taskMode === TASK_MODES.READ_ONLY ? "true" : "false"}`,
-    `can_write_files: ${taskMode === TASK_MODES.READ_ONLY ? "false" : "true"}`,
+    `task_mode: ${effectiveTaskMode}`,
+    `read_only_mode: ${effectiveReadOnlyMode ? "true" : "false"}`,
+    `can_write_files: ${effectiveReadOnlyMode ? "false" : "true"}`,
     "docs_write_allowed: only docs/** may change.",
     "automation_system_write_allowed: only approved automation-system files may change.",
     `product_write_allowed: may change ${PRODUCT_WRITE_ALLOWED_SCOPE_TEXT}.`,
+    "Codex may only modify files in allowed_scope and must respect forbidden_scope.",
+    "Codex must not run git add, git commit, or git push; the outer Worker owns Git writes.",
+    "read_only tasks must not write files.",
     "",
     ...formatWorkerJobContractLines(contract, { includeOriginalRequest: false }),
     "",
@@ -3064,6 +3463,7 @@ function buildCodexPrompt(job) {
   const contract = resolveWorkerJobContract(job, {
     taskMode: getTaskMode(job),
     readOnlyMode: isReadOnlyTask(job),
+    workerStage: "codex_prompt",
     workflowStage: "codex_prompt",
   });
   return buildWorkerGuardedPrompt(job?.request_text || "", {
@@ -3097,6 +3497,12 @@ function buildCodexRepairPrompt(job, error, attempt) {
     {
       readOnlyMode: isReadOnlyTask(job),
       taskMode: getTaskMode(job),
+      contract: resolveWorkerJobContract(job, {
+        taskMode: getTaskMode(job),
+        readOnlyMode: isReadOnlyTask(job),
+        workerStage: `codex_retry_${attempt}`,
+        workflowStage: `codex_retry_${attempt}`,
+      }),
     }
   );
 }
@@ -4006,8 +4412,12 @@ async function pollOnce() {
   );
   console.log(`任务内容：${job.request_text}`);
 
-  const taskModeForReport = getTaskMode(job);
-  const readOnlyMode = taskModeForReport === TASK_MODES.READ_ONLY;
+  const initialContract = resolveWorkerJobContract(job, {
+    attemptId,
+    workerStage: "claimed",
+  });
+  const taskModeForReport = initialContract.task_mode;
+  const readOnlyMode = initialContract.read_only_mode === true;
   currentReadOnlyMode = readOnlyMode;
   const stopHeartbeat = startHeartbeat(job.id, attemptId);
   let gitCheckpoint = null;
@@ -4189,6 +4599,7 @@ async function pollOnce() {
       attemptId,
       taskMode: taskModeForReport,
       readOnlyMode,
+      workerStage: "completed",
       workflowStage: "completed",
       finalReportStatus: "succeeded",
       effectiveFinalStatus: "succeeded",
@@ -4376,6 +4787,7 @@ async function pollOnce() {
       attemptId,
       taskMode: taskModeForReport,
       readOnlyMode,
+      workerStage: "failed",
       workflowStage: "failed",
       finalReportStatus: "failed",
       effectiveFinalStatus: "failed",
@@ -4568,6 +4980,7 @@ module.exports = {
   INSUFFICIENT_DOC_OUTPUT,
   INCOMPLETE_QA_REPORT,
   INCOMPLETE_ARCHITECTURE_REPORT,
+  CONTEXT_MISSING_WARNING,
   FAILURE_FINGERPRINTS,
   TASK_MODES,
   assertTaskGoalApplied,
@@ -4586,6 +4999,7 @@ module.exports = {
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
   getTaskMode,
+  normalizeWorkerContext,
   recordFailureMemory,
   resolveWorkerJobContract,
   getTaskChangedPaths,

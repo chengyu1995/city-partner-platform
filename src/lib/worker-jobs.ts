@@ -47,6 +47,8 @@ const TASK_MODES = {
   PRODUCT_WRITE_ALLOWED: "product_write_allowed",
 } as const;
 export const WORKER_JOB_CONTRACT_FIELDS = [
+  "context_source",
+  "context_reconstruct_failed",
   "project_domain",
   "task_mode",
   "read_only_mode",
@@ -57,6 +59,7 @@ export const WORKER_JOB_CONTRACT_FIELDS = [
   "payload",
   "approved_batch",
   "attempt_id",
+  "worker_stage",
   "workflow_stage",
   "final_report_status",
   "effective_final_status",
@@ -65,6 +68,7 @@ export const WORKER_JOB_CONTRACT_FIELDS = [
   "pushed",
   "deploy_status",
 ] as const;
+const CONTEXT_MISSING_WARNING = "CONTEXT_MISSING_WARNING";
 const DOCS_WRITE_TASK_PATTERN =
   /\bBATCH-37-(?:DOCS(?:-[A-Z0-9]+)*|FIX)\b|docs_write_allowed/i;
 const DOCS_WRITE_TARGET_PATTERN = /\bdocs\//i;
@@ -133,7 +137,7 @@ function decodeOriginalRequestTextBase64(value: unknown): string | null {
 }
 
 const WORKER_CONTEXT_FIELD_PATTERN =
-  /\b(?:project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|original_request_text(?:_base64)?|route|approved_batch|attempt_id|workflow_stage|final_report_status|effective_final_status|changed_files|git_commit_sha|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|original_request_text(?:_base64)?|route|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|changed_files|git_commit_sha|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName: string): string {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -251,6 +255,280 @@ function readLatestOriginalRequestText(text: unknown): string | null {
   const explicitTexts = expandedTexts.flatMap(extractOriginalRequestTextsFromContext);
   if (explicitTexts.length > 0) return explicitTexts[explicitTexts.length - 1];
   return null;
+}
+
+const WORKER_CONTEXT_FIELD_NAMES = [
+  "context_source",
+  "context_reconstruct_failed",
+  "project_domain",
+  "task_mode",
+  "read_only_mode",
+  "allowed_scope",
+  "forbidden_scope",
+  "original_request_text",
+  "original_request_text_base64",
+  "route",
+  "approved_batch",
+  "attempt_id",
+  "worker_stage",
+  "workflow_stage",
+  "final_report_status",
+  "effective_final_status",
+  "changed_files",
+  "git_commit_sha",
+  "pushed",
+  "deploy_status",
+];
+
+const WORKER_CONTEXT_CORE_FIELDS = [
+  "project_domain",
+  "task_mode",
+  "read_only_mode",
+  "allowed_scope",
+  "forbidden_scope",
+  "route",
+];
+
+interface WorkerContextCandidate {
+  fields: Record<string, string>;
+  depth: number;
+  sourceLabel: string;
+  startIndex: number;
+  distance: number;
+  fieldCount: number;
+  coreMissing: number;
+}
+
+function canonicalWorkerContextFieldName(fieldName: string): string {
+  return fieldName === "workflow_stage" ? "worker_stage" : fieldName;
+}
+
+function extractOriginalTaskBody(text: unknown): string {
+  const raw = String(text ?? "");
+  const marker = "【原始任务内容】";
+  const markerIndex = raw.lastIndexOf(marker);
+  if (markerIndex < 0) return raw;
+
+  const afterMarker = raw.slice(markerIndex + marker.length);
+  const stopMarkers = ["【再次强调】", "【Windows Worker 强制规则】"];
+  const stopIndex = stopMarkers
+    .map((stopMarker) => afterMarker.indexOf(stopMarker))
+    .filter((index) => index >= 0)
+    .sort((a, b) => a - b)[0];
+  return (stopIndex >= 0 ? afterMarker.slice(0, stopIndex) : afterMarker).trim();
+}
+
+function parseWorkerContextFieldLine(rawLine: string): { fieldName: string; value: string } | null {
+  for (const fieldName of WORKER_CONTEXT_FIELD_NAMES) {
+    const pattern = new RegExp(
+      `(?:^|[^\\w-])${contextFieldNamePattern(fieldName)}\\s*[:=]\\s*`,
+      "i"
+    );
+    const match = pattern.exec(rawLine);
+    if (!match) continue;
+
+    const rawValue = rawLine.slice(match.index + match[0].length);
+    const decodedValue = decodeEscapedWorkerContextText(rawValue).split(/\r?\n/)[0] ?? "";
+    const nextField = WORKER_CONTEXT_FIELD_PATTERN.exec(decodedValue);
+    const value = stripWorkerContextValue(nextField ? decodedValue.slice(0, nextField.index) : decodedValue);
+    return { fieldName: canonicalWorkerContextFieldName(fieldName), value };
+  }
+  return null;
+}
+
+function parseWorkerContextFields(text: unknown): Record<string, string> {
+  const fields: Record<string, string> = {};
+
+  for (const rawLine of String(text ?? "").split(/\r?\n/)) {
+    const parsed = parseWorkerContextFieldLine(rawLine.trim());
+    if (!parsed?.value) continue;
+
+    if (parsed.fieldName === "original_request_text_base64") {
+      fields.original_request_text_base64 = parsed.value;
+      const decoded = decodeOriginalRequestTextBase64(parsed.value.match(/[A-Za-z0-9+/=]+/)?.[0] ?? "");
+      if (decoded) fields.original_request_text = decoded;
+      continue;
+    }
+
+    fields[parsed.fieldName] = parsed.value;
+  }
+
+  return fields;
+}
+
+function findOriginalDemandAnchor(text: unknown): number {
+  const raw = String(text ?? "");
+  const indexes = ["【原始任务内容】", "新需求", "Original task", "original_request_text"]
+    .map((marker) => raw.indexOf(marker))
+    .filter((index) => index >= 0);
+  return indexes.length > 0 ? Math.min(...indexes) : 0;
+}
+
+function extractHermesContextCandidatesFromText(
+  text: unknown,
+  options: { depth?: number; sourceLabel?: string; seen?: Set<string> } = {}
+): WorkerContextCandidate[] {
+  const raw = String(text ?? "");
+  if (!raw.trim()) return [];
+
+  const depth = options.depth ?? 0;
+  const sourceLabel = options.sourceLabel ?? "request_text";
+  const seen = options.seen ?? new Set<string>();
+  const candidates: WorkerContextCandidate[] = [];
+
+  for (const variant of [raw, decodeEscapedWorkerContextText(raw)]) {
+    const normalizedVariant = variant.trim();
+    const seenKey = `${depth}:${sourceLabel}:${normalizedVariant}`;
+    if (!normalizedVariant || seen.has(seenKey)) continue;
+    seen.add(seenKey);
+
+    const lines = normalizedVariant.split(/\r?\n/);
+    const lineStarts: number[] = [];
+    let cursor = 0;
+    for (const line of lines) {
+      lineStarts.push(cursor);
+      cursor += line.length + 1;
+    }
+
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!/^\s*HERMES_WORKER_CONTEXT\s*[:：]\s*$/i.test(lines[index])) continue;
+
+      const blockLines: string[] = [];
+      for (let blockIndex = index + 1; blockIndex < lines.length; blockIndex += 1) {
+        if (/^\s*HERMES_WORKER_CONTEXT\s*[:：]\s*$/i.test(lines[blockIndex])) break;
+        blockLines.push(lines[blockIndex]);
+      }
+
+      const fields = parseWorkerContextFields(blockLines.join("\n"));
+      const fieldCount = Object.values(fields).filter((value) => readString(value)).length;
+      if (fieldCount === 0) continue;
+
+      const startIndex = lineStarts[index] ?? 0;
+      const anchor = findOriginalDemandAnchor(normalizedVariant);
+      const coreMissing = WORKER_CONTEXT_CORE_FIELDS.filter((fieldName) => !readString(fields[fieldName])).length;
+      candidates.push({
+        fields,
+        depth,
+        sourceLabel,
+        startIndex,
+        distance: Math.abs(startIndex - anchor),
+        fieldCount,
+        coreMissing,
+      });
+    }
+
+    for (const nestedText of extractOriginalRequestTextsFromContext(normalizedVariant)) {
+      candidates.push(
+        ...extractHermesContextCandidatesFromText(nestedText, {
+          depth: depth + 1,
+          sourceLabel: "original_request_text",
+          seen,
+        })
+      );
+    }
+  }
+
+  return candidates;
+}
+
+function selectPreferredHermesContext(text: unknown): WorkerContextCandidate | null {
+  const candidates = extractHermesContextCandidatesFromText(text);
+  if (candidates.length === 0) return null;
+
+  return candidates.sort((a, b) => {
+    if (a.coreMissing !== b.coreMissing) return a.coreMissing - b.coreMissing;
+    if (a.depth !== b.depth) return a.depth - b.depth;
+    if (a.distance !== b.distance) return a.distance - b.distance;
+    if (a.fieldCount !== b.fieldCount) return b.fieldCount - a.fieldCount;
+    return a.startIndex - b.startIndex;
+  })[0];
+}
+
+function readTextContextField(text: unknown, fieldName: string): string | null {
+  const taskBody = extractOriginalTaskBody(text);
+  if (fieldName === "original_request_text") {
+    const base64Values = extractWorkerContextFieldValues(taskBody, "original_request_text_base64");
+    const decoded = base64Values
+      .map((value) => decodeOriginalRequestTextBase64(value.match(/[A-Za-z0-9+/=]+/)?.[0] ?? ""))
+      .filter(Boolean);
+    if (decoded.length > 0) return decoded[decoded.length - 1] ?? null;
+  }
+
+  const values = extractWorkerContextFieldValues(taskBody, fieldName);
+  return values.length > 0 ? values[values.length - 1] ?? null : null;
+}
+
+function readPayloadContextField(
+  payload: Record<string, unknown> | null | undefined,
+  fieldName: string
+): unknown {
+  if (!payload || typeof payload !== "object") return null;
+
+  const aliases: Record<string, string[]> = {
+    project_domain: ["project_domain", "projectDomain"],
+    task_mode: ["task_mode", "taskMode"],
+    read_only_mode: ["read_only_mode", "readOnlyMode", "readonly", "read_only"],
+    allowed_scope: ["allowed_scope", "allowedScope", "allowed_files", "allowedFiles"],
+    forbidden_scope: ["forbidden_scope", "forbiddenScope", "forbidden_files", "forbiddenFiles"],
+    original_request_text: [
+      "original_request_text",
+      "originalRequestText",
+      "original_request_text_base64",
+      "originalRequestTextBase64",
+    ],
+    route: ["route"],
+    approved_batch: ["approved_batch", "approvedBatch", "batch_code", "batchCode"],
+    attempt_id: ["attempt_id", "attemptId"],
+    worker_stage: ["worker_stage", "workerStage", "workflow_stage", "workflowStage"],
+    final_report_status: ["final_report_status", "finalReportStatus"],
+    effective_final_status: ["effective_final_status", "effectiveFinalStatus"],
+    changed_files: ["changed_files", "changedFiles", "files_changed", "filesChanged"],
+    git_commit_sha: ["git_commit_sha", "gitCommitSha"],
+    pushed: ["pushed"],
+    deploy_status: ["deploy_status", "deployStatus"],
+  };
+
+  for (const key of aliases[fieldName] ?? [fieldName]) {
+    const value = payload[key];
+    if (
+      fieldName === "original_request_text" &&
+      (key === "original_request_text_base64" || key === "originalRequestTextBase64")
+    ) {
+      const decoded = decodeOriginalRequestTextBase64(value);
+      if (decoded) return decoded;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      const scopeValue = readScopeText(value);
+      if (scopeValue) return scopeValue;
+      continue;
+    }
+    if (typeof value === "boolean" || typeof value === "number") return value;
+    const textValue = readString(value);
+    if (textValue) return textValue;
+  }
+
+  return null;
+}
+
+function hasStructuredPayloadContext(payload: Record<string, unknown> | null): boolean {
+  return Boolean(
+    payload &&
+      (readPayloadContextField(payload, "route") !== null ||
+        readPayloadContextField(payload, "allowed_scope") !== null ||
+        readPayloadContextField(payload, "forbidden_scope") !== null ||
+        readPayloadContextField(payload, "original_request_text") !== null ||
+        readPayloadContextField(payload, "approved_batch") !== null ||
+        readPayloadContextField(payload, "worker_stage") !== null ||
+        readPayloadContextField(payload, "final_report_status") !== null)
+  );
+}
+
+function hasPayloadContext(payload: Record<string, unknown> | null): boolean {
+  return Boolean(
+    payload &&
+      WORKER_CONTEXT_CORE_FIELDS.some((fieldName) => readPayloadContextField(payload, fieldName) !== null)
+  );
 }
 
 function findBatchCodes(text: unknown): string[] {
@@ -748,6 +1026,7 @@ export function buildWorkerJobPayloadContract(input: {
   route?: string | null;
   approvedBatch?: string | null;
   attemptId?: string | null;
+  workerStage?: string | null;
   workflowStage?: string | null;
   finalReportStatus?: string | null;
   effectiveFinalStatus?: string | null;
@@ -760,55 +1039,80 @@ export function buildWorkerJobPayloadContract(input: {
   const payload = input.payload ?? readRecord(job?.payload);
   const result = input.result ?? readRecord(job?.result);
   const requestText = readString(input.requestText) ?? readString(job?.request_text) ?? readString(job?.prompt) ?? "";
+  const fallbackOriginalRequest =
+    readString(input.originalRequestText) ??
+    (readPayloadContextField(payload, "original_request_text") as string | null) ??
+    (readPayloadContextField(result, "original_request_text") as string | null) ??
+    readString(job?.original_request_text) ??
+    readString(job?.originalRequestText) ??
+    decodeOriginalRequestTextBase64(job?.original_request_text_base64) ??
+    decodeOriginalRequestTextBase64(job?.originalRequestTextBase64) ??
+    null;
   const sourceText = [
     requestText,
-    readString(input.originalRequestText),
-    readString(job?.original_request_text),
-    readString(job?.originalRequestText),
-    decodeOriginalRequestTextBase64(job?.original_request_text_base64),
-    decodeOriginalRequestTextBase64(job?.originalRequestTextBase64),
-    readString(payload?.original_request_text),
-    readString(payload?.originalRequestText),
-    decodeOriginalRequestTextBase64(payload?.original_request_text_base64),
-    decodeOriginalRequestTextBase64(payload?.originalRequestTextBase64),
-    readString(result?.original_request_text),
-    readString(result?.originalRequestText),
-    decodeOriginalRequestTextBase64(result?.original_request_text_base64),
-    decodeOriginalRequestTextBase64(result?.originalRequestTextBase64),
+    fallbackOriginalRequest,
   ]
     .filter(Boolean)
     .join("\n");
+  const explicitContext = selectPreferredHermesContext(sourceText);
+  const explicitFields = explicitContext?.fields ?? {};
+  const explicitOriginalRequestText = readLatestOriginalRequestText(sourceText);
   const originalRequestText =
-    readLatestOriginalRequestText(sourceText) ??
-    readString(input.originalRequestText) ??
-    readString(payload?.original_request_text) ??
-    readString(payload?.originalRequestText) ??
-    decodeOriginalRequestTextBase64(payload?.original_request_text_base64) ??
-    decodeOriginalRequestTextBase64(payload?.originalRequestTextBase64) ??
-    readString(job?.original_request_text) ??
-    readString(job?.originalRequestText) ??
+    readString(explicitFields.original_request_text) ??
+    explicitOriginalRequestText ??
+    fallbackOriginalRequest ??
+    readTextContextField(requestText, "original_request_text") ??
     requestText;
-  const explicitTaskMode =
-    normalizeTaskMode(readLatestWorkerContextField(sourceText, "task_mode")) ??
-    normalizeTaskMode(input.taskMode) ??
-    normalizeTaskMode(payload?.task_mode) ??
-    normalizeTaskMode(payload?.taskMode) ??
-    normalizeTaskMode(result?.task_mode) ??
-    normalizeTaskMode(result?.taskMode);
+  const originalRequestTextFields: Record<string, string | null> = {
+    project_domain: readTextContextField(fallbackOriginalRequest, "project_domain"),
+    task_mode: readTextContextField(fallbackOriginalRequest, "task_mode"),
+    read_only_mode: readTextContextField(fallbackOriginalRequest, "read_only_mode"),
+    allowed_scope: readTextContextField(fallbackOriginalRequest, "allowed_scope"),
+    forbidden_scope: readTextContextField(fallbackOriginalRequest, "forbidden_scope"),
+    route: readTextContextField(fallbackOriginalRequest, "route"),
+    approved_batch: readTextContextField(fallbackOriginalRequest, "approved_batch"),
+  };
+  const requestTextFields: Record<string, string | null> = {
+    project_domain: readTextContextField(requestText, "project_domain"),
+    task_mode: readTextContextField(requestText, "task_mode"),
+    read_only_mode: readTextContextField(requestText, "read_only_mode"),
+    allowed_scope: readTextContextField(requestText, "allowed_scope"),
+    forbidden_scope: readTextContextField(requestText, "forbidden_scope"),
+    route: readTextContextField(requestText, "route"),
+    approved_batch: readTextContextField(requestText, "approved_batch"),
+  };
+  const overrideFields: Record<string, unknown> = {
+    project_domain: input.projectDomain,
+    task_mode: input.taskMode,
+    read_only_mode: input.readOnlyMode,
+    allowed_scope: readScopeText(input.allowedScope),
+    forbidden_scope: readScopeText(input.forbiddenScope),
+    route: input.route,
+    approved_batch: input.approvedBatch,
+  };
+  const structuredPayload = hasStructuredPayloadContext(payload);
+  const payloadField = (fieldName: string): unknown => {
+    const payloadValue = readPayloadContextField(payload, fieldName);
+    return payloadValue !== null && payloadValue !== undefined
+      ? payloadValue
+      : readPayloadContextField(result, fieldName);
+  };
+  const readPriorityField = (fieldName: string): unknown =>
+    readString(explicitFields[fieldName]) ??
+    (structuredPayload ? payloadField(fieldName) : null) ??
+    readString(originalRequestTextFields[fieldName]) ??
+    readString(requestTextFields[fieldName]) ??
+    (!structuredPayload ? payloadField(fieldName) : null) ??
+    readString(overrideFields[fieldName]);
+  const explicitTaskMode = normalizeTaskMode(readPriorityField("task_mode"));
   const explicitReadOnlyMode =
-    readNullableBooleanFlag(readLatestWorkerContextField(sourceText, "read_only_mode")) ??
-    (typeof input.readOnlyMode === "boolean" ? input.readOnlyMode : null) ??
-    readNullableBooleanFlag(payload?.read_only_mode) ??
-    readNullableBooleanFlag(payload?.readOnlyMode) ??
-    readNullableBooleanFlag(result?.read_only_mode) ??
-    readNullableBooleanFlag(result?.readOnlyMode);
+    readNullableBooleanFlag(explicitFields.read_only_mode) ??
+    (structuredPayload ? readNullableBooleanFlag(payloadField("read_only_mode")) : null) ??
+    readNullableBooleanFlag(originalRequestTextFields.read_only_mode) ??
+    readNullableBooleanFlag(requestTextFields.read_only_mode) ??
+    (typeof input.readOnlyMode === "boolean" ? input.readOnlyMode : null);
   const batchCode =
-    readLatestWorkerContextField(sourceText, "approved_batch") ??
-    readString(input.approvedBatch) ??
-    readString(payload?.approved_batch) ??
-    readString(payload?.approvedBatch) ??
-    readString(payload?.batch_code) ??
-    readString(payload?.batchCode) ??
+    readString(readPriorityField("approved_batch")) ??
     getJobBatchCode(job) ??
     findBatchCodes(sourceText)[0] ??
     null;
@@ -819,57 +1123,66 @@ export function buildWorkerJobPayloadContract(input: {
     jobResult: result,
     submitted: input.taskMode,
   });
+  const classificationText = [originalRequestText, requestText, batchCode].filter(Boolean).join("\n");
+  const currentBatchIsQa = Boolean(batchCode && QA_BATCH_PATTERN.test(batchCode));
+  const productRepairRequest = !currentBatchIsQa && isBatchFixProductTaskText(classificationText);
+  const forceReadOnlyMode =
+    explicitReadOnlyMode === true &&
+    !(productRepairRequest && explicitTaskMode !== TASK_MODES.READ_ONLY);
   const taskMode =
-    explicitReadOnlyMode === true || explicitTaskMode === TASK_MODES.READ_ONLY
+    forceReadOnlyMode || explicitTaskMode === TASK_MODES.READ_ONLY
       ? TASK_MODES.READ_ONLY
       : explicitTaskMode ?? inferredTaskMode;
-  const readOnlyMode = explicitReadOnlyMode ?? taskMode === TASK_MODES.READ_ONLY;
+  const readOnlyMode =
+    productRepairRequest && explicitTaskMode !== TASK_MODES.READ_ONLY
+      ? false
+      : explicitReadOnlyMode ?? taskMode === TASK_MODES.READ_ONLY;
   const projectDomain =
-    readLatestWorkerContextField(sourceText, "project_domain") ??
-    readString(input.projectDomain) ??
-    readString(payload?.project_domain) ??
-    readString(payload?.projectDomain) ??
-    readString(result?.project_domain) ??
-    readString(result?.projectDomain) ??
+    readString(readPriorityField("project_domain")) ??
     classifyWorkerTaskDomain([originalRequestText, requestText].filter(Boolean).join("\n"));
-  const allowedScope =
-    readMergedWorkerContextField(sourceText, "allowed_scope") ??
-    readScopeText(input.allowedScope) ??
-    readScopeText(payload?.allowed_scope) ??
-    readScopeText(payload?.allowedScope) ??
-    readScopeText(payload?.allowed_files) ??
-    readScopeText(payload?.allowedFiles) ??
-    null;
-  const forbiddenScope =
-    readMergedWorkerContextField(sourceText, "forbidden_scope") ??
-    readScopeText(input.forbiddenScope) ??
-    readScopeText(payload?.forbidden_scope) ??
-    readScopeText(payload?.forbiddenScope) ??
-    readScopeText(payload?.forbidden_files) ??
-    readScopeText(payload?.forbiddenFiles) ??
-    null;
+  const allowedScope = readString(readPriorityField("allowed_scope")) ?? null;
+  const forbiddenScope = readString(readPriorityField("forbidden_scope")) ?? null;
   const changedFiles = readStringArray(
     input.changedFiles ??
-      payload?.changed_files ??
-      payload?.files_changed ??
-      result?.changed_files ??
-      result?.files_changed
+      payloadField("changed_files")
   );
   const gitCommitSha =
     readString(input.gitCommitSha) ??
-    readLatestWorkerContextField(sourceText, "git_commit_sha") ??
-    readString(payload?.git_commit_sha) ??
-    readString(result?.git_commit_sha) ??
+    readString(payloadField("git_commit_sha")) ??
     readString(job?.git_commit_sha);
   const pushed =
     typeof input.pushed === "boolean"
       ? input.pushed
-      : readNullableBooleanFlag(readLatestWorkerContextField(sourceText, "pushed")) ??
-        readNullableBooleanFlag(payload?.pushed) ??
-        readNullableBooleanFlag(result?.pushed) ??
+      : readNullableBooleanFlag(payloadField("pushed")) ??
         false;
+  const workerStage =
+    readString(input.workerStage) ??
+    readString(input.workflowStage) ??
+    readString(readPriorityField("worker_stage"));
+  const contextSource = explicitContext
+    ? "explicit_hermes_worker_context"
+    : structuredPayload || hasPayloadContext(payload)
+      ? "payload"
+      : WORKER_CONTEXT_CORE_FIELDS.some((fieldName) => originalRequestTextFields[fieldName])
+        ? "original_request_text"
+        : WORKER_CONTEXT_CORE_FIELDS.some((fieldName) => requestTextFields[fieldName])
+          ? "request_text"
+          : "automatic_classification";
+  const contextWarnings =
+    contextSource === "explicit_hermes_worker_context"
+      ? []
+      : [`${CONTEXT_MISSING_WARNING}: explicit HERMES_WORKER_CONTEXT missing; using ${contextSource}`];
+  const contextReconstructFailed = Boolean(
+    !projectDomain ||
+      !taskMode ||
+      readOnlyMode === null ||
+      (taskMode !== TASK_MODES.READ_ONLY && !allowedScope)
+  );
 
   return {
+    context_source: contextSource,
+    context_reconstruct_failed: contextReconstructFailed,
+    context_warnings: contextWarnings,
     project_domain: projectDomain,
     task_mode: taskMode,
     read_only_mode: readOnlyMode,
@@ -877,41 +1190,31 @@ export function buildWorkerJobPayloadContract(input: {
     forbidden_scope: forbiddenScope,
     original_request_text: originalRequestText,
     route:
-      readLatestWorkerContextField(sourceText, "route") ??
-      readString(input.route) ??
-      readString(payload?.route) ??
+      readString(readPriorityField("route")) ??
       null,
+    payload: payload ?? null,
     approved_batch: batchCode,
     attempt_id:
       readString(input.attemptId) ??
-      readLatestWorkerContextField(sourceText, "attempt_id") ??
-      readString(payload?.attempt_id) ??
-      readString(result?.attempt_id) ??
+      readString(readPriorityField("attempt_id")) ??
       null,
+    worker_stage: workerStage,
     workflow_stage:
-      readString(input.workflowStage) ??
-      readLatestWorkerContextField(sourceText, "workflow_stage") ??
-      readString(payload?.workflow_stage) ??
-      readString(result?.workflow_stage) ??
-      null,
+      workerStage,
     final_report_status:
       readString(input.finalReportStatus) ??
-      readLatestWorkerContextField(sourceText, "final_report_status") ??
-      readString(result?.final_report_status) ??
+      readString(readPriorityField("final_report_status")) ??
       null,
     effective_final_status:
       readString(input.effectiveFinalStatus) ??
-      readLatestWorkerContextField(sourceText, "effective_final_status") ??
-      readString(result?.effective_final_status) ??
+      readString(readPriorityField("effective_final_status")) ??
       null,
     changed_files: changedFiles,
     git_commit_sha: gitCommitSha ?? null,
     pushed,
     deploy_status:
       readString(input.deployStatus) ??
-      readLatestWorkerContextField(sourceText, "deploy_status") ??
-      readString(payload?.deploy_status) ??
-      readString(result?.deploy_status) ??
+      readString(readPriorityField("deploy_status")) ??
       null,
   };
 }
@@ -1009,14 +1312,8 @@ export function buildProjectDirectorWorkerReport(input: {
   const safetyBoundary = buildSafetyBoundary(filesChanged, input.deployStatus);
   const sanitizedError = input.errorText ? sanitizeReportText(input.errorText) : "";
   const combinedReportText = [summary, sanitizedError, ...validation].join("\n");
-  const taskMode = inferTaskMode({
-    demand: taskTextForClassification || demand,
-    batchCode,
-    jobPayload,
-    jobResult,
-    submitted: input.readOnlyMode,
-  });
-  const readOnlyMode = taskMode === TASK_MODES.READ_ONLY;
+  const taskMode = readString(contract.task_mode) ?? TASK_MODES.READ_ONLY;
+  const readOnlyMode = Boolean(contract.read_only_mode);
   const readOnlyViolation = reportTextHasReadOnlyViolation(combinedReportText);
   const writeAllowedNoFixApplied =
     input.status === "succeeded" &&
@@ -1105,6 +1402,9 @@ export function buildProjectDirectorWorkerReport(input: {
     final_report_status: input.status,
     effective_final_status: effectiveFinalStatus,
     status_title: statusTitle,
+    context_source: readString(contract.context_source),
+    context_reconstruct_failed: Boolean(contract.context_reconstruct_failed),
+    context_warnings: contract.context_warnings ?? [],
     project_domain: readString(contract.project_domain),
     task_domain: taskDomain,
     task_mode: taskMode,
@@ -1114,6 +1414,7 @@ export function buildProjectDirectorWorkerReport(input: {
     route: contract.route,
     payload: jobPayload ?? null,
     approved_batch: contract.approved_batch ?? batchCode,
+    worker_stage: contract.worker_stage,
     workflow_stage:
       input.status === "succeeded" ? "completed" : input.status === "failed" ? "failed" : input.status,
     worker_execution_status: workerExecutionStatus,
@@ -1164,6 +1465,8 @@ export function buildProjectDirectorWorkerReport(input: {
     `Original worker status: ${input.status}`,
     `Effective final status: ${effectiveFinalStatus}`,
     `Task mode: ${taskMode}`,
+    `context_source: ${placeholder(readString(contract.context_source))}`,
+    `context_reconstruct_failed: ${Boolean(contract.context_reconstruct_failed) ? "true" : "false"}`,
     `project_domain: ${placeholder(readString(contract.project_domain))}`,
     `task_mode: ${taskMode}`,
     `read_only_mode: ${readOnlyMode ? "true" : "false"}`,
@@ -1171,6 +1474,7 @@ export function buildProjectDirectorWorkerReport(input: {
     `forbidden_scope: ${placeholder(readString(contract.forbidden_scope))}`,
     `route: ${placeholder(readString(contract.route))}`,
     `approved_batch: ${placeholder(readString(contract.approved_batch) ?? batchCode)}`,
+    `worker_stage: ${placeholder(readString(contract.worker_stage))}`,
     `workflow_stage: ${data.workflow_stage}`,
     `final_report_status: ${input.status}`,
     `effective_final_status: ${effectiveFinalStatus}`,
@@ -1246,6 +1550,7 @@ export function buildAttemptPayload(
     requestText: job?.request_text,
     payload,
     attemptId: attempt.attempt_id,
+    workerStage: "execution",
     workflowStage: "execution",
     finalReportStatus: null,
     effectiveFinalStatus: "running",

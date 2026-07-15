@@ -36,6 +36,7 @@ const {
   INSUFFICIENT_DOC_OUTPUT,
   INCOMPLETE_QA_REPORT,
   INCOMPLETE_ARCHITECTURE_REPORT,
+  CONTEXT_MISSING_WARNING,
   TASK_MODES,
   assertGitOperationAllowed,
   assertOriginalBatchContextAvailable,
@@ -51,6 +52,7 @@ const {
   getTaskMode,
   isReadOnlyTask,
   isReadOnlyTaskText,
+  normalizeWorkerContext,
   recordFailureMemory,
   resolveWorkerJobContract,
 } = require("../local_worker");
@@ -1134,7 +1136,7 @@ test("read_only_mode task lock", async (t) => {
     );
   });
 
-  await t.test("automation_system_write_allowed merges multiple HERMES contexts", () => {
+  await t.test("automation_system_write_allowed selects one preferred HERMES context", () => {
     const job = {
       request_text: [
         "BATCH-ARCH-06C",
@@ -1154,6 +1156,11 @@ test("read_only_mode task lock", async (t) => {
       ].join("\n"),
     };
 
+    const contract = resolveWorkerJobContract(job);
+    assert.equal(
+      contract.allowed_scope,
+      "infra/windows-worker/**, docs/architecture/context-contract.md, docs/projects/feishu-gm-automation.md"
+    );
     assert.doesNotThrow(() =>
       assertTaskGoalApplied(job, ["docs/architecture/context-contract.md"])
     );
@@ -1177,7 +1184,7 @@ test("read_only_mode task lock", async (t) => {
     );
   });
 
-  await t.test("automation_system_write_allowed merges base64 original request context", () => {
+  await t.test("automation_system_write_allowed restores base64 original request without merging scope", () => {
     const originalRequest = [
       "BATCH-ARCH-06C",
       "HERMES_WORKER_CONTEXT:",
@@ -1210,8 +1217,13 @@ test("read_only_mode task lock", async (t) => {
       ].join("\n"),
     };
 
-    assert.doesNotThrow(() =>
-      assertTaskGoalApplied(job, ["docs/architecture/context-contract.md"])
+    const contract = resolveWorkerJobContract(job);
+    assert.match(contract.original_request_text, /BATCH-ARCH-06C/);
+    assert.match(contract.original_request_text, /docs\/architecture\/context-contract\.md/);
+    assert.equal(contract.allowed_scope, "infra/windows-worker/**, docs/projects/feishu-gm-automation.md");
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["docs/architecture/context-contract.md"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
     );
     assert.throws(
       () => assertTaskGoalApplied(wildcardOnlyJob, ["docs/architecture/context-contract.md"]),
@@ -1292,6 +1304,132 @@ test("read_only_mode task lock", async (t) => {
     assert.match(prompt, /git_commit_sha: null/);
     assert.match(prompt, /pushed: false/);
     assert.match(prompt, /deploy_status: null/);
+  });
+
+  await t.test("allowed and forbidden scope stay identical in prompt and validation context", () => {
+    const job = {
+      request_text: [
+        "BATCH-ARCH-07",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/local_worker.js, docs/architecture/context-contract.md",
+        "forbidden_scope=src/app/**, app/**, src/lib/db/**",
+        "route=direct_worker_create",
+        "Repair target: docs/architecture/context-contract.md",
+      ].join("\n"),
+    };
+    const contract = resolveWorkerJobContract(job);
+    const prompt = buildCodexPrompt(job);
+
+    assert.match(prompt, new RegExp(`allowed_scope: ${contract.allowed_scope.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.match(prompt, new RegExp(`forbidden_scope: ${contract.forbidden_scope.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/architecture/context-contract.md"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["docs/architecture/other.md"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
+  await t.test("original_request_text_base64 restores Chinese original demand", () => {
+    const originalRequest = "新需求：修复 Worker 上下文字段，不修改产品页面。";
+    const job = {
+      request_text: [
+        "BATCH-ARCH-07",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/local_worker.js",
+        "forbidden_scope=src/app/**, app/**",
+        `original_request_text_base64=${Buffer.from(originalRequest, "utf8").toString("base64")}`,
+        "route=direct_worker_create",
+      ].join("\n"),
+    };
+
+    assert.equal(resolveWorkerJobContract(job).original_request_text, originalRequest);
+  });
+
+  await t.test("missing explicit HERMES context reports warning instead of silent defaults", () => {
+    const job = {
+      request_text: "BATCH-ARCH-07 repair Worker context normalizer.",
+      payload: {
+        project_domain: "automation_system",
+        task_mode: "automation_system_write_allowed",
+        read_only_mode: false,
+        allowed_scope: "infra/windows-worker/local_worker.js",
+        forbidden_scope: "src/app/**",
+        route: "direct_worker_create",
+      },
+    };
+    const contract = normalizeWorkerContext(job);
+
+    assert.equal(contract.context_source, "payload");
+    assert.equal(contract.context_reconstruct_failed, false);
+    assert.match(contract.context_warnings.join("\n"), new RegExp(CONTEXT_MISSING_WARNING));
+    assert.equal(contract.task_mode, TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.equal(contract.read_only_mode, false);
+  });
+
+  await t.test("explicit read_only is not overridden by repair keywords", () => {
+    const job = {
+      request_text: [
+        "BATCH-QA-08",
+        "project_domain=qa_review",
+        "task_mode=read_only",
+        "read_only_mode=true",
+        "只读验收：正文提到修复、修改、补齐，但本任务禁止文件写入。",
+      ].join("\n"),
+    };
+
+    assert.equal(getTaskMode(job), TASK_MODES.READ_ONLY);
+    assert.doesNotThrow(() => assertTaskGoalApplied(job, []));
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["infra/windows-worker/local_worker.js"]),
+      (error) => error.code === READ_ONLY_MODE_VIOLATION
+    );
+  });
+
+  await t.test("product QA automation and architecture modes do not cross-wire", () => {
+    const cases = [
+      {
+        job: {
+          request_text: "BATCH-FIX-08 project_domain=city_partner_product task_mode=product_write_allowed read_only_mode=false fix partners product page.",
+        },
+        taskMode: TASK_MODES.PRODUCT_WRITE_ALLOWED,
+        projectDomain: "city_partner_product",
+      },
+      {
+        job: {
+          request_text: "BATCH-QA-08 project_domain=qa_review task_mode=read_only read_only_mode=true static QA only.",
+        },
+        taskMode: TASK_MODES.READ_ONLY,
+        projectDomain: "qa_review",
+      },
+      {
+        job: {
+          request_text: "BATCH-ARCH-07 project_domain=automation_system task_mode=automation_system_write_allowed read_only_mode=false repair Worker.",
+        },
+        taskMode: TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED,
+        projectDomain: "automation_system",
+      },
+      {
+        job: {
+          request_text: "BATCH-ARCH-SMOKE-02 project_domain=automation_architecture task_mode=read_only read_only_mode=true ARCH_REPORT_FIELDS smoke.",
+        },
+        taskMode: TASK_MODES.READ_ONLY,
+        projectDomain: "automation_architecture",
+      },
+    ];
+
+    for (const item of cases) {
+      const contract = resolveWorkerJobContract(item.job);
+      assert.equal(contract.task_mode, item.taskMode);
+      assert.equal(contract.project_domain, item.projectDomain);
+    }
   });
 
   await t.test("automation_system_write_allowed passes when Worker file changed despite forbidden product context", () => {
@@ -1579,7 +1717,8 @@ test("read_only_mode task lock", async (t) => {
       "utf8"
     );
     assert.equal(/task_mode:\s*taskMode\b/.test(workerSource), false);
-    assert.match(workerSource, /const taskModeForReport = getTaskMode\(job\);/);
+    assert.match(workerSource, /const initialContract = resolveWorkerJobContract\(job/);
+    assert.match(workerSource, /const taskModeForReport = initialContract\.task_mode;/);
   });
 
   await t.test("detects explicit read-only task text", () => {

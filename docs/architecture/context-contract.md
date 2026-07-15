@@ -121,3 +121,38 @@ Final reports must show all four status layers separately:
 - Task goal status
 - `original_worker_status`
 - `effective_final_status`
+
+## BATCH-ARCH-07 normalized context contract
+
+BATCH-ARCH-07 defines a single normalized context entry for Worker execution. Codex prompt generation, scope validation, task-goal validation, and final reporting must all read the same normalized context object.
+
+Required normalized fields:
+
+- `context_source`
+- `context_reconstruct_failed`
+- `project_domain`
+- `task_mode`
+- `read_only_mode`
+- `allowed_scope`
+- `forbidden_scope`
+- `original_request_text`
+- `route`
+- `payload`
+- `approved_batch`
+- `attempt_id`
+- `worker_stage`
+
+Resolution order:
+
+1. Explicit `HERMES_WORKER_CONTEXT`
+2. Structured job `payload`
+3. `original_request_text`
+4. `request_text`
+5. Automatic classification
+6. Historical context, only as last-resort reference
+
+When multiple `HERMES_WORKER_CONTEXT` blocks are present, Worker selects one preferred block instead of merging fields. The selected block must have the fewest missing core fields, prefer the current task text over nested historical text, and then prefer the block closest to the original demand. Nested `original_request_text_base64` may restore the original demand text, but it must not merge or expand `allowed_scope` / `forbidden_scope`.
+
+If explicit `HERMES_WORKER_CONTEXT` is missing, Worker may fall back to structured payload or current task text, but it must emit `CONTEXT_MISSING_WARNING`. Missing explicit context must not silently become `product_write_allowed` or `read_only`.
+
+Codex prompts must show the final effective normalized fields and must state that Codex only edits `allowed_scope`, respects `forbidden_scope`, does not run `git add`, `git commit`, or `git push`, and performs no writes for `read_only` tasks. Final reports must include `context_source`, `context_reconstruct_failed`, `project_domain`, `task_mode`, `read_only_mode`, `allowed_scope`, `forbidden_scope`, `approved_batch`, and `route`.
