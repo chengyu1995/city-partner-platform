@@ -51,6 +51,7 @@ const {
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
   getTaskMode,
+  isTrueTaskFailureCode,
   isReadOnlyTask,
   isReadOnlyTaskText,
   normalizeWorkerContext,
@@ -237,6 +238,13 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
         "const ROUTE_BATCH_CODE_PATTERN = /\\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\\b/gi;"
       )
     );
+  });
+
+  await t.test("project director reports keep task-goal failure codes machine-readable", () => {
+    assert.match(workerJobsSource, /taskGoalFailureCode/);
+    assert.match(workerJobsSource, /NO_FIX_APPLIED/);
+    assert.match(workerJobsSource, /READ_ONLY_MODE_VIOLATION/);
+    assert.match(workerJobsSource, /failed_no_fix_applied/);
   });
 
   await t.test("hermes_jobs payload shape and insert errors are observable without secrets", () => {
@@ -2340,6 +2348,56 @@ test("BATCH-ARCH-09 terminal final result rules", async (t) => {
 
     assert.equal(finalResult.failure_code, "TYPESCRIPT_FAILED");
     assert.equal(indexResult.entry.failure_code, "TYPESCRIPT_FAILED");
+  });
+
+  await t.test("NO_FIX_APPLIED separates worker report status from task goal status", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-no-fix" },
+      approvedBatch: "BATCH-GM-DIRECTOR-OUTPUT-SEPARATION-FIX-01",
+      status: "succeeded",
+      finalReportStatus: "succeeded",
+      effectiveFinalStatus: "failed",
+      resultText: [
+        "final_report_status: succeeded",
+        "effective_final_status: failed",
+        "failure_stage: task_goal_validation",
+        "Worker execution status: succeeded_until_task_goal_validation",
+        "Task goal status: failed_no_fix_applied",
+        "NO_FIX_APPLIED: yes",
+      ].join("\n"),
+      completedAt: "2026-07-15T00:04:30.000Z",
+    });
+
+    assert.equal(finalResult.final_report_status, "succeeded");
+    assert.equal(finalResult.effective_final_status, "failed");
+    assert.equal(finalResult.failure_code, NO_FIX_APPLIED);
+    assert.equal(finalResult.failure_memory_status, "recordable");
+    assert.equal(isTrueTaskFailureCode(NO_FIX_APPLIED), true);
+    assert.deepEqual(buildAutoIterationSuggestion(finalResult), {
+      action: "repair",
+      suggested_batch: "BATCH-GM-DIRECTOR-OUTPUT-SEPARATION-FIX-01-FIX",
+      failure_code: NO_FIX_APPLIED,
+      failure_stage: "task_goal_validation",
+      reason: "minimal_repair_batch",
+    });
+  });
+
+  await t.test("read-only violations are task-goal failures, not report transport failures", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-read-only-violation" },
+      approvedBatch: "BATCH-GM-DIRECTOR-OUTPUT-SEPARATION-FIX-01",
+      status: "failed",
+      effectiveFinalStatus: "failed",
+      errorText: [
+        "Worker execution status: succeeded_until_read_only_validation",
+        "Task goal status: failed_read_only_mode_violation",
+        "Read-only violation: yes",
+      ].join("\n"),
+    });
+
+    assert.equal(finalResult.failure_code, READ_ONLY_MODE_VIOLATION);
+    assert.equal(finalResult.failure_memory_status, "recordable");
+    assert.equal(isTrueTaskFailureCode(READ_ONLY_MODE_VIOLATION), true);
   });
 
   await t.test("cancelled final result does not generate repair suggestion", () => {

@@ -91,6 +91,13 @@ const READ_ONLY_BATCH_PATTERN =
   /\bBATCH-QA(?:-[A-Z0-9]+)*\b|\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const WORKER_BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
 const TRUE_TASK_FAILURE_CODES = new Set([
+  "NO_FIX_APPLIED",
+  "READ_ONLY_MODE_VIOLATION",
+  "TASK_MODE_MISMATCH",
+  "MISSING_REQUIRED_DOCS",
+  "INSUFFICIENT_DOC_OUTPUT",
+  "INCOMPLETE_QA_REPORT",
+  "INCOMPLETE_ARCHITECTURE_REPORT",
   "TEST_FAILED",
   "TYPESCRIPT_FAILED",
   "OUT_OF_SCOPE_CHANGE",
@@ -881,6 +888,12 @@ function normalizeFailureCodeValue(value: unknown): string | null {
     OUT_OF_SCOPE_BUSINESS_CHANGE: "OUT_OF_SCOPE_CHANGE",
     OUT_OF_SCOPE_SYSTEM_CHANGE: "OUT_OF_SCOPE_CHANGE",
     BUSINESS_PAGE_BOUNDARY_VIOLATION: "OUT_OF_SCOPE_CHANGE",
+    READ_ONLY_VIOLATION: "READ_ONLY_MODE_VIOLATION",
+    READONLY_MODE_VIOLATION: "READ_ONLY_MODE_VIOLATION",
+    NOOP_RUN: "NO_FIX_APPLIED",
+    NO_OP_RUN: "NO_FIX_APPLIED",
+    NO_FILE_CHANGE: "NO_FIX_APPLIED",
+    NO_FILE_CHANGES: "NO_FIX_APPLIED",
     CONTEXT_FAILED: "CONTEXT_RECONSTRUCT_FAILED",
     ORIGINAL_BATCH_CONTEXT_MISSING: "CONTEXT_RECONSTRUCT_FAILED",
     COMMIT_FAILED: "GIT_COMMIT_FAILED",
@@ -901,6 +914,13 @@ function classifyFailureCodeFromText(text: unknown): string | null {
   const raw = String(text ?? "");
   const nonTaskFailureCode = classifyNonTaskFailureCode(raw);
   if (nonTaskFailureCode) return nonTaskFailureCode;
+  if (/NO_FIX_APPLIED|no_fix_applied\s*[:=]\s*(true|yes)|Task goal status:\s*failed_no_fix_applied/i.test(raw)) return "NO_FIX_APPLIED";
+  if (/READ_ONLY_MODE_VIOLATION|read_only_mode_violation\s*[:=]\s*(true|yes)|Read-only violation:\s*yes|Task goal status:\s*failed_read_only_mode_violation/i.test(raw)) return "READ_ONLY_MODE_VIOLATION";
+  if (/TASK_MODE_MISMATCH|task_mode_mismatch\s*[:=]\s*(true|yes)|Task goal status:\s*failed_task_mode_mismatch/i.test(raw)) return "TASK_MODE_MISMATCH";
+  if (/MISSING_REQUIRED_DOCS|Task goal status:\s*failed_missing_required_docs/i.test(raw)) return "MISSING_REQUIRED_DOCS";
+  if (/INSUFFICIENT_DOC_OUTPUT|insufficient_doc_output\s*[:=]\s*(true|yes)|Task goal status:\s*failed_insufficient_doc_output/i.test(raw)) return "INSUFFICIENT_DOC_OUTPUT";
+  if (/INCOMPLETE_QA_REPORT|incomplete_qa_report\s*[:=]\s*(true|yes)|Task goal status:\s*failed_incomplete_qa_report/i.test(raw)) return "INCOMPLETE_QA_REPORT";
+  if (/INCOMPLETE_ARCHITECTURE_REPORT|incomplete_architecture_report\s*[:=]\s*(true|yes)|Task goal status:\s*failed_incomplete_architecture_report/i.test(raw)) return "INCOMPLETE_ARCHITECTURE_REPORT";
   if (/node\s+--test|tests?\s+failed|test\s+failure|测试失败/i.test(raw)) return "TEST_FAILED";
   if (/typescript|tsc|typecheck|TypeScript\s+检查失败/i.test(raw)) return "TYPESCRIPT_FAILED";
   if (/context_reconstruct_failed\s*[:=：]\s*true|ORIGINAL_BATCH_CONTEXT_MISSING|上下文恢复失败|context.*(?:missing|failed|缺失|失败)/i.test(raw)) {
@@ -1699,6 +1719,21 @@ export function buildProjectDirectorWorkerReport(input: {
   const missingRequiredDocs = readDiagnosticLine(combinedReportText, "missing_required_docs") ?? "none";
   const insufficientDocOutput =
     /INSUFFICIENT_DOC_OUTPUT|insufficient_doc_output\s*[:=]\s*(yes|true)/i.test(combinedReportText);
+  const taskGoalFailureCode =
+    readOnlyViolation
+      ? "READ_ONLY_MODE_VIOLATION"
+      : noFixApplied
+        ? "NO_FIX_APPLIED"
+        : outOfScopeBusinessChange
+          ? "OUT_OF_SCOPE_CHANGE"
+          : insufficientDocOutput
+            ? "INSUFFICIENT_DOC_OUTPUT"
+            : failedTaskGoal
+              ? classifyFailureCodeFromText(combinedReportText)
+              : null;
+  const failedTaskGoalStatus = taskGoalFailureCode
+    ? `failed_${taskGoalFailureCode.toLowerCase()}`
+    : "failed";
   const noOpRun =
     noFixApplied ||
     (input.status === "succeeded" &&
@@ -1731,7 +1766,10 @@ export function buildProjectDirectorWorkerReport(input: {
     effectiveFinalStatus: legacyEffectiveFinalStatus,
     resultText: summary,
     errorText: sanitizedError,
-    failureCode: legacyEffectiveFinalStatus === "failed" ? classifyFailureCodeFromText(combinedReportText) : null,
+    failureCode:
+      legacyEffectiveFinalStatus === "failed"
+        ? taskGoalFailureCode ?? classifyFailureCodeFromText(combinedReportText)
+        : null,
     failureStage: rawFailureStage,
     gitCommitSha,
     nextBatch: extractNextBatchFromText(combinedReportText),
@@ -1751,10 +1789,10 @@ export function buildProjectDirectorWorkerReport(input: {
     buildAutoIterationSuggestion(normalizedFinalResult);
   needsBossConfirmation = effectiveFinalStatus === "succeeded";
   const failureStage = effectiveFinalStatus === "failed"
-    ? readDiagnosticLine(sanitizedError, "失败阶段") ?? "未提供"
+    ? readString(normalizedFinalResult.failure_stage) ?? "task_goal_validation"
     : null;
   const keyError = effectiveFinalStatus === "failed"
-    ? readDiagnosticLine(sanitizedError, "关键错误") ?? truncateText(sanitizedError, 500)
+    ? readDiagnosticLine(sanitizedError, "关键错误") ?? truncateText(sanitizedError || summary, 500)
     : null;
   const failureSuggestion = effectiveFinalStatus === "failed"
     ? buildFailureNextStep(sanitizedError)
@@ -1766,11 +1804,13 @@ export function buildProjectDirectorWorkerReport(input: {
         ? "succeeded_until_task_goal_validation"
         : outOfScopeBusinessChange
           ? "succeeded_until_scope_validation"
-        : input.status === "failed"
-          ? "failed"
-          : input.status === "succeeded"
-            ? "succeeded"
-            : input.status;
+          : failedTaskGoal
+            ? "succeeded_until_task_goal_validation"
+            : input.status === "failed"
+              ? "failed"
+              : input.status === "succeeded"
+                ? "succeeded"
+                : input.status;
   const taskGoalStatus =
     readOnlyViolation
       ? "failed_read_only_mode_violation"
@@ -1779,7 +1819,7 @@ export function buildProjectDirectorWorkerReport(input: {
         : outOfScopeBusinessChange
           ? "failed_out_of_scope_business_change"
         : failedTaskGoal
-          ? "failed"
+          ? failedTaskGoalStatus
         : input.status === "succeeded"
           ? readOnlyMode && filesChanged.length === 0
             ? "completed_read_only_no_file_changes"
