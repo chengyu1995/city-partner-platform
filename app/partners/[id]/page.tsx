@@ -1,6 +1,7 @@
-﻿export {
+export {
   default,
   generateMetadata,
-  dynamic,
-  runtime,
 } from '../../../src/app/partners/[id]/page';
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
