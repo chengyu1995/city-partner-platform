@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { createHermesJobs } from "@/lib/worker-jobs";
 import type {
   ProjectDirectorDispatchPlanDraft,
   ProjectDirectorDispatchTask,
@@ -9,6 +10,8 @@ type JobRecord = Record<string, unknown>;
 interface SupabaseWriteError {
   message?: string;
   code?: string;
+  details?: string;
+  hint?: string;
 }
 
 export interface DispatchJobBuildResult {
@@ -21,6 +24,19 @@ export interface DispatchJobInsertResult {
   insertedCount: number;
   skippedColumns: string[];
 }
+
+export const HERMES_JOBS_TABLE = "hermes_jobs";
+
+export const HERMES_JOB_CONTEXT_PAYLOAD_FIELDS = [
+  "project_domain",
+  "task_mode",
+  "read_only_mode",
+  "allowed_scope",
+  "forbidden_scope",
+  "original_request_text",
+  "approved_batch",
+  "route",
+] as const;
 
 export interface ProjectDirectorPlanningJobInput {
   originalDemand: string;
@@ -76,6 +92,71 @@ function extractMissingColumn(error: SupabaseWriteError | null): string | null {
 function cleanLines(values: string[]): string {
   if (values.length === 0) return "- 无";
   return values.map((value) => `- ${value}`).join("\n");
+}
+
+function escapeContextValue(value: unknown): string {
+  return String(value ?? "").replace(/\r?\n/g, "\\n").trim();
+}
+
+function buildHermesWorkerContextLines(context: Record<string, unknown>): string[] {
+  return [
+    "HERMES_WORKER_CONTEXT:",
+    ...HERMES_JOB_CONTEXT_PAYLOAD_FIELDS
+      .filter((field) => {
+        const value = context[field];
+        return value !== undefined && value !== null && String(value).trim() !== "";
+      })
+      .map((field) => `${field}=${escapeContextValue(context[field])}`),
+  ];
+}
+
+function withHermesWorkerContext(requestText: string, context: Record<string, unknown>): string {
+  if (/^\s*HERMES_WORKER_CONTEXT\s*:/im.test(requestText)) return requestText;
+  return [...buildHermesWorkerContextLines(context), "", requestText].join("\n");
+}
+
+function buildContextPayload(
+  basePayload: Record<string, unknown>,
+  context: Record<string, unknown>
+): Record<string, unknown> {
+  return {
+    ...basePayload,
+    ...context,
+    hermes_worker_context: context,
+  };
+}
+
+function buildDocsWriteContext(
+  originalRequestText: string,
+  approvedBatch: string,
+  allowedScope: string
+): Record<string, unknown> {
+  return {
+    project_domain: "automation_architecture",
+    task_mode: "docs_write_allowed",
+    read_only_mode: false,
+    allowed_scope: allowedScope,
+    forbidden_scope: "src/app/**, src/lib/db/**, src/types/db.ts, .env, database, worker, tencent-cloud",
+    original_request_text: originalRequestText,
+    approved_batch: approvedBatch,
+    route: "project_director_dispatch",
+  };
+}
+
+function buildAgentDispatchContext(
+  task: ProjectDirectorDispatchTask,
+  requestText: string
+): Record<string, unknown> {
+  return {
+    project_domain: "automation_system",
+    task_mode: "automation_system_write_allowed",
+    read_only_mode: false,
+    allowed_scope: task.allowed_files.join(", "),
+    forbidden_scope: task.forbidden_files.join(", "),
+    original_request_text: requestText,
+    approved_batch: task.dispatch_batch,
+    route: "project_director_approved_execution",
+  };
 }
 
 function isAllowedProductPlanningTask(task: ProjectDirectorDispatchTask): boolean {
@@ -145,19 +226,25 @@ function buildJobRow(
   task: ProjectDirectorDispatchTask,
   requestText: string
 ): JobRecord {
+  const context = buildDocsWriteContext(
+    requestText,
+    PROJECT_DIRECTOR_BATCH_01,
+    task.output_files.join(", ")
+  );
+  const contextualRequestText = withHermesWorkerContext(requestText, context);
   return {
     source: "project_director",
     job_type: "product_planning",
     job_id: task.task_code,
     title: task.task_title,
-    description: requestText,
+    description: contextualRequestText,
     priority: 10,
     acceptance: task.acceptance_criteria.join("\n"),
     branch: null,
     executor: "product_manager",
     repo: "city-partner-platform",
-    prompt: requestText,
-    request_text: requestText,
+    prompt: contextualRequestText,
+    request_text: contextualRequestText,
     status: "queued",
     plan_status: "approved",
     workflow_stage: "execution",
@@ -168,7 +255,7 @@ function buildJobRow(
     project_id: projectTitle,
     task_code: task.task_code,
     dispatch_batch: PROJECT_DIRECTOR_BATCH_01,
-    payload: {
+    payload: buildContextPayload({
       project_title: projectTitle,
       batch_code: PROJECT_DIRECTOR_BATCH_01,
       role: task.role,
@@ -176,7 +263,7 @@ function buildJobRow(
       task_title: task.task_title,
       output_files: task.output_files,
       acceptance_criteria: task.acceptance_criteria,
-    },
+    }, context),
   };
 }
 
@@ -262,19 +349,21 @@ function buildAgentDispatchJobRow(
   task: ProjectDirectorDispatchTask,
   requestText: string
 ): JobRecord {
+  const context = buildAgentDispatchContext(task, requestText);
+  const contextualRequestText = withHermesWorkerContext(requestText, context);
   return {
     source: "agent_dispatch",
     job_type: PROJECT_DIRECTOR_AGENT_DISPATCH_JOB_TYPE,
     job_id: task.task_key,
     title: task.task_title,
-    description: requestText,
+    description: contextualRequestText,
     priority: task.requires_boss_approval ? 30 : 15,
     acceptance: task.acceptance_criteria.join("\n"),
     branch: null,
     executor: task.agent_role,
     repo: "city-partner-platform",
-    prompt: requestText,
-    request_text: requestText,
+    prompt: contextualRequestText,
+    request_text: contextualRequestText,
     status: "queued",
     plan_status: "approved",
     workflow_stage: "execution",
@@ -285,7 +374,7 @@ function buildAgentDispatchJobRow(
     project_id: projectTitle,
     task_code: task.task_key,
     dispatch_batch: task.dispatch_batch,
-    payload: {
+    payload: buildContextPayload({
       project_title: projectTitle,
       batch_code: task.dispatch_batch,
       role: task.agent_role,
@@ -298,7 +387,7 @@ function buildAgentDispatchJobRow(
       acceptance_criteria: task.acceptance_criteria,
       requires_boss_approval: task.requires_boss_approval,
       execution_mode: "approved_execution",
-    },
+    }, context),
   };
 }
 
@@ -307,28 +396,7 @@ async function insertRowsWithMissingColumnFallback(
   rowsInput: JobRecord[],
   failureLabel: string
 ): Promise<DispatchJobInsertResult> {
-  let rows = rowsInput;
-  const skippedColumns: string[] = [];
-
-  for (let attempt = 0; attempt < 16; attempt++) {
-    const { error } = await supabase.from("hermes_jobs").insert(rows);
-    if (!error) return { insertedCount: rows.length, skippedColumns };
-    if (!isMissingColumnError(error)) throw new Error(`${failureLabel}: ${error.message}`);
-
-    const missingColumn = extractMissingColumn(error);
-    if (!missingColumn || !rows.some((row) => missingColumn in row)) {
-      throw new Error(`${failureLabel}: ${error.message}`);
-    }
-
-    skippedColumns.push(missingColumn);
-    rows = rows.map((row) => {
-      const next = { ...row };
-      delete next[missingColumn];
-      return next;
-    });
-  }
-
-  throw new Error(`${failureLabel}: too many missing columns`);
+  return createHermesJobs(supabase, rowsInput, failureLabel);
 }
 
 function buildAcceptanceFeedbackRequestText(input: AcceptanceFeedbackJobInput): string {
@@ -630,30 +698,10 @@ export async function insertBatch01ProductPlanningJobs(
   supabase: SupabaseClient,
   buildResult: DispatchJobBuildResult
 ): Promise<DispatchJobInsertResult> {
-  let rows = buildResult.tasks.map((task, index) =>
+  const rows = buildResult.tasks.map((task, index) =>
     buildJobRow(buildResult.projectTitle, task, buildResult.requestTexts[index])
   );
-  const skippedColumns: string[] = [];
-
-  for (let attempt = 0; attempt < 16; attempt++) {
-    const { error } = await supabase.from("hermes_jobs").insert(rows);
-    if (!error) return { insertedCount: rows.length, skippedColumns };
-    if (!isMissingColumnError(error)) throw new Error(`insert hermes_jobs failed: ${error.message}`);
-
-    const missingColumn = extractMissingColumn(error);
-    if (!missingColumn || !rows.some((row) => missingColumn in row)) {
-      throw new Error(`insert hermes_jobs failed: ${error.message}`);
-    }
-
-    skippedColumns.push(missingColumn);
-    rows = rows.map((row) => {
-      const next = { ...row };
-      delete next[missingColumn];
-      return next;
-    });
-  }
-
-  throw new Error("insert hermes_jobs failed: too many missing columns");
+  return insertRowsWithMissingColumnFallback(supabase, rows, "insert hermes_jobs failed");
 }
 
 export async function hasRecentAcceptanceFeedbackJob(
@@ -704,28 +752,11 @@ export async function insertAcceptanceFeedbackJob(
   supabase: SupabaseClient,
   input: AcceptanceFeedbackJobInput
 ): Promise<DispatchJobInsertResult> {
-  let rows = [buildAcceptanceFeedbackJobRow(input)];
-  const skippedColumns: string[] = [];
-
-  for (let attempt = 0; attempt < 16; attempt++) {
-    const { error } = await supabase.from("hermes_jobs").insert(rows);
-    if (!error) return { insertedCount: rows.length, skippedColumns };
-    if (!isMissingColumnError(error)) throw new Error(`insert acceptance feedback job failed: ${error.message}`);
-
-    const missingColumn = extractMissingColumn(error);
-    if (!missingColumn || !rows.some((row) => missingColumn in row)) {
-      throw new Error(`insert acceptance feedback job failed: ${error.message}`);
-    }
-
-    skippedColumns.push(missingColumn);
-    rows = rows.map((row) => {
-      const next = { ...row };
-      delete next[missingColumn];
-      return next;
-    });
-  }
-
-  throw new Error("insert acceptance feedback job failed: too many missing columns");
+  return insertRowsWithMissingColumnFallback(
+    supabase,
+    [buildAcceptanceFeedbackJobRow(input)],
+    "insert acceptance feedback job failed"
+  );
 }
 
 export function buildAcceptanceFeedbackQueuedReply(insertedCount: number): string {

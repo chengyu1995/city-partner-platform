@@ -83,6 +83,8 @@ import {
   type ProjectDirectorTaskTreeDraft,
 } from "@/lib/project-director-task-tree";
 import {
+  createHermesJob,
+  createHermesJobs,
   buildWorkerJobPayloadContract,
   findRecentDuplicateFeishuJob,
   normalizeFeishuTaskText,
@@ -106,13 +108,43 @@ function errorToText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function readHermesInsertError(errorText: string): Record<string, any> | null {
+  const jsonStart = errorText.indexOf("{");
+  if (jsonStart < 0) return null;
+
+  try {
+    const parsed = JSON.parse(errorText.slice(jsonStart));
+    return parsed?.stage === "hermes_jobs_insert" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildHermesInsertFailureReply(errorText: string, sourceText: string): string | null {
+  const error = readHermesInsertError(errorText);
+  if (!error) return null;
+
+  const batchCode = extractRelevantRouteBatchText(sourceText).match(ROUTE_BATCH_CODE_PATTERN)?.[0] ?? "unknown";
+  return [
+    "已识别批准批次，但创建 hermes_jobs 失败。",
+    `批准批次：${batchCode}`,
+    "错误阶段：hermes_jobs_insert",
+    `HTTP status：${error.http_status ?? "unknown"}`,
+    `错误代码：${error.code ?? "unknown"}`,
+    `错误信息：${error.message ?? "unknown"}`,
+    `details：${error.details ?? "none"}`,
+    `hint：${error.hint ?? "none"}`,
+    "任务尚未创建。",
+  ].join("\n");
+}
+
 function sanitizeLogText(text: string): string {
   return text
     .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
     .replace(/(token|secret|password|key)["':=\s]+[^"',\s}]+/gi, "$1=[redacted]");
 }
 
-const ROUTE_BATCH_CODE_PATTERN = /\bBATCH-(?:P\d+|\d+[A-Z]?)(?:-[A-Z0-9]+)?\b/gi;
+const ROUTE_BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
 const ROUTE_BATCH_RELEVANT_LINE_PATTERN =
   /标题|title|修复目标|目标|批准|approved|approval|执行批次|当前批次/i;
 const ROUTE_BATCH_FORBIDDEN_FRAGMENT_PATTERN = /禁止范围|禁止修改|不得|不允许|forbidden|不执行/i;
@@ -715,6 +747,34 @@ function buildDirectWorkerTaskText(text: string): string {
   );
 }
 
+function escapeWorkerContextValue(value: unknown): string {
+  return String(value ?? "").replace(/\r?\n/g, "\\n").trim();
+}
+
+const DIRECT_WORKER_CONTEXT_REQUIRED_FIELDS = [
+  "project_domain",
+  "task_mode",
+  "read_only_mode",
+  "allowed_scope",
+  "forbidden_scope",
+  "original_request_text",
+  "approved_batch",
+];
+
+function withHermesWorkerContext(requestText: string, context: Record<string, unknown>): string {
+  const orderedKeys = Array.from(new Set([...DIRECT_WORKER_CONTEXT_REQUIRED_FIELDS, ...Object.keys(context)]));
+  const contextLines = orderedKeys
+    .filter((key) => context[key] !== null && context[key] !== undefined && context[key] !== "")
+    .map((key) => `${key}: ${escapeWorkerContextValue(context[key])}`);
+
+  return [
+    requestText.trim(),
+    "",
+    "HERMES_WORKER_CONTEXT:",
+    ...contextLines,
+  ].join("\n");
+}
+
 async function insertDirectWorkerTask(
   supabase: SupabaseClient,
   input: {
@@ -740,13 +800,14 @@ async function insertDirectWorkerTask(
     pushed: false,
     deployStatus: null,
   });
+  const contextualRequestText = withHermesWorkerContext(input.requestText, contractPayload);
   const row = {
     source: "feishu",
     job_type: taskDomain,
     title: `Direct Worker task: ${input.requestText.slice(0, 80)}`,
-    description: input.requestText,
-    prompt: input.requestText,
-    request_text: input.requestText,
+    description: contextualRequestText,
+    prompt: contextualRequestText,
+    request_text: contextualRequestText,
     status: "queued",
     priority: 10,
     feishu_message_id: input.feishuMessageId,
@@ -761,14 +822,12 @@ async function insertDirectWorkerTask(
       skip_planning_choice: true,
     },
   };
-  const { data, error } = await supabase
-    .from("hermes_jobs")
-    .insert(row)
-    .select("id, job_id")
-    .maybeSingle();
-
-  if (error) throw new Error(`insert direct worker task failed: ${error.message}`);
-  return { jobId: (data?.job_id as string | null | undefined) ?? (data?.id as string | null | undefined) ?? null };
+  const insertResult = await createHermesJob(
+    supabase,
+    row,
+    "insert direct worker task failed"
+  );
+  return { jobId: insertResult.jobIds[0] ?? null };
 }
 
 function readTaskScopeItems(value: unknown): string[] {
@@ -819,50 +878,6 @@ function projectDomainForTaskMode(taskMode: string | null): string | null {
   if (taskMode === "product_write_allowed") return "city_partner_product";
   if (taskMode === "docs_write_allowed") return "governance_docs";
   return null;
-}
-
-function isHermesJobsMissingColumnError(error: { message?: string; code?: string } | null): boolean {
-  const message = error?.message ?? "";
-  return error?.code === "PGRST204" || /column .* does not exist/i.test(message);
-}
-
-function extractHermesJobsMissingColumn(error: { message?: string } | null): string | null {
-  const message = error?.message ?? "";
-  const quoted = message.match(/'([^']+)' column/);
-  if (quoted) return quoted[1];
-  const plain = message.match(/column "([^"]+)"/i);
-  return plain ? plain[1] : null;
-}
-
-async function insertHermesRowsWithMissingColumnFallback(
-  supabase: SupabaseClient,
-  rowsInput: Array<Record<string, any>>,
-  failureLabel: string
-): Promise<{ insertedCount: number; skippedColumns: string[] }> {
-  let rows = rowsInput;
-  const skippedColumns: string[] = [];
-
-  for (let attempt = 0; attempt < 16; attempt += 1) {
-    const { error } = await supabase.from("hermes_jobs").insert(rows);
-    if (!error) return { insertedCount: rows.length, skippedColumns };
-    if (!isHermesJobsMissingColumnError(error)) {
-      throw new Error(`${failureLabel}: ${error.message}`);
-    }
-
-    const missingColumn = extractHermesJobsMissingColumn(error);
-    if (!missingColumn || !rows.some((row) => missingColumn in row)) {
-      throw new Error(`${failureLabel}: ${error.message}`);
-    }
-
-    skippedColumns.push(missingColumn);
-    rows = rows.map((row) => {
-      const next = { ...row };
-      delete next[missingColumn];
-      return next;
-    });
-  }
-
-  throw new Error(`${failureLabel}: too many missing columns`);
 }
 
 async function insertApprovedAgentDispatchJobsWithContract(
@@ -932,7 +947,7 @@ async function insertApprovedAgentDispatchJobsWithContract(
     };
   });
 
-  return insertHermesRowsWithMissingColumnFallback(
+  return createHermesJobs(
     supabase,
     rows,
     "insert approved agent dispatch jobs failed"
@@ -1196,7 +1211,7 @@ export async function POST(req: NextRequest) {
             code: 0,
             direct_worker_task: true,
             state: "duplicate_skipped",
-            worker_jobs_created: false,
+            hermes_jobs_created: false,
             existing_job_id: duplicateCheck.duplicate.id,
             existing_job_no: duplicateCheck.duplicate.job_id ?? null,
           });
@@ -1228,7 +1243,7 @@ export async function POST(req: NextRequest) {
             `job_id: ${insertResult.jobId ?? "pending"}`,
             `request_text: ${requestText}`,
             "skip_planning_choice: true",
-            "worker_jobs_created: yes",
+            "hermes_jobs_created: yes",
           ].join("\n"),
           "project_director_direct_worker_task",
           ev.message.message_id
@@ -1244,7 +1259,7 @@ export async function POST(req: NextRequest) {
           code: 0,
           direct_worker_task: true,
           state: "queued",
-          worker_jobs_created: true,
+          hermes_jobs_created: true,
           job_id: insertResult.jobId,
         });
       }
@@ -1321,7 +1336,7 @@ export async function POST(req: NextRequest) {
           state: "planning_choice_recorded",
           choice: planningChoice,
           execution_mode: "planning_only",
-          worker_jobs_created: false,
+          hermes_jobs_created: false,
         });
       }
 
@@ -2010,14 +2025,32 @@ export async function POST(req: NextRequest) {
 
       await markReceiptCompleted(supabase, eventId);
     } catch (e) {
-      console.error("[feishu-event] processing failed:", sanitizeLogText(errorToText(e)));
+      const processingErrorText = errorToText(e);
+      console.error("[feishu-event] processing failed:", sanitizeLogText(processingErrorText));
       try {
-        await markReceiptFailed(supabase, eventId, errorToText(e));
+        await markReceiptFailed(supabase, eventId, processingErrorText);
       } catch (receiptFailError) {
         console.error(
           "[feishu-event] receipt fail update failed:",
           sanitizeLogText(errorToText(receiptFailError))
         );
+      }
+      const hermesInsertFailureReply = buildHermesInsertFailureReply(processingErrorText, text);
+      if (hermesInsertFailureReply) {
+        try {
+          const token = await getFeishuToken();
+          await sendFeishuMessage(
+            token,
+            ev.message.chat_id,
+            ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+            hermesInsertFailureReply
+          );
+        } catch (sendError) {
+          console.error(
+            "[feishu-event] hermes insert failure reply failed:",
+            sanitizeLogText(errorToText(sendError))
+          );
+        }
       }
       return NextResponse.json({ code: 0, processing_error: true });
     }

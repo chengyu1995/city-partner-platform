@@ -190,6 +190,104 @@ function joinedWords(...parts) {
   return parts.join(" ");
 }
 
+function readRepoFile(relativePath) {
+  return fs.readFileSync(path.resolve(workerRoot, "..", "..", relativePath), "utf8");
+}
+
+test("Project Director Worker task creation uses hermes_jobs contract", async (t) => {
+  const builderSource = readRepoFile("src/lib/project-director-job-builder.ts");
+  const routeSource = readRepoFile("src/app/api/feishu/event/route.ts");
+  const workerJobsSource = readRepoFile("src/lib/worker-jobs.ts");
+
+  await t.test("runtime creation never inserts into worker_jobs", () => {
+    assert.doesNotMatch(builderSource, /\.from\(["'`]worker_jobs["'`]\)/);
+    assert.doesNotMatch(routeSource, /\.from\(["'`]worker_jobs["'`]\)/);
+    assert.doesNotMatch(workerJobsSource, /\.from\(["'`]worker_jobs["'`]\)/);
+    assert.match(workerJobsSource, /export async function createHermesJobs/);
+    assert.match(workerJobsSource, /\.from\("hermes_jobs"\)\.insert\(rows\)/);
+    assert.match(builderSource, /createHermesJobs\(supabase, rowsInput, failureLabel\)/);
+    assert.match(routeSource, /createHermesJobs\(/);
+  });
+
+  await t.test("normalized Worker context survives missing payload column", () => {
+    for (const source of [builderSource, routeSource]) {
+      assert.match(source, /HERMES_WORKER_CONTEXT/);
+      assert.match(source, /project_domain/);
+      assert.match(source, /task_mode/);
+      assert.match(source, /read_only_mode/);
+      assert.match(source, /allowed_scope/);
+      assert.match(source, /forbidden_scope/);
+      assert.match(source, /original_request_text/);
+      assert.match(source, /approved_batch/);
+    }
+
+    assert.match(builderSource, /withHermesWorkerContext\(requestText, context\)/);
+    assert.match(routeSource, /withHermesWorkerContext\(input\.requestText, contractPayload\)/);
+  });
+
+  await t.test("long approval batch codes are not truncated", () => {
+    const approvalText =
+      "总管 批准执行：仅批准 BATCH-GM-DIRECTOR-OUTPUT-SEPARATION-FIX-01";
+    const batchPattern = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
+    assert.deepEqual(approvalText.match(batchPattern), [
+      "BATCH-GM-DIRECTOR-OUTPUT-SEPARATION-FIX-01",
+    ]);
+    assert.ok(
+      routeSource.includes(
+        "const ROUTE_BATCH_CODE_PATTERN = /\\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\\b/gi;"
+      )
+    );
+  });
+
+  await t.test("hermes_jobs payload shape and insert errors are observable without secrets", () => {
+    const insertErrorFormatterStart = workerJobsSource.indexOf("function formatHermesJobInsertError");
+    const insertErrorFormatterEnd = workerJobsSource.indexOf("export async function createHermesJobs");
+    const insertErrorFormatter = workerJobsSource.slice(insertErrorFormatterStart, insertErrorFormatterEnd);
+
+    assert.match(workerJobsSource, /summarizeHermesInsertRows/);
+    assert.match(workerJobsSource, /insert_payload_shape/);
+    assert.match(workerJobsSource, /payload_fields/);
+    assert.match(workerJobsSource, /task_mode/);
+    assert.match(workerJobsSource, /batch/);
+    assert.match(workerJobsSource, /http_status/);
+    assert.match(workerJobsSource, /code: error\?\.code/);
+    assert.match(workerJobsSource, /message: error\?\.message/);
+    assert.match(workerJobsSource, /details: error\?\.details/);
+    assert.match(workerJobsSource, /hint: error\?\.hint/);
+    assert.doesNotMatch(insertErrorFormatter, /SERVICE_ROLE/);
+    assert.doesNotMatch(insertErrorFormatter, /Authorization/);
+  });
+
+  await t.test("legacy hermes_jobs status and priority constraints are retried safely", () => {
+    assert.match(workerJobsSource, /status:queued->pending/);
+    assert.match(workerJobsSource, /priority:number->P0\/P1\/P2/);
+    assert.match(workerJobsSource, /shouldRetryPendingStatus/);
+    assert.match(workerJobsSource, /shouldRetryTextPriority/);
+  });
+
+  await t.test("insert errors preserve Supabase body and field details", () => {
+    assert.match(workerJobsSource, /code: error\?\.code/);
+    assert.match(workerJobsSource, /message: error\?\.message/);
+    assert.match(workerJobsSource, /details: error\?\.details/);
+    assert.match(workerJobsSource, /hint: error\?\.hint/);
+    assert.match(workerJobsSource, /hermes_jobs_insert/);
+    assert.match(routeSource, /hermes_jobs_insert/);
+    assert.match(routeSource, /已识别批准批次，但创建 hermes_jobs 失败。/);
+    assert.doesNotMatch(routeSource, /hermes_jobs_insert[\s\S]{0,200}请重新明确批次/);
+  });
+
+  await t.test("duplicate approvals are checked before creating hermes_jobs", () => {
+    const duplicateCheckIndex = routeSource.lastIndexOf("hasExistingAgentDispatchJobs(");
+    const insertIndex = routeSource.lastIndexOf("insertApprovedAgentDispatchJobsWithContract(");
+    assert.notEqual(duplicateCheckIndex, -1);
+    assert.notEqual(insertIndex, -1);
+    assert.ok(duplicateCheckIndex < insertIndex);
+    assert.match(routeSource, /PROJECT_DIRECTOR_APPROVED_EXECUTION_DUPLICATE/);
+    assert.match(workerJobsSource, /findDuplicateByEmbeddedRequestText/);
+    assert.match(workerJobsSource, /normalizedRequestText\.includes\(normalizedNeedle\)/);
+  });
+});
+
 test("Git porcelain v1 -z status parsing", async (t) => {
   await t.test("ordinary modified file", () => {
     const entry = parseGitStatusPorcelain(" M tracked.txt\0")[0];

@@ -7,6 +7,8 @@ type JobRecord = Record<string, unknown>;
 interface SupabaseWriteError {
   message?: string;
   code?: string;
+  details?: string;
+  hint?: string;
 }
 
 interface DuplicateFeishuJob {
@@ -20,6 +22,13 @@ export interface DuplicateFeishuJobCheckResult {
   duplicate: DuplicateFeishuJob | null;
   normalizedText: string;
   error: SupabaseWriteError | null;
+}
+
+export interface HermesJobInsertResult {
+  insertedCount: number;
+  skippedColumns: string[];
+  adjustedFields: string[];
+  jobIds: string[];
 }
 
 const RECORD_ID_KEYS = [
@@ -2076,6 +2085,32 @@ async function findDuplicateByRequestText(
   return { data: (data as DuplicateFeishuJob | null) ?? null, error };
 }
 
+async function findDuplicateByEmbeddedRequestText(
+  supabase: SupabaseClient,
+  requestText: string,
+  createdAfter: string
+): Promise<{ data: DuplicateFeishuJob | null; error: SupabaseWriteError | null }> {
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .select("id, job_id, request_text, created_at")
+    .eq("source", "feishu")
+    .in("status", ["queued", "running"])
+    .gte("created_at", createdAfter)
+    .order("created_at", { ascending: false })
+    .limit(20);
+
+  if (error) return { data: null, error };
+
+  const normalizedNeedle = normalizeFeishuTaskText(requestText);
+  const duplicate =
+    (data as DuplicateFeishuJob[] | null | undefined)?.find((job) => {
+      const normalizedRequestText = normalizeFeishuTaskText(job.request_text ?? "");
+      return normalizedRequestText.includes(normalizedNeedle);
+    }) ?? null;
+
+  return { data: duplicate, error: null };
+}
+
 export async function findRecentDuplicateFeishuJob(
   supabase: SupabaseClient,
   rawText: string,
@@ -2094,6 +2129,14 @@ export async function findRecentDuplicateFeishuJob(
     if (data) return { duplicate: data, normalizedText, error: null };
   }
 
+  const { data: embeddedDuplicate, error: embeddedError } = await findDuplicateByEmbeddedRequestText(
+    supabase,
+    normalizedText,
+    createdAfter
+  );
+  if (embeddedError) return { duplicate: null, normalizedText, error: embeddedError };
+  if (embeddedDuplicate) return { duplicate: embeddedDuplicate, normalizedText, error: null };
+
   return { duplicate: null, normalizedText, error: null };
 }
 
@@ -2108,6 +2151,166 @@ function extractMissingColumn(error: SupabaseWriteError | null): string | null {
   if (quoted) return quoted[1];
   const plain = message.match(/column "([^"]+)"/i);
   return plain ? plain[1] : null;
+}
+
+function isCheckConstraintError(error: SupabaseWriteError | null): boolean {
+  const text = `${error?.code ?? ""}\n${error?.message ?? ""}\n${error?.details ?? ""}\n${error?.hint ?? ""}`;
+  return error?.code === "23514" || /check constraint|violates check/i.test(text);
+}
+
+function shouldRetryPendingStatus(error: SupabaseWriteError | null, rows: JobRecord[]): boolean {
+  if (!isCheckConstraintError(error)) return false;
+  if (!rows.some((row) => row.status === "queued")) return false;
+  const text = `${error?.message ?? ""}\n${error?.details ?? ""}\n${error?.hint ?? ""}`;
+  return /status|queued|pending|hermes_jobs/i.test(text);
+}
+
+function shouldRetryTextPriority(error: SupabaseWriteError | null, rows: JobRecord[]): boolean {
+  if (!isCheckConstraintError(error)) return false;
+  if (!rows.some((row) => typeof row.priority === "number")) return false;
+  const text = `${error?.message ?? ""}\n${error?.details ?? ""}\n${error?.hint ?? ""}`;
+  return /priority|P0|P1|P2|hermes_jobs/i.test(text);
+}
+
+function normalizeLegacyHermesPriority(value: unknown): string {
+  if (typeof value === "string" && /^P[0-2]$/i.test(value.trim())) {
+    return value.trim().toUpperCase();
+  }
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (Number.isFinite(numeric)) {
+    if (numeric <= 5) return "P0";
+    if (numeric <= 20) return "P1";
+  }
+  return "P2";
+}
+
+function summarizeHermesInsertRows(rows: JobRecord[]): Array<Record<string, unknown>> {
+  return rows.map((row) => {
+    const payload = row.payload && typeof row.payload === "object"
+      ? (row.payload as Record<string, unknown>)
+      : null;
+    return {
+      fields: Object.fromEntries(
+        Object.entries(row).map(([key, value]) => [
+          key,
+          {
+            type: Array.isArray(value) ? "array" : value === null ? "null" : typeof value,
+            is_null: value === null,
+          },
+        ])
+      ),
+      status: row.status ?? null,
+      priority: row.priority ?? null,
+      batch:
+        row.dispatch_batch ??
+        row.task_code ??
+        payload?.approved_batch ??
+        payload?.batch_code ??
+        null,
+      task_mode: payload?.task_mode ?? null,
+      payload_fields: payload ? Object.keys(payload).sort() : [],
+    };
+  });
+}
+
+function formatHermesJobInsertError(
+  label: string,
+  error: SupabaseWriteError | null,
+  rows: JobRecord[],
+  skippedColumns: string[],
+  adjustedFields: string[]
+): string {
+  return `${label}: ${JSON.stringify({
+    stage: "hermes_jobs_insert",
+    http_status: null,
+    code: error?.code ?? null,
+    message: error?.message ?? null,
+    details: error?.details ?? null,
+    hint: error?.hint ?? null,
+    skipped_columns: skippedColumns,
+    adjusted_fields: adjustedFields,
+    insert_payload_shape: summarizeHermesInsertRows(rows),
+  })}`;
+}
+
+export async function createHermesJobs(
+  supabase: SupabaseClient,
+  rowsInput: JobRecord[],
+  failureLabel = "create hermes job failed"
+): Promise<HermesJobInsertResult> {
+  let rows = rowsInput.map((row) => ({ ...row }));
+  const skippedColumns: string[] = [];
+  const adjustedFields: string[] = [];
+  let retriedPendingStatus = false;
+  let retriedTextPriority = false;
+
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    const { data, error } = await supabase.from("hermes_jobs").insert(rows).select("id, job_id");
+    if (!error) {
+      const jobIds = Array.isArray(data)
+        ? data
+            .map((row) => row?.job_id ?? row?.id)
+            .filter((value): value is string => typeof value === "string" && value.length > 0)
+        : [];
+      return { insertedCount: rows.length, skippedColumns, adjustedFields, jobIds };
+    }
+
+    if (isMissingColumnError(error)) {
+      const missingColumn = extractMissingColumn(error);
+      if (!missingColumn || !rows.some((row) => missingColumn in row)) {
+        throw new Error(
+          formatHermesJobInsertError(failureLabel, error, rows, skippedColumns, adjustedFields)
+        );
+      }
+      skippedColumns.push(missingColumn);
+      rows = rows.map((row) => {
+        const next = { ...row };
+        delete next[missingColumn];
+        return next;
+      });
+      continue;
+    }
+
+    if (!retriedPendingStatus && shouldRetryPendingStatus(error, rows)) {
+      retriedPendingStatus = true;
+      adjustedFields.push("status:queued->pending");
+      rows = rows.map((row) => (row.status === "queued" ? { ...row, status: "pending" } : row));
+      continue;
+    }
+
+    if (!retriedTextPriority && shouldRetryTextPriority(error, rows)) {
+      retriedTextPriority = true;
+      adjustedFields.push("priority:number->P0/P1/P2");
+      rows = rows.map((row) =>
+        typeof row.priority === "number"
+          ? { ...row, priority: normalizeLegacyHermesPriority(row.priority) }
+          : row
+      );
+      continue;
+    }
+
+    throw new Error(
+      formatHermesJobInsertError(failureLabel, error, rows, skippedColumns, adjustedFields)
+    );
+  }
+
+  throw new Error(
+    `${failureLabel}: ${JSON.stringify({
+      stage: "hermes_jobs_insert",
+      message: "too many hermes_jobs insert compatibility retries",
+      skipped_columns: skippedColumns,
+      adjusted_fields: adjustedFields,
+      insert_payload_shape: summarizeHermesInsertRows(rows),
+    })}`
+  );
+}
+
+export async function createHermesJob(
+  supabase: SupabaseClient,
+  row: JobRecord,
+  failureLabel = "create hermes job failed"
+): Promise<HermesJobInsertResult> {
+  return createHermesJobs(supabase, [row], failureLabel);
 }
 
 export async function updateHermesJob(

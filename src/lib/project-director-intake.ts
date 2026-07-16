@@ -484,7 +484,7 @@ export function buildProjectDirectorPlanningChoiceRecord(input: {
     `original_demand: ${input.originalDemand}`,
     `boss_reply: ${normalizeDemandText(input.bossReply)}`,
     "routing: handled_before_website_product_request",
-    "worker_jobs_created: no",
+    "hermes_jobs_created: no",
     "note: choice replies must not trigger another A/B confirmation.",
   ].join("\n");
 }
@@ -507,7 +507,7 @@ export function buildProjectDirectorPlanChangeRecord(changeText: string): string
     "state: waiting_boss_reply",
     `change: ${getPlanChangeReplyBody(changeText)}`,
     "routing: handled_before_website_product_request",
-    "worker_jobs_created: no",
+    "hermes_jobs_created: no",
   ].join("\n");
 }
 
