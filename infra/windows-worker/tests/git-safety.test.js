@@ -247,6 +247,13 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
     assert.match(workerJobsSource, /failed_no_fix_applied/);
   });
 
+  await t.test("project director report title separates worker status from final task status", () => {
+    assert.match(workerJobsSource, /workerStatusTitle/);
+    assert.match(workerJobsSource, /worker_status_title/);
+    assert.match(workerJobsSource, /effectiveFinalStatus === "failed" && input\.status === "succeeded"/);
+    assert.match(workerJobsSource, /任务目标验收失败/);
+  });
+
   await t.test("hermes_jobs payload shape and insert errors are observable without secrets", () => {
     const insertErrorFormatterStart = workerJobsSource.indexOf("function formatHermesJobInsertError");
     const insertErrorFormatterEnd = workerJobsSource.indexOf("export async function createHermesJobs");

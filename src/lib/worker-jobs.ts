@@ -1690,7 +1690,7 @@ export function buildProjectDirectorWorkerReport(input: {
     taskTextForClassification
   );
   const jobId = readString(input.job?.id) ?? readString(input.job?.job_id);
-  const statusTitle =
+  const workerStatusTitle =
     input.status === "succeeded"
       ? "✅ Codex 任务执行成功"
       : input.status === "failed"
@@ -1791,6 +1791,16 @@ export function buildProjectDirectorWorkerReport(input: {
   const failureStage = effectiveFinalStatus === "failed"
     ? readString(normalizedFinalResult.failure_stage) ?? "task_goal_validation"
     : null;
+  const statusTitle =
+    effectiveFinalStatus === "succeeded"
+      ? "✅ 任务最终完成"
+      : effectiveFinalStatus === "failed" && input.status === "succeeded"
+        ? "❌ 任务目标验收失败"
+        : effectiveFinalStatus === "failed"
+          ? "❌ Codex 任务执行失败"
+          : effectiveFinalStatus === "cancelled"
+            ? "任务已取消"
+            : `任务最终状态：${effectiveFinalStatus}`;
   const keyError = effectiveFinalStatus === "failed"
     ? readDiagnosticLine(sanitizedError, "关键错误") ?? truncateText(sanitizedError || summary, 500)
     : null;
@@ -1857,6 +1867,7 @@ export function buildProjectDirectorWorkerReport(input: {
     completed_at: readString(normalizedFinalResult.completed_at),
     auto_iteration_suggestion: autoIterationSuggestion,
     status_title: statusTitle,
+    worker_status_title: workerStatusTitle,
     context_source: readString(contract.context_source),
     context_reconstruct_failed: Boolean(contract.context_reconstruct_failed),
     context_warnings: contract.context_warnings ?? [],
@@ -1905,6 +1916,7 @@ export function buildProjectDirectorWorkerReport(input: {
 
   const requiredHeader = [
     statusTitle,
+    `Worker 执行标题：${workerStatusTitle}`,
     `任务编号：${placeholder(jobId)}`,
     `job_id：${placeholder(jobId)}`,
     `实际执行批次：${placeholder(batchCode)}`,
