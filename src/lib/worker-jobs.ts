@@ -51,6 +51,8 @@ const BATCH_FIX_PRODUCT_SIGNAL_PATTERN =
   /同城搭子网站|partners|\/partners|\/post|login|profile|page\.tsx|src\/app|产品页面|产品修复|QA\s*发现|首页|发布页|搭子浏览|详情页|product\s+repair|product\s+page/i;
 const TASK_MODES = {
   READ_ONLY: "read_only",
+  MANAGER_READ_ONLY: "manager_read_only",
+  WORKER_READ_ONLY: "worker_read_only",
   DOCS_WRITE_ALLOWED: "docs_write_allowed",
   AUTOMATION_SYSTEM_WRITE_ALLOWED: "automation_system_write_allowed",
   PRODUCT_WRITE_ALLOWED: "product_write_allowed",
@@ -180,6 +182,14 @@ function normalizeTaskMode(value: unknown): string | null {
   return Object.values(TASK_MODES).includes(text as typeof TASK_MODES[keyof typeof TASK_MODES])
     ? text
     : null;
+}
+
+function isReadOnlyTaskMode(taskMode: unknown): boolean {
+  return (
+    taskMode === TASK_MODES.READ_ONLY ||
+    taskMode === TASK_MODES.MANAGER_READ_ONLY ||
+    taskMode === TASK_MODES.WORKER_READ_ONLY
+  );
 }
 
 function decodeOriginalRequestTextBase64(value: unknown): string | null {
@@ -1501,15 +1511,15 @@ export function buildWorkerJobPayloadContract(input: {
   const productRepairRequest = !currentBatchIsQa && isBatchFixProductTaskText(classificationText);
   const forceReadOnlyMode =
     explicitReadOnlyMode === true &&
-    !(productRepairRequest && explicitTaskMode !== TASK_MODES.READ_ONLY);
+    !(productRepairRequest && !isReadOnlyTaskMode(explicitTaskMode));
   const taskMode =
-    forceReadOnlyMode || explicitTaskMode === TASK_MODES.READ_ONLY
-      ? TASK_MODES.READ_ONLY
+    forceReadOnlyMode || isReadOnlyTaskMode(explicitTaskMode)
+      ? (isReadOnlyTaskMode(explicitTaskMode) ? explicitTaskMode : TASK_MODES.READ_ONLY)
       : explicitTaskMode ?? inferredTaskMode;
   const readOnlyMode =
-    productRepairRequest && explicitTaskMode !== TASK_MODES.READ_ONLY
+    productRepairRequest && !isReadOnlyTaskMode(explicitTaskMode)
       ? false
-      : explicitReadOnlyMode ?? taskMode === TASK_MODES.READ_ONLY;
+      : explicitReadOnlyMode ?? isReadOnlyTaskMode(taskMode);
   const projectDomain =
     readString(readPriorityField("project_domain")) ??
     classifyWorkerTaskDomain([originalRequestText, requestText].filter(Boolean).join("\n"));
@@ -1546,10 +1556,10 @@ export function buildWorkerJobPayloadContract(input: {
       ? []
       : [`${CONTEXT_MISSING_WARNING}: explicit HERMES_WORKER_CONTEXT missing; using ${contextSource}`];
   const contextReconstructFailed = Boolean(
-    !projectDomain ||
+      !projectDomain ||
       !taskMode ||
       readOnlyMode === null ||
-      (taskMode !== TASK_MODES.READ_ONLY && !allowedScope)
+      (!isReadOnlyTaskMode(taskMode) && !allowedScope)
   );
 
   return {
@@ -1707,7 +1717,7 @@ export function buildProjectDirectorWorkerReport(input: {
   const readOnlyViolation = reportTextHasReadOnlyViolation(combinedReportText);
   const writeAllowedNoFixApplied =
     input.status === "succeeded" &&
-    taskMode !== TASK_MODES.READ_ONLY &&
+    !isReadOnlyTaskMode(taskMode) &&
     filesChanged.length === 0;
   const noFixApplied =
     reportTextHasNoFixApplied(combinedReportText) || writeAllowedNoFixApplied;

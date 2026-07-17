@@ -164,6 +164,9 @@ function isAutomationSystemRepairDemand(text: string): boolean {
 
 function classifyFeishuWorkerTaskDomain(text: string): string {
   const normalized = normalizeFeishuTaskText(text);
+  const batchCode = extractPrimaryRouteBatchCode(normalized);
+
+  if (batchCode && /^BATCH-GM-/i.test(batchCode)) return "automation_system";
 
   if (/文档整理|整理文档|归档|governance[_ -]?docs/i.test(normalized)) return "governance_docs";
   if (isAutomationSystemRepairDemand(normalized) || /automation[_ -]?system/i.test(normalized)) {
@@ -177,6 +180,54 @@ function classifyFeishuWorkerTaskDomain(text: string): string {
   }
 
   return "direct_worker_task";
+}
+
+
+function extractPrimaryRouteBatchCode(text: string): string | null {
+  const normalized = normalizeFeishuTaskText(text);
+  const explicit = normalized.match(/\b(BATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*)\b/i);
+  return explicit ? explicit[1].toUpperCase() : null;
+}
+
+function isExplicitDirectWorkerCreateCommand(text: string): boolean {
+  const normalized = normalizeFeishuTaskText(text);
+  return /direct\s+create\s+Worker\s+task|create\s+Worker\s+task|Worker\s+task/i.test(normalized) ||
+    /(?:\u8bf7\s*)?\u76f4\u63a5\s*\u521b\u5efa\s*Worker\s*\u4efb\u52a1|\u7acb\u5373\s*\u521b\u5efa\s*Worker\s*\u4efb\u52a1|(?:\u8bf7\s*)?\u7acb\u5373\s*\u6392\u961f\s*Worker\s*\u4efb\u52a1/i.test(normalized);
+}
+
+function parseDirectRequestedMode(text: string, batchCode: string | null): string | null {
+  const normalized = normalizeFeishuTaskText(text);
+  const explicit = normalized.match(
+    /(?:execution_mode|requested_mode|final_mode|task_mode|\u6267\u884c\u6a21\u5f0f)\s*[:\uFF1A=]\s*(manager_read_only|worker_read_only|write_allowed)\b/i
+  );
+  if (explicit) return explicit[1].toLowerCase();
+  if (batchCode && /\bBATCH-GM-MODE-SMOKE-MANAGER(?:-[A-Z0-9]+)*\b/i.test(batchCode)) return "manager_read_only";
+  if (batchCode && /\bBATCH-GM-MODE-SMOKE-WORKER(?:-[A-Z0-9]+)*\b/i.test(batchCode)) return "worker_read_only";
+  if (batchCode && /\bBATCH-GM-MODE-SMOKE-WRITE(?:-[A-Z0-9]+)*\b/i.test(batchCode)) return "write_allowed";
+  return null;
+}
+
+function resolveDirectWorkerReadOnlyContract(text: string) {
+  const batchCode = extractPrimaryRouteBatchCode(text);
+  const requestedMode = parseDirectRequestedMode(text, batchCode);
+  const projectDomain = batchCode && /^BATCH-GM-/i.test(batchCode) ? "automation_system" : classifyFeishuWorkerTaskDomain(text);
+  const readOnlyAllowedScope = "Worker read-only static inspection; no file writes; no git add/commit/push";
+  const readOnlyForbiddenScope = "file writes, git add, git commit, git push, dev server, database, env, deploy";
+
+  if (!batchCode || !/^BATCH-GM-/i.test(batchCode)) {
+    return { ok: false, error: "DIRECT_WORKER_BATCH_MISSING", batchCode, projectDomain, requestedMode, finalMode: requestedMode, taskMode: requestedMode, readOnlyMode: true, approvalRequired: false, allowedScope: readOnlyAllowedScope, forbiddenScope: readOnlyForbiddenScope };
+  }
+  if (requestedMode === "manager_read_only") {
+    return { ok: false, error: "DIRECT_MANAGER_READ_ONLY_REJECTED", batchCode, projectDomain, requestedMode, finalMode: "manager_read_only", taskMode: "manager_read_only", readOnlyMode: true, approvalRequired: false, allowedScope: readOnlyAllowedScope, forbiddenScope: readOnlyForbiddenScope };
+  }
+  if (requestedMode === "write_allowed") {
+    return { ok: false, error: "DIRECT_WRITE_ALLOWED_REQUIRES_APPROVAL", batchCode, projectDomain, requestedMode, finalMode: "write_allowed", taskMode: "automation_system_write_allowed", readOnlyMode: false, approvalRequired: true, allowedScope: "automation system allowed_scope from approved request only", forbiddenScope: readOnlyForbiddenScope };
+  }
+  if (requestedMode !== "worker_read_only") {
+    return { ok: false, error: "DIRECT_WORKER_MODE_UNSUPPORTED", batchCode, projectDomain, requestedMode, finalMode: requestedMode, taskMode: requestedMode, readOnlyMode: true, approvalRequired: false, allowedScope: readOnlyAllowedScope, forbiddenScope: readOnlyForbiddenScope };
+  }
+
+  return { ok: true, batchCode, projectDomain: "automation_system", requestedMode: "worker_read_only", finalMode: "worker_read_only", taskMode: "worker_read_only", readOnlyMode: true, approvalRequired: false, allowedScope: readOnlyAllowedScope, forbiddenScope: readOnlyForbiddenScope };
 }
 
 function classifyProjectDirectorDemand(
@@ -756,6 +807,10 @@ function attachProjectDirectorDispatchMetadata(
 function buildDirectWorkerTaskText(text: string): string {
   return normalizeFeishuTaskText(
     text
+      .replace(/请\s*直接\s*创建\s*Worker\s*任务[：:，,。.]?/gi, "")
+      .replace(/直接\s*创建\s*Worker\s*任务[：:，,。.]?/gi, "")
+      .replace(/立即\s*创建\s*Worker\s*任务[：:，,。.]?/gi, "")
+      .replace(/请\s*立即\s*排队\s*Worker\s*任务[：:，,。.]?/gi, "")
       .replace(/请直接创建\s*Worker\s*任务[：:，,。.]?/gi, "")
       .replace(/直接创建\s*Worker\s*任务[：:，,。.]?/gi, "")
       .replace(/直接进入\s*Worker\s*创建流程[：:，,。.]?/gi, "")
@@ -769,8 +824,11 @@ function escapeWorkerContextValue(value: unknown): string {
 
 const DIRECT_WORKER_CONTEXT_REQUIRED_FIELDS = [
   "project_domain",
+  "requested_mode",
+  "final_mode",
   "task_mode",
   "read_only_mode",
+  "approval_required",
   "allowed_scope",
   "forbidden_scope",
   "original_request_text",
@@ -802,11 +860,17 @@ async function insertDirectWorkerTask(
     feishuUserId: string;
   }
 ): Promise<{ jobId: string | null }> {
-  const taskDomain = classifyFeishuWorkerTaskDomain(input.requestText);
+  const modeContract = resolveDirectWorkerReadOnlyContract(input.rawText);
+  const taskDomain = modeContract.projectDomain;
   const contractPayload = buildWorkerJobPayloadContract({
     requestText: input.requestText,
     originalRequestText: input.rawText,
     projectDomain: taskDomain,
+    taskMode: modeContract.taskMode,
+    readOnlyMode: modeContract.readOnlyMode,
+    allowedScope: modeContract.allowedScope,
+    forbiddenScope: modeContract.forbiddenScope,
+    approvedBatch: modeContract.batchCode,
     route: "direct_worker_create",
     workerStage: "queued",
     workflowStage: "queued",
@@ -816,7 +880,13 @@ async function insertDirectWorkerTask(
     pushed: false,
     deployStatus: null,
   });
-  const contextualRequestText = withHermesWorkerContext(input.requestText, contractPayload);
+  const directWorkerPayload = {
+    ...contractPayload,
+    requested_mode: modeContract.requestedMode,
+    final_mode: modeContract.finalMode,
+    approval_required: modeContract.approvalRequired,
+  };
+  const contextualRequestText = withHermesWorkerContext(input.requestText, directWorkerPayload);
   const row = {
     source: "feishu",
     job_type: taskDomain,
@@ -831,7 +901,7 @@ async function insertDirectWorkerTask(
     feishu_chat_id: input.feishuChatId,
     feishu_user_id: input.feishuUserId,
     payload: {
-      ...contractPayload,
+      ...directWorkerPayload,
       task_domain: taskDomain,
       route: "direct_worker_create",
       raw_message: input.rawText,
@@ -1191,10 +1261,56 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      if (isDirectWorkerTaskRequest(text)) {
+      if (isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text)) {
         const requestText = buildDirectWorkerTaskText(text) || normalizeFeishuTaskText(text);
-        const duplicateCheck = await findRecentDuplicateFeishuJob(supabase, requestText);
+        const modeContract = resolveDirectWorkerReadOnlyContract(text);
         const token = await getFeishuToken();
+
+        if (!modeContract.ok) {
+          const reply = [
+            "PROJECT_DIRECTOR_DIRECT_WORKER_TASK_REJECTED",
+            `error_code: ${modeContract.error}`,
+            `batch: ${modeContract.batchCode ?? "missing"}`,
+            `project_domain=${modeContract.projectDomain}`,
+            `requested_mode=${modeContract.requestedMode ?? "not_provided"}`,
+            `final_mode=${modeContract.finalMode ?? "not_provided"}`,
+            `task_mode=${modeContract.taskMode ?? "not_provided"}`,
+            `read_only_mode=${modeContract.readOnlyMode ? "true" : "false"}`,
+            `approval_required=${modeContract.approvalRequired ? "true" : "false"}`,
+            "worker_created=false",
+            "manager_read_only does not create Worker; write_allowed requires exact approval.",
+          ].join("\n");
+          await saveSystemRecordedReply(
+            supabase,
+            convId,
+            text,
+            reply,
+            [
+              "PROJECT_DIRECTOR_DIRECT_WORKER_TASK_REJECTED",
+              `state: ${modeContract.error}`,
+              `batch: ${modeContract.batchCode ?? "missing"}`,
+              `requested_mode: ${modeContract.requestedMode ?? "not_provided"}`,
+            ].join("\n"),
+            "project_director_direct_worker_task_rejected",
+            ev.message.message_id
+          );
+          await sendFeishuMessage(
+            token,
+            ev.message.chat_id,
+            ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+            reply
+          );
+          await markReceiptCompleted(supabase, eventId);
+          return NextResponse.json({
+            code: 0,
+            direct_worker_task: true,
+            state: "rejected",
+            hermes_jobs_created: false,
+            error: modeContract.error,
+          });
+        }
+
+        const duplicateCheck = await findRecentDuplicateFeishuJob(supabase, requestText);
 
         if (duplicateCheck.error) {
           console.error(
@@ -1203,7 +1319,13 @@ export async function POST(req: NextRequest) {
           );
         } else if (duplicateCheck.duplicate) {
           const existingJobNo = duplicateCheck.duplicate.job_id ?? duplicateCheck.duplicate.id;
-          const reply = `检测到重复 Worker 任务，已跳过创建。已有任务编号：${existingJobNo}`;
+          const reply = [
+            "PROJECT_DIRECTOR_DIRECT_WORKER_TASK_DUPLICATE",
+            `existing_job_id: ${existingJobNo}`,
+            `batch: ${modeContract.batchCode}`,
+            `current_status: ${(duplicateCheck.duplicate as any).status ?? "unknown"}`,
+            "created_duplicate=false",
+          ].join("\n");
           await saveSystemRecordedReply(
             supabase,
             convId,
@@ -1212,6 +1334,7 @@ export async function POST(req: NextRequest) {
             [
               "PROJECT_DIRECTOR_DIRECT_WORKER_TASK_DUPLICATE",
               "state: duplicate_skipped",
+              `approved_batch: ${modeContract.batchCode}`,
               `request_text: ${requestText}`,
               "skip_planning_choice: true",
               "note: direct Worker task requests are handled before A/B choice parsing.",
@@ -1245,11 +1368,13 @@ export async function POST(req: NextRequest) {
           feishuUserId: userId,
         });
         const reply = [
-          "【项目总管：已直接创建 Worker 任务】",
-          `任务编号：${insertResult.jobId ?? "pending"}`,
-          "",
-          "已按你的明确指令跳过 A/B 方案询问，并写入 Worker 队列。",
-          "后续由 Worker 领取执行，完成后回报修改文件、验证结果和剩余风险。",
+          "PROJECT_DIRECTOR_WORKER_READ_ONLY_TASK_CREATED",
+          `job_id: ${insertResult.jobId ?? "pending"}`,
+          `batch: ${modeContract.batchCode}`,
+          "status: queued",
+          "task_mode: worker_read_only",
+          "read_only_mode: true",
+          "codex_sandbox: read-only",
         ].join("\n");
         await saveSystemRecordedReply(
           supabase,
@@ -1259,6 +1384,9 @@ export async function POST(req: NextRequest) {
           [
             "PROJECT_DIRECTOR_DIRECT_WORKER_TASK_CREATED",
             "state: queued",
+            "task_mode: worker_read_only",
+            "read_only_mode: true",
+            `approved_batch: ${modeContract.batchCode}`,
             `job_id: ${insertResult.jobId ?? "pending"}`,
             `request_text: ${requestText}`,
             "skip_planning_choice: true",

@@ -760,6 +760,8 @@ const CONTEXT_MISSING_WARNING = "CONTEXT_MISSING_WARNING";
 
 const TASK_MODES = {
   READ_ONLY: "read_only",
+  MANAGER_READ_ONLY: "manager_read_only",
+  WORKER_READ_ONLY: "worker_read_only",
   DOCS_WRITE_ALLOWED: "docs_write_allowed",
   AUTOMATION_SYSTEM_WRITE_ALLOWED: "automation_system_write_allowed",
   PRODUCT_WRITE_ALLOWED: "product_write_allowed",
@@ -1332,9 +1334,11 @@ function resolveTaskModeFromExplicitTextContext(context) {
   if (
     context.taskMode &&
     (context.readOnlyMode === true ||
-      context.taskMode === TASK_MODES.READ_ONLY)
+      isReadOnlyTaskMode(context.taskMode))
   ) {
-    return TASK_MODES.READ_ONLY;
+    return isReadOnlyTaskMode(context.taskMode)
+      ? context.taskMode
+      : TASK_MODES.READ_ONLY;
   }
 
   return context.taskMode || null;
@@ -1542,10 +1546,10 @@ function isReadOnlyTaskText(text) {
 
 function isReadOnlyTask(jobOrText) {
   if (typeof jobOrText === "string") {
-    return getTaskModeFromText(jobOrText) === TASK_MODES.READ_ONLY;
+    return isReadOnlyTaskMode(getTaskModeFromText(jobOrText));
   }
 
-  return getTaskMode(jobOrText) === TASK_MODES.READ_ONLY;
+  return isReadOnlyTaskMode(getTaskMode(jobOrText));
 }
 
 function pathMatchesPrefix(filePath, prefixes) {
@@ -1565,9 +1569,11 @@ function getTaskModeFromText(text) {
   if (
     explicitTextMode &&
     (explicitReadOnlyMode === true ||
-      explicitTextMode === TASK_MODES.READ_ONLY)
+      isReadOnlyTaskMode(explicitTextMode))
   ) {
-    return TASK_MODES.READ_ONLY;
+    return isReadOnlyTaskMode(explicitTextMode)
+      ? explicitTextMode
+      : TASK_MODES.READ_ONLY;
   }
 
   if (explicitTextMode) {
@@ -2072,6 +2078,14 @@ function normalizeTaskModeValue(value) {
   return Object.values(TASK_MODES).includes(normalized) ? normalized : null;
 }
 
+function isReadOnlyTaskMode(taskMode) {
+  return (
+    taskMode === TASK_MODES.READ_ONLY ||
+    taskMode === TASK_MODES.MANAGER_READ_ONLY ||
+    taskMode === TASK_MODES.WORKER_READ_ONLY
+  );
+}
+
 function readNullableBooleanFlag(value) {
   if (readBooleanFlag(value)) return true;
   if (readBooleanFalseFlag(value)) return false;
@@ -2512,17 +2526,17 @@ function normalizeWorkerContext(job, overrides = {}) {
     !currentBatchIsQa && isBatchFixProductTaskText(classificationText);
   const forceReadOnlyMode =
     explicitReadOnlyMode === true &&
-    !(productRepairRequest && explicitTaskMode !== TASK_MODES.READ_ONLY);
+    !(productRepairRequest && !isReadOnlyTaskMode(explicitTaskMode));
   const inferredTaskMode =
     getTaskModeFromText(classificationText) ||
     TASK_MODES.READ_ONLY;
   const taskMode =
-    forceReadOnlyMode || explicitTaskMode === TASK_MODES.READ_ONLY
-      ? TASK_MODES.READ_ONLY
+    forceReadOnlyMode || isReadOnlyTaskMode(explicitTaskMode)
+      ? (isReadOnlyTaskMode(explicitTaskMode) ? explicitTaskMode : TASK_MODES.READ_ONLY)
       : explicitTaskMode || inferredTaskMode;
-  const readOnlyMode = productRepairRequest && explicitTaskMode !== TASK_MODES.READ_ONLY
+  const readOnlyMode = productRepairRequest && !isReadOnlyTaskMode(explicitTaskMode)
     ? false
-    : explicitReadOnlyMode ?? taskMode === TASK_MODES.READ_ONLY;
+    : explicitReadOnlyMode ?? isReadOnlyTaskMode(taskMode);
   const projectDomain =
     readString(readPriorityField("project_domain")) ||
     classifyWorkerTaskDomain([originalRequestText, requestText].join("\n"));
@@ -2543,10 +2557,10 @@ function normalizeWorkerContext(job, overrides = {}) {
       ? []
       : [`${CONTEXT_MISSING_WARNING}: explicit HERMES_WORKER_CONTEXT missing; using ${contextSource}`];
   const contextReconstructFailed = Boolean(
-    !projectDomain ||
+      !projectDomain ||
       !taskMode ||
       readOnlyMode === null ||
-      (taskMode !== TASK_MODES.READ_ONLY && !allowedScope)
+      (!isReadOnlyTaskMode(taskMode) && !allowedScope)
   );
   const changedFiles = uniqueSortedPaths(
     readStringList(
@@ -3776,7 +3790,7 @@ function assertArchitectureReportComplete(job, reportText) {
 function assertQaTaskOutcome(job, changedPaths, reportText) {
   const shouldValidateQaReport = isQaReviewTask(job);
   const shouldValidateArchitectureReport =
-    getTaskMode(job) === TASK_MODES.READ_ONLY && isArchitectureReviewTask(job);
+    isReadOnlyTaskMode(getTaskMode(job)) && isArchitectureReviewTask(job);
 
   if (!shouldValidateQaReport && !shouldValidateArchitectureReport) {
     return;
@@ -3863,7 +3877,7 @@ function assertTaskGoalApplied(job, changedPaths) {
     );
   }
 
-  if (taskMode === TASK_MODES.READ_ONLY) {
+  if (isReadOnlyTaskMode(taskMode)) {
     if (normalizedChangedPaths.length > 0) {
       throw createReadOnlyModeViolationError(normalizedChangedPaths);
     }
@@ -4260,7 +4274,7 @@ function buildQaReviewGuard(taskText) {
 }
 
 function buildArchitectureReviewGuard(taskText, taskMode) {
-  if (taskMode !== TASK_MODES.READ_ONLY || !isArchitectureReviewTaskText(taskText)) {
+  if (!isReadOnlyTaskMode(taskMode) || !isArchitectureReviewTaskText(taskText)) {
     return null;
   }
 
@@ -4350,9 +4364,9 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
   const effectiveReadOnlyMode = contract.read_only_mode === true;
   const promptTaskText = sanitizeProductTaskTextForPrompt(taskText, effectiveTaskMode);
   const readOnlyGuard =
-    effectiveTaskMode === TASK_MODES.READ_ONLY
+    isReadOnlyTaskMode(effectiveTaskMode)
       ? buildReadOnlyGuard(taskText, {
-          force: effectiveReadOnlyMode || effectiveTaskMode === TASK_MODES.READ_ONLY,
+          force: effectiveReadOnlyMode || isReadOnlyTaskMode(effectiveTaskMode),
         })
       : null;
   const qaReviewGuard = buildQaReviewGuard(taskText);
@@ -4416,6 +4430,29 @@ function buildCodexPrompt(job) {
     payload: job?.payload || null,
     contract,
   });
+}
+
+function buildCodexExecArgs(prompt, job) {
+  const contract = resolveWorkerJobContract(job, {
+    taskMode: getTaskMode(job),
+    readOnlyMode: isReadOnlyTask(job),
+    workerStage: "codex_spawn",
+    workflowStage: "codex_spawn",
+  });
+  const sandboxMode =
+    contract.read_only_mode === true || isReadOnlyTaskMode(contract.task_mode)
+      ? "read-only"
+      : "workspace-write";
+
+  return [
+    "exec",
+    "-C",
+    PROJECT_DIR,
+    "--sandbox",
+    sandboxMode,
+    "--skip-git-repo-check",
+    prompt,
+  ];
 }
 
 function buildCodexRepairPrompt(job, error, attempt) {
@@ -4835,7 +4872,7 @@ async function runCodexWithRetries(job) {
 
 async function commitGitTask(job) {
   const taskMode = getTaskMode(job);
-  const readOnlyMode = taskMode === TASK_MODES.READ_ONLY;
+  const readOnlyMode = isReadOnlyTaskMode(taskMode);
   const taskChangedEntries = await getTaskChangedEntries();
   const taskChangedPaths = getStatusPaths(taskChangedEntries);
 
@@ -5122,15 +5159,7 @@ function runCodex(prompt, job) {
     let capture;
     try {
       capture = createCodexOutputCapture("codex-task");
-      child = spawnCodexProcess([
-        "exec",
-        "-C",
-        PROJECT_DIR,
-        "--sandbox",
-        "workspace-write",
-        "--skip-git-repo-check",
-        prompt,
-      ], {
+      child = spawnCodexProcess(buildCodexExecArgs(prompt, job), {
         stdio: capture.stdio,
       });
     } catch (error) {
@@ -6064,6 +6093,7 @@ module.exports = {
   assertGitOperationAllowed,
   assertCleanWorktreeBeforeCodex,
   buildCodexPrompt,
+  buildCodexExecArgs,
   buildCodexSpawnCommand,
   buildFailureReport,
   buildAutoIterationSuggestion,

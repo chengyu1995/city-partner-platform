@@ -44,6 +44,7 @@ const {
   assertTaskGoalApplied,
   assertExplicitTaskFieldsNotOverridden,
   buildCodexPrompt,
+  buildCodexExecArgs,
   buildCodexSpawnCommand,
   buildFailureReport,
   buildAutoIterationSuggestion,
@@ -276,7 +277,10 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
     }
 
     assert.match(builderSource, /withHermesWorkerContext\(requestText, context\)/);
-    assert.match(routeSource, /withHermesWorkerContext\(input\.requestText, contractPayload\)/);
+    assert.match(routeSource, /withHermesWorkerContext\(input\.requestText, directWorkerPayload\)/);
+    assert.match(routeSource, /requested_mode/);
+    assert.match(routeSource, /final_mode/);
+    assert.match(routeSource, /approval_required/);
   });
 
   await t.test("long approval batch codes are not truncated", () => {
@@ -2920,6 +2924,85 @@ test("Codex prompt git operation guard", async (t) => {
 });
 
 test("Codex spawn preflight guard", async (t) => {
+  await t.test("uses read-only sandbox for worker_read_only tasks", () => {
+    const job = {
+      id: "job-worker-read-only",
+      request_text: [
+        "新需求：执行 BATCH-GM-MODE-SMOKE-WORKER-04",
+        "project_domain=automation_system",
+        "requested_mode=worker_read_only",
+        "final_mode=worker_read_only",
+        "task_mode=worker_read_only",
+        "read_only_mode=true",
+        "allowed_scope=Worker read-only static inspection; no file writes",
+        "forbidden_scope=file writes, git add, git commit, git push",
+        "approved_batch=BATCH-GM-MODE-SMOKE-WORKER-04",
+      ].join("\n"),
+      payload: {
+        project_domain: "automation_system",
+        requested_mode: "worker_read_only",
+        final_mode: "worker_read_only",
+        task_mode: "worker_read_only",
+        read_only_mode: true,
+        allowed_scope: "Worker read-only static inspection; no file writes",
+        forbidden_scope: "file writes, git add, git commit, git push",
+        approved_batch: "BATCH-GM-MODE-SMOKE-WORKER-04",
+      },
+    };
+
+    const contract = resolveWorkerJobContract(job);
+    assert.equal(contract.project_domain, "automation_system");
+    assert.equal(contract.task_mode, "worker_read_only");
+    assert.equal(contract.read_only_mode, true);
+    assert.equal(isReadOnlyTask(job), true);
+
+    const args = buildCodexExecArgs("report only", job);
+    const sandboxIndex = args.indexOf("--sandbox");
+    assert.notEqual(sandboxIndex, -1);
+    assert.equal(args[sandboxIndex + 1], "read-only");
+    assert.doesNotMatch(args.join(" "), /workspace-write/);
+  });
+
+  await t.test("uses workspace-write sandbox for write-allowed tasks", () => {
+    const job = {
+      id: "job-write",
+      request_text: [
+        "BATCH-GM-WRITE-FIX",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**",
+      ].join("\n"),
+      payload: {
+        project_domain: "automation_system",
+        task_mode: "automation_system_write_allowed",
+        read_only_mode: false,
+        allowed_scope: "infra/windows-worker/**",
+      },
+    };
+
+    const args = buildCodexExecArgs("fix safely", job);
+    const sandboxIndex = args.indexOf("--sandbox");
+    assert.equal(args[sandboxIndex + 1], "workspace-write");
+  });
+
+  await t.test("direct worker route enforces worker_read_only three-mode boundaries", () => {
+    const routeSource = fs.readFileSync(
+      path.join(workerRoot, "..", "..", "src", "app", "api", "feishu", "event", "route.ts"),
+      "utf8"
+    );
+
+    assert.match(routeSource, /isExplicitDirectWorkerCreateCommand/);
+    assert.match(routeSource, /resolveDirectWorkerReadOnlyContract/);
+    assert.match(routeSource, /DIRECT_MANAGER_READ_ONLY_REJECTED/);
+    assert.match(routeSource, /DIRECT_WRITE_ALLOWED_REQUIRES_APPROVAL/);
+    assert.match(routeSource, /PROJECT_DIRECTOR_WORKER_READ_ONLY_TASK_CREATED/);
+    assert.match(routeSource, /PROJECT_DIRECTOR_DIRECT_WORKER_TASK_DUPLICATE/);
+    assert.match(routeSource, /taskMode: modeContract\.taskMode/);
+    assert.match(routeSource, /readOnlyMode: modeContract\.readOnlyMode/);
+    assert.match(routeSource, /approvedBatch: modeContract\.batchCode/);
+  });
+
   await t.test("detects executable file types", () => {
     assert.equal(getCodexFileType("C:/Tools/Codex/codex.exe"), "exe");
     assert.equal(getCodexFileType("C:/Users/admin/AppData/Roaming/npm/codex.cmd"), "cmd");
