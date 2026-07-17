@@ -72,6 +72,311 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function quoteWindowsCmdArg(value) {
+  return '"' + String(value).replace(/"/g, '\\"') + '"';
+}
+
+function sanitizeSpawnValue(value) {
+  return String(value == null ? "" : value)
+    .replace(/(Bearer\s+)[A-Za-z0-9._\-]+/gi, "$1[redacted]")
+    .replace(/([?&](?:token|authorization|key|secret)=)[^&\s]+/gi, "$1[redacted]");
+}
+
+function sanitizeSpawnArgs(args = []) {
+  return args.map((arg) => {
+    const text = sanitizeSpawnValue(arg);
+    return text.length > 240 ? `${text.slice(0, 240)}...[truncated]` : text;
+  });
+}
+
+function getCodexFileType(filePath) {
+  const ext = path.extname(String(filePath || "")).toLowerCase();
+  if (ext === ".exe") return "exe";
+  if (ext === ".cmd") return "cmd";
+  if (ext === ".bat") return "bat";
+  if (ext === ".ps1") return "powershell-script";
+  if (!ext) return "shim-or-app-alias";
+  return ext.slice(1) || "unknown";
+}
+
+function resolveCodexExecutable(options = {}) {
+  const explicitPath = String(options.codexExe || CODEX_EXE || "").trim();
+  if (!explicitPath) {
+    return {
+      ok: false,
+      reason: "CODEX_EXE_EMPTY",
+      requestedPath: explicitPath,
+      resolvedPath: "",
+      fileType: "missing",
+    };
+  }
+
+  const resolvedPath = path.resolve(explicitPath);
+  const exists = fs.existsSync(resolvedPath);
+  const fileType = getCodexFileType(resolvedPath);
+  const isWindowsAppAlias = /[\\/]WindowsApps[\\/]/i.test(resolvedPath);
+
+  if (!exists) {
+    return {
+      ok: false,
+      reason: "CODEX_EXE_NOT_FOUND",
+      requestedPath: explicitPath,
+      resolvedPath,
+      fileType,
+      isWindowsAppAlias,
+    };
+  }
+
+  if (isWindowsAppAlias || fileType === "shim-or-app-alias") {
+    return {
+      ok: false,
+      reason: "CODEX_EXE_APP_ALIAS_OR_SHIM",
+      requestedPath: explicitPath,
+      resolvedPath,
+      fileType,
+      isWindowsAppAlias,
+    };
+  }
+
+  if (!["exe", "cmd", "bat"].includes(fileType)) {
+    return {
+      ok: false,
+      reason: "CODEX_EXE_UNSUPPORTED_FILE_TYPE",
+      requestedPath: explicitPath,
+      resolvedPath,
+      fileType,
+      isWindowsAppAlias,
+    };
+  }
+
+  return {
+    ok: true,
+    requestedPath: explicitPath,
+    resolvedPath,
+    fileType,
+    isWindowsAppAlias,
+  };
+}
+
+function buildCodexSpawnCommand(codexResolution, codexArgs) {
+  if (!codexResolution || !codexResolution.ok) {
+    throw new Error("Codex executable is not resolved");
+  }
+
+  if (codexResolution.fileType === "exe") {
+    return {
+      command: codexResolution.resolvedPath,
+      args: codexArgs,
+      shell: false,
+      fileType: codexResolution.fileType,
+    };
+  }
+
+  if (codexResolution.fileType === "cmd" || codexResolution.fileType === "bat") {
+    const commandLine = [codexResolution.resolvedPath, ...codexArgs]
+      .map(quoteWindowsCmdArg)
+      .join(" ");
+    return {
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", commandLine],
+      shell: false,
+      fileType: codexResolution.fileType,
+    };
+  }
+
+  throw new Error(`Unsupported Codex executable file type: ${codexResolution.fileType}`);
+}
+
+function formatCodexSpawnError(error, commandInfo) {
+  const details = {
+    failure_code: error && error.code === "EPERM" ? "CODEX_SPAWN_EPERM" : "CODEX_SPAWN_FAILED",
+    error_code: error && error.code ? error.code : null,
+    errno: error && Object.prototype.hasOwnProperty.call(error, "errno") ? error.errno : null,
+    syscall: error && error.syscall ? error.syscall : null,
+    resolved_executable:
+      commandInfo && commandInfo.codexResolution
+        ? sanitizeSpawnValue(commandInfo.codexResolution.resolvedPath)
+        : null,
+    file_type:
+      commandInfo && commandInfo.codexResolution
+        ? commandInfo.codexResolution.fileType
+        : null,
+    command: commandInfo ? sanitizeSpawnValue(commandInfo.command) : null,
+    spawnargs: commandInfo ? sanitizeSpawnArgs(commandInfo.args) : [],
+  };
+
+  return Object.entries(details)
+    .filter(([, value]) => value !== null && value !== undefined && value !== "")
+    .map(([key, value]) => `${key}=${Array.isArray(value) ? JSON.stringify(value) : value}`)
+    .join(" ");
+}
+
+function spawnCodexProcess(codexArgs, options = {}) {
+  const codexResolution = options.codexResolution || resolveCodexExecutable(options);
+  if (!codexResolution.ok) {
+    const error = new Error(`Codex preflight failed: ${codexResolution.reason}`);
+    error.code = codexResolution.reason;
+    error.codexResolution = codexResolution;
+    throw error;
+  }
+
+  const commandInfo = buildCodexSpawnCommand(codexResolution, codexArgs);
+  commandInfo.codexResolution = codexResolution;
+
+  try {
+    const child = spawn(commandInfo.command, commandInfo.args, {
+      shell: false,
+      windowsHide: true,
+      stdio: options.stdio || ["ignore", "pipe", "pipe"],
+      env: {
+        ...sanitizeWindowsEnv(process.env),
+        CI: "1",
+        NO_COLOR: "1",
+      },
+    });
+    child.codexCommandInfo = commandInfo;
+    return child;
+  } catch (error) {
+    error.codexCommandInfo = commandInfo;
+    throw error;
+  }
+}
+
+function createCodexOutputCapture(label = "codex") {
+  const dir = path.join(os.tmpdir(), "city-partner-worker-codex");
+  fs.mkdirSync(dir, { recursive: true });
+  const suffix = `${process.pid}-${Date.now()}-${Math.random()
+    .toString(16)
+    .slice(2)}`;
+  const stdoutPath = path.join(dir, `${label}-${suffix}.out.log`);
+  const stderrPath = path.join(dir, `${label}-${suffix}.err.log`);
+  const stdoutFd = fs.openSync(stdoutPath, "a+");
+  const stderrFd = fs.openSync(stderrPath, "a+");
+
+  return {
+    stdoutPath,
+    stderrPath,
+    stdoutFd,
+    stderrFd,
+    stdio: ["ignore", stdoutFd, stderrFd],
+  };
+}
+
+function closeCodexOutputCapture(capture) {
+  for (const fd of [capture && capture.stdoutFd, capture && capture.stderrFd]) {
+    if (typeof fd === "number") {
+      try {
+        fs.closeSync(fd);
+      } catch (_) {}
+    }
+  }
+}
+
+function readCodexCaptureChunk(filePath, state) {
+  try {
+    const stat = fs.statSync(filePath);
+    const start = Number(state.position || 0);
+    if (stat.size <= start) return "";
+    const length = stat.size - start;
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const buffer = Buffer.alloc(length);
+      const bytesRead = fs.readSync(fd, buffer, 0, length, start);
+      state.position = start + bytesRead;
+      return buffer.slice(0, bytesRead).toString();
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (_) {
+    return "";
+  }
+}
+
+function runCodexPreflight(options = {}) {
+  return new Promise((resolve) => {
+    const codexResolution = resolveCodexExecutable(options);
+    if (!codexResolution.ok) {
+      resolve({ ok: false, codexResolution, error: codexResolution.reason });
+      return;
+    }
+
+    const mode = String(options.mode || "version").toLowerCase();
+    const codexArgs =
+      mode === "smoke"
+        ? [
+            "exec",
+            "-C",
+            PROJECT_DIR,
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "只输出 CODEX_WORKER_PREFLIGHT_OK，不修改文件",
+          ]
+        : ["--version"];
+
+    let child;
+    let capture;
+    try {
+      capture = createCodexOutputCapture("codex-preflight");
+      child = spawnCodexProcess(codexArgs, {
+        codexResolution,
+        stdio: capture.stdio,
+      });
+    } catch (error) {
+      if (capture) closeCodexOutputCapture(capture);
+      resolve({
+        ok: false,
+        codexResolution,
+        error: error && error.message ? error.message : String(error),
+        code: error && error.code ? error.code : null,
+        diagnostic: formatCodexSpawnError(error, error && error.codexCommandInfo),
+      });
+      return;
+    }
+
+    const timeoutMs = Number(options.timeoutMs || 30000);
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      closeCodexOutputCapture(capture);
+      resolve({
+        ok: false,
+        codexResolution,
+        error: `codex preflight ${mode} timed out after ${timeoutMs}ms`,
+      });
+    }, timeoutMs);
+
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      closeCodexOutputCapture(capture);
+      resolve({
+        ok: false,
+        codexResolution,
+        error: error && error.message ? error.message : String(error),
+        code: error && error.code ? error.code : null,
+        diagnostic: formatCodexSpawnError(error, error && error.codexCommandInfo),
+      });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      closeCodexOutputCapture(capture);
+      const stdout = fs.existsSync(capture.stdoutPath)
+        ? fs.readFileSync(capture.stdoutPath, "utf8")
+        : "";
+      const stderr = fs.existsSync(capture.stderrPath)
+        ? fs.readFileSync(capture.stderrPath, "utf8")
+        : "";
+      resolve({
+        ok: code === 0,
+        codexResolution,
+        exitCode: code,
+        stdout: stdout.trim().slice(0, 500),
+        stderr: stderr.trim().slice(0, 1000),
+        error: code === 0 ? null : `codex preflight ${mode} exited with ${code}`,
+      });
+    });
+  });
+}
+
 function redactWorkerUrl(value) {
   try {
     const url = new URL(String(value || ""));
@@ -4813,9 +5118,11 @@ function runCodex(prompt, job) {
   return new Promise((resolve, reject) => {
     console.log(`开始执行 Codex，项目目录：${PROJECT_DIR}`);
 
-    const child = spawn(
-      CODEX_EXE,
-      [
+    let child;
+    let capture;
+    try {
+      capture = createCodexOutputCapture("codex-task");
+      child = spawnCodexProcess([
         "exec",
         "-C",
         PROJECT_DIR,
@@ -4823,29 +5130,39 @@ function runCodex(prompt, job) {
         "workspace-write",
         "--skip-git-repo-check",
         prompt,
-      ],
-      {
-        shell: false,
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...sanitizeWindowsEnv(process.env),
-          CI: "1",
-          NO_COLOR: "1",
-        },
-      }
-    );
+      ], {
+        stdio: capture.stdio,
+      });
+    } catch (error) {
+      if (capture) closeCodexOutputCapture(capture);
+      const diagnostic = formatCodexSpawnError(
+        error,
+        error && error.codexCommandInfo
+      );
+      reject(
+        new Error(
+          `${diagnostic || "CODEX_SPAWN_FAILED"}\n${
+            error && error.message ? error.message : String(error)
+          }`
+        )
+      );
+      return;
+    }
 
     let stdout = "";
     let stderr = "";
     let settled = false;
     let lastOutputAt = Date.now();
     let stopCodexHeartbeat = () => {};
+    const stdoutCaptureState = { position: 0 };
+    const stderrCaptureState = { position: 0 };
 
     const cleanupTimers = () => {
       stopCodexHeartbeat();
       clearTimeout(hardTimer);
       clearTimeout(idleTimer);
+      clearInterval(outputDrainTimer);
+      closeCodexOutputCapture(capture);
     };
 
     const appendOutput = (target, chunk) => {
@@ -4867,6 +5184,14 @@ function runCodex(prompt, job) {
       }
 
       resetIdleTimer();
+    };
+
+    const drainCapturedOutput = () => {
+      if (!capture) return;
+      const stdoutChunk = readCodexCaptureChunk(capture.stdoutPath, stdoutCaptureState);
+      if (stdoutChunk) appendOutput("stdout", Buffer.from(stdoutChunk));
+      const stderrChunk = readCodexCaptureChunk(capture.stderrPath, stderrCaptureState);
+      if (stderrChunk) appendOutput("stderr", Buffer.from(stderrChunk));
     };
 
     const failAndKill = (message) => {
@@ -4899,12 +5224,11 @@ function runCodex(prompt, job) {
       failAndKill(`Codex 执行总超时：${CODEX_TIMEOUT_MS}ms，已强制结束进程树`);
     }, CODEX_TIMEOUT_MS);
 
+    const outputDrainTimer = setInterval(drainCapturedOutput, 1000);
+
     child.on("spawn", () => {
       stopCodexHeartbeat = startCodexHeartbeat(job);
     });
-
-    child.stdout.on("data", (chunk) => appendOutput("stdout", chunk));
-    child.stderr.on("data", (chunk) => appendOutput("stderr", chunk));
 
     child.on("error", (error) => {
       if (settled) {
@@ -4922,6 +5246,7 @@ function runCodex(prompt, job) {
       }
 
       settled = true;
+      drainCapturedOutput();
       cleanupTimers();
 
       if (code === 0) {
@@ -5650,6 +5975,25 @@ async function main() {
   console.log(`云端地址：${WORKER_API_URL}`);
   console.log(`项目目录：${PROJECT_DIR}`);
 
+  const codexPreflight = await runCodexPreflight({
+    mode: "smoke",
+    timeoutMs: Number(process.env.CODEX_PREFLIGHT_TIMEOUT_MS || 120000),
+  });
+  if (!codexPreflight.ok) {
+    console.error("Codex preflight failed; Worker will not poll for jobs.");
+    console.error(
+      codexPreflight.diagnostic ||
+      codexPreflight.error ||
+      "CODEX_PREFLIGHT_FAILED"
+    );
+    throw new Error(codexPreflight.error || "CODEX_PREFLIGHT_FAILED");
+  }
+  console.log(
+    `Codex preflight passed: ${codexPreflight.codexResolution.resolvedPath} ${
+      codexPreflight.stdout || ""
+    }`.trim()
+  );
+
   let consecutivePollFailures = 0;
 
   while (!stopping) {
@@ -5720,6 +6064,7 @@ module.exports = {
   assertGitOperationAllowed,
   assertCleanWorktreeBeforeCodex,
   buildCodexPrompt,
+  buildCodexSpawnCommand,
   buildFailureReport,
   buildAutoIterationSuggestion,
   buildTerminalJobIndex,
@@ -5729,7 +6074,9 @@ module.exports = {
   commitGitTask,
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
+  formatCodexSpawnError,
   formatWorkerFetchError,
+  getCodexFileType,
   getWorkerPollBackoffMs,
   getTaskMode,
   isTrueTaskFailureCode,
@@ -5738,7 +6085,10 @@ module.exports = {
   recordFailureMemoryForFinalResult,
   recordFailureMemory,
   recordTerminalJobIndex,
+  resolveCodexExecutable,
   resolveWorkerJobContract,
+  runCodexPreflight,
+  spawnCodexProcess,
   getTaskChangedPaths,
   isReadOnlyTask,
   isReadOnlyTaskText,

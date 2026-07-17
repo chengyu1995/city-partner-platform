@@ -44,6 +44,7 @@ const {
   assertTaskGoalApplied,
   assertExplicitTaskFieldsNotOverridden,
   buildCodexPrompt,
+  buildCodexSpawnCommand,
   buildFailureReport,
   buildAutoIterationSuggestion,
   buildWorkerGuardedPrompt,
@@ -51,7 +52,9 @@ const {
   classifyWorkerTaskDomain,
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
+  formatCodexSpawnError,
   formatWorkerFetchError,
+  getCodexFileType,
   getWorkerPollBackoffMs,
   getTaskMode,
   isTrueTaskFailureCode,
@@ -62,7 +65,9 @@ const {
   recordFailureMemoryForFinalResult,
   recordFailureMemory,
   recordTerminalJobIndex,
+  resolveCodexExecutable,
   resolveWorkerJobContract,
+  runCodexPreflight,
 } = require("../local_worker");
 
 const workerRoot = path.resolve(__dirname, "..");
@@ -2846,5 +2851,89 @@ test("Codex prompt git operation guard", async (t) => {
       prompt,
       /Codex 应理解为外层 Worker 的验收目标，而不是自己执行 Git/
     );
+  });
+});
+
+test("Codex spawn preflight guard", async (t) => {
+  await t.test("detects executable file types", () => {
+    assert.equal(getCodexFileType("C:/Tools/Codex/codex.exe"), "exe");
+    assert.equal(getCodexFileType("C:/Users/admin/AppData/Roaming/npm/codex.cmd"), "cmd");
+    assert.equal(getCodexFileType("C:/Tools/codex.bat"), "bat");
+    assert.equal(getCodexFileType("C:/Users/admin/AppData/Roaming/npm/codex"), "shim-or-app-alias");
+  });
+
+  await t.test("builds direct exe spawn command", () => {
+    const command = buildCodexSpawnCommand(
+      {
+        ok: true,
+        resolvedPath: "C:\\Program Files\\OpenAI Codex\\codex.exe",
+        fileType: "exe",
+      },
+      ["exec", "-C", "D:\\Project With Spaces", "prompt text"]
+    );
+
+    assert.equal(command.command, "C:\\Program Files\\OpenAI Codex\\codex.exe");
+    assert.deepEqual(command.args, ["exec", "-C", "D:\\Project With Spaces", "prompt text"]);
+    assert.equal(command.shell, false);
+  });
+
+  await t.test("wraps cmd and bat launchers without shell prompt concatenation", () => {
+    const command = buildCodexSpawnCommand(
+      {
+        ok: true,
+        resolvedPath: "C:\\Users\\admin\\AppData\\Roaming\\npm\\codex.cmd",
+        fileType: "cmd",
+      },
+      ["exec", "-C", "D:\\Project With Spaces", "prompt with spaces"]
+    );
+
+    assert.equal(command.command, "cmd.exe");
+    assert.deepEqual(command.args.slice(0, 3), ["/d", "/s", "/c"]);
+    assert.match(command.args[3], /"C:\\Users\\admin\\AppData\\Roaming\\npm\\codex\.cmd"/);
+    assert.match(command.args[3], /"D:\\Project With Spaces"/);
+    assert.match(command.args[3], /"prompt with spaces"/);
+  });
+
+  await t.test("rejects Windows App aliases and extensionless shims", (t) => {
+    const root = createTempRoot(t);
+    const aliasPath = path.join(root, "WindowsApps", "codex");
+    writeFile(root, "WindowsApps/codex", "");
+
+    const result = resolveCodexExecutable({ codexExe: aliasPath });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "CODEX_EXE_APP_ALIAS_OR_SHIM");
+  });
+
+  await t.test("formats spawn EPERM diagnostics without leaking full prompt", () => {
+    const error = new Error("spawn EPERM");
+    error.code = "EPERM";
+    error.errno = -4048;
+    error.syscall = "spawn";
+
+    const diagnostic = formatCodexSpawnError(error, {
+      command: "C:\\Program Files\\OpenAI Codex\\codex.exe",
+      args: ["exec", "-C", "D:\\Project", "prompt ".repeat(80)],
+      codexResolution: {
+        resolvedPath: "C:\\Program Files\\OpenAI Codex\\codex.exe",
+        fileType: "exe",
+      },
+    });
+
+    assert.match(diagnostic, /CODEX_SPAWN_EPERM/);
+    assert.match(diagnostic, /errno=-4048/);
+    assert.match(diagnostic, /syscall=spawn/);
+    assert.match(diagnostic, /file_type=exe/);
+    assert.match(diagnostic, /truncated/);
+  });
+
+  await t.test("preflight fails before any worker polling when executable is missing", async () => {
+    const result = await runCodexPreflight({
+      codexExe: "C:\\definitely-missing\\codex.exe",
+      timeoutMs: 100,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.codexResolution.reason, "CODEX_EXE_NOT_FOUND");
   });
 });
