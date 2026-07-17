@@ -37,6 +37,8 @@ const WORKER_AUTH = process.env[WORKER_AUTH_ENV_KEY];
 const WORKER_NAME = process.env.WORKER_NAME || os.hostname();
 const PROJECT_DIR = process.env.PROJECT_DIR;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5000);
+const WORKER_REQUEST_TIMEOUT_MS = Number(process.env.WORKER_REQUEST_TIMEOUT_MS || 15000);
+const WORKER_POLL_BACKOFF_MAX_MS = Number(process.env.WORKER_POLL_BACKOFF_MAX_MS || 60000);
 const CODEX_TIMEOUT_MS = Number(process.env.CODEX_TIMEOUT_MS || 900000);
 const CODEX_IDLE_TIMEOUT_MS = Number(process.env.CODEX_IDLE_TIMEOUT_MS || 60000);
 const CODEX_PROGRESS_HEARTBEAT_INTERVAL_MS = 30 * 1000;
@@ -70,19 +72,113 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function request(path, options = {}) {
-  const response = await fetch(`${WORKER_API_URL}${path}`, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${WORKER_AUTH}`,
-      "Content-Type": "application/json",
-      "X-Worker-Id": WORKER_NAME,
-      "X-Worker-Name": WORKER_NAME,
-      ...(options.headers || {}),
-    },
-  });
+function redactWorkerUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return `${url.protocol}//${url.host}${url.pathname}`;
+  } catch (_) {
+    return String(value || "").replace(/([?&](?:token|authorization|key|secret)=)[^&]+/gi, "$1[redacted]");
+  }
+}
 
-  return response;
+function classifyWorkerFetchError(error) {
+  const cause = error && error.cause ? error.cause : null;
+  const code = String(
+    (cause && (cause.code || cause.errno)) ||
+      (error && (error.code || error.name)) ||
+      ""
+  );
+  const message = String(error && error.message ? error.message : error || "");
+
+  if (/AbortError|timeout|timed out/i.test([code, message].join(" "))) {
+    return "timeout";
+  }
+  if (/ENOTFOUND|EAI_AGAIN|dns/i.test(code) || /getaddrinfo/i.test(message)) {
+    return "dns_failure";
+  }
+  if (/ECONNREFUSED/i.test(code)) {
+    return "connection_refused";
+  }
+  if (/ECONNRESET|EPIPE|UND_ERR_SOCKET|socket/i.test([code, message].join(" "))) {
+    return "tcp_connection_reset";
+  }
+  if (/CERT|TLS|SSL|certificate/i.test([code, message].join(" "))) {
+    return "tls_failure";
+  }
+  if (/HTTP\s+\d{3}/i.test(message)) {
+    return "http_error";
+  }
+  if (/JSON|Unexpected token|Unexpected end/i.test(message)) {
+    return "json_parse_failure";
+  }
+  if (/fetch failed/i.test(message)) {
+    return "network_fetch_failed";
+  }
+  return "unknown";
+}
+
+function formatWorkerFetchError(error) {
+  const cause = error && error.cause ? error.cause : null;
+  const details = {
+    type: classifyWorkerFetchError(error),
+    name: error && error.name ? error.name : null,
+    message: error && error.message ? error.message : String(error),
+    cause_name: cause && cause.name ? cause.name : null,
+    cause_code: cause && cause.code ? cause.code : null,
+    cause_errno: cause && cause.errno ? cause.errno : null,
+    cause_syscall: cause && cause.syscall ? cause.syscall : null,
+    cause_address: cause && cause.address ? cause.address : null,
+    cause_port: cause && cause.port ? cause.port : null,
+    method: error && error.workerRequest ? error.workerRequest.method : null,
+    url: error && error.workerRequest ? redactWorkerUrl(error.workerRequest.url) : null,
+    timeout_ms: error && error.workerRequest ? error.workerRequest.timeoutMs : null,
+  };
+
+  return Object.entries(details)
+    .filter(([, value]) => value !== null && value !== undefined && value !== "")
+    .map(([key, value]) => `${key}=${value}`)
+    .join(" ");
+}
+
+function getWorkerPollBackoffMs(consecutiveFailures) {
+  if (consecutiveFailures <= 0) return POLL_INTERVAL_MS;
+  const exponent = Math.min(consecutiveFailures - 1, 5);
+  return Math.min(WORKER_POLL_BACKOFF_MAX_MS, POLL_INTERVAL_MS * 2 ** exponent);
+}
+
+async function request(path, options = {}) {
+  const url = `${WORKER_API_URL}${path}`;
+  const method = String(options.method || "GET").toUpperCase();
+  const timeoutMs = Number(options.timeoutMs || WORKER_REQUEST_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: options.signal || controller.signal,
+      headers: {
+        Authorization: `Bearer ${WORKER_AUTH}`,
+        "Content-Type": "application/json",
+        "X-Worker-Id": WORKER_NAME,
+        "X-Worker-Name": WORKER_NAME,
+        ...(options.headers || {}),
+      },
+    });
+
+    return response;
+  } catch (error) {
+    if (error && typeof error === "object") {
+      error.workerRequest = {
+        method,
+        url,
+        timeoutMs,
+      };
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function sendHeartbeat(jobId, attemptId = null) {
@@ -5554,17 +5650,32 @@ async function main() {
   console.log(`云端地址：${WORKER_API_URL}`);
   console.log(`项目目录：${PROJECT_DIR}`);
 
+  let consecutivePollFailures = 0;
+
   while (!stopping) {
+    let sleepMs = POLL_INTERVAL_MS;
+
     try {
       await pollOnce();
+      if (consecutivePollFailures > 0) {
+        console.log(
+          `[${new Date().toISOString()}] Worker 轮询已恢复，连续失败次数已清零`
+        );
+      }
+      consecutivePollFailures = 0;
     } catch (error) {
+      consecutivePollFailures += 1;
+      sleepMs = getWorkerPollBackoffMs(consecutivePollFailures);
       console.error(
         `[${new Date().toISOString()}] 轮询失败：`,
-        error instanceof Error ? error.message : error
+        formatWorkerFetchError(error)
+      );
+      console.error(
+        `[${new Date().toISOString()}] 下次轮询将在 ${sleepMs}ms 后重试，连续失败次数=${consecutivePollFailures}`
       );
     }
 
-    await sleep(POLL_INTERVAL_MS);
+    await sleep(sleepMs);
   }
 }
 
@@ -5605,6 +5716,7 @@ module.exports = {
   assertOriginalBatchContextAvailable,
   assertQaReportComplete,
   assertQaTaskOutcome,
+  classifyWorkerFetchError,
   assertGitOperationAllowed,
   assertCleanWorktreeBeforeCodex,
   buildCodexPrompt,
@@ -5617,6 +5729,8 @@ module.exports = {
   commitGitTask,
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
+  formatWorkerFetchError,
+  getWorkerPollBackoffMs,
   getTaskMode,
   isTrueTaskFailureCode,
   normalizeWorkerContext,

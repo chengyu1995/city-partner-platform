@@ -47,9 +47,12 @@ const {
   buildFailureReport,
   buildAutoIterationSuggestion,
   buildWorkerGuardedPrompt,
+  classifyWorkerFetchError,
   classifyWorkerTaskDomain,
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
+  formatWorkerFetchError,
+  getWorkerPollBackoffMs,
   getTaskMode,
   isTrueTaskFailureCode,
   isReadOnlyTask,
@@ -194,6 +197,51 @@ function joinedWords(...parts) {
 function readRepoFile(relativePath) {
   return fs.readFileSync(path.resolve(workerRoot, "..", "..", relativePath), "utf8");
 }
+
+test("Windows Worker polling errors are classified and back off", async (t) => {
+  await t.test("DNS failures include actionable fetch diagnostics", () => {
+    const error = new TypeError("fetch failed");
+    error.cause = {
+      name: "Error",
+      code: "ENOTFOUND",
+      syscall: "getaddrinfo",
+    };
+    error.workerRequest = {
+      method: "GET",
+      url: "http://150.109.71.58.nip.io/api/worker/next?worker_id=local-worker",
+      timeoutMs: 15000,
+    };
+
+    assert.equal(classifyWorkerFetchError(error), "dns_failure");
+    const formatted = formatWorkerFetchError(error);
+    assert.match(formatted, /type=dns_failure/);
+    assert.match(formatted, /method=GET/);
+    assert.match(formatted, /url=http:\/\/150\.109\.71\.58\.nip\.io\/api\/worker\/next/);
+    assert.match(formatted, /timeout_ms=15000/);
+    assert.doesNotMatch(
+      formatted,
+      new RegExp(["Authorization", "Bearer", joinedName("WORKER", "TOKEN")].join("|"))
+    );
+  });
+
+  await t.test("TCP refusal and timeout are separated from generic fetch failed", () => {
+    const refused = new TypeError("fetch failed");
+    refused.cause = { code: "ECONNREFUSED", address: "150.109.71.58", port: 80 };
+    assert.equal(classifyWorkerFetchError(refused), "connection_refused");
+
+    const timeout = new Error("This operation was aborted");
+    timeout.name = "AbortError";
+    assert.equal(classifyWorkerFetchError(timeout), "timeout");
+  });
+
+  await t.test("poll retry backoff is bounded", () => {
+    assert.equal(getWorkerPollBackoffMs(0), 5000);
+    assert.equal(getWorkerPollBackoffMs(1), 5000);
+    assert.equal(getWorkerPollBackoffMs(2), 10000);
+    assert.equal(getWorkerPollBackoffMs(3), 20000);
+    assert.equal(getWorkerPollBackoffMs(99), 60000);
+  });
+});
 
 test("Project Director Worker task creation uses hermes_jobs contract", async (t) => {
   const builderSource = readRepoFile("src/lib/project-director-job-builder.ts");
