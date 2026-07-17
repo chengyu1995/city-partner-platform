@@ -193,21 +193,37 @@ function isApprovedRepairReply(text: string): boolean {
   return /总管\s*批准修复|批准修复/i.test(normalizeFeishuTaskText(text));
 }
 
+function isApprovedBatchExecutionReply(text: string): boolean {
+  const normalized = normalizeFeishuTaskText(text);
+  if (!normalized.match(ROUTE_BATCH_CODE_PATTERN)) return false;
+
+  return (
+    /(?:总管\s*)?批准执行\s*[:：\s]/i.test(normalized) ||
+    /(?:仅批准|只批准)\s*BATCH-/i.test(normalized) ||
+    /approved\s+execution\s+only\s+BATCH-/i.test(normalized)
+  );
+}
+
 function isApprovedExecutionReply(text: string): boolean {
   const normalized = normalizeFeishuTaskText(text);
   return (
     isBaseApprovedExecutionReply(normalized) ||
     /^(总管\s*)?批准执行$/i.test(normalized) ||
+    isApprovedBatchExecutionReply(normalized) ||
     isApprovedRepairReply(normalized)
   );
 }
 
-function extractApprovedRepairBatchCode(text: string): string | null {
-  if (!isApprovedRepairReply(text)) return null;
+function extractApprovedBatchCode(text: string): string | null {
+  if (!isApprovedRepairReply(text) && !isApprovedBatchExecutionReply(text)) return null;
   const match = extractRelevantRouteBatchText(normalizeFeishuTaskText(text)).match(
     ROUTE_BATCH_CODE_PATTERN
   );
   return match?.[0] ?? null;
+}
+
+function extractApprovedRepairBatchCode(text: string): string | null {
+  return extractApprovedBatchCode(text);
 }
 
 function stripForbiddenRouteBatchFragments(line: string): string {
@@ -1098,7 +1114,10 @@ export async function POST(req: NextRequest) {
         }
       }
       if (consoleCommand === "approve_execution") {
-        text = isApprovedRepairReply(text) ? text : "总管 批准执行";
+        text =
+          isApprovedRepairReply(text) || isApprovedBatchExecutionReply(text)
+            ? text
+            : "总管 批准执行";
       }
 
       if (isAcceptanceFeedbackMessage(text)) {
@@ -1511,23 +1530,23 @@ export async function POST(req: NextRequest) {
         "approved_execution"
       );
       const dispatchPlan = buildProjectDirectorDispatchPlanDraft(approvedTree, "approved_execution");
-      const repairBatchCode = extractApprovedRepairBatchCode(text);
+      const approvedBatchCode = extractApprovedRepairBatchCode(text);
       const buildResult = filterApprovedRepairBuildResult(
         buildApprovedAgentDispatchJobs(dispatchPlan),
-        repairBatchCode
+        approvedBatchCode
       );
-      if (repairBatchCode && buildResult.tasks.length === 0) {
-        const reply = `未找到可执行的 ${repairBatchCode} 最小修复任务，本次不会分发其他批次。`;
+      if (approvedBatchCode && buildResult.tasks.length === 0) {
+        const reply = `未找到可执行的 ${approvedBatchCode} 最小执行任务，本次不会分发其他批次。`;
         await saveSystemRecordedReply(
           supabase,
           convId,
           text,
           reply,
           [
-            "PROJECT_DIRECTOR_APPROVED_REPAIR_BLOCKED",
-            "state: repair_batch_missing",
-            `batch_code: ${repairBatchCode}`,
-            "reason: boss approved repair for a specific failed batch, but the current task tree has no matching task.",
+            "PROJECT_DIRECTOR_APPROVED_BATCH_BLOCKED",
+            "state: approved_batch_missing",
+            `batch_code: ${approvedBatchCode}`,
+            "reason: boss approved a specific batch, but the current task tree has no matching task.",
           ].join("\n"),
           "project_director_approved_repair_blocked",
           ev.message.message_id
@@ -1543,9 +1562,16 @@ export async function POST(req: NextRequest) {
           code: 0,
           project_director_intake: true,
           state: "approved_repair_batch_missing",
-          batch_code: repairBatchCode,
+          batch_code: approvedBatchCode,
         });
       }
+      const dispatchedTaskKeys = new Set(buildResult.tasks.map((task) => task.task_key));
+      const dispatchedBatches = dispatchPlan.dispatch_plan.batches
+        .map((batch) => ({
+          ...batch,
+          tasks: batch.tasks.filter((task) => dispatchedTaskKeys.has(task.task_key)),
+        }))
+        .filter((batch) => batch.tasks.length > 0);
       attachProjectDirectorDispatchMetadata(buildResult, {
         bossRequestId: approvedTree.boss_request_id,
         planId: approvedTree.plan_id,
@@ -1589,8 +1615,7 @@ export async function POST(req: NextRequest) {
         `已创建 ${insertResult.insertedCount} 个 Agent 执行任务。`,
         "",
         "执行顺序：",
-        ...dispatchPlan.dispatch_plan.batches
-          .filter((batch) => batch.tasks.length > 0)
+        ...dispatchedBatches
           .map((batch, index) => `${index + 1}. ${batch.title}：${batch.tasks.length} 个任务`),
         "",
         "说明：具体任务已写入 Worker 兼容队列，子任务内容存放在 hermes_jobs.request_text。",
@@ -1615,7 +1640,8 @@ export async function POST(req: NextRequest) {
           `boss_request_id: ${approvedTree.boss_request_id}`,
           `plan_id: ${approvedTree.plan_id}`,
           `original_demand: ${recentDraft.originalDemand}`,
-          `repair_batch_filter: ${repairBatchCode || "none"}`,
+          `approved_batch_filter: ${approvedBatchCode || "none"}`,
+          `repair_batch_filter: ${approvedBatchCode || "none"}`,
           "attempt_id_contract: assigned_on_worker_claim_and_required_on_report",
           `inserted_jobs: ${insertResult.insertedCount}`,
           `skipped_hermes_jobs_columns: ${insertResult.skippedColumns.join(", ") || "none"}`,

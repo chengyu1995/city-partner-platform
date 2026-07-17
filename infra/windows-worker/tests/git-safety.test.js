@@ -2016,6 +2016,49 @@ test("read_only_mode task lock", async (t) => {
     assert.match(prompt, /read_only_mode: false/);
   });
 
+  await t.test("BATCH-GM-LIVE approval-only context stays automation write allowed", () => {
+    const approvedBatch = "BATCH-GM-LIVE-THREE-MODE-ROUTER-FIX-02";
+    const requestText = [
+      "新需求：执行项目总管批准批次 BATCH-GM-LIVE-THREE-MODE-ROUTER-FIX-02",
+      "HERMES_WORKER_CONTEXT:",
+      "project_domain=automation_system",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      "allowed_scope=infra/windows-worker/**, src/lib/worker-jobs.ts, src/app/api/feishu/event/route.ts, src/lib/project-director-console.ts",
+      "forbidden_scope=BATCH-P3/BATCH-P4 unless separately approved; src/app/page.tsx, src/app/partners/**, src/app/post/**, database/env/secrets/Vercel deploy",
+      "original_request_text=总管 批准执行：仅批准 BATCH-GM-LIVE-THREE-MODE-ROUTER-FIX-02",
+      "approved_batch=BATCH-GM-LIVE-THREE-MODE-ROUTER-FIX-02",
+      "route=approval_only",
+      "",
+      "禁止范围：不得执行 BATCH-P3 或 BATCH-P4，不得修改产品页面。",
+    ].join("\n");
+    const job = {
+      request_text: requestText,
+      payload: {
+        approved_batch: "BATCH-P3",
+        project_domain: "city_partner_product",
+        task_mode: "read_only",
+        read_only_mode: true,
+        route: "historical_route",
+      },
+    };
+
+    const contract = resolveWorkerJobContract(job);
+
+    assert.equal(contract.approved_batch, approvedBatch);
+    assert.equal(contract.project_domain, "automation_system");
+    assert.equal(contract.task_mode, TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.equal(contract.read_only_mode, false);
+    assert.equal(contract.route, "approval_only");
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["src/app/api/feishu/event/route.ts"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["src/app/page.tsx"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
   await t.test("failure report paths do not reference an undefined taskMode", () => {
     const job = {
       request_text: "BATCH-GM-SMOKE-01 read_only_mode=true final smoke validation.",
@@ -2214,6 +2257,23 @@ test("batch extraction and automation routing guards", async (t) => {
     );
   });
 
+  await t.test("extracts approved GM live router batch and ignores forbidden product batches", () => {
+    assert.equal(
+      extractCurrentExecutionBatchCode({
+        title: "",
+        request_text: [
+          "新需求：执行项目总管批准批次 BATCH-GM-LIVE-THREE-MODE-ROUTER-FIX-02",
+          "修复目标：只修复 Worker / Codex / 飞书总经理三模式路由和上报链路",
+          "禁止范围",
+          "- 当前批次 BATCH-P3 产品开发任务",
+          "- 当前批次 BATCH-P4 产品开发任务",
+          "老板批准原文：总管 批准执行：仅批准 BATCH-GM-LIVE-THREE-MODE-ROUTER-FIX-02",
+        ].join("\n"),
+      }),
+      "BATCH-GM-LIVE-THREE-MODE-ROUTER-FIX-02"
+    );
+  });
+
   await t.test("uses title before forbidden batch mentions", () => {
     assert.equal(
       extractCurrentExecutionBatchCode({
@@ -2253,6 +2313,7 @@ test("approved repair route remains on approved execution path", async (t) => {
     );
 
     assert.match(source, /批准修复/);
+    assert.match(source, /批准执行\[:：\\s\]/);
     assert.match(source, /approve_execution/);
   });
 
@@ -2263,8 +2324,12 @@ test("approved repair route remains on approved execution path", async (t) => {
     );
 
     assert.match(source, /isApprovedRepairReply/);
+    assert.match(source, /isApprovedBatchExecutionReply/);
+    assert.match(source, /extractApprovedBatchCode/);
     assert.match(source, /extractApprovedRepairBatchCode/);
     assert.match(source, /filterApprovedRepairBuildResult/);
+    assert.match(source, /approved_batch_filter/);
+    assert.match(source, /dispatchedBatches/);
   });
 });
 
