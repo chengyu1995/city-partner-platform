@@ -90,7 +90,12 @@
 
 ## 下一批入口
 
-下一批从 BATCH-ARCH-06 开始。BATCH-ARCH-06 的前置条件是本批 5 个目标文档存在，并且 `git diff --name-only` 只出现允许范围文件。
+BATCH-ARCH-10 静态验收后，架构文档链路已完成到交接状态。后续不应自动进入产品开发，也不应在未批准时修改 Worker 代码。
+
+下一批由老板选择：
+
+- `automation_system_write_allowed` 小修复批次：将 `failure_stage` 写入 terminal index，并补充对应静态测试。
+- `read_only` smoke 批次：只跑现有字段链路的静态测试和终态报告样例，不修改文件。
 
 ## BATCH-ARCH-09 Final-State Loop
 
@@ -104,3 +109,17 @@ BATCH-ARCH-09 updates the loop from a report-only chain into a stable terminal-s
 6. Duplicate final reports are idempotent and must not write duplicate failure memory, duplicate terminal index entries, duplicate final notifications, or a changed terminal state.
 7. `next_batch` is preserved in the normalized result and terminal index. A succeeded BATCH-ARCH-09 result should point to `BATCH-ARCH-10`.
 8. Automatic iteration suggestions follow the terminal state: succeeded continues to `next_batch`, failed creates the smallest repair batch from `failure_code` and `failure_stage`, and cancelled creates no repair batch.
+
+## BATCH-ARCH-10 Static Validation
+
+BATCH-ARCH-10 validates the field flow from Feishu intake to Worker payload, Windows Worker prompt, final report, failure memory status, terminal index, and automatic iteration suggestion.
+
+Static result:
+
+1. Direct worker create writes `HERMES_WORKER_CONTEXT` into request text and stores the same contract fields in `hermes_jobs.payload`.
+2. Project Director approved execution uses `buildContextPayload` to store explicit context and preserve `original_request_text`.
+3. Worker claim uses `buildAttemptPayload` to retain payload fields and attach the active `attempt_id`.
+4. Windows Worker prompt renders the `[Worker job payload contract]` block, including scope, original request, status, next batch, commit, push, and deploy fields.
+5. Final report generation normalizes `effective_final_status`, classifies failure memory status, builds terminal index data, and generates automatic iteration suggestions.
+
+Known handoff gap: `failure_stage` is available in normalized final result and automatic repair suggestions, but is not currently stored in terminal index entries. See `batch-arch-10-static-validation.md` for the full report.

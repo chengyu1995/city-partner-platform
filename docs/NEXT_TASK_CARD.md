@@ -2,9 +2,19 @@
 
 ## 当前状态
 
-BATCH-ARCH-05 已进入文档补齐阶段，目标是统一项目总经理、飞书入口、Worker job payload、Windows Worker、最终报告层和知识库之间的上下文字段契约。
+BATCH-ARCH-10 已完成端到端静态验收与交接文档补齐。
 
-本阶段属于 `automation_architecture`，不是产品开发任务，也不是 Worker 代码修复任务。当前只允许更新架构文档和指定项目文档。
+本阶段属于 `automation_architecture`。当前结果只代表文档静态验收，不自动授权产品开发、Worker 代码修复、部署或数据库变更。
+
+## 本批结论
+
+- 飞书 direct worker create 和项目总经理 approved execution 都会保留当前任务正文，并写入统一上下文字段。
+- Worker claim 会通过 payload 继续传递字段，并补充当前 `attempt_id`。
+- Windows Worker prompt 会展示 `[Worker job payload contract]`，让 Codex 看到任务模式、允许范围、禁止范围和终态字段。
+- 最终报告层会重算 `effective_final_status`，并生成失败记忆状态、terminal index 和自动迭代建议。
+- `failure_stage` 已在 normalized final result 和自动修复建议中流转，但 terminal index 当前不保存 `failure_stage`。
+
+完整验收报告：`docs/architecture/batch-arch-10-static-validation.md`
 
 ## 当前禁止
 
@@ -20,47 +30,17 @@ BATCH-ARCH-05 已进入文档补齐阶段，目标是统一项目总经理、飞
 
 ## 当前允许
 
+- 读取仓库做静态盘点。
 - 更新 `docs/architecture/**`。
 - 更新 `docs/NEXT_TASK_CARD.md`。
 - 更新 `docs/projects/feishu-gm-automation.md`。
-- 做静态验证：目标文件是否存在、`git diff --name-only` 是否只命中允许范围。
-
-## 字段契约摘要
-
-字段优先级规则：显式 HERMES_WORKER_CONTEXT > payload > request_text/original_request_text > 自动分类 > 历史上下文。
-
-只读任务规则：read_only 任务 changed_files=[] 是正常状态，不得触发 NO_FIX_APPLIED。
-
-写入任务规则：write_allowed 任务必须产生允许范围内变更，否则触发 NO_FIX_APPLIED。
+- 做静态验证：目标文件是否存在，`git diff --name-only` 是否只命中允许范围。
 
 ## 下一步建议
 
-下一批从 BATCH-ARCH-06 开始：
+需要老板选择后再执行：
 
-BATCH-ARCH-06：字段契约落地到 job payload。
+1. `BATCH-ARCH-11`：`automation_system_write_allowed` 小修复批次，把 `failure_stage` 写入 terminal index，并补充对应测试。
+2. `BATCH-ARCH-SMOKE-01`：`read_only` smoke 批次，只跑现有字段链路的静态测试和终态报告样例，不修改文件。
 
-目标：
-- 按 `docs/architecture/context-contract.md` 统一 Worker job payload 字段。
-- 保留 `project_domain`、`task_mode`、`read_only_mode`、`allowed_scope`、`forbidden_scope`、`original_request_text`、`route` 和 `approved_batch`。
-- 禁止用历史上下文覆盖显式 `HERMES_WORKER_CONTEXT`。
-- approved execution 丢失 `original_request_text` 时失败，而不是回退到历史文档。
-
-后续顺序：
-
-1. BATCH-ARCH-06：字段契约落地到 job payload。
-2. BATCH-ARCH-07：Windows Worker 与 Codex prompt 字段保护。
-3. BATCH-ARCH-08：最终报告层有效终态统一。
-4. BATCH-ARCH-09：文档型知识库目录与索引。
-5. BATCH-ARCH-10：端到端静态验收与交接。
-
-## BATCH-ARCH-10 Handoff
-
-Source: BATCH-ARCH-09 normalized final result.
-
-Next batch: `BATCH-ARCH-10`
-
-Goal:
-
-- Validate the end-to-end static field flow from Feishu intake to Worker payload, Windows Worker final report, failure memory, terminal index, and automatic iteration suggestion.
-- Confirm `effective_final_status`, `failure_code`, `failure_stage`, `git_commit_sha`, `next_batch`, and `completed_at` are consistent across the chain.
-- Do not start a dev server, open a browser, deploy, change product pages, change database files, or change Tencent Cloud runtime files.
+若没有老板批准，下一步只能做只读盘点和文档检查。

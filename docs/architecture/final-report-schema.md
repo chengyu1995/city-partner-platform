@@ -68,3 +68,9 @@ Succeeded results preserve `next_batch` in the normalized final result and termi
 - `succeeded`: continue with `next_batch` when present.
 - `failed`: generate the smallest repair batch from `failure_code` and `failure_stage`.
 - `cancelled`: generate no repair batch.
+
+## BATCH-ARCH-10 Static Validation Note
+
+BATCH-ARCH-10 confirmed the normalized final result carries `failure_stage`, and automatic iteration suggestions read it when proposing a repair batch.
+
+Current terminal index entries still store only `job_id`, `approved_batch`, `effective_final_status`, `failure_code`, `git_commit_sha`, `next_batch`, and `completed_at`. They do not store `failure_stage`. If terminal-index-level querying by `failure_stage` is required, that must be implemented in a separately approved `automation_system_write_allowed` batch.

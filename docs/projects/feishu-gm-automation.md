@@ -175,3 +175,15 @@ Automatic iteration reads the normalized result:
 - `cancelled`: do not create a repair batch.
 
 The next architecture batch after BATCH-ARCH-09 is `BATCH-ARCH-10`.
+
+## BATCH-ARCH-10 Static Validation Handoff
+
+BATCH-ARCH-10 completed a static end-to-end validation of the current field flow:
+
+- Feishu direct worker create and Project Director approved execution preserve the current task text through `original_request_text`.
+- Worker job payload, Worker claim payload, Windows Worker prompt, final report data, failure memory status, terminal index, and automatic iteration suggestion use the same field names from `docs/architecture/context-contract.md`.
+- `read_only` tasks may complete with `changed_files=[]`; write-allowed tasks that report success without allowed-scope diff must become `NO_FIX_APPLIED`.
+- `effective_final_status`, `failure_code`, `git_commit_sha`, `next_batch`, and `completed_at` are present in the normalized final result and terminal index.
+- `failure_stage` is present in the normalized final result and automatic repair suggestion, but is not yet stored in terminal index entries.
+
+Recommended next step: wait for boss approval before any automation-system code change. The smallest repair batch would add `failure_stage` to terminal index entries and tests; otherwise run a read-only smoke batch over the existing field chain.
