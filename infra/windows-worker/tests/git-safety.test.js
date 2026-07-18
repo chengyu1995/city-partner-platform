@@ -283,6 +283,16 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
     assert.match(routeSource, /approval_required/);
   });
 
+  await t.test("Feishu final replies keep source-independent reply context", () => {
+    assert.match(routeSource, /source:\s*"direct_worker_create"/);
+    assert.match(routeSource, /source:\s*"project_director_approval"/);
+    assert.match(routeSource, /source_message_id:\s*input\.feishuMessageId/);
+    assert.match(routeSource, /source_chat_id:\s*input\.feishuChatId/);
+    assert.match(routeSource, /source_message_id:\s*feishuContext\?\.messageId/);
+    assert.match(routeSource, /source_chat_id:\s*feishuContext\?\.chatId/);
+    assert.doesNotMatch(routeSource, /source:\s*"feishu"[\s\S]{0,240}route:\s*"direct_worker_create"/);
+  });
+
   await t.test("long approval batch codes are not truncated", () => {
     const approvalText =
       "总管 批准执行：仅批准 BATCH-GM-DIRECTOR-OUTPUT-SEPARATION-FIX-01";

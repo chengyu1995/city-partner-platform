@@ -888,7 +888,7 @@ async function insertDirectWorkerTask(
   };
   const contextualRequestText = withHermesWorkerContext(input.requestText, directWorkerPayload);
   const row = {
-    source: "feishu",
+    source: "direct_worker_create",
     job_type: taskDomain,
     title: `Direct Worker task: ${input.requestText.slice(0, 80)}`,
     description: contextualRequestText,
@@ -896,6 +896,9 @@ async function insertDirectWorkerTask(
     request_text: contextualRequestText,
     status: "queued",
     priority: 10,
+    source_message_id: input.feishuMessageId,
+    source_chat_id: input.feishuChatId,
+    source_event_id: input.feishuEventId,
     feishu_message_id: input.feishuMessageId,
     feishu_event_id: input.feishuEventId,
     feishu_chat_id: input.feishuChatId,
@@ -968,7 +971,13 @@ function projectDomainForTaskMode(taskMode: string | null): string | null {
 
 async function insertApprovedAgentDispatchJobsWithContract(
   supabase: SupabaseClient,
-  buildResult: DispatchJobBuildResult
+  buildResult: DispatchJobBuildResult,
+  feishuContext?: {
+    messageId: string;
+    eventId: string;
+    chatId: string;
+    userId: string;
+  }
 ): Promise<{ insertedCount: number; skippedColumns: string[] }> {
   const rows = buildResult.tasks.map((task: any, index) => {
     const requestText = buildResult.requestTexts[index] ?? "";
@@ -993,7 +1002,7 @@ async function insertApprovedAgentDispatchJobsWithContract(
     });
 
     return {
-      source: "agent_dispatch",
+      source: "project_director_approval",
       job_type: "agent_dispatch",
       job_id: task.task_key,
       title: task.task_title,
@@ -1008,6 +1017,13 @@ async function insertApprovedAgentDispatchJobsWithContract(
       status: "queued",
       plan_status: "approved",
       workflow_stage: "execution",
+      source_message_id: feishuContext?.messageId ?? null,
+      source_chat_id: feishuContext?.chatId ?? null,
+      source_event_id: feishuContext?.eventId ?? null,
+      feishu_message_id: feishuContext?.messageId ?? null,
+      feishu_event_id: feishuContext?.eventId ?? null,
+      feishu_chat_id: feishuContext?.chatId ?? null,
+      feishu_user_id: feishuContext?.userId ?? null,
       claimed_by: null,
       claimed_at: null,
       started_at: null,
@@ -1735,7 +1751,12 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      const insertResult = await insertApprovedAgentDispatchJobsWithContract(supabase, buildResult);
+      const insertResult = await insertApprovedAgentDispatchJobsWithContract(supabase, buildResult, {
+        messageId: ev.message.message_id,
+        eventId,
+        chatId: ev.message.chat_id,
+        userId,
+      });
       const reply = [
         `[Project Director Dispatch] boss_request_id=${approvedTree.boss_request_id}`,
         `[Project Director Dispatch] plan_id=${approvedTree.plan_id}`,
