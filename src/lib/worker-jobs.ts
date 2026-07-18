@@ -322,6 +322,50 @@ function readScopeText(value: unknown): string | null {
   return readString(value);
 }
 
+function readTextValue(value: unknown): string {
+  if (value == null) return "";
+  if (Array.isArray(value)) return value.map(readTextValue).filter(Boolean).join("\n");
+  if (typeof value === "object") return Object.values(value).map(readTextValue).filter(Boolean).join("\n");
+  return String(value);
+}
+
+function readWorkerJobContextText(
+  job: JobRecord | null,
+  payload: Record<string, unknown> | null,
+  result: Record<string, unknown> | null
+): string {
+  return [
+    job?.request_text,
+    job?.requestText,
+    job?.prompt,
+    job?.description,
+    job?.demand,
+    job?.title,
+    job?.name,
+    job?.original_request_text,
+    job?.originalRequestText,
+    decodeOriginalRequestTextBase64(job?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(job?.originalRequestTextBase64),
+    payload?.request_text,
+    payload?.requestText,
+    payload?.original_request_text,
+    payload?.originalRequestText,
+    decodeOriginalRequestTextBase64(payload?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(payload?.originalRequestTextBase64),
+    payload?.demand,
+    payload?.title,
+    result?.request_text,
+    result?.requestText,
+    result?.original_request_text,
+    result?.originalRequestText,
+    decodeOriginalRequestTextBase64(result?.original_request_text_base64),
+    decodeOriginalRequestTextBase64(result?.originalRequestTextBase64),
+  ]
+    .map(readTextValue)
+    .filter(Boolean)
+    .join("\n");
+}
+
 function readLatestOriginalRequestText(text: unknown): string | null {
   const expandedTexts = expandWorkerContextTexts(text);
   const explicitTexts = expandedTexts.flatMap(extractOriginalRequestTextsFromContext);
@@ -1421,7 +1465,13 @@ export function buildWorkerJobPayloadContract(input: {
   const job = input.job ?? null;
   const payload = input.payload ?? readRecord(job?.payload);
   const result = input.result ?? readRecord(job?.result);
-  const requestText = readString(input.requestText) ?? readString(job?.request_text) ?? readString(job?.prompt) ?? "";
+  const jobContextText = readWorkerJobContextText(job, payload, result);
+  const requestText =
+    readString(input.requestText) ??
+    readString(job?.request_text) ??
+    readString(job?.prompt) ??
+    readString(job?.description) ??
+    jobContextText;
   const fallbackOriginalRequest =
     readString(input.originalRequestText) ??
     (readPayloadContextField(payload, "original_request_text") as string | null) ??
@@ -1434,6 +1484,7 @@ export function buildWorkerJobPayloadContract(input: {
   const sourceText = [
     requestText,
     fallbackOriginalRequest,
+    jobContextText,
   ]
     .filter(Boolean)
     .join("\n");

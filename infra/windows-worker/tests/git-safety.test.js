@@ -283,6 +283,21 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
     assert.match(routeSource, /approval_required/);
   });
 
+  await t.test("worker job contract reads full job context when request_text is unavailable", () => {
+    assert.match(workerJobsSource, /function readWorkerJobContextText/);
+    assert.match(workerJobsSource, /job\?\.description/);
+    assert.match(workerJobsSource, /job\?\.prompt/);
+    assert.match(workerJobsSource, /job\?\.title/);
+
+    const helperIndex = workerJobsSource.indexOf("function readWorkerJobContextText");
+    const usageIndex = workerJobsSource.indexOf("const jobContextText = readWorkerJobContextText");
+    const sourceTextIndex = workerJobsSource.indexOf("const sourceText = [", usageIndex);
+    assert.ok(helperIndex >= 0);
+    assert.ok(usageIndex > helperIndex);
+    assert.ok(sourceTextIndex > usageIndex);
+    assert.match(workerJobsSource.slice(sourceTextIndex, sourceTextIndex + 180), /jobContextText/);
+  });
+
   await t.test("Feishu final replies keep source-independent reply context", () => {
     assert.match(routeSource, /source:\s*"direct_worker_create"/);
     assert.match(routeSource, /source:\s*"project_director_approval"/);
