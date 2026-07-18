@@ -4191,6 +4191,11 @@ function getCurrentBatchCodeFromText(text) {
 }
 
 function getCurrentBatchCode(job) {
+  const currentExecutionBatch = extractCurrentExecutionBatchCode(job);
+  if (currentExecutionBatch) {
+    return currentExecutionBatch.toUpperCase();
+  }
+
   return readBatchCodeField(job) || getCurrentBatchCodeFromText(getJobText(job));
 }
 
@@ -5605,13 +5610,14 @@ async function pollOnce() {
     );
 
     const completedAt = new Date().toISOString();
+    const approvedBatchForReport = initialContract.approved_batch || getJobBatchCode(job);
     const normalizedFinalResult = normalizeWorkerFinalResult({
       job,
       status: "succeeded",
       finalReportStatus: "succeeded",
       effectiveFinalStatus: "succeeded",
       resultText: result,
-      approvedBatch: getJobBatchCode(job),
+      approvedBatch: approvedBatchForReport,
       gitCommitSha: gitResult.commitSha || null,
       nextBatch: extractNextBatchFromText(result),
       completedAt,
@@ -5708,7 +5714,7 @@ async function pollOnce() {
       finalResult,
       {
         attempt_id: attemptId,
-        batch_code: getJobBatchCode(job),
+        batch_code: successContract.approved_batch || approvedBatchForReport,
         job_created_at: job.created_at || null,
         ...buildWorkerReportContractExtra(successContract),
         project_name: "同城搭子网站",
@@ -5824,6 +5830,7 @@ async function pollOnce() {
     );
 
     const completedAt = new Date().toISOString();
+    const approvedBatchForReport = initialContract.approved_batch || getJobBatchCode(job);
     const normalizedFinalResult = normalizeWorkerFinalResult({
       job,
       status: "failed",
@@ -5831,7 +5838,7 @@ async function pollOnce() {
       effectiveFinalStatus: "failed",
       error,
       errorText: error instanceof Error ? error.message : String(error),
-      approvedBatch: getJobBatchCode(job),
+      approvedBatch: approvedBatchForReport,
       gitCommitSha: null,
       completedAt,
     });
@@ -5868,7 +5875,7 @@ async function pollOnce() {
       failureReport,
       {
         attempt_id: attemptId,
-        batch_code: getJobBatchCode(job),
+        batch_code: failureContract.approved_batch || approvedBatchForReport,
         job_created_at: job.created_at || null,
         ...buildWorkerReportContractExtra(failureContract),
         project_name: "同城搭子网站",
