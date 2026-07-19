@@ -90,6 +90,7 @@ Known fingerprints:
 - `BUSINESS_PAGE_BOUNDARY_VIOLATION`: automation/docs/read-only tasks touched frozen product pages. This must not be raised for `city_partner_product` + `product_write_allowed` changes inside `src/app/**`; product tasks remain blocked from Worker, gateway, env, and database files.
 - `ORIGINAL_BATCH_CONTEXT_MISSING`: approved BATCH-FIX execution did not carry the original `新需求：BATCH-FIX-*` full request text.
 - `WRITE_REQUEST_REPLY_INTERRUPTED`: first write_allowed intake saved no approval context and sent no manager reply because the gateway called a missing classifier before `replyFeishu`.
+- `FINAL_REPORT_SOURCE_GATE`: final Feishu delivery was gated by `source=feishu`, so terminal jobs from `project_director_approval` or `direct_worker_create` with valid reply context were marked `not_feishu_job`.
 
 Escalation:
 

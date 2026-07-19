@@ -253,6 +253,7 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
   const builderSource = readRepoFile("src/lib/project-director-job-builder.ts");
   const routeSource = readRepoFile("src/app/api/feishu/event/route.ts");
   const workerJobsSource = readRepoFile("src/lib/worker-jobs.ts");
+  const troubleshootingSource = readRepoFile("docs/TROUBLESHOOTING.md");
 
   await t.test("runtime creation never inserts into worker_jobs", () => {
     assert.doesNotMatch(builderSource, /\.from\(["'`]worker_jobs["'`]\)/);
@@ -306,6 +307,12 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
     assert.match(routeSource, /source_message_id:\s*feishuContext\?\.messageId/);
     assert.match(routeSource, /source_chat_id:\s*feishuContext\?\.chatId/);
     assert.doesNotMatch(routeSource, /source:\s*"feishu"[\s\S]{0,240}route:\s*"direct_worker_create"/);
+  });
+
+  await t.test("final report delivery must not be gated by source=feishu only", () => {
+    assert.match(troubleshootingSource, /FINAL_REPORT_SOURCE_GATE/);
+    assert.match(troubleshootingSource, /project_director_approval/);
+    assert.match(troubleshootingSource, /direct_worker_create/);
   });
 
   await t.test("long approval batch codes are not truncated", () => {
