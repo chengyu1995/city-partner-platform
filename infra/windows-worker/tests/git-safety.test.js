@@ -2146,6 +2146,85 @@ test("read_only_mode task lock", async (t) => {
     );
   });
 
+  await t.test("BATCH-GM-MODE-SMOKE-WRITE-02 approval-only context stays write allowed", () => {
+    const approvedBatch = "BATCH-GM-MODE-SMOKE-WRITE-02";
+    const allowedScope = [
+      "infra/windows-worker/**",
+      "src/lib/worker-jobs.ts",
+      "src/app/api/feishu/event/route.ts",
+      "src/lib/project-director-console.ts",
+      "docs/projects/feishu-gm-automation.md",
+      "docs/projects/team-routing.md",
+      "docs/projects/feishu-group-routing.md",
+    ].join(", ");
+    const requestText = [
+      `New demand: execute Project Director approved batch ${approvedBatch}`,
+      "task_domain: automation_system",
+      `Current execution batch: ${approvedBatch}`,
+      `original_request_text: Project Director approved execution: only approve ${approvedBatch}`,
+      `approved_batch: ${approvedBatch}`,
+      "task_mode: automation_system_write_allowed",
+      "read_only_mode: false",
+      `allowed_scope: ${allowedScope}`,
+      "forbidden_scope: BATCH-P3/BATCH-P4 unless separately approved; src/app/page.tsx, src/app/partners/**, src/app/post/**, database/env/secrets/Vercel deploy",
+      "HERMES_WORKER_CONTEXT:",
+      "context_source=explicit_hermes_worker_context",
+      "project_domain=automation_system",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      `allowed_scope=${allowedScope}`,
+      "forbidden_scope=src/app/page.tsx, src/app/partners/**, src/app/post/**, src/lib/db/mock.ts, src/types/db.ts, .env, database",
+      `original_request_text=Project Director approved execution: only approve ${approvedBatch}`,
+      `approved_batch=${approvedBatch}`,
+      "route=approval_only",
+      "",
+      "Do not execute BATCH-P3 or BATCH-P4, and do not modify product pages.",
+    ].join("\n");
+    const job = {
+      request_text: requestText,
+      payload: {
+        approved_batch: "BATCH-P4",
+        project_domain: "city_partner_product",
+        task_mode: "read_only",
+        read_only_mode: true,
+        allowed_scope: "src/app/**",
+        route: "historical_route",
+      },
+    };
+
+    const contract = resolveWorkerJobContract(job);
+    const args = buildCodexExecArgs("fix safely", job);
+    const sandboxIndex = args.indexOf("--sandbox");
+
+    assert.equal(extractCurrentExecutionBatchCode(job), approvedBatch);
+    assert.equal(contract.context_source, "explicit_hermes_worker_context");
+    assert.equal(contract.approved_batch, approvedBatch);
+    assert.equal(contract.allowed_scope, allowedScope);
+    assert.equal(contract.project_domain, "automation_system");
+    assert.equal(contract.task_mode, TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.equal(contract.read_only_mode, false);
+    assert.equal(contract.route, "approval_only");
+    assert.equal(getTaskMode(job), TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.equal(isReadOnlyTask(job), false);
+    assert.notEqual(sandboxIndex, -1);
+    assert.equal(args[sandboxIndex + 1], "workspace-write");
+
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["infra/windows-worker/tests/git-safety.test.js"])
+    );
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/projects/feishu-gm-automation.md"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, []),
+      (error) => error.code === NO_FIX_APPLIED
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["src/app/page.tsx"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
   await t.test("BATCH-GM-WRITE-SCOPE-CONTRACT-FIX keeps explicit write scope and batch", () => {
     const approvedBatch = "BATCH-GM-WRITE-SCOPE-CONTRACT-FIX-01";
     const allowedScope = [
