@@ -64,6 +64,7 @@ export const WORKER_JOB_CONTRACT_FIELDS = [
   "task_mode",
   "read_only_mode",
   "allowed_scope",
+  "exact_allowed_scope",
   "forbidden_scope",
   "original_request_text",
   "route",
@@ -209,7 +210,7 @@ function decodeOriginalRequestTextBase64(value: unknown): string | null {
 }
 
 const WORKER_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|original_request_text(?:_base64)?|route|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|exact_allowed_scope|forbidden_scope|original_request_text(?:_base64)?|route|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName: string): string {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -380,6 +381,7 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "task_mode",
   "read_only_mode",
   "allowed_scope",
+  "exact_allowed_scope",
   "forbidden_scope",
   "original_request_text",
   "original_request_text_base64",
@@ -589,6 +591,7 @@ function readPayloadContextField(
     task_mode: ["task_mode", "taskMode"],
     read_only_mode: ["read_only_mode", "readOnlyMode", "readonly", "read_only"],
     allowed_scope: ["allowed_scope", "allowedScope", "allowed_files", "allowedFiles"],
+    exact_allowed_scope: ["exact_allowed_scope", "exactAllowedScope", "exact_allowed_paths", "exactAllowedPaths"],
     forbidden_scope: ["forbidden_scope", "forbiddenScope", "forbidden_files", "forbiddenFiles"],
     original_request_text: [
       "original_request_text",
@@ -1444,6 +1447,7 @@ export function buildWorkerJobPayloadContract(input: {
   taskMode?: string | null;
   readOnlyMode?: boolean | null;
   allowedScope?: unknown;
+  exactAllowedScope?: unknown;
   forbiddenScope?: unknown;
   originalRequestText?: string | null;
   route?: string | null;
@@ -1502,6 +1506,7 @@ export function buildWorkerJobPayloadContract(input: {
     task_mode: readTextContextField(fallbackOriginalRequest, "task_mode"),
     read_only_mode: readTextContextField(fallbackOriginalRequest, "read_only_mode"),
     allowed_scope: readTextContextField(fallbackOriginalRequest, "allowed_scope"),
+    exact_allowed_scope: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope"),
     forbidden_scope: readTextContextField(fallbackOriginalRequest, "forbidden_scope"),
     route: readTextContextField(fallbackOriginalRequest, "route"),
     approved_batch: readTextContextField(fallbackOriginalRequest, "approved_batch"),
@@ -1511,6 +1516,7 @@ export function buildWorkerJobPayloadContract(input: {
     task_mode: readTextContextField(requestText, "task_mode"),
     read_only_mode: readTextContextField(requestText, "read_only_mode"),
     allowed_scope: readTextContextField(requestText, "allowed_scope"),
+    exact_allowed_scope: readTextContextField(requestText, "exact_allowed_scope"),
     forbidden_scope: readTextContextField(requestText, "forbidden_scope"),
     route: readTextContextField(requestText, "route"),
     approved_batch: readTextContextField(requestText, "approved_batch"),
@@ -1520,6 +1526,7 @@ export function buildWorkerJobPayloadContract(input: {
     task_mode: input.taskMode,
     read_only_mode: input.readOnlyMode,
     allowed_scope: readScopeText(input.allowedScope),
+    exact_allowed_scope: readScopeText(input.exactAllowedScope),
     forbidden_scope: readScopeText(input.forbiddenScope),
     route: input.route,
     approved_batch: input.approvedBatch,
@@ -1575,6 +1582,7 @@ export function buildWorkerJobPayloadContract(input: {
     readString(readPriorityField("project_domain")) ??
     classifyWorkerTaskDomain([originalRequestText, requestText].filter(Boolean).join("\n"));
   const allowedScope = readString(readPriorityField("allowed_scope")) ?? null;
+  const exactAllowedScope = readString(readPriorityField("exact_allowed_scope")) ?? null;
   const forbiddenScope = readString(readPriorityField("forbidden_scope")) ?? null;
   const changedFiles = readStringArray(
     input.changedFiles ??
@@ -1621,6 +1629,7 @@ export function buildWorkerJobPayloadContract(input: {
     task_mode: taskMode,
     read_only_mode: readOnlyMode,
     allowed_scope: allowedScope,
+    exact_allowed_scope: exactAllowedScope,
     forbidden_scope: forbiddenScope,
     original_request_text: originalRequestText,
     route:
@@ -1936,6 +1945,7 @@ export function buildProjectDirectorWorkerReport(input: {
     task_domain: taskDomain,
     task_mode: taskMode,
     allowed_scope: contract.allowed_scope,
+    exact_allowed_scope: contract.exact_allowed_scope,
     forbidden_scope: contract.forbidden_scope,
     original_request_text: contract.original_request_text,
     route: contract.route,
@@ -1997,6 +2007,7 @@ export function buildProjectDirectorWorkerReport(input: {
     `task_mode: ${taskMode}`,
     `read_only_mode: ${readOnlyMode ? "true" : "false"}`,
     `allowed_scope: ${placeholder(readString(contract.allowed_scope))}`,
+    `exact_allowed_scope: ${placeholder(readString(contract.exact_allowed_scope))}`,
     `forbidden_scope: ${placeholder(readString(contract.forbidden_scope))}`,
     `route: ${placeholder(readString(contract.route))}`,
     `approved_batch: ${placeholder(readString(contract.approved_batch) ?? batchCode)}`,

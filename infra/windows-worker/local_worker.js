@@ -1937,7 +1937,7 @@ function isExplicitAutomationAllowedDocPath(filePath) {
 }
 
 const HERMES_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|forbidden_scope|route|original_request_text(?:_base64)?|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|exact_allowed_scope|forbidden_scope|route|original_request_text(?:_base64)?|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName) {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -2078,6 +2078,27 @@ function normalizeTaskModeValue(value) {
   return Object.values(TASK_MODES).includes(normalized) ? normalized : null;
 }
 
+function extractExactAllowedScopePaths(scopeValue) {
+  return uniqueSortedPaths(extractPathLikeTokens(` ${String(scopeValue || "")}`));
+}
+
+function exactAllowedScopePathMatches(allowedPath, filePath) {
+  const normalizedAllowed = normalizeGitPath(allowedPath);
+  const normalizedFile = normalizeGitPath(filePath);
+  if (!normalizedAllowed) return false;
+  if (normalizedAllowed.endsWith("/**")) {
+    const prefix = normalizedAllowed.slice(0, -3);
+    return normalizedFile === prefix || normalizedFile.startsWith(`${prefix}/`);
+  }
+  return normalizedFile === normalizedAllowed;
+}
+
+function fileMatchesExactAllowedScope(filePath, exactAllowedScope) {
+  const exactPaths = extractExactAllowedScopePaths(exactAllowedScope);
+  if (exactPaths.length === 0) return false;
+  return exactPaths.some((allowedPath) => exactAllowedScopePathMatches(allowedPath, filePath));
+}
+
 function isReadOnlyTaskMode(taskMode) {
   return (
     taskMode === TASK_MODES.READ_ONLY ||
@@ -2120,6 +2141,7 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "task_mode",
   "read_only_mode",
   "allowed_scope",
+  "exact_allowed_scope",
   "forbidden_scope",
   "original_request_text",
   "original_request_text_base64",
@@ -2350,6 +2372,7 @@ function readPayloadContextField(payload, fieldName) {
     task_mode: ["task_mode", "taskMode"],
     read_only_mode: ["read_only_mode", "readOnlyMode", "readonly", "read_only"],
     allowed_scope: ["allowed_scope", "allowedScope", "allowed_files", "allowedFiles"],
+    exact_allowed_scope: ["exact_allowed_scope", "exactAllowedScope", "exact_allowed_paths", "exactAllowedPaths"],
     forbidden_scope: ["forbidden_scope", "forbiddenScope", "forbidden_files", "forbiddenFiles"],
     original_request_text: [
       "original_request_text",
@@ -2469,6 +2492,7 @@ function normalizeWorkerContext(job, overrides = {}) {
     task_mode: readTextContextField(fallbackOriginalRequest, "task_mode"),
     read_only_mode: readTextContextField(fallbackOriginalRequest, "read_only_mode"),
     allowed_scope: readTextContextField(fallbackOriginalRequest, "allowed_scope"),
+    exact_allowed_scope: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope"),
     forbidden_scope: readTextContextField(fallbackOriginalRequest, "forbidden_scope"),
     route: readTextContextField(fallbackOriginalRequest, "route"),
     approved_batch: readTextContextField(fallbackOriginalRequest, "approved_batch"),
@@ -2478,6 +2502,7 @@ function normalizeWorkerContext(job, overrides = {}) {
     task_mode: readTextContextField(requestText, "task_mode"),
     read_only_mode: readTextContextField(requestText, "read_only_mode"),
     allowed_scope: readTextContextField(requestText, "allowed_scope"),
+    exact_allowed_scope: readTextContextField(requestText, "exact_allowed_scope"),
     forbidden_scope: readTextContextField(requestText, "forbidden_scope"),
     route: readTextContextField(requestText, "route"),
     approved_batch: readTextContextField(requestText, "approved_batch"),
@@ -2487,6 +2512,7 @@ function normalizeWorkerContext(job, overrides = {}) {
     task_mode: overrides.taskMode,
     read_only_mode: overrides.readOnlyMode,
     allowed_scope: readScopeValue(overrides.allowedScope),
+    exact_allowed_scope: readScopeValue(overrides.exactAllowedScope),
     forbidden_scope: readScopeValue(overrides.forbiddenScope),
     route: overrides.route,
     approved_batch: overrides.approvedBatch,
@@ -2541,6 +2567,7 @@ function normalizeWorkerContext(job, overrides = {}) {
     readString(readPriorityField("project_domain")) ||
     classifyWorkerTaskDomain([originalRequestText, requestText].join("\n"));
   const allowedScope = readString(readPriorityField("allowed_scope")) || null;
+  const exactAllowedScope = readString(readPriorityField("exact_allowed_scope")) || null;
   const forbiddenScope = readString(readPriorityField("forbidden_scope")) || null;
   const route = readString(readPriorityField("route")) || null;
   const contextSource = explicitContext
@@ -2586,6 +2613,7 @@ function normalizeWorkerContext(job, overrides = {}) {
     ["task_" + "mode"]: taskMode,
     read_only_mode: readOnlyMode,
     allowed_scope: allowedScope,
+    exact_allowed_scope: exactAllowedScope,
     forbidden_scope: forbiddenScope,
     original_request_text: originalRequestText,
     route,
@@ -2676,6 +2704,7 @@ function formatWorkerJobContractLines(contract, options = {}) {
     `task_mode: ${contract.task_mode || "null"}`,
     `read_only_mode: ${contract.read_only_mode ? "true" : "false"}`,
     `allowed_scope: ${contract.allowed_scope || "null"}`,
+    `exact_allowed_scope: ${contract.exact_allowed_scope || "null"}`,
     `forbidden_scope: ${contract.forbidden_scope || "null"}`,
     `original_request_text: ${originalRequestValue}`,
     `route: ${contract.route || "null"}`,
@@ -2707,6 +2736,7 @@ function buildWorkerReportContractExtra(contract) {
     task_mode: contract.task_mode,
     read_only_mode: contract.read_only_mode,
     allowed_scope: contract.allowed_scope,
+    exact_allowed_scope: contract.exact_allowed_scope,
     forbidden_scope: contract.forbidden_scope,
     original_request_text: contract.original_request_text,
     route: contract.route,
@@ -3859,6 +3889,7 @@ function assertTaskGoalApplied(job, changedPaths) {
   const normalizedScopeText = buildNormalizedScopeText(contract);
   const taskDomain = classifyWorkerTaskDomain(requestText);
   const taskMode = contract.task_mode;
+  const exactAllowedScope = contract.exact_allowed_scope;
   const requiredPaths = filterRequiredChangePathsForTask(
     extractRequiredChangePaths(requestText),
     normalizedScopeText || requestText,
@@ -3869,6 +3900,22 @@ function assertTaskGoalApplied(job, changedPaths) {
     )
   );
   const normalizedChangedPaths = uniqueSortedPaths(changedPaths || []);
+
+  if (exactAllowedScope && normalizedChangedPaths.length > 0) {
+    const outOfScopePaths = normalizedChangedPaths.filter(
+      (filePath) => !fileMatchesExactAllowedScope(filePath, exactAllowedScope)
+    );
+
+    if (outOfScopePaths.length > 0) {
+      throw createOutOfScopeBusinessChangeError(
+        "exact_allowed_scope is present; changed_files must match the boss-approved exact scope before git add.",
+        {
+          taskMode,
+          outOfScopePaths,
+        }
+      );
+    }
+  }
 
   if (hasConflictingReadOnlyLock(job, taskMode)) {
     throw createTaskModeMismatchError(

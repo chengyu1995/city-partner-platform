@@ -830,10 +830,62 @@ const DIRECT_WORKER_CONTEXT_REQUIRED_FIELDS = [
   "read_only_mode",
   "approval_required",
   "allowed_scope",
+  "exact_allowed_scope",
   "forbidden_scope",
   "original_request_text",
   "approved_batch",
 ];
+
+function normalizeScopePathToken(value: string): string {
+  return value
+    .replace(/\\/g, "/")
+    .replace(/^[`'"\s]+|[`'"\s]+$/g, "")
+    .replace(/[，,。；;:：、）)】\]]+$/g, "")
+    .trim();
+}
+
+function uniqueScopePaths(paths: string[]): string[] {
+  return Array.from(
+    new Set(paths.map(normalizeScopePathToken).filter((item) => item.length > 0))
+  ).sort();
+}
+
+function extractExactAllowedScopePaths(text: unknown): string[] {
+  const lines = String(text ?? "").split(/\r?\n/);
+  const paths: string[] = [];
+  let inAllowedBlock = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    if (/^(?:禁止|不得|不允许|不要修改|forbidden_scope|forbidden|prohibit)/i.test(line)) {
+      inAllowedBlock = false;
+      continue;
+    }
+
+    if (/^(?:验证要求|完成后|返回|测试|禁止|禁用|不得|不允许)\s*[:：]?/i.test(line)) {
+      inAllowedBlock = false;
+    }
+
+    const inlineMatch = line.match(
+      /(?:仅允许修改|只允许修改|允许修改|changed_files\s*必须严格等于)\s*[:：]\s*(.+)$/i
+    );
+    if (/(?:仅允许修改|只允许修改|允许修改|changed_files\s*必须严格等于)\s*[:：]?\s*$/i.test(line)) {
+      inAllowedBlock = true;
+      continue;
+    }
+
+    const source = inlineMatch?.[1] ?? (inAllowedBlock ? line.replace(/^[-*]\s*/, "") : "");
+    if (!source) continue;
+
+    for (const match of source.matchAll(/\b(?:app|src|infra|docs|work)\/[A-Za-z0-9_./*[\]-]+/g)) {
+      paths.push(match[0]);
+    }
+  }
+
+  return uniqueScopePaths(paths);
+}
 
 function withHermesWorkerContext(requestText: string, context: Record<string, unknown>): string {
   const orderedKeys = Array.from(new Set([...DIRECT_WORKER_CONTEXT_REQUIRED_FIELDS, ...Object.keys(context)]));
@@ -862,13 +914,16 @@ async function insertDirectWorkerTask(
 ): Promise<{ jobId: string | null }> {
   const modeContract = resolveDirectWorkerReadOnlyContract(input.rawText);
   const taskDomain = modeContract.projectDomain;
+  const exactAllowedScope = extractExactAllowedScopePaths(input.rawText);
+  const allowedScope = exactAllowedScope.length > 0 ? exactAllowedScope : modeContract.allowedScope;
   const contractPayload = buildWorkerJobPayloadContract({
     requestText: input.requestText,
     originalRequestText: input.rawText,
     projectDomain: taskDomain,
     taskMode: modeContract.taskMode,
     readOnlyMode: modeContract.readOnlyMode,
-    allowedScope: modeContract.allowedScope,
+    allowedScope,
+    exactAllowedScope,
     forbiddenScope: modeContract.forbiddenScope,
     approvedBatch: modeContract.batchCode,
     route: "direct_worker_create",
@@ -885,6 +940,7 @@ async function insertDirectWorkerTask(
     requested_mode: modeContract.requestedMode,
     final_mode: modeContract.finalMode,
     approval_required: modeContract.approvalRequired,
+    exact_allowed_scope: exactAllowedScope,
   };
   const contextualRequestText = withHermesWorkerContext(input.requestText, directWorkerPayload);
   const row = {
@@ -982,13 +1038,16 @@ async function insertApprovedAgentDispatchJobsWithContract(
   const rows = buildResult.tasks.map((task: any, index) => {
     const requestText = buildResult.requestTexts[index] ?? "";
     const taskMode = inferApprovedTaskMode(task);
+    const exactAllowedScope = extractExactAllowedScopePaths(requestText);
+    const allowedScope = exactAllowedScope.length > 0 ? exactAllowedScope : task.allowed_files;
     const contractPayload = buildWorkerJobPayloadContract({
       requestText,
       originalRequestText: requestText,
       projectDomain: projectDomainForTaskMode(taskMode),
       taskMode,
       readOnlyMode: taskMode ? false : null,
-      allowedScope: task.allowed_files,
+      allowedScope,
+      exactAllowedScope,
       forbiddenScope: task.forbidden_files,
       route: "approved_execution",
       approvedBatch: task.dispatch_batch,
@@ -1040,7 +1099,8 @@ async function insertApprovedAgentDispatchJobsWithContract(
         task_key: task.task_key,
         task_title: task.task_title,
         dependency_keys: task.dependency_keys,
-        allowed_files: task.allowed_files,
+        allowed_files: allowedScope,
+        exact_allowed_scope: exactAllowedScope,
         forbidden_files: task.forbidden_files,
         acceptance_criteria: task.acceptance_criteria,
         requires_boss_approval: task.requires_boss_approval,

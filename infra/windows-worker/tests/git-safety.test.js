@@ -383,6 +383,15 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
     assert.match(workerJobsSource, /findDuplicateByEmbeddedRequestText/);
     assert.match(workerJobsSource, /normalizedRequestText\.includes\(normalizedNeedle\)/);
   });
+
+  await t.test("route preserves exact allowed scope in Hermes Worker context", () => {
+    assert.match(routeSource, /extractExactAllowedScopePaths/);
+    assert.match(routeSource, /"exact_allowed_scope"/);
+    assert.match(routeSource, /exactAllowedScope/);
+    assert.match(routeSource, /allowedScope = exactAllowedScope\.length > 0 \? exactAllowedScope/);
+    assert.match(workerJobsSource, /exactAllowedScope\?: unknown/);
+    assert.match(workerJobsSource, /exact_allowed_scope: exactAllowedScope/);
+  });
 });
 
 test("Git porcelain v1 -z status parsing", async (t) => {
@@ -2222,6 +2231,86 @@ test("read_only_mode task lock", async (t) => {
     assert.throws(
       () => assertTaskGoalApplied(job, ["src/app/page.tsx"]),
       (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
+  await t.test("exact_allowed_scope permits only the boss-approved path", () => {
+    const approvedBatch = "BATCH-GM-MODE-SMOKE-WRITE-03";
+    const exactScope = "docs/architecture/exact-scope-a.md";
+    const requestText = [
+      `New demand: execute Project Director approved batch ${approvedBatch}`,
+      "project_domain=automation_system",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      "allowed_scope=docs/architecture/exact-scope-a.md, infra/windows-worker/**",
+      `exact_allowed_scope=${exactScope}`,
+      `original_request_text=新需求：执行 ${approvedBatch}\\n只允许修改：\\n- ${exactScope}`,
+      `approved_batch=${approvedBatch}`,
+      "HERMES_WORKER_CONTEXT:",
+      "project_domain=automation_system",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      "allowed_scope=docs/architecture/exact-scope-a.md, infra/windows-worker/**",
+      `exact_allowed_scope=${exactScope}`,
+      "forbidden_scope=src/app/**, .env, database",
+      `original_request_text=新需求：执行 ${approvedBatch}\\n只允许修改：\\n- ${exactScope}`,
+      `approved_batch=${approvedBatch}`,
+      "route=approval_only",
+    ].join("\n");
+    const job = { request_text: requestText, payload: {} };
+
+    const contract = resolveWorkerJobContract(job);
+
+    assert.equal(contract.exact_allowed_scope, exactScope);
+    assert.doesNotThrow(() => assertTaskGoalApplied(job, [exactScope]));
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["infra/windows-worker/tests/git-safety.test.js"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.outOfScopePaths.includes("infra/windows-worker/tests/git-safety.test.js")
+    );
+  });
+
+  await t.test("exact_allowed_scope beats default automation scope", () => {
+    const job = {
+      request_text: [
+        "approved_batch=BATCH-GM-MODE-SMOKE-WRITE-03",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=infra/windows-worker/**, src/lib/worker-jobs.ts, docs/architecture/exact-scope-a.md",
+        "exact_allowed_scope=docs/architecture/exact-scope-a.md",
+        "original_request_text=只允许修改： docs/architecture/exact-scope-a.md",
+      ].join("\n"),
+      payload: {
+        allowed_scope: "infra/windows-worker/**",
+        exact_allowed_scope: "docs/architecture/exact-scope-a.md",
+      },
+    };
+
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["infra/windows-worker/local_worker.js"]),
+      (error) =>
+        error.code === OUT_OF_SCOPE_BUSINESS_CHANGE &&
+        error.outOfScopePaths.includes("infra/windows-worker/local_worker.js")
+    );
+  });
+
+  await t.test("exact write task with required output still fails when no files changed", () => {
+    const job = {
+      request_text: [
+        "approved_batch=BATCH-GM-MODE-SMOKE-WRITE-03",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=docs/architecture/exact-scope-a.md",
+        "exact_allowed_scope=docs/architecture/exact-scope-a.md",
+        "original_request_text=必须创建 docs/architecture/exact-scope-a.md",
+      ].join("\n"),
+      payload: {},
+    };
+
+    assert.throws(
+      () => assertTaskGoalApplied(job, []),
+      (error) => error.code === NO_FIX_APPLIED
     );
   });
 
