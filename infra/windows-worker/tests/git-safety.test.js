@@ -392,6 +392,14 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
     assert.match(workerJobsSource, /exactAllowedScope\?: unknown/);
     assert.match(workerJobsSource, /exact_allowed_scope: exactAllowedScope/);
   });
+
+  await t.test("write request intake keeps exact scope without cloud-only classifiers", () => {
+    assert.doesNotMatch(routeSource, /classifyGatewayTaskContext/);
+    assert.match(routeSource, /extractExactAllowedScopePaths/);
+    assert.match(routeSource, /original_request_text/);
+    assert.match(routeSource, /exact_allowed_scope/);
+    assert.match(routeSource, /DIRECT_WRITE_ALLOWED_REQUIRES_APPROVAL/);
+  });
 });
 
 test("Git porcelain v1 -z status parsing", async (t) => {

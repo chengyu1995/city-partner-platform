@@ -89,6 +89,7 @@ Known fingerprints:
 - `PRODUCT_WRITE_PROMPT_POLLUTED_BY_READ_ONLY_LOCK`: product repair was already `product_write_allowed`, but the Codex prompt still contained a read-only lock and caused `NO_FIX_APPLIED`.
 - `BUSINESS_PAGE_BOUNDARY_VIOLATION`: automation/docs/read-only tasks touched frozen product pages. This must not be raised for `city_partner_product` + `product_write_allowed` changes inside `src/app/**`; product tasks remain blocked from Worker, gateway, env, and database files.
 - `ORIGINAL_BATCH_CONTEXT_MISSING`: approved BATCH-FIX execution did not carry the original `新需求：BATCH-FIX-*` full request text.
+- `WRITE_REQUEST_REPLY_INTERRUPTED`: first write_allowed intake saved no approval context and sent no manager reply because the gateway called a missing classifier before `replyFeishu`.
 
 Escalation:
 
