@@ -833,7 +833,14 @@ const DIRECT_WORKER_CONTEXT_REQUIRED_FIELDS = [
   "exact_allowed_scope",
   "forbidden_scope",
   "original_request_text",
+  "original_request_text_base64",
   "approved_batch",
+  "chat_id",
+  "root_id",
+  "message_id",
+  "created_at",
+  "consumed",
+  "context_id",
 ];
 
 function normalizeScopePathToken(value: string): string {
@@ -941,6 +948,14 @@ async function insertDirectWorkerTask(
     final_mode: modeContract.finalMode,
     approval_required: modeContract.approvalRequired,
     exact_allowed_scope: exactAllowedScope,
+    original_request_text_base64: Buffer.from(input.rawText, "utf8").toString("base64"),
+    approved_batch: modeContract.batchCode,
+    chat_id: input.feishuChatId,
+    root_id: input.feishuMessageId,
+    message_id: input.feishuMessageId,
+    created_at: new Date().toISOString(),
+    consumed: false,
+    context_id: `${modeContract.batchCode ?? "unknown"}:${input.feishuMessageId}`,
   };
   const contextualRequestText = withHermesWorkerContext(input.requestText, directWorkerPayload);
   const row = {
@@ -1025,6 +1040,31 @@ function projectDomainForTaskMode(taskMode: string | null): string | null {
   return null;
 }
 
+function isWriteAllowedApprovalText(text: string): boolean {
+  return /(?:requested_mode|final_mode|执行模式)\s*[:：=]\s*write_allowed\b|task_mode\s*[:=]\s*automation_system_write_allowed\b/i.test(
+    normalizeFeishuTaskText(text)
+  );
+}
+
+function assertApprovedWriteRequestHasExactScope(
+  requestText: string,
+  taskMode: string | null,
+  exactAllowedScope: string[]
+) {
+  if (
+    taskMode === "automation_system_write_allowed" &&
+    isWriteAllowedApprovalText(requestText) &&
+    exactAllowedScope.length === 0
+  ) {
+    const error = new Error(
+      "ORIGINAL_BATCH_CONTEXT_MISSING: write_allowed approval is missing boss-approved exact_allowed_scope; refusing generic automation scope fallback."
+    );
+    (error as Error & { code?: string; stage?: string }).code = "ORIGINAL_BATCH_CONTEXT_MISSING";
+    (error as Error & { code?: string; stage?: string }).stage = "approval_context_exact_scope_validation";
+    throw error;
+  }
+}
+
 async function insertApprovedAgentDispatchJobsWithContract(
   supabase: SupabaseClient,
   buildResult: DispatchJobBuildResult,
@@ -1039,6 +1079,7 @@ async function insertApprovedAgentDispatchJobsWithContract(
     const requestText = buildResult.requestTexts[index] ?? "";
     const taskMode = inferApprovedTaskMode(task);
     const exactAllowedScope = extractExactAllowedScopePaths(requestText);
+    assertApprovedWriteRequestHasExactScope(requestText, taskMode, exactAllowedScope);
     const allowedScope = exactAllowedScope.length > 0 ? exactAllowedScope : task.allowed_files;
     const contractPayload = buildWorkerJobPayloadContract({
       requestText,
@@ -1092,6 +1133,16 @@ async function insertApprovedAgentDispatchJobsWithContract(
       dispatch_batch: task.dispatch_batch,
       payload: {
         ...contractPayload,
+        requested_mode: isWriteAllowedApprovalText(requestText) ? "write_allowed" : null,
+        final_mode: taskMode === "automation_system_write_allowed" ? "write_allowed" : taskMode,
+        approval_required: task.requires_boss_approval ?? true,
+        original_request_text_base64: Buffer.from(requestText, "utf8").toString("base64"),
+        chat_id: feishuContext?.chatId ?? null,
+        root_id: feishuContext?.messageId ?? null,
+        message_id: feishuContext?.messageId ?? null,
+        created_at: new Date().toISOString(),
+        consumed: false,
+        context_id: `${task.dispatch_batch ?? "unknown"}:${feishuContext?.messageId ?? task.task_key}`,
         project_title: buildResult.projectTitle,
         batch_code: task.dispatch_batch,
         role: task.agent_role,

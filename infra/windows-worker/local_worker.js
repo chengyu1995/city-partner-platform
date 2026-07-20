@@ -1099,6 +1099,7 @@ const TRUE_TASK_FAILURE_CODES = new Set([
   "CONTEXT_RECONSTRUCT_FAILED",
   "GIT_COMMIT_FAILED",
   "GIT_PUSH_FAILED",
+  "GIT_SYNC_FAILED",
 ]);
 
 const NON_TASK_FAILURE_CODES = new Set([
@@ -1578,6 +1579,13 @@ function getTaskModeFromText(text) {
 
   if (explicitTextMode) {
     return explicitTextMode;
+  }
+
+  if (
+    readProjectDomainFromText(raw) === "automation_system" &&
+    /(?:requested_mode|final_mode|执行模式)\s*[:：=]\s*write_allowed\b/i.test(raw)
+  ) {
+    return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
   }
 
   if (isBatchFixProductTaskText(raw)) {
@@ -2616,6 +2624,7 @@ function normalizeWorkerContext(job, overrides = {}) {
     exact_allowed_scope: exactAllowedScope,
     forbidden_scope: forbiddenScope,
     original_request_text: originalRequestText,
+    original_request_text_base64: Buffer.from(originalRequestText, "utf8").toString("base64"),
     route,
     payload: payload || null,
     approved_batch: approvedBatch || null,
@@ -2707,6 +2716,7 @@ function formatWorkerJobContractLines(contract, options = {}) {
     `exact_allowed_scope: ${contract.exact_allowed_scope || "null"}`,
     `forbidden_scope: ${contract.forbidden_scope || "null"}`,
     `original_request_text: ${originalRequestValue}`,
+    `original_request_text_base64: ${contract.original_request_text_base64 ? "[present]" : "null"}`,
     `route: ${contract.route || "null"}`,
     "payload: hermes_jobs.payload",
     `approved_batch: ${contract.approved_batch || "null"}`,
@@ -2739,6 +2749,7 @@ function buildWorkerReportContractExtra(contract) {
     exact_allowed_scope: contract.exact_allowed_scope,
     forbidden_scope: contract.forbidden_scope,
     original_request_text: contract.original_request_text,
+    original_request_text_base64: contract.original_request_text_base64,
     route: contract.route,
     approved_batch: contract.approved_batch,
     worker_stage: contract.worker_stage,
@@ -2924,6 +2935,9 @@ function normalizeFailureCodeValue(value) {
     ORIGINAL_BATCH_CONTEXT_MISSING: "CONTEXT_RECONSTRUCT_FAILED",
     COMMIT_FAILED: "GIT_COMMIT_FAILED",
     PUSH_FAILED: "GIT_PUSH_FAILED",
+    TLS_HANDSHAKE_FAILED: "GIT_SYNC_FAILED",
+    NETWORK_TIMEOUT: "GIT_SYNC_FAILED",
+    CONNECTION_RESET: "GIT_SYNC_FAILED",
   };
 
   return aliases[code] || code;
@@ -2943,6 +2957,13 @@ function classifyFailureCodeFromText(text) {
   const raw = String(text || "");
   const nonTaskFailureCode = classifyNonTaskFailureCode(raw);
   if (nonTaskFailureCode) return nonTaskFailureCode;
+  if (
+    /git\s+(?:fetch|pull|ls-remote|sync|remote)|schannel|TLS|SSL|CERT|handshake|timed?\s*out|timeout|ECONNRESET|EAI_AGAIN|ENOTFOUND|fetch failed|connection reset/i.test(
+      raw
+    )
+  ) {
+    return "GIT_SYNC_FAILED";
+  }
   if (/NO_FIX_APPLIED|no_fix_applied\s*[:=]\s*(true|yes)|Task goal status:\s*failed_no_fix_applied/i.test(raw)) {
     return "NO_FIX_APPLIED";
   }
@@ -3071,6 +3092,7 @@ function normalizeWorkerFinalResult(input = {}) {
       ? readString(input.failure_stage) ||
         readString(input.failureStage) ||
         readStructuredResultField(reportText, "failure_stage") ||
+        (failureCode === "GIT_SYNC_FAILED" ? "git_sync_preflight" : null) ||
         readStructuredResultField(reportText, "失败阶段") ||
         error?.failureStage ||
         analysis?.stage ||
@@ -3090,18 +3112,36 @@ function normalizeWorkerFinalResult(input = {}) {
       readString(job.job_id) ||
       null,
     approved_batch: approvedBatch,
+    worker_execution_status:
+      readString(input.worker_execution_status) ||
+      readStructuredResultField(reportText, "worker_execution_status") ||
+      null,
+    task_goal_status:
+      readString(input.task_goal_status) ||
+      readStructuredResultField(reportText, "task_goal_status") ||
+      null,
     final_report_status:
       normalizeTerminalStatus(input.final_report_status || input.finalReportStatus || input.status) ||
       null,
     effective_final_status: effectiveFinalStatus,
     failure_code: failureCode,
     failure_stage: failureStage,
+    changed_files: uniqueSortedPaths(readStringList(input.changed_files || input.files_changed)),
     git_commit_sha:
       readString(input.git_commit_sha) ||
       readString(input.gitCommitSha) ||
       readString(job.git_commit_sha) ||
       null,
+    pushed:
+      typeof input.pushed === "boolean"
+        ? input.pushed
+        : readNullableBooleanFlag(input.pushed) || false,
     next_batch: nextBatch,
+    next_stage_allowed:
+      typeof input.next_stage_allowed === "boolean"
+        ? input.next_stage_allowed
+        : readNullableBooleanFlag(input.next_stage_allowed) || false,
+    reply_error: readString(input.reply_error) || null,
     completed_at:
       readString(input.completed_at) ||
       readString(input.completedAt) ||
@@ -3121,10 +3161,23 @@ function buildTerminalJobIndex(finalResult) {
   return {
     job_id: finalResult?.job_id || null,
     approved_batch: finalResult?.approved_batch || null,
+    worker_execution_status: finalResult?.worker_execution_status || null,
+    task_goal_status: finalResult?.task_goal_status || null,
     effective_final_status: finalResult?.effective_final_status || null,
     failure_code: finalResult?.failure_code || null,
+    failure_stage: finalResult?.failure_stage || null,
+    changed_files: uniqueSortedPaths(finalResult?.changed_files || []),
     git_commit_sha: finalResult?.git_commit_sha || null,
+    pushed:
+      typeof finalResult?.pushed === "boolean"
+        ? finalResult.pushed
+        : readNullableBooleanFlag(finalResult?.pushed) || false,
     next_batch: finalResult?.next_batch || null,
+    next_stage_allowed:
+      typeof finalResult?.next_stage_allowed === "boolean"
+        ? finalResult.next_stage_allowed
+        : readNullableBooleanFlag(finalResult?.next_stage_allowed) || false,
+    reply_error: finalResult?.reply_error || null,
     completed_at: finalResult?.completed_at || null,
   };
 }
@@ -4610,6 +4663,22 @@ function classifyFailure(error) {
       suggestion:
         "检查 git status 解析逻辑，使用 git status --porcelain=v1 -z；git add 前校验路径真实存在，保留原始 status 行用于排查。",
       recommendBossApproval: true,
+    };
+  }
+
+  if (
+    error?.code === "GIT_SYNC_FAILED" ||
+    /git\s+(?:fetch|pull|ls-remote|sync|remote)|schannel|TLS|SSL|CERT|handshake|timed?\s*out|timeout|ECONNRESET|EAI_AGAIN|ENOTFOUND|fetch failed|connection reset/i.test(
+      errorText
+    )
+  ) {
+    return {
+      stage: "git_sync_preflight",
+      keyError: sanitizeGitErrorMessage(errorText).slice(-1200),
+      suggestion:
+        "Git 同步预检失败且可重试；先恢复网络/TLS/远端连接后重试，禁止进入 Codex 执行或伪造成功。",
+      recommendBossApproval: false,
+      retryable: true,
     };
   }
 

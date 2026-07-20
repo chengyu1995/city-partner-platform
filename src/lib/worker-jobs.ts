@@ -67,6 +67,7 @@ export const WORKER_JOB_CONTRACT_FIELDS = [
   "exact_allowed_scope",
   "forbidden_scope",
   "original_request_text",
+  "original_request_text_base64",
   "route",
   "payload",
   "approved_batch",
@@ -107,6 +108,7 @@ const TRUE_TASK_FAILURE_CODES = new Set([
   "CONTEXT_RECONSTRUCT_FAILED",
   "GIT_COMMIT_FAILED",
   "GIT_PUSH_FAILED",
+  "GIT_SYNC_FAILED",
 ]);
 const NON_TASK_FAILURE_CODES = new Set([
   "FEISHU_RATE_LIMIT",
@@ -737,6 +739,7 @@ export function extractCurrentExecutionBatchCode(
 
 function classifyWorkerTaskDomain(text: unknown): string {
   const value = String(text ?? "");
+  if (/\bproject[_\s-]*domain\s*[:=]\s*automation_system\b/i.test(value)) return "automation_system";
   if (isBatchFixProductTaskText(value)) return "city_partner_product";
   if (QA_BATCH_PATTERN.test(value)) return "qa_review";
 
@@ -955,6 +958,9 @@ function normalizeFailureCodeValue(value: unknown): string | null {
     ORIGINAL_BATCH_CONTEXT_MISSING: "CONTEXT_RECONSTRUCT_FAILED",
     COMMIT_FAILED: "GIT_COMMIT_FAILED",
     PUSH_FAILED: "GIT_PUSH_FAILED",
+    TLS_HANDSHAKE_FAILED: "GIT_SYNC_FAILED",
+    NETWORK_TIMEOUT: "GIT_SYNC_FAILED",
+    CONNECTION_RESET: "GIT_SYNC_FAILED",
   };
   return aliases[code] ?? code;
 }
@@ -971,6 +977,13 @@ function classifyFailureCodeFromText(text: unknown): string | null {
   const raw = String(text ?? "");
   const nonTaskFailureCode = classifyNonTaskFailureCode(raw);
   if (nonTaskFailureCode) return nonTaskFailureCode;
+  if (
+    /git\s+(?:fetch|pull|ls-remote|sync|remote)|schannel|TLS|SSL|CERT|handshake|timed?\s*out|timeout|ECONNRESET|EAI_AGAIN|ENOTFOUND|fetch failed|connection reset/i.test(
+      raw
+    )
+  ) {
+    return "GIT_SYNC_FAILED";
+  }
   if (/NO_FIX_APPLIED|no_fix_applied\s*[:=]\s*(true|yes)|Task goal status:\s*failed_no_fix_applied/i.test(raw)) return "NO_FIX_APPLIED";
   if (/READ_ONLY_MODE_VIOLATION|read_only_mode_violation\s*[:=]\s*(true|yes)|Read-only violation:\s*yes|Task goal status:\s*failed_read_only_mode_violation/i.test(raw)) return "READ_ONLY_MODE_VIOLATION";
   if (/TASK_MODE_MISMATCH|task_mode_mismatch\s*[:=]\s*(true|yes)|Task goal status:\s*failed_task_mode_mismatch/i.test(raw)) return "TASK_MODE_MISMATCH";
@@ -1015,10 +1028,23 @@ export function buildTerminalJobIndex(finalResult: Record<string, unknown>): Rec
   return {
     job_id: readString(finalResult.job_id),
     approved_batch: readString(finalResult.approved_batch),
+    worker_execution_status: readString(finalResult.worker_execution_status),
+    task_goal_status: readString(finalResult.task_goal_status),
     effective_final_status: readString(finalResult.effective_final_status),
     failure_code: readString(finalResult.failure_code),
+    failure_stage: readString(finalResult.failure_stage),
+    changed_files: readStringArray(finalResult.changed_files),
     git_commit_sha: readString(finalResult.git_commit_sha),
+    pushed:
+      typeof finalResult.pushed === "boolean"
+        ? finalResult.pushed
+        : readNullableBooleanFlag(finalResult.pushed) ?? false,
     next_batch: readString(finalResult.next_batch),
+    next_stage_allowed:
+      typeof finalResult.next_stage_allowed === "boolean"
+        ? finalResult.next_stage_allowed
+        : readNullableBooleanFlag(finalResult.next_stage_allowed) ?? false,
+    reply_error: readString(finalResult.reply_error),
     completed_at: readString(finalResult.completed_at),
   };
 }
@@ -1122,6 +1148,7 @@ export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
         readString(input.failure_stage) ??
         readString(projectDirectorReport?.failure_stage) ??
         readDiagnosticLine(reportText, "failure_stage") ??
+        (failureCode === "GIT_SYNC_FAILED" ? "git_sync_preflight" : null) ??
         readDiagnosticLine(reportText, "失败阶段")
       : null;
   const nextBatch =
@@ -1133,16 +1160,46 @@ export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
   const finalResult = {
     job_id: readString(input.job_id) ?? readString(job?.id) ?? readString(job?.job_id),
     approved_batch: approvedBatch,
+    worker_execution_status:
+      readString(input.worker_execution_status) ??
+      readString(projectDirectorReport?.worker_execution_status) ??
+      readDiagnosticLine(reportText, "worker_execution_status"),
+    task_goal_status:
+      readString(input.task_goal_status) ??
+      readString(projectDirectorReport?.task_goal_status) ??
+      readDiagnosticLine(reportText, "task_goal_status"),
     final_report_status: normalizeTerminalStatus(input.final_report_status ?? input.finalReportStatus ?? input.status),
     effective_final_status: effectiveFinalStatus,
     failure_code: failureCode,
     failure_stage: failureStage,
+    changed_files: readStringArray(
+      input.changed_files ??
+        input.files_changed ??
+        projectDirectorReport?.changed_files ??
+        projectDirectorReport?.files_changed
+    ),
     git_commit_sha:
       readString(input.gitCommitSha) ??
       readString(input.git_commit_sha) ??
       readString(projectDirectorReport?.git_commit_sha) ??
       readString(job?.git_commit_sha),
+    pushed:
+      typeof input.pushed === "boolean"
+        ? input.pushed
+        : readNullableBooleanFlag(input.pushed) ??
+          readNullableBooleanFlag(projectDirectorReport?.pushed) ??
+          false,
     next_batch: nextBatch,
+    next_stage_allowed:
+      typeof input.next_stage_allowed === "boolean"
+        ? input.next_stage_allowed
+        : readNullableBooleanFlag(input.next_stage_allowed) ??
+          readNullableBooleanFlag(projectDirectorReport?.next_stage_allowed) ??
+          false,
+    reply_error:
+      readString(input.reply_error) ??
+      readString(projectDirectorReport?.reply_error) ??
+      null,
     completed_at:
       readString(input.completedAt) ??
       readString(input.completed_at) ??
@@ -1330,6 +1387,13 @@ function inferTaskMode(input: {
   const explicitTextMode = explicitTextModeMatch ? explicitTextModeMatch[1].toLowerCase() : null;
   if (explicitTextMode && Object.values(TASK_MODES).includes(explicitTextMode as typeof TASK_MODES[keyof typeof TASK_MODES])) {
     return explicitTextMode;
+  }
+
+  if (
+    /\bproject[_\s-]*domain\s*[:=]\s*automation_system\b/i.test(text) &&
+    /(?:requested_mode|final_mode|执行模式)\s*[:：=]\s*write_allowed\b/i.test(text)
+  ) {
+    return TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED;
   }
 
   // Product repair batches must stay product even when QA/docs/system words appear in the prompt.
@@ -1632,6 +1696,7 @@ export function buildWorkerJobPayloadContract(input: {
     exact_allowed_scope: exactAllowedScope,
     forbidden_scope: forbiddenScope,
     original_request_text: originalRequestText,
+    original_request_text_base64: Buffer.from(originalRequestText, "utf8").toString("base64"),
     route:
       readString(readPriorityField("route")) ??
       null,
@@ -1700,14 +1765,7 @@ export function buildProjectDirectorWorkerReport(input: {
 }): { text: string; data: Record<string, unknown> } {
   const correlation = getProjectDirectorJobCorrelation(input.job);
   const batchCode = getJobBatchCode(input.job);
-  const submittedFilesChanged = readStringArray(input.filesChanged);
-  const filesChanged =
-    submittedFilesChanged.length > 0
-      ? submittedFilesChanged
-      : readStringArray(
-          readRecord(input.job?.result)?.changed_files ??
-            readRecord(input.job?.result)?.files_changed
-        );
+  const filesChanged = readStringArray(input.filesChanged);
   const submittedValidationResults = readStringArray(input.validationResults);
   const validation = [
     ...(submittedValidationResults.length > 0 ? submittedValidationResults : []),
@@ -1948,6 +2006,7 @@ export function buildProjectDirectorWorkerReport(input: {
     exact_allowed_scope: contract.exact_allowed_scope,
     forbidden_scope: contract.forbidden_scope,
     original_request_text: contract.original_request_text,
+    original_request_text_base64: contract.original_request_text_base64,
     route: contract.route,
     payload: jobPayload ?? null,
     approved_batch: contract.approved_batch ?? batchCode,

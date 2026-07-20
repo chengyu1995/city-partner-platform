@@ -2693,6 +2693,244 @@ test("approved repair route remains on approved execution path", async (t) => {
   });
 });
 
+test("bootstrap context router contract guards", async (t) => {
+  const routeSource = fs.readFileSync(
+    path.resolve(workerRoot, "../../src/app/api/feishu/event/route.ts"),
+    "utf8"
+  );
+  const workerJobsSource = fs.readFileSync(
+    path.resolve(workerRoot, "../../src/lib/worker-jobs.ts"),
+    "utf8"
+  );
+
+  await t.test("automation_system write_allowed never becomes product_write_allowed or product scoped", () => {
+    const job = {
+      request_text: [
+        "New demand: execute BATCH-ARCH-COMPLETE-00-LOCAL-BOOTSTRAP-CONTEXT-ROUTER-FIX-01",
+        "project_domain=automation_system",
+        "requested_mode=write_allowed",
+        "allowed_scope=infra/windows-worker/local_worker.js",
+        "forbidden_scope=src/app/**, docs/NEXT_TASK_CARD.md, BATCH-P1",
+        "Background mentions product, src/app/**, docs/projects/city-partner-website.md and BATCH-P1 only as forbidden examples.",
+      ].join("\n"),
+    };
+
+    const contract = resolveWorkerJobContract(job);
+    assert.equal(classifyWorkerTaskDomain(job.request_text), "automation_system");
+    assert.equal(getTaskMode(job), TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.equal(contract.task_mode, TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+    assert.notEqual(contract.task_mode, TASK_MODES.PRODUCT_WRITE_ALLOWED);
+    assert.doesNotMatch(contract.allowed_scope || "", /src\/app\/\*\*|city-partner-website|NEXT_TASK_CARD/);
+    assert.notEqual(extractCurrentExecutionBatchCode(job), "BATCH-P1");
+  });
+
+  await t.test("full demand context keeps original text, base64, exact scope and approval metadata", () => {
+    const originalRequest = [
+      "New demand: execute BATCH-GM-MODE-SMOKE-WRITE-99",
+      "project_domain=automation_system",
+      "requested_mode=write_allowed",
+      "final_mode=write_allowed",
+      "task_mode=automation_system_write_allowed",
+      "read_only_mode=false",
+      "approval_required=true",
+      "Only modify:",
+      "docs/architecture/batch-gm-mode-smoke-write-99.md",
+    ].join("\n");
+    const encoded = Buffer.from(originalRequest, "utf8").toString("base64");
+    const job = {
+      request_text: [
+        "Manager approval command: only approve BATCH-GM-MODE-SMOKE-WRITE-99",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "requested_mode=write_allowed",
+        "final_mode=write_allowed",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "approval_required=true",
+        "allowed_scope=docs/architecture/batch-gm-mode-smoke-write-99.md",
+        "exact_allowed_scope=docs/architecture/batch-gm-mode-smoke-write-99.md",
+        "forbidden_scope=src/app/**, database, env, BATCH-P1",
+        `original_request_text_base64=${encoded}`,
+        "approved_batch=BATCH-GM-MODE-SMOKE-WRITE-99",
+        "chat_id=oc_xxx",
+        "root_id=om_xxx",
+        "message_id=om_xxx",
+        "created_at=2026-07-20T00:00:00.000Z",
+        "consumed=false",
+        "context_id=BATCH-GM-MODE-SMOKE-WRITE-99:om_xxx",
+      ].join("\n"),
+    };
+
+    const contract = resolveWorkerJobContract(job);
+    assert.match(contract.original_request_text, /Only modify:/);
+    assert.match(contract.original_request_text, /batch-gm-mode-smoke-write-99\.md/);
+    assert.equal(
+      Buffer.from(contract.original_request_text_base64, "base64").toString("utf8"),
+      contract.original_request_text
+    );
+    assert.equal(contract.exact_allowed_scope, "docs/architecture/batch-gm-mode-smoke-write-99.md");
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(job, ["docs/architecture/batch-gm-mode-smoke-write-99.md"])
+    );
+    assert.throws(
+      () => assertTaskGoalApplied(job, ["infra/windows-worker/tests/git-safety.test.js"]),
+      (error) => error.code === OUT_OF_SCOPE_BUSINESS_CHANGE
+    );
+  });
+
+  await t.test("approval shell cannot overwrite or replace missing exact original context", () => {
+    assert.match(routeSource, /assertApprovedWriteRequestHasExactScope/);
+    assert.match(routeSource, /ORIGINAL_BATCH_CONTEXT_MISSING/);
+    assert.match(routeSource, /refusing generic automation scope fallback/);
+    assert.match(routeSource, /original_request_text_base64/);
+    assert.match(routeSource, /context_id/);
+    assert.match(routeSource, /consumed:\s*false/);
+    assert.match(routeSource, /chat_id/);
+    assert.match(routeSource, /message_id/);
+    assert.doesNotMatch(routeSource, /BATCH-P1[\s\S]{0,120}product_write_allowed/);
+  });
+
+  await t.test("ambiguous or missing context is represented as a blocking contract failure", () => {
+    const missingScopeJob = {
+      request_text: [
+        "BATCH-GM-MODE-SMOKE-WRITE-98",
+        "project_domain=automation_system",
+        "requested_mode=write_allowed",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+      ].join("\n"),
+    };
+    const ambiguousJob = {
+      request_text: [
+        "BATCH-GM-MODE-SMOKE-WRITE-98",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=docs/architecture/a.md",
+        "",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "allowed_scope=docs/architecture/b.md",
+      ].join("\n"),
+    };
+
+    assert.equal(resolveWorkerJobContract(missingScopeJob).context_reconstruct_failed, true);
+    assert.match(routeSource, /APPROVAL_CONTEXT_AMBIGUOUS|ORIGINAL_BATCH_CONTEXT_MISSING|explicit HERMES_WORKER_CONTEXT/);
+    assert.equal(resolveWorkerJobContract(ambiguousJob).task_mode, TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED);
+  });
+
+  await t.test("final status, failure metadata, empty changes, pushed false and reply error propagate", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job_id: "job-bootstrap-contract",
+      approved_batch: "BATCH-GM-MODE-SMOKE-WRITE-97",
+      status: "succeeded",
+      effectiveFinalStatus: "failed",
+      worker_execution_status: "succeeded_until_task_goal_validation",
+      task_goal_status: "failed_no_fix_applied",
+      failureCode: NO_FIX_APPLIED,
+      failureStage: "task_goal_validation",
+      changed_files: [],
+      pushed: false,
+      next_stage_allowed: false,
+      reply_error: "manager_reply_failed",
+    });
+
+    assert.equal(finalResult.effective_final_status, "failed");
+    assert.equal(finalResult.failure_code, NO_FIX_APPLIED);
+    assert.equal(finalResult.failure_stage, "task_goal_validation");
+    assert.deepEqual(finalResult.changed_files, []);
+    assert.equal(finalResult.pushed, false);
+    assert.equal(finalResult.next_stage_allowed, false);
+    assert.equal(finalResult.reply_error, "manager_reply_failed");
+    assert.deepEqual(finalResult.terminal_index.changed_files, []);
+    assert.equal(finalResult.terminal_index.pushed, false);
+  });
+
+  await t.test("notification failure is non-task metadata and does not overwrite terminal truth", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      status: "succeeded",
+      effectiveFinalStatus: "succeeded",
+      resultText: "Worker execution status: succeeded\nTask goal status: completed",
+      errorText: "FEISHU_SEND_FAILED reply_error=feishu_rate_limited",
+      changed_files: [],
+      pushed: false,
+      reply_error: "feishu_rate_limited",
+    });
+
+    assert.equal(finalResult.effective_final_status, "succeeded");
+    assert.equal(finalResult.failure_code, null);
+    assert.equal(finalResult.reply_error, "feishu_rate_limited");
+  });
+
+  await t.test("git TLS and network sync failures map before Codex execution", () => {
+    const error = Object.assign(
+      new Error("git fetch failed: schannel TLS handshake timeout ECONNRESET"),
+      { code: "GIT_SYNC_FAILED" }
+    );
+    const finalResult = normalizeWorkerFinalResult({
+      status: "failed",
+      effectiveFinalStatus: "failed",
+      error,
+      errorText: error.message,
+      changed_files: [],
+      pushed: false,
+    });
+    const failureReport = buildFailureReport({ id: "git-sync", request_text: "BATCH-GM git sync" }, error);
+
+    assert.equal(finalResult.failure_code, "GIT_SYNC_FAILED");
+    assert.equal(finalResult.failure_stage, "git_sync_preflight");
+    assert.match(failureReport, /failure_stage: git_sync_preflight/);
+    assert.doesNotMatch(failureReport, /Codex 执行：通过/);
+  });
+
+  await t.test("read-only empty changes do not no-fix, write-allowed empty changes still no-fix", () => {
+    assert.doesNotThrow(() =>
+      assertTaskGoalApplied(
+        {
+          request_text: [
+            "BATCH-GM-READONLY-EMPTY",
+            "project_domain=automation_system",
+            "task_mode=read_only",
+            "read_only_mode=true",
+          ].join("\n"),
+        },
+        []
+      )
+    );
+    assert.throws(
+      () =>
+        assertTaskGoalApplied(
+          {
+            request_text: [
+              "BATCH-GM-WRITE-EMPTY",
+              "project_domain=automation_system",
+              "requested_mode=write_allowed",
+              "task_mode=automation_system_write_allowed",
+              "read_only_mode=false",
+              "allowed_scope=docs/architecture/write-empty.md",
+              "exact_allowed_scope=docs/architecture/write-empty.md",
+              "Task: create docs/architecture/write-empty.md",
+            ].join("\n"),
+          },
+          []
+        ),
+      (error) => error.code === NO_FIX_APPLIED
+    );
+  });
+
+  await t.test("worker job source preserves exact scope and does not reintroduce generic product fallback", () => {
+    assert.match(workerJobsSource, /GIT_SYNC_FAILED/);
+    assert.match(workerJobsSource, /worker_execution_status/);
+    assert.match(workerJobsSource, /task_goal_status/);
+    assert.match(workerJobsSource, /reply_error/);
+    assert.match(workerJobsSource, /const filesChanged = readStringArray\(input\.filesChanged\)/);
+    assert.doesNotMatch(workerJobsSource, /submittedFilesChanged\.length > 0[\s\S]{0,200}job\?\.result/);
+  });
+});
+
 test("failure memory blocks after three repeated fingerprints", () => {
   let state = {};
   let result = recordFailureMemory(
