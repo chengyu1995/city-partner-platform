@@ -39,6 +39,12 @@ interface WorkerReportBody {
   created_at?: string;
   git_commit_sha?: string;
   deploy_status?: string | null;
+  failure_code?: string | null;
+  failure_stage?: string | null;
+  worker_execution_status?: string | null;
+  task_goal_status?: string | null;
+  effective_final_status?: string | null;
+  diagnostics?: Record<string, unknown> | null;
   result_text?: string;
   error_text?: string;
   error?: string;
@@ -76,6 +82,7 @@ function buildResult(body: WorkerReportBody): Record<string, unknown> {
     github_push_status: body.github_push_status ?? null,
     deploy_status: body.deploy_status ?? null,
     result_text: body.result_text ?? null,
+    diagnostics: body.diagnostics ?? null,
   };
 }
 
@@ -161,7 +168,14 @@ export async function POST(req: NextRequest) {
     buildPassed: body.build_passed,
     testPassed: body.test_passed,
     errorText,
+    failureCode: body.failure_code,
+    failureStage: body.failure_stage,
+    workerExecutionStatus: body.worker_execution_status,
+    taskGoalStatus: body.task_goal_status,
+    effectiveFinalStatus: body.effective_final_status,
   });
+  const effectiveFinalStatus = normalizeWorkerStatus(projectDirectorReport.data.effective_final_status);
+  const storedStatus = terminal ? effectiveFinalStatus : workerStatus;
 
   if (isTerminalWorkerStatus(existingJob.status)) {
     const storedProjectDirectorReport =
@@ -198,21 +212,22 @@ export async function POST(req: NextRequest) {
   }
 
   const { data, error, skippedColumns } = await updateHermesJob(supabase, jobId, {
-    status: workerStatus,
+    status: storedStatus,
     claimed_by: workerId,
     attempt_id: attemptId,
     active_attempt_id: attemptId,
     progress_percent: progressPercent,
     current_step:
       body.current_step ??
-      (workerStatus === "succeeded" ? "completed" : workerStatus === "failed" ? "failed" : null),
+      (storedStatus === "succeeded" ? "completed" : storedStatus === "failed" ? "failed" : null),
     status_message: terminal ? projectDirectorReport.text : body.status_message ?? null,
     git_commit_sha: body.git_commit_sha ?? null,
-    error_text: workerStatus === "failed" ? errorText : null,
+    error_text: storedStatus === "failed" ? errorText : null,
     result: {
       ...buildResult({ ...body, attempt_id: attemptId ?? body.attempt_id }),
       project_director_report: projectDirectorReport.data,
       project_director_report_text: projectDirectorReport.text,
+      diagnostics: projectDirectorReport.data.diagnostics ?? null,
     },
     completed_at: terminal ? now : null,
     updated_at: now,
@@ -228,12 +243,12 @@ export async function POST(req: NextRequest) {
   const recordId = getBitableRecordId(body, data, existingJob);
   await syncWorkerStatusToFeishu({
     recordId,
-    status: workerStatus,
-    stage: workerStatus === "failed" ? "failed" : terminal ? "completed" : "execution",
+    status: storedStatus,
+    stage: storedStatus === "failed" ? "failed" : terminal ? "completed" : "execution",
     progressPercent,
     currentStep:
       body.current_step ??
-      (workerStatus === "succeeded" ? "completed" : workerStatus === "failed" ? "failed" : null),
+      (storedStatus === "succeeded" ? "completed" : storedStatus === "failed" ? "failed" : null),
     statusMessage: terminal ? projectDirectorReport.text : body.status_message ?? null,
     gitCommitSha: body.git_commit_sha ?? null,
     errorText: workerStatus === "failed" ? projectDirectorReport.text : "",

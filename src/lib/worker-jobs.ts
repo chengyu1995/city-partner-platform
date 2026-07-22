@@ -94,6 +94,55 @@ const AUTOMATION_WRITE_TASK_PATTERN =
 const READ_ONLY_BATCH_PATTERN =
   /\bBATCH-QA(?:-[A-Z0-9]+)*\b|\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const WORKER_BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
+export const DIAGNOSTICS_SCHEMA_VERSION = 1;
+const FAILURE_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,64}$/;
+const IMPLEMENTED_DIAGNOSTICS_FAILURE_CODES = [
+  "NO_FIX_APPLIED",
+  "READ_ONLY_MODE_VIOLATION",
+  "TASK_MODE_MISMATCH",
+  "MISSING_REQUIRED_DOCS",
+  "INSUFFICIENT_DOC_OUTPUT",
+  "INCOMPLETE_QA_REPORT",
+  "INCOMPLETE_ARCHITECTURE_REPORT",
+  "TEST_FAILED",
+  "TYPESCRIPT_FAILED",
+  "OUT_OF_SCOPE_CHANGE",
+  "CONTEXT_RECONSTRUCT_FAILED",
+  "GIT_COMMIT_FAILED",
+  "GIT_PUSH_FAILED",
+  "GIT_SYNC_FAILED",
+  "CODEX_QUOTA_EXHAUSTED",
+  "CODEX_IDLE_TIMEOUT",
+  "APPROVAL_CONTEXT_SAVE_FAILED",
+  "AGENT_PAUSED",
+  "EXACT_ALLOWED_SCOPE_MISSING",
+  "TASK_INSERT_FAILED",
+  "GIT_SYNC_PREFLIGHT_FAILED",
+  "CHANGED_FILES_PARSE_FAILED",
+  "UTF8_REPLY_CORRUPTED",
+  "DEPLOYMENT_FAILED",
+  "TERMINAL_REPORT_DUPLICATE",
+  "WORKER_REPORT_CONTRACT_INCOMPLETE",
+  "UNKNOWN_FAILURE",
+] as const;
+const IMPLEMENTED_DIAGNOSTICS_FAILURE_STAGES = [
+  "intake",
+  "approval_context",
+  "worker_creation",
+  "worker_claim",
+  "codex_execution",
+  "validation",
+  "git",
+  "git_sync_preflight",
+  "push",
+  "report",
+  "notification",
+  "deployment",
+  "task_goal_validation",
+  "unknown",
+] as const;
+const IMPLEMENTED_DIAGNOSTICS_FAILURE_CODE_SET = new Set<string>(IMPLEMENTED_DIAGNOSTICS_FAILURE_CODES);
+const IMPLEMENTED_DIAGNOSTICS_FAILURE_STAGE_SET = new Set<string>(IMPLEMENTED_DIAGNOSTICS_FAILURE_STAGES);
 const TRUE_TASK_FAILURE_CODES = new Set([
   "NO_FIX_APPLIED",
   "READ_ONLY_MODE_VIOLATION",
@@ -910,6 +959,86 @@ function truncateText(value: string, maxLength: number): string {
   return `${value.slice(0, maxLength - 40)}\n...[已截断，保留关键字段]`;
 }
 
+function sanitizeDiagnosticsErrorSummary(value: unknown): string | null {
+  const text = sanitizeReportText(value)
+    .replace(/Authorization\s*:\s*Bearer\s+[^\s,}]+/gi, "Authorization: Bearer [redacted]")
+    .replace(/\b(token|secret|key|password)\b\s*[:=]\s*[^\s,}]+/gi, "$1=[redacted]")
+    .replace(/([?&](?:token|key|secret|access_token|api_key)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/original_request_text(?:_base64)?\s*[:=].*/gi, "original_request_text=[redacted]")
+    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi, "[redacted private key]")
+    .replace(/https?:\/\/[^\s]+\.supabase\.co[^\s]*/gi, "[redacted supabase url]")
+    .trim();
+  if (!text) return null;
+  return text.length > 1000 ? text.slice(0, 1000) : text;
+}
+
+function normalizeDiagnosticsFailureCode(value: unknown, effectiveFinalStatus: unknown, reportText?: unknown): string | null {
+  const normalized = normalizeFailureCodeValue(value);
+  if (normalized && FAILURE_CODE_PATTERN.test(normalized) && IMPLEMENTED_DIAGNOSTICS_FAILURE_CODE_SET.has(normalized)) {
+    return normalized;
+  }
+  const classified = classifyFailureCodeFromText(reportText);
+  if (classified && FAILURE_CODE_PATTERN.test(classified) && IMPLEMENTED_DIAGNOSTICS_FAILURE_CODE_SET.has(classified)) {
+    return classified;
+  }
+  return normalizeTerminalStatus(effectiveFinalStatus) === "failed" ? "UNKNOWN_FAILURE" : null;
+}
+
+function normalizeDiagnosticsFailureStage(value: unknown, failureCode: unknown, effectiveFinalStatus: unknown): string | null {
+  const stage = readString(value);
+  if (stage && IMPLEMENTED_DIAGNOSTICS_FAILURE_STAGE_SET.has(stage)) return stage;
+  if (normalizeFailureCodeValue(failureCode) === "GIT_SYNC_FAILED") return "git_sync_preflight";
+  if (normalizeTerminalStatus(effectiveFinalStatus) === "failed") return "unknown";
+  return null;
+}
+
+function readNonNegativeInteger(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
+  const text = readString(value);
+  if (!text || !/^\d+$/.test(text)) return null;
+  const parsed = Number(text);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function buildWorkerFailureDiagnostics(input: {
+  job: JobRecord | null;
+  contract: Record<string, unknown>;
+  normalizedFinalResult: Record<string, unknown>;
+  workerExecutionStatus: string;
+  taskGoalStatus: string;
+  effectiveFinalStatus: string;
+  failureCode: string | null;
+  failureStage: string | null;
+  batchCode: string | null;
+  attemptId: string | null;
+  completedAt: string | null;
+  errorText: string | null;
+  summary: string;
+}): Record<string, unknown> {
+  const jobPayload = readRecord(input.job?.payload);
+  const jobResult = readRecord(input.job?.result);
+  const effectiveStatus = normalizeTerminalStatus(input.effectiveFinalStatus) ?? "failed";
+  const reportText = [input.errorText, input.summary].filter(Boolean).join("\n");
+  const failureCode = normalizeDiagnosticsFailureCode(input.failureCode, effectiveStatus, reportText);
+  const failureStage = normalizeDiagnosticsFailureStage(input.failureStage, failureCode, effectiveStatus);
+  return {
+    diagnostics_schema_version: DIAGNOSTICS_SCHEMA_VERSION,
+    failure_code: effectiveStatus === "failed" ? failureCode : null,
+    failure_stage: effectiveStatus === "failed" ? failureStage : null,
+    worker_execution_status: input.workerExecutionStatus || "unknown",
+    task_goal_status: input.taskGoalStatus || "unknown",
+    effective_final_status: effectiveStatus,
+    project_domain: readString(input.contract.project_domain) ?? readString(jobPayload?.project_domain) ?? readString(jobResult?.project_domain) ?? "unknown",
+    requested_mode: readString(input.contract.requested_mode) ?? readString(jobPayload?.requested_mode) ?? readString(jobResult?.requested_mode) ?? "unknown",
+    task_mode: readString(input.contract.task_mode) ?? readString(jobPayload?.task_mode) ?? readString(jobResult?.task_mode) ?? "unknown",
+    batch: readString(input.contract.approved_batch) ?? input.batchCode ?? readString(jobPayload?.approved_batch) ?? readString(jobResult?.batch_code) ?? "unknown",
+    attempt_id: input.attemptId ?? readString(input.normalizedFinalResult.attempt_id) ?? readString(input.job?.attempt_id),
+    retry_count: readNonNegativeInteger(input.job?.retry_count) ?? readNonNegativeInteger(jobPayload?.retry_count) ?? readNonNegativeInteger(jobResult?.retry_count),
+    completed_at: input.completedAt,
+    diagnostics_source: "worker_report_api",
+    error_summary: sanitizeDiagnosticsErrorSummary(reportText),
+  };
+}
 function readDiagnosticLine(content: string, label: string): string | null {
   const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/_/g, "[_\\s-]*");
   const pattern = new RegExp(`^\\s*${escapedLabel}\\s*[:=：]\\s*(.*?)\\s*$`, "i");
@@ -1762,6 +1891,11 @@ export function buildProjectDirectorWorkerReport(input: {
   buildPassed?: boolean | null;
   testPassed?: boolean | null;
   errorText?: string | null;
+  failureCode?: string | null;
+  failureStage?: string | null;
+  workerExecutionStatus?: string | null;
+  taskGoalStatus?: string | null;
+  effectiveFinalStatus?: string | null;
 }): { text: string; data: Record<string, unknown> } {
   const correlation = getProjectDirectorJobCorrelation(input.job);
   const batchCode = getJobBatchCode(input.job);
@@ -1891,14 +2025,14 @@ export function buildProjectDirectorWorkerReport(input: {
     job: input.job,
     status: input.status,
     finalReportStatus: input.status,
-    effectiveFinalStatus: legacyEffectiveFinalStatus,
+    effectiveFinalStatus: input.effectiveFinalStatus ?? legacyEffectiveFinalStatus,
     resultText: summary,
     errorText: sanitizedError,
     failureCode:
       legacyEffectiveFinalStatus === "failed"
-        ? taskGoalFailureCode ?? classifyFailureCodeFromText(combinedReportText)
+        ? input.failureCode ?? taskGoalFailureCode ?? classifyFailureCodeFromText(combinedReportText)
         : null,
-    failureStage: rawFailureStage,
+    failureStage: input.failureStage ?? rawFailureStage,
     gitCommitSha,
     nextBatch: extractNextBatchFromText(combinedReportText),
     completedAt: input.status === "succeeded" || input.status === "failed"
@@ -1935,8 +2069,10 @@ export function buildProjectDirectorWorkerReport(input: {
   const failureSuggestion = effectiveFinalStatus === "failed"
     ? buildFailureNextStep(sanitizedError)
     : null;
+  const reportedWorkerExecutionStatus = readString(input.workerExecutionStatus);
   const workerExecutionStatus =
-    readOnlyViolation
+    reportedWorkerExecutionStatus ??
+    (readOnlyViolation
       ? "succeeded_until_read_only_validation"
       : noFixApplied
         ? "succeeded_until_task_goal_validation"
@@ -1948,9 +2084,11 @@ export function buildProjectDirectorWorkerReport(input: {
               ? "failed"
               : input.status === "succeeded"
                 ? "succeeded"
-                : input.status;
+                : input.status);
+  const reportedTaskGoalStatus = readString(input.taskGoalStatus);
   const taskGoalStatus =
-    readOnlyViolation
+    reportedTaskGoalStatus ??
+    (readOnlyViolation
       ? "failed_read_only_mode_violation"
       : noFixApplied
         ? "failed_no_fix_applied"
@@ -1964,7 +2102,7 @@ export function buildProjectDirectorWorkerReport(input: {
             : "completed"
         : input.status === "failed"
           ? "failed"
-          : "running";
+          : "running");
   const iterationNextStep = needsBossConfirmation
     ? nextBatch
       ? `Continue with ${nextBatch}.`
@@ -1973,6 +2111,21 @@ export function buildProjectDirectorWorkerReport(input: {
       ? `Create minimal repair batch ${autoIterationSuggestion.suggested_batch} for ${failureCode ?? "unknown_failure"}.`
       : failureSuggestion ?? "No automatic repair batch is generated for this terminal state.";
 
+  const diagnostics = buildWorkerFailureDiagnostics({
+    job: input.job,
+    contract,
+    normalizedFinalResult,
+    workerExecutionStatus,
+    taskGoalStatus,
+    effectiveFinalStatus,
+    failureCode,
+    failureStage,
+    batchCode,
+    attemptId: input.attemptId,
+    completedAt: readString(normalizedFinalResult.completed_at),
+    errorText: sanitizedError || null,
+    summary,
+  });
   const data = {
     job_id: jobId,
     batch_code: batchCode,
@@ -2039,6 +2192,7 @@ export function buildProjectDirectorWorkerReport(input: {
     needs_boss_confirmation: needsBossConfirmation,
     next_step: iterationNextStep,
     failure_stage: failureStage,
+    diagnostics,
     key_error: keyError,
     repair_suggestion: failureSuggestion,
     error: sanitizedError || null,
