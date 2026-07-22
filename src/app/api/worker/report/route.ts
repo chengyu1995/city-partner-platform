@@ -20,6 +20,7 @@ import {
   normalizeWorkerStatus,
   parseJsonBody,
   responseFromMaybe,
+  terminalAttemptMatches,
   updateHermesJob,
 } from "@/lib/worker-jobs";
 
@@ -238,6 +239,21 @@ export async function POST(req: NextRequest) {
   const storedStatus = terminal && isTerminalWorkerStatus(effectiveFinalStatus) ? effectiveFinalStatus : workerStatus;
 
   if (isTerminalWorkerStatus(existingJob.status)) {
+    if (!terminalAttemptMatches(existingJob, attemptId)) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "stale_attempt_terminal_report",
+          stale_attempt: true,
+          duplicate_report_detected: false,
+          status_unchanged: true,
+          diagnostics_persisted: false,
+          attempt_id: attemptId,
+        },
+        { status: 409 }
+      );
+    }
+
     const storedProjectDirectorReport =
       getStoredProjectDirectorReport(existingJob) ?? projectDirectorReport;
     const storedResult = readRecord(existingJob.result);

@@ -910,16 +910,26 @@ export function getClaimedBy(job: JobRecord | null | undefined): string | null {
 export function getActiveAttemptId(job: JobRecord | null | undefined): string | null {
   if (!job) return null;
   const payload = readRecord(job.payload);
-  const result = readRecord(job.result);
   const activeAttempt = readRecord(payload?.active_attempt);
 
   return (
     readString(job.active_attempt_id) ??
     readString(job.attempt_id) ??
     readString(activeAttempt?.attempt_id) ??
-    readString(payload?.attempt_id) ??
-    readString(result?.attempt_id)
+    readString(payload?.attempt_id)
   );
+}
+
+export function getStoredTerminalAttemptId(job: JobRecord | null | undefined): string | null {
+  if (!job) return null;
+  const result = readRecord(job.result);
+  return getActiveAttemptId(job) ?? readString(result?.attempt_id);
+}
+
+export function terminalAttemptMatches(job: JobRecord | null | undefined, attemptId: string | null): boolean {
+  const storedAttemptId = getStoredTerminalAttemptId(job);
+  if (!storedAttemptId) return !attemptId;
+  return attemptId === storedAttemptId;
 }
 
 function readLineValue(content: string, key: string): string | null {

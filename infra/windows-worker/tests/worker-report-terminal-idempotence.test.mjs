@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(dirname, "..", "..", "..");
 const reportRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker", "report", "route.ts"), "utf8");
+const workerJobs = fs.readFileSync(path.join(root, "src", "lib", "worker-jobs.ts"), "utf8");
 
 function duplicateBranch() {
   const start = reportRoute.indexOf("if (isTerminalWorkerStatus(existingJob.status))");
@@ -48,4 +49,28 @@ test("duplicate terminal report preserves stored terminal truth", () => {
   assert.match(branch, /status:\s*storedTerminalStatus/);
   assert.doesNotMatch(branch, /status:\s*workerStatus/);
   assert.doesNotMatch(branch, /status:\s*storedStatus/);
+});
+
+test("active attempt identity is not polluted by old result diagnostics", () => {
+  const start = workerJobs.indexOf("export function getActiveAttemptId");
+  const end = workerJobs.indexOf("export function getStoredTerminalAttemptId", start);
+  assert.ok(start >= 0 && end > start, "getActiveAttemptId should be detectable");
+  const fn = workerJobs.slice(start, end);
+  assert.doesNotMatch(fn, /result\?\.attempt_id/);
+  assert.match(workerJobs, /export function getStoredTerminalAttemptId/);
+  assert.match(workerJobs, /readString\(result\?\.attempt_id\)/);
+});
+
+test("terminal duplicate requires same stored attempt", () => {
+  const branch = duplicateBranch();
+  assert.match(branch, /terminalAttemptMatches\(existingJob, attemptId\)/);
+  assert.match(branch, /stale_attempt_terminal_report/);
+  assert.match(branch, /duplicate_report_detected:\s*false/);
+});
+
+test("active attempts still update terminal fields on first report", () => {
+  assert.match(reportRoute, /status:\s*storedStatus/);
+  assert.match(reportRoute, /completed_at:\s*terminal \? now : null/);
+  assert.match(reportRoute, /diagnostics:\s*projectDirectorReport\.data\.diagnostics \?\? null/);
+  assert.match(reportRoute, /effective_final_status/);
 });
