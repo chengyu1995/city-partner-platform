@@ -95,8 +95,11 @@ const READ_ONLY_BATCH_PATTERN =
   /\bBATCH-QA(?:-[A-Z0-9]+)*\b|\bBATCH-43\b|\bBATCH-GM-SMOKE(?:-\d+)?\b/i;
 const WORKER_BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
 export const DIAGNOSTICS_SCHEMA_VERSION = 1;
+export const DIAGNOSTICS_STORAGE_FIELD = "result.diagnostics";
+export const DIAGNOSTICS_STORAGE_UNAVAILABLE = "DIAGNOSTICS_STORAGE_UNAVAILABLE";
 const FAILURE_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,64}$/;
 const IMPLEMENTED_DIAGNOSTICS_FAILURE_CODES = [
+  "DIAGNOSTICS_STORAGE_UNAVAILABLE",
   "NO_FIX_APPLIED",
   "READ_ONLY_MODE_VIOLATION",
   "TASK_MODE_MISMATCH",
@@ -963,6 +966,7 @@ function sanitizeDiagnosticsErrorSummary(value: unknown): string | null {
   const text = sanitizeReportText(value)
     .replace(/Authorization\s*:\s*Bearer\s+[^\s,}]+/gi, "Authorization: Bearer [redacted]")
     .replace(/\b(token|secret|key|password)\b\s*[:=]\s*[^\s,}]+/gi, "$1=[redacted]")
+    .replace(/\b[A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD)[A-Z0-9_]*\b\s*[:=]\s*[^\s,}]+/gi, "[redacted_secret]=[redacted]")
     .replace(/([?&](?:token|key|secret|access_token|api_key)=)[^&\s]+/gi, "$1[redacted]")
     .replace(/original_request_text(?:_base64)?\s*[:=].*/gi, "original_request_text=[redacted]")
     .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi, "[redacted private key]")

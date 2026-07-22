@@ -8,9 +8,11 @@ const dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(dirname, "..", "..", "..");
 const workerJobs = fs.readFileSync(path.join(root, "src", "lib", "worker-jobs.ts"), "utf8");
 const reportRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker", "report", "route.ts"), "utf8");
+const migrationDraft = fs.readFileSync(path.join(root, "docs", "setup-hermes-jobs-diagnostics.sql"), "utf8");
 
 test("worker reports build versioned diagnostics", () => {
   assert.match(workerJobs, /DIAGNOSTICS_SCHEMA_VERSION\s*=\s*1/);
+  assert.match(workerJobs, /DIAGNOSTICS_STORAGE_FIELD\s*=\s*"result\.diagnostics"/);
   assert.match(workerJobs, /function buildWorkerFailureDiagnostics/);
   assert.match(workerJobs, /diagnostics_schema_version:\s*DIAGNOSTICS_SCHEMA_VERSION/);
 });
@@ -45,6 +47,7 @@ test("diagnostics preserves context without original request text", () => {
 test("diagnostics redacts sensitive summaries and caps length", () => {
   assert.match(workerJobs, /function sanitizeDiagnosticsErrorSummary/);
   assert.match(workerJobs, /Authorization:\s*Bearer \[redacted\]/);
+  assert.match(workerJobs, /A-Z0-9_]\*\(\?:TOKEN\|SECRET\|KEY\|PASSWORD\)/);
   assert.match(workerJobs, /\[redacted private key\]/);
   assert.match(workerJobs, /text\.length > 1000 \? text\.slice\(0, 1000\)/);
 });
@@ -52,6 +55,36 @@ test("diagnostics redacts sensitive summaries and caps length", () => {
 test("worker report route persists diagnostics in hermes_jobs result json", () => {
   assert.match(reportRoute, /diagnostics\?: Record<string, unknown> \| null/);
   assert.match(reportRoute, /diagnostics: projectDirectorReport\.data\.diagnostics \?\? null/);
-  assert.match(reportRoute, /const storedStatus = terminal \? effectiveFinalStatus : workerStatus/);
+  assert.match(reportRoute, /terminal && isTerminalWorkerStatus\(effectiveFinalStatus\) \? effectiveFinalStatus : workerStatus/);
   assert.match(reportRoute, /status: storedStatus/);
+});
+
+test("missing diagnostics storage fails closed before notification side effects", () => {
+  assert.match(workerJobs, /DIAGNOSTICS_STORAGE_UNAVAILABLE/);
+  assert.match(reportRoute, /buildDiagnosticsStorageUnavailablePayload/);
+  assert.match(reportRoute, /skippedColumns\.includes\("result"\)/);
+  const unavailableIndex = reportRoute.indexOf('skippedColumns.includes("result")');
+  const syncIndex = reportRoute.indexOf("await syncWorkerStatusToFeishu", unavailableIndex);
+  assert.ok(unavailableIndex >= 0, "route should inspect result schema fallback");
+  assert.ok(syncIndex > unavailableIndex, "route should check result storage before final sync");
+});
+
+test("duplicate terminal report is idempotent and skips non-diagnostic side effects", () => {
+  const duplicateStart = reportRoute.indexOf("if (isTerminalWorkerStatus(existingJob.status))");
+  const duplicateEnd = reportRoute.indexOf("const { data, error, skippedColumns }", duplicateStart);
+  assert.ok(duplicateStart >= 0 && duplicateEnd > duplicateStart, "duplicate branch should be detectable");
+  const duplicateBranch = reportRoute.slice(duplicateStart, duplicateEnd);
+  assert.doesNotMatch(duplicateBranch, /syncWorkerStatusToFeishu/);
+  assert.match(duplicateBranch, /duplicate_report_detected:\s*true/);
+  assert.match(duplicateBranch, /duplicate_report_idempotent:\s*true/);
+  assert.match(duplicateBranch, /second_side_effect_triggered:\s*false/);
+});
+
+test("diagnostics migration draft uses nullable result jsonb without backfill", () => {
+  assert.match(migrationDraft, /ALTER TABLE public\.hermes_jobs\s+ADD COLUMN IF NOT EXISTS result jsonb NULL;/);
+  assert.match(migrationDraft, /BEGIN;/);
+  assert.match(migrationDraft, /COMMIT;/);
+  assert.doesNotMatch(migrationDraft, /\bUPDATE\s+public\.hermes_jobs\b/i);
+  assert.doesNotMatch(migrationDraft, /CREATE\s+INDEX/i);
+  assert.doesNotMatch(migrationDraft, /ALTER\s+TABLE\s+public\.hermes_jobs\s+DROP\s+CONSTRAINT/i);
 });

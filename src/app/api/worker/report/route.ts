@@ -7,6 +7,8 @@ import {
   buildRunningJobNotFoundPayload,
   buildProjectDirectorWorkerReport,
   clampProgress,
+  DIAGNOSTICS_STORAGE_FIELD,
+  DIAGNOSTICS_STORAGE_UNAVAILABLE,
   findHermesJob,
   getAttemptIdFromBody,
   getBatchCodeFromBody,
@@ -105,6 +107,64 @@ function getStoredProjectDirectorReport(job: Record<string, unknown>) {
     : null;
 }
 
+function getStoredDiagnostics(job: Record<string, unknown>): Record<string, unknown> | null {
+  const result = readRecord(job.result);
+  return readRecord(result?.diagnostics);
+}
+
+async function enrichTerminalDiagnosticsIfMissing(input: {
+  supabase: Parameters<typeof updateHermesJob>[0];
+  jobId: string;
+  existingJob: Record<string, unknown>;
+  diagnostics: unknown;
+}) {
+  if (!Object.prototype.hasOwnProperty.call(input.existingJob, "result")) {
+    return { enriched: false, reason: "result_column_not_loaded" };
+  }
+  if (getStoredDiagnostics(input.existingJob)) {
+    return { enriched: false, reason: "diagnostics_present" };
+  }
+  const diagnostics = readRecord(input.diagnostics);
+  if (!diagnostics) {
+    return { enriched: false, reason: "diagnostics_not_provided" };
+  }
+
+  const result = readRecord(input.existingJob.result) ?? {};
+  const { data, error, skippedColumns } = await updateHermesJob(input.supabase, input.jobId, {
+    result: {
+      ...result,
+      diagnostics,
+    },
+    updated_at: typeof input.existingJob.updated_at === "string" ? input.existingJob.updated_at : new Date().toISOString(),
+  });
+
+  if (error || skippedColumns.includes("result")) {
+    return { enriched: false, reason: "diagnostics_storage_unavailable" };
+  }
+
+  return { enriched: Boolean(data), reason: data ? "diagnostics_enriched" : "diagnostics_enrichment_not_applied" };
+}
+
+function buildDiagnosticsStorageUnavailablePayload(input: {
+  jobId: string;
+  attemptId: string | null;
+  terminalStatusPersisted: boolean;
+  skippedColumns: string[];
+}) {
+  return {
+    ok: false,
+    error: "diagnostics_storage_unavailable",
+    failure_code: DIAGNOSTICS_STORAGE_UNAVAILABLE,
+    failure_stage: "report",
+    job_id: input.jobId,
+    attempt_id: input.attemptId,
+    diagnostics_storage_field: DIAGNOSTICS_STORAGE_FIELD,
+    terminal_status_persisted: input.terminalStatusPersisted,
+    diagnostics_persisted: false,
+    terminal_report_idempotent: false,
+  };
+}
+
 export async function POST(req: NextRequest) {
   const unauthorized = assertWorkerAuthorized(req);
   if (unauthorized) return unauthorized;
@@ -175,7 +235,7 @@ export async function POST(req: NextRequest) {
     effectiveFinalStatus: body.effective_final_status,
   });
   const effectiveFinalStatus = normalizeWorkerStatus(projectDirectorReport.data.effective_final_status);
-  const storedStatus = terminal ? effectiveFinalStatus : workerStatus;
+  const storedStatus = terminal && isTerminalWorkerStatus(effectiveFinalStatus) ? effectiveFinalStatus : workerStatus;
 
   if (isTerminalWorkerStatus(existingJob.status)) {
     const storedProjectDirectorReport =
@@ -183,21 +243,11 @@ export async function POST(req: NextRequest) {
     const storedResult = readRecord(existingJob.result);
     const storedTerminalStatus =
       normalizeWorkerStatus(existingJob.status) === "failed" ? "failed" : "succeeded";
-    const recordId = getBitableRecordId(body, existingJob);
-
-    await syncWorkerStatusToFeishu({
-      recordId,
-      status: storedTerminalStatus,
-      stage: storedTerminalStatus === "failed" ? "failed" : "completed",
-      progressPercent: 100,
-      currentStep: storedTerminalStatus === "failed" ? "failed" : "completed",
-      statusMessage: storedProjectDirectorReport.text,
-      gitCommitSha:
-        body.git_commit_sha ??
-        (typeof storedResult?.git_commit_sha === "string" ? storedResult.git_commit_sha : null),
-      errorText: storedTerminalStatus === "failed" ? storedProjectDirectorReport.text : "",
-      completedAt: typeof existingJob.completed_at === "string" ? existingJob.completed_at : now,
-      updatedAt: now,
+    const diagnosticsEnrichment = await enrichTerminalDiagnosticsIfMissing({
+      supabase,
+      jobId,
+      existingJob,
+      diagnostics: projectDirectorReport.data.diagnostics,
     });
 
     return NextResponse.json({
@@ -206,8 +256,20 @@ export async function POST(req: NextRequest) {
       attempt_id: attemptId,
       project_director_report: storedProjectDirectorReport,
       idempotent: true,
+      duplicate_report_detected: true,
+      duplicate_report_idempotent: true,
+      second_side_effect_triggered: false,
+      diagnostics_enrichment_only: diagnosticsEnrichment.enriched,
+      diagnostics_enrichment_reason: diagnosticsEnrichment.reason,
+      non_diagnostic_side_effects: 0,
       skipped: "terminal_job_report_ignored",
-      feishu_sync: recordId ? "attempted_idempotent_terminal_retry" : "skipped_no_record_id",
+      feishu_sync: "skipped_duplicate_terminal",
+      git_commit_sha:
+        body.git_commit_sha ??
+        (typeof storedResult?.git_commit_sha === "string" ? storedResult.git_commit_sha : null),
+      terminal_status_persisted: true,
+      diagnostics_persisted: Boolean(readRecord(storedResult?.diagnostics)),
+      status: storedTerminalStatus,
     });
   }
 
@@ -239,6 +301,22 @@ export async function POST(req: NextRequest) {
   if (skippedColumns.length > 0) {
     console.log(`[worker/report] skipped missing hermes_jobs columns: ${skippedColumns.join(", ")}`);
   }
+  if (terminal && skippedColumns.includes("result")) {
+    console.error("[worker/report] diagnostics storage unavailable", {
+      job_id: jobId,
+      storage_field: DIAGNOSTICS_STORAGE_FIELD,
+      skipped_columns: skippedColumns,
+    });
+    return NextResponse.json(
+      buildDiagnosticsStorageUnavailablePayload({
+        jobId,
+        attemptId,
+        terminalStatusPersisted: Boolean(data),
+        skippedColumns,
+      }),
+      { status: 500 }
+    );
+  }
 
   const recordId = getBitableRecordId(body, data, existingJob);
   await syncWorkerStatusToFeishu({
@@ -262,6 +340,9 @@ export async function POST(req: NextRequest) {
     attempt_id: attemptId,
     project_director_report: projectDirectorReport,
     feishu_sync: recordId ? "attempted" : "skipped_no_record_id",
+    terminal_status_persisted: terminal,
+    diagnostics_persisted: terminal ? true : null,
+    diagnostics_storage_field: terminal ? DIAGNOSTICS_STORAGE_FIELD : null,
   });
 }
 
