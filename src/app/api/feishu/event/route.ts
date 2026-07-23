@@ -1065,6 +1065,24 @@ function assertApprovedWriteRequestHasExactScope(
   }
 }
 
+function assertApprovedWriteRequestModeMatches(
+  requestText: string,
+  taskMode: string | null,
+  readOnlyMode: boolean | null
+) {
+  if (
+    isWriteAllowedApprovalText(requestText) &&
+    (taskMode !== "automation_system_write_allowed" || readOnlyMode !== false)
+  ) {
+    const error = new Error(
+      "APPROVAL_CONTEXT_MODE_MISMATCH: write_allowed approval was downgraded before Worker creation."
+    );
+    (error as Error & { code?: string; stage?: string }).code = "APPROVAL_CONTEXT_MODE_MISMATCH";
+    (error as Error & { code?: string; stage?: string }).stage = "approval_context_mode_validation";
+    throw error;
+  }
+}
+
 async function insertApprovedAgentDispatchJobsWithContract(
   supabase: SupabaseClient,
   buildResult: DispatchJobBuildResult,
@@ -1079,6 +1097,8 @@ async function insertApprovedAgentDispatchJobsWithContract(
     const requestText = buildResult.requestTexts[index] ?? "";
     const taskMode = inferApprovedTaskMode(task);
     const exactAllowedScope = extractExactAllowedScopePaths(requestText);
+    const readOnlyMode = taskMode ? false : null;
+    assertApprovedWriteRequestModeMatches(requestText, taskMode, readOnlyMode);
     assertApprovedWriteRequestHasExactScope(requestText, taskMode, exactAllowedScope);
     const allowedScope = exactAllowedScope.length > 0 ? exactAllowedScope : task.allowed_files;
     const contractPayload = buildWorkerJobPayloadContract({
@@ -1086,7 +1106,7 @@ async function insertApprovedAgentDispatchJobsWithContract(
       originalRequestText: requestText,
       projectDomain: projectDomainForTaskMode(taskMode),
       taskMode,
-      readOnlyMode: taskMode ? false : null,
+      readOnlyMode,
       allowedScope,
       exactAllowedScope,
       forbiddenScope: task.forbidden_files,

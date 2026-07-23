@@ -113,6 +113,111 @@ function getStoredDiagnostics(job: Record<string, unknown>): Record<string, unkn
   return readRecord(result?.diagnostics);
 }
 
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function fullReportText(job: Record<string, unknown>, body: WorkerReportBody): string {
+  return [job.request_text, body.result_text, body.output, body.error_text, body.error, body.status_message]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join("\n");
+}
+
+function readContextField(text: string, fieldName: string): string | null {
+  const escaped = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = text.match(new RegExp(`(?:^|\\n|\\r)\\s*[\`'"]?${escaped}[\`'"]?\\s*[:=]\\s*([^\\r\\n]+)`, "i"));
+  return match ? match[1].replace(/^`|`$/g, "").trim() || null : null;
+}
+
+function normalizePathList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean);
+  if (typeof value === "string") {
+    return value.split(/[\r\n,]+/g).map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function reportPushed(body: WorkerReportBody): boolean {
+  return (
+    /^(success|succeeded|pushed|true|yes)$/i.test(String(body.github_push_status || "").trim()) ||
+    /^(success|succeeded|pushed|pending)$/i.test(String(body.deploy_status || "").trim())
+  );
+}
+
+function buildFalsePositiveSuccessGuard(
+  job: Record<string, unknown>,
+  body: WorkerReportBody,
+  workerStatus: string
+): { failureCode: string; failureStage: string; errorText: string } | null {
+  if (workerStatus !== "succeeded") return null;
+
+  const payload = readRecord(job.payload);
+  const text = fullReportText(job, body);
+  const taskMode = readString(payload?.task_mode) ?? readContextField(text, "task_mode");
+  const finalMode = readString(payload?.final_mode) ?? readContextField(text, "final_mode");
+  const requestedMode = readString(payload?.requested_mode) ?? readContextField(text, "requested_mode");
+  const approvedBatch = readString(payload?.approved_batch) ?? readContextField(text, "approved_batch");
+  const workerBatch = body.batch_code ?? readContextField(text, "batch_code");
+  const exactAllowedScope =
+    normalizePathList(payload?.exact_allowed_scope).length > 0
+      ? normalizePathList(payload?.exact_allowed_scope)
+      : normalizePathList(readContextField(text, "exact_allowed_scope"));
+  const changedFiles = normalizePathList(body.files_changed);
+  const writeAllowed =
+    finalMode === "write_allowed" ||
+    requestedMode === "write_allowed" ||
+    taskMode === "automation_system_write_allowed";
+  const readOnlyExecution =
+    taskMode === "read_only" ||
+    finalMode === "read_only" ||
+    /read_only_mode\s*[:=]\s*true|allowed_scope\s*[:=]\s*git status\s*\/\s*git diff only|只读任务锁死|只执行\s*git\s*status|只执行\s*git\s*diff/i.test(text);
+
+  if (/running_job_not_found|running_job_not_found_or_not_owned|WORKER_ATTEMPT_MISMATCH/i.test(text)) {
+    return {
+      failureCode: "WORKER_ATTEMPT_LIFECYCLE_FAILED",
+      failureStage: "worker_lifecycle",
+      errorText: "WORKER_ATTEMPT_LIFECYCLE_FAILED: heartbeat/progress ownership failed before terminal report.",
+    };
+  }
+  if (writeAllowed && readOnlyExecution) {
+    return {
+      failureCode: "APPROVAL_CONTEXT_MODE_MISMATCH",
+      failureStage: "approval_context_rehydration",
+      errorText: "APPROVAL_CONTEXT_MODE_MISMATCH: write_allowed task was executed with read_only context.",
+    };
+  }
+  if (writeAllowed && exactAllowedScope.length === 0) {
+    return {
+      failureCode: "APPROVAL_CONTEXT_MODE_MISMATCH",
+      failureStage: "approval_context_rehydration",
+      errorText: "APPROVAL_CONTEXT_MODE_MISMATCH: write_allowed task is missing exact_allowed_scope.",
+    };
+  }
+  if (approvedBatch && workerBatch && approvedBatch !== workerBatch) {
+    return {
+      failureCode: "APPROVED_BATCH_MISMATCH",
+      failureStage: "approval_context_rehydration",
+      errorText: "APPROVED_BATCH_MISMATCH: approved batch and Worker batch do not match.",
+    };
+  }
+  if (writeAllowed && changedFiles.length === 0) {
+    return {
+      failureCode: "NO_FIX_APPLIED",
+      failureStage: "task_goal_validation",
+      errorText: "NO_FIX_APPLIED: write_allowed smoke completed with changed_files=[].",
+    };
+  }
+  if (writeAllowed && (!body.git_commit_sha || !reportPushed(body))) {
+    return {
+      failureCode: "GIT_PUBLISH_REQUIRED",
+      failureStage: "git_publish_validation",
+      errorText: "GIT_PUBLISH_REQUIRED: write_allowed smoke requires git_commit_sha and successful push.",
+    };
+  }
+
+  return null;
+}
+
 async function enrichTerminalDiagnosticsIfMissing(input: {
   supabase: Parameters<typeof updateHermesJob>[0];
   jobId: string;
@@ -212,11 +317,12 @@ export async function POST(req: NextRequest) {
   const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
   if (attemptError) return attemptError;
 
+  const falsePositiveGuard = buildFalsePositiveSuccessGuard(existingJob, body, workerStatus);
   const projectDirectorReport = buildProjectDirectorWorkerReport({
     job: existingJob,
     workerId,
     attemptId,
-    status: workerStatus,
+    status: falsePositiveGuard ? "failed" : workerStatus,
     projectName: body.project_name,
     projectDir: body.project_dir,
     resultText: body.result_text,
@@ -228,12 +334,12 @@ export async function POST(req: NextRequest) {
     deployStatus: body.deploy_status,
     buildPassed: body.build_passed,
     testPassed: body.test_passed,
-    errorText,
-    failureCode: body.failure_code,
-    failureStage: body.failure_stage,
-    workerExecutionStatus: body.worker_execution_status,
-    taskGoalStatus: body.task_goal_status,
-    effectiveFinalStatus: body.effective_final_status,
+    errorText: falsePositiveGuard?.errorText ?? errorText,
+    failureCode: falsePositiveGuard?.failureCode ?? body.failure_code,
+    failureStage: falsePositiveGuard?.failureStage ?? body.failure_stage,
+    workerExecutionStatus: falsePositiveGuard ? "failed" : body.worker_execution_status,
+    taskGoalStatus: falsePositiveGuard ? "failed" : body.task_goal_status,
+    effectiveFinalStatus: falsePositiveGuard ? "failed" : body.effective_final_status,
   });
   const effectiveFinalStatus = normalizeWorkerStatus(projectDirectorReport.data.effective_final_status);
   const storedStatus = terminal && isTerminalWorkerStatus(effectiveFinalStatus) ? effectiveFinalStatus : workerStatus;
@@ -300,7 +406,7 @@ export async function POST(req: NextRequest) {
       (storedStatus === "succeeded" ? "completed" : storedStatus === "failed" ? "failed" : null),
     status_message: terminal ? projectDirectorReport.text : body.status_message ?? null,
     git_commit_sha: body.git_commit_sha ?? null,
-    error_text: storedStatus === "failed" ? errorText : null,
+    error_text: storedStatus === "failed" ? falsePositiveGuard?.errorText ?? errorText : null,
     result: {
       ...buildResult({ ...body, attempt_id: attemptId ?? body.attempt_id }),
       project_director_report: projectDirectorReport.data,

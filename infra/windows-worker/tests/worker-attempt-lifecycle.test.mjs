@@ -1,0 +1,82 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const dirname = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(dirname, "..", "..", "..");
+
+const nextRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker", "next", "route.ts"), "utf8");
+const heartbeatRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker", "heartbeat", "route.ts"), "utf8");
+const progressRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker", "progress", "route.ts"), "utf8");
+const reportRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker", "report", "route.ts"), "utf8");
+const workerJobs = fs.readFileSync(path.join(root, "src", "lib", "worker-jobs.ts"), "utf8");
+const feishuRoute = fs.readFileSync(path.join(root, "src", "app", "api", "feishu", "event", "route.ts"), "utf8");
+const jobBuilder = fs.readFileSync(path.join(root, "src", "lib", "project-director-job-builder.ts"), "utf8");
+
+function functionBlock(source, name) {
+  const start = source.indexOf(`function ${name}`);
+  assert.notEqual(start, -1, `${name} not found`);
+  const next = source.indexOf("\nfunction ", start + 1);
+  return source.slice(start, next === -1 ? source.length : next);
+}
+
+test("/next persists claim and attempt contract before returning a job", () => {
+  assert.match(nextRoute, /claimHermesJob\(/);
+  assert.match(nextRoute, /status:\s*"running"/);
+  assert.match(nextRoute, /claimed_by:\s*workerId/);
+  assert.match(nextRoute, /claimed_at:\s*now/);
+  assert.match(nextRoute, /attempt_id:\s*attemptId/);
+  assert.match(nextRoute, /active_attempt_id:\s*attemptId/);
+  assert.match(nextRoute, /expires_at:\s*expiresAt/);
+  assert.match(nextRoute, /persistedAttemptId !== attemptId/);
+  assert.match(nextRoute, /WORKER_ATTEMPT_PERSISTENCE_FAILED/);
+  assert.match(nextRoute, /job:\s*claimedJob/);
+});
+
+test("heartbeat and progress reject wrong attempts with explicit failure code", () => {
+  assert.match(heartbeatRoute, /assertWorkerAttemptMatchesJob\(existingJob, attemptId\)/);
+  assert.match(progressRoute, /assertWorkerAttemptMatchesJob\(existingJob, attemptId\)/);
+  assert.match(workerJobs, /failure_code:\s*"WORKER_ATTEMPT_MISMATCH"/);
+  assert.match(workerJobs, /failure_stage:\s*"worker_attempt_validation"/);
+  assert.match(workerJobs, /stale_attempt:\s*true/);
+});
+
+test("heartbeat and progress update the active attempt payload for the correct attempt", () => {
+  assert.match(heartbeatRoute, /payload:\s*buildAttemptPayload\(existingJob/);
+  assert.match(progressRoute, /payload:\s*buildAttemptPayload\(existingJob/);
+  assert.match(heartbeatRoute, /active_attempt_id:\s*attemptId/);
+  assert.match(progressRoute, /active_attempt_id:\s*attemptId/);
+});
+
+test("terminal report blocks false positive success after lifecycle failure", () => {
+  assert.match(reportRoute, /function buildFalsePositiveSuccessGuard/);
+  assert.match(reportRoute, /WORKER_ATTEMPT_LIFECYCLE_FAILED/);
+  assert.match(reportRoute, /running_job_not_found_or_not_owned/);
+  assert.match(reportRoute, /status:\s*falsePositiveGuard \? "failed" : workerStatus/);
+});
+
+test("write allowed read-only downgrade is blocked before success persistence", () => {
+  assert.match(reportRoute, /APPROVAL_CONTEXT_MODE_MISMATCH/);
+  assert.match(reportRoute, /write_allowed task was executed with read_only context/);
+  assert.match(feishuRoute, /function assertApprovedWriteRequestModeMatches/);
+  assert.match(feishuRoute, /APPROVAL_CONTEXT_MODE_MISMATCH/);
+});
+
+test("approved write contexts keep original request and approved execution route", () => {
+  const block = functionBlock(jobBuilder, "buildAgentDispatchContext");
+  assert.match(block, /requested_mode:\s*"write_allowed"/);
+  assert.match(block, /final_mode:\s*"write_allowed"/);
+  assert.match(block, /task_mode:\s*"automation_system_write_allowed"/);
+  assert.match(block, /original_request_text_base64:\s*Buffer\.from\(requestText/);
+  assert.match(block, /route:\s*"approved_execution"/);
+  assert.doesNotMatch(block, /route:\s*"project_director_approved_execution"/);
+});
+
+test("approval command text is not used as the only exact write scope source", () => {
+  assert.match(feishuRoute, /assertApprovedWriteRequestHasExactScope/);
+  assert.match(feishuRoute, /ORIGINAL_BATCH_CONTEXT_MISSING/);
+  assert.match(feishuRoute, /refusing generic automation scope fallback/);
+  assert.match(jobBuilder, /exact_allowed_scope/);
+});

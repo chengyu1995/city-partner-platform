@@ -29,11 +29,15 @@ export const HERMES_JOBS_TABLE = "hermes_jobs";
 
 export const HERMES_JOB_CONTEXT_PAYLOAD_FIELDS = [
   "project_domain",
+  "requested_mode",
+  "final_mode",
   "task_mode",
   "read_only_mode",
   "allowed_scope",
+  "exact_allowed_scope",
   "forbidden_scope",
   "original_request_text",
+  "original_request_text_base64",
   "approved_batch",
   "route",
 ] as const;
@@ -147,15 +151,20 @@ function buildAgentDispatchContext(
   task: ProjectDirectorDispatchTask,
   requestText: string
 ): Record<string, unknown> {
+  const exactAllowedScope = task.allowed_files;
   return {
     project_domain: "automation_system",
+    requested_mode: "write_allowed",
+    final_mode: "write_allowed",
     task_mode: "automation_system_write_allowed",
     read_only_mode: false,
-    allowed_scope: task.allowed_files.join(", "),
+    allowed_scope: exactAllowedScope.join(", "),
+    exact_allowed_scope: exactAllowedScope.join(", "),
     forbidden_scope: task.forbidden_files.join(", "),
     original_request_text: requestText,
+    original_request_text_base64: Buffer.from(requestText, "utf8").toString("base64"),
     approved_batch: task.dispatch_batch,
-    route: "project_director_approved_execution",
+    route: "approved_execution",
   };
 }
 

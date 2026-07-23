@@ -2367,9 +2367,12 @@ export function assertWorkerAttemptMatchesJob(
   return NextResponse.json(
     {
       ok: false,
+      failure_code: "WORKER_ATTEMPT_MISMATCH",
+      failure_stage: "worker_attempt_validation",
       error: attemptId
         ? "attempt_id does not match active job attempt"
         : "attempt_id is required for active job attempt",
+      stale_attempt: true,
       active_attempt_id: activeAttemptId,
       attempt_id: attemptId,
     },

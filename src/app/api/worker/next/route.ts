@@ -81,6 +81,34 @@ async function handleNext(req: NextRequest) {
     console.log(`[worker/next] skipped missing hermes_jobs columns: ${skippedColumns.join(", ")}`);
   }
 
+  const claimedPayload =
+    claimedJob.payload && typeof claimedJob.payload === "object" && !Array.isArray(claimedJob.payload)
+      ? (claimedJob.payload as Record<string, unknown>)
+      : null;
+  const activeAttempt =
+    claimedPayload?.active_attempt && typeof claimedPayload.active_attempt === "object"
+      ? (claimedPayload.active_attempt as Record<string, unknown>)
+      : null;
+  const persistedAttemptId =
+    claimedJob.active_attempt_id ??
+    claimedJob.attempt_id ??
+    activeAttempt?.attempt_id ??
+    claimedPayload?.attempt_id;
+  if (persistedAttemptId !== attemptId) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "claim attempt contract was not persisted",
+        failure_code: "WORKER_ATTEMPT_PERSISTENCE_FAILED",
+        failure_stage: "worker_claim",
+        worker_created: false,
+        job_id: job.id,
+        attempt_id: attemptId,
+      },
+      { status: 500 }
+    );
+  }
+
   const recordId = getBitableRecordId(claimedJob, job);
   const projectDirector = getProjectDirectorJobCorrelation(claimedJob);
   await syncWorkerStatusToFeishu({
