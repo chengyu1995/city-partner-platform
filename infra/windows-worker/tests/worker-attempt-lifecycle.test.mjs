@@ -24,15 +24,31 @@ function functionBlock(source, name) {
 
 test("/next persists claim and attempt contract before returning a job", () => {
   assert.match(nextRoute, /claimHermesJob\(/);
+  assert.match(nextRoute, /\.in\("status",\s*\["queued",\s*"pending"\]\)/);
+  assert.match(nextRoute, /\.is\("claimed_by",\s*null\)/);
+  assert.doesNotMatch(nextRoute, /\.order\("priority"/);
+  assert.match(nextRoute, /\.order\("created_at",\s*\{\s*ascending:\s*true\s*\}\)/);
   assert.match(nextRoute, /status:\s*"running"/);
   assert.match(nextRoute, /claimed_by:\s*workerId/);
   assert.match(nextRoute, /claimed_at:\s*now/);
   assert.match(nextRoute, /attempt_id:\s*attemptId/);
   assert.match(nextRoute, /active_attempt_id:\s*attemptId/);
   assert.match(nextRoute, /expires_at:\s*expiresAt/);
+  assert.match(nextRoute, /request_text:\s*\[/);
+  assert.match(nextRoute, /HERMES_WORKER_ATTEMPT_CONTEXT:/);
   assert.match(nextRoute, /persistedAttemptId !== attemptId/);
   assert.match(nextRoute, /WORKER_ATTEMPT_PERSISTENCE_FAILED/);
+  assert.match(nextRoute, /updateHermesJob\(supabase,\s*job\.id/);
+  assert.match(nextRoute, /claimed_by:\s*null/);
   assert.match(nextRoute, /job:\s*claimedJob/);
+});
+
+test("attempt identity can survive schemas without attempt_id columns or payload", () => {
+  assert.match(workerJobs, /function readAttemptContextFromRequestText/);
+  assert.match(workerJobs, /HERMES_WORKER_ATTEMPT_CONTEXT:/);
+  assert.match(workerJobs, /readString\(requestTextAttempt\?\.active_attempt_id\)/);
+  assert.match(workerJobs, /readString\(requestTextAttempt\?\.attempt_id\)/);
+  assert.match(workerJobs, /function buildAttemptRequestText/);
 });
 
 test("heartbeat and progress reject wrong attempts with explicit failure code", () => {

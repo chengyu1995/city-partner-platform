@@ -10,6 +10,7 @@ import {
   getWorkerIdFromRequest,
   getWorkerSupabase,
   responseFromMaybe,
+  updateHermesJob,
 } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
@@ -26,7 +27,7 @@ async function handleNext(req: NextRequest) {
     .from("hermes_jobs")
     .select("*")
     .in("status", ["queued", "pending"])
-    .order("priority", { ascending: true })
+    .is("claimed_by", null)
     .order("created_at", { ascending: true })
     .limit(1)
     .maybeSingle();
@@ -64,6 +65,18 @@ async function handleNext(req: NextRequest) {
         started_at: now,
         updated_at: now,
       }),
+      request_text: [
+        String(job.request_text ?? "")
+          .replace(/\n*HERMES_WORKER_ATTEMPT_CONTEXT:\n(?:`[^`\r\n]+=[^`\r\n]*`\n?)+/g, "")
+          .trim(),
+        [
+          "HERMES_WORKER_ATTEMPT_CONTEXT:",
+          `\`attempt_id=${attemptId}\``,
+          `\`active_attempt_id=${attemptId}\``,
+          `\`worker_id=${workerId}\``,
+          `\`claimed_at=${now}\``,
+        ].join("\n"),
+      ].filter(Boolean).join("\n\n").trim(),
       updated_at: now,
     }
   );
@@ -95,6 +108,21 @@ async function handleNext(req: NextRequest) {
     activeAttempt?.attempt_id ??
     claimedPayload?.attempt_id;
   if (persistedAttemptId !== attemptId) {
+    await updateHermesJob(supabase, job.id, {
+      status: job.status ?? "queued",
+      claimed_by: null,
+      claimed_at: null,
+      attempt_id: null,
+      active_attempt_id: null,
+      expires_at: null,
+      progress_percent: 0,
+      current_step: null,
+      status_message: null,
+      request_text: String(claimedJob.request_text ?? job.request_text ?? "")
+        .replace(/\n*HERMES_WORKER_ATTEMPT_CONTEXT:\n(?:`[^`\r\n]+=[^`\r\n]*`\n?)+/g, "")
+        .trim(),
+      updated_at: new Date().toISOString(),
+    });
     return NextResponse.json(
       {
         ok: false,

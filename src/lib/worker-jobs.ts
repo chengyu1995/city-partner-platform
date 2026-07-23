@@ -911,12 +911,15 @@ export function getActiveAttemptId(job: JobRecord | null | undefined): string | 
   if (!job) return null;
   const payload = readRecord(job.payload);
   const activeAttempt = readRecord(payload?.active_attempt);
+  const requestTextAttempt = readAttemptContextFromRequestText(job.request_text);
 
   return (
     readString(job.active_attempt_id) ??
     readString(job.attempt_id) ??
     readString(activeAttempt?.attempt_id) ??
-    readString(payload?.attempt_id)
+    readString(payload?.attempt_id) ??
+    readString(requestTextAttempt?.active_attempt_id) ??
+    readString(requestTextAttempt?.attempt_id)
   );
 }
 
@@ -924,6 +927,39 @@ export function getStoredTerminalAttemptId(job: JobRecord | null | undefined): s
   if (!job) return null;
   const result = readRecord(job.result);
   return getActiveAttemptId(job) ?? readString(result?.attempt_id);
+}
+
+function stripAttemptContextFromRequestText(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\n*HERMES_WORKER_ATTEMPT_CONTEXT:\n(?:`[^`\r\n]+=[^`\r\n]*`\n?)+/g, "")
+    .trim();
+}
+
+function buildAttemptRequestText(job: JobRecord | null | undefined, attempt: Record<string, unknown>): string {
+  const original = stripAttemptContextFromRequestText(job?.request_text);
+  const attemptId = readString(attempt.attempt_id) ?? "";
+  const workerId = readString(attempt.worker_id) ?? "";
+  const claimedAt = readString(attempt.started_at) ?? readString(attempt.claimed_at) ?? "";
+  const context = [
+    "HERMES_WORKER_ATTEMPT_CONTEXT:",
+    `\`attempt_id=${attemptId}\``,
+    `\`active_attempt_id=${attemptId}\``,
+    `\`worker_id=${workerId}\``,
+    `\`claimed_at=${claimedAt}\``,
+  ].join("\n");
+  return [original, context].filter(Boolean).join("\n\n").trim();
+}
+
+function readAttemptContextFromRequestText(value: unknown): Record<string, string> | null {
+  const text = String(value ?? "");
+  const marker = text.lastIndexOf("HERMES_WORKER_ATTEMPT_CONTEXT:");
+  if (marker < 0) return null;
+  const contextText = text.slice(marker);
+  const result: Record<string, string> = {};
+  for (const match of contextText.matchAll(/`([^=`\r\n]+)=([^`\r\n]*)`/g)) {
+    result[match[1]] = match[2];
+  }
+  return Object.keys(result).length > 0 ? result : null;
 }
 
 export function terminalAttemptMatches(job: JobRecord | null | undefined, attemptId: string | null): boolean {
