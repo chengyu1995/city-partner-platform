@@ -2790,6 +2790,44 @@ test("bootstrap context router contract guards", async (t) => {
     assert.doesNotMatch(routeSource, /BATCH-P1[\s\S]{0,120}product_write_allowed/);
   });
 
+  await t.test("scope polarity parser only trusts positive allow sections", () => {
+    assert.match(routeSource, /POSITIVE_SCOPE_BLOCK_HEADING_PATTERN/);
+    assert.match(routeSource, /POSITIVE_SCOPE_INLINE_PATTERN/);
+    assert.match(routeSource, /NEGATIVE_SCOPE_LABEL_PATTERN/);
+    assert.match(routeSource, /ORDINARY_SCOPE_SECTION_PATTERN/);
+    assert.match(routeSource, /extractForbiddenScopePaths/);
+    assert.match(routeSource, /SCOPE_CONTRACT_CONFLICT/);
+    assert.match(routeSource, /assertNoScopeContractConflict\(exactAllowedScope,\s*task\.forbidden_files\)/);
+    assert.match(routeSource, /assertNoScopeContractConflict\(exactAllowedScope,\s*input\.rawText\)/);
+    assert.doesNotMatch(routeSource, /path\.dirname|split\("\/"\)\.slice|replace\([^)]*src\/app\/\*\*/);
+  });
+
+  await t.test("scope polarity regression fixture stays constrained to exact positive paths", () => {
+    const positivePaths = [
+      "src/app/api/feishu/event/route.ts",
+      "src/lib/project-director-job-builder.ts",
+      "src/lib/worker-jobs.ts",
+      "infra/windows-worker/tests/git-safety.test.js",
+    ];
+    const negativeAndOrdinaryText = [
+      "故障描述：历史结果提到了 docs/architecture/example-smoke.md",
+      "不得修改 src/app",
+      "forbidden_scope=src/app/api/feishu/event/route.ts",
+      "示例：不要创建 BATCH-P1，也不要把 src/app 加入 allowed_scope",
+    ].join("\n");
+
+    assert.match(routeSource, /extractExactAllowedScopePaths/);
+    assert.match(routeSource, /extractScopePathsFromFragment/);
+    assert.match(routeSource, /stripScopeListPrefix/);
+    for (const item of positivePaths) {
+      assert.match(item, /\.[cm]?[jt]sx?$|\.js$/);
+    }
+    assert.match(negativeAndOrdinaryText, /src\/app/);
+    assert.match(negativeAndOrdinaryText, /BATCH-P1/);
+    assert.match(routeSource, /lineStartsNegativeScopeBlock\(line\)/);
+    assert.match(routeSource, /ORDINARY_SCOPE_SECTION_PATTERN\.test\(line\)/);
+  });
+
   await t.test("ambiguous or missing context is represented as a blocking contract failure", () => {
     const missingScopeJob = {
       request_text: [

@@ -857,6 +857,35 @@ function uniqueScopePaths(paths: string[]): string[] {
   ).sort();
 }
 
+const ROUTE_SCOPE_PATH_PATTERN = /\b(?:app|src|infra|docs|work)\/[A-Za-z0-9_./*[\]-]+/g;
+const POSITIVE_SCOPE_BLOCK_HEADING_PATTERN =
+  /^\s*(?:[-*#>\d.、)]\s*)?(?:唯一允许修改文件|只允许修改文件|仅允许修改文件|允许修改文件|唯一允许修改|只允许修改|仅允许修改|允许修改|exact_allowed_scope|allowed_scope|changed_files\s*必须严格等于)\s*[:：=]?\s*$/i;
+const POSITIVE_SCOPE_INLINE_PATTERN =
+  /(?:唯一允许修改文件|只允许修改文件|仅允许修改文件|允许修改文件|唯一允许修改|只允许修改|仅允许修改|允许修改|exact_allowed_scope|allowed_scope|changed_files\s*必须严格等于)\s*[:：=]\s*(.+)$/i;
+const NEGATIVE_SCOPE_LABEL_PATTERN =
+  /(?:禁止修改范围|禁止修改|不得修改|不允许修改|不要修改|排除范围|forbidden_scope|forbidden|prohibit|不得|不允许|禁止)/i;
+const ORDINARY_SCOPE_SECTION_PATTERN =
+  /^(?:故障|故障现象|根因|问题|历史|示例|验收|测试|完成后|输出|报告|当前|目标|修复要求|验证要求|禁止事项|硬性边界)\s*[:：]?/i;
+
+function lineStartsPositiveScopeBlock(line: string): boolean {
+  return (
+    (POSITIVE_SCOPE_BLOCK_HEADING_PATTERN.test(line) || POSITIVE_SCOPE_INLINE_PATTERN.test(line)) &&
+    !NEGATIVE_SCOPE_LABEL_PATTERN.test(line)
+  );
+}
+
+function lineStartsNegativeScopeBlock(line: string): boolean {
+  return NEGATIVE_SCOPE_LABEL_PATTERN.test(line);
+}
+
+function extractScopePathsFromFragment(value: string): string[] {
+  return Array.from(value.matchAll(ROUTE_SCOPE_PATH_PATTERN)).map((match) => match[0]);
+}
+
+function stripScopeListPrefix(line: string): string {
+  return line.replace(/^\s*(?:[-*•]|\d+[.)、])\s*/, "").trim();
+}
+
 function extractExactAllowedScopePaths(text: unknown): string[] {
   const lines = String(text ?? "").split(/\r?\n/);
   const paths: string[] = [];
@@ -864,34 +893,113 @@ function extractExactAllowedScopePaths(text: unknown): string[] {
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
-    if (!line) continue;
-
-    if (/^(?:禁止|不得|不允许|不要修改|forbidden_scope|forbidden|prohibit)/i.test(line)) {
+    if (!line) {
       inAllowedBlock = false;
       continue;
     }
 
-    if (/^(?:验证要求|完成后|返回|测试|禁止|禁用|不得|不允许)\s*[:：]?/i.test(line)) {
+    if (lineStartsNegativeScopeBlock(line)) {
       inAllowedBlock = false;
+      continue;
     }
 
-    const inlineMatch = line.match(
-      /(?:仅允许修改|只允许修改|允许修改|changed_files\s*必须严格等于)\s*[:：]\s*(.+)$/i
-    );
-    if (/(?:仅允许修改|只允许修改|允许修改|changed_files\s*必须严格等于)\s*[:：]?\s*$/i.test(line)) {
+    if (ORDINARY_SCOPE_SECTION_PATTERN.test(line) && !lineStartsPositiveScopeBlock(line)) {
+      inAllowedBlock = false;
+      continue;
+    }
+
+    const inlineMatch = line.match(POSITIVE_SCOPE_INLINE_PATTERN);
+    if (POSITIVE_SCOPE_BLOCK_HEADING_PATTERN.test(line) && !inlineMatch) {
       inAllowedBlock = true;
       continue;
     }
 
-    const source = inlineMatch?.[1] ?? (inAllowedBlock ? line.replace(/^[-*]\s*/, "") : "");
+    const source = inlineMatch?.[1] ?? (inAllowedBlock ? stripScopeListPrefix(line) : "");
     if (!source) continue;
 
-    for (const match of source.matchAll(/\b(?:app|src|infra|docs|work)\/[A-Za-z0-9_./*[\]-]+/g)) {
-      paths.push(match[0]);
+    const linePaths = extractScopePathsFromFragment(source);
+    if (linePaths.length === 0) {
+      inAllowedBlock = false;
+      continue;
+    }
+    for (const item of linePaths) {
+      paths.push(item);
     }
   }
 
   return uniqueScopePaths(paths);
+}
+
+function extractForbiddenScopePaths(text: unknown): string[] {
+  const lines = String(text ?? "").split(/\r?\n/);
+  const paths: string[] = [];
+  let inForbiddenBlock = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      inForbiddenBlock = false;
+      continue;
+    }
+
+    if (lineStartsPositiveScopeBlock(line)) {
+      inForbiddenBlock = false;
+      continue;
+    }
+
+    const inlineMatch = line.match(
+      /(?:禁止修改范围|禁止修改|不得修改|不允许修改|不要修改|排除范围|forbidden_scope|forbidden|prohibit)\s*[:：=]\s*(.+)$/i
+    );
+    if (lineStartsNegativeScopeBlock(line) && /[:：]?\s*$/.test(line) && !inlineMatch) {
+      inForbiddenBlock = true;
+      continue;
+    }
+
+    const source = inlineMatch?.[1] ?? (inForbiddenBlock ? stripScopeListPrefix(line) : "");
+    if (!source) continue;
+
+    const linePaths = extractScopePathsFromFragment(source);
+    if (linePaths.length === 0) {
+      inForbiddenBlock = false;
+      continue;
+    }
+    paths.push(...linePaths);
+  }
+
+  return uniqueScopePaths(paths);
+}
+
+function normalizeScopeListItems(items: unknown[]): string[] {
+  return uniqueScopePaths(
+    items.flatMap((item) => extractScopePathsFromFragment(String(item ?? "")))
+  );
+}
+
+function findScopeConflicts(allowed: string[], forbidden: string[]): string[] {
+  const forbiddenSet = new Set(forbidden.map(normalizeScopePathToken));
+  return uniqueScopePaths(allowed.filter((item) => forbiddenSet.has(normalizeScopePathToken(item))));
+}
+
+function assertNoScopeContractConflict(
+  exactAllowedScope: string[],
+  forbiddenScope: unknown[] | string
+) {
+  const forbiddenPaths = Array.isArray(forbiddenScope)
+    ? normalizeScopeListItems(forbiddenScope)
+    : extractForbiddenScopePaths(forbiddenScope);
+  const conflicts = findScopeConflicts(exactAllowedScope, forbiddenPaths);
+  if (conflicts.length > 0) {
+    const error = new Error(
+      `SCOPE_CONTRACT_CONFLICT: positive exact_allowed_scope conflicts with forbidden_scope: ${conflicts.join(", ")}`
+    );
+    (error as Error & { code?: string; stage?: string; conflicts?: string[] }).code =
+      "SCOPE_CONTRACT_CONFLICT";
+    (error as Error & { code?: string; stage?: string; conflicts?: string[] }).stage =
+      "scope_contract_validation";
+    (error as Error & { code?: string; stage?: string; conflicts?: string[] }).conflicts =
+      conflicts;
+    throw error;
+  }
 }
 
 function withHermesWorkerContext(requestText: string, context: Record<string, unknown>): string {
@@ -922,6 +1030,7 @@ async function insertDirectWorkerTask(
   const modeContract = resolveDirectWorkerReadOnlyContract(input.rawText);
   const taskDomain = modeContract.projectDomain;
   const exactAllowedScope = extractExactAllowedScopePaths(input.rawText);
+  assertNoScopeContractConflict(exactAllowedScope, input.rawText);
   const allowedScope = exactAllowedScope.length > 0 ? exactAllowedScope : modeContract.allowedScope;
   const contractPayload = buildWorkerJobPayloadContract({
     requestText: input.requestText,
@@ -1100,6 +1209,7 @@ async function insertApprovedAgentDispatchJobsWithContract(
     const readOnlyMode = taskMode ? false : null;
     assertApprovedWriteRequestModeMatches(requestText, taskMode, readOnlyMode);
     assertApprovedWriteRequestHasExactScope(requestText, taskMode, exactAllowedScope);
+    assertNoScopeContractConflict(exactAllowedScope, task.forbidden_files);
     const allowedScope = exactAllowedScope.length > 0 ? exactAllowedScope : task.allowed_files;
     const contractPayload = buildWorkerJobPayloadContract({
       requestText,
