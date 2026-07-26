@@ -57,13 +57,24 @@ const TASK_MODES = {
   AUTOMATION_SYSTEM_WRITE_ALLOWED: "automation_system_write_allowed",
   PRODUCT_WRITE_ALLOWED: "product_write_allowed",
 } as const;
+const SYSTEM_REPAIR_BATCH_PREFIX = "BATCH-ARCH-COMPLETE";
+const SYSTEM_REPAIR_TASK_TYPE = "system_repair";
+const SYSTEM_REPAIR_SCOPE = [
+  "src/app/api/feishu/event/route.ts",
+  "src/lib/project-director-console.ts",
+  "src/lib/worker-jobs.ts",
+];
+const SYSTEM_REPAIR_SCOPE_TEXT = SYSTEM_REPAIR_SCOPE.join(", ");
 const WORKER_READONLY_CONTEXT_INCOMPLETE = "WORKER_READONLY_CONTEXT_INCOMPLETE";
 export const WORKER_JOB_CONTRACT_FIELDS = [
   "context_source",
   "context_reconstruct_failed",
   "project_domain",
+  "task_type",
   "task_mode",
   "read_only_mode",
+  "repair_mode",
+  "repair_scope",
   "allowed_scope",
   "exact_allowed_scope",
   "exact_allowed_scope_count",
@@ -260,6 +271,19 @@ function isReadOnlyTaskMode(taskMode: unknown): boolean {
   );
 }
 
+function isSystemRepairMode(input: {
+  projectDomain: unknown;
+  taskType: unknown;
+  batchCode: unknown;
+}): boolean {
+  return (
+    input.projectDomain === "automation_system" &&
+    input.taskType === SYSTEM_REPAIR_TASK_TYPE &&
+    typeof input.batchCode === "string" &&
+    input.batchCode.startsWith(SYSTEM_REPAIR_BATCH_PREFIX)
+  );
+}
+
 function decodeOriginalRequestTextBase64(value: unknown): string | null {
   const raw = readString(value);
   if (!raw) return null;
@@ -277,7 +301,7 @@ function decodeOriginalRequestTextBase64(value: unknown): string | null {
 }
 
 const WORKER_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|route|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|task_mode|read_only_mode|repair_mode|repair_scope|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|route|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName: string): string {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -587,8 +611,11 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "context_source",
   "context_reconstruct_failed",
   "project_domain",
+  "task_type",
   "task_mode",
   "read_only_mode",
+  "repair_mode",
+  "repair_scope",
   "allowed_scope",
   "exact_allowed_scope",
   "exact_allowed_scope_count",
@@ -622,8 +649,11 @@ const WORKER_CONTEXT_FIELD_NAMES = [
 
 const WORKER_CONTEXT_CORE_FIELDS = [
   "project_domain",
+  "task_type",
   "task_mode",
   "read_only_mode",
+  "repair_mode",
+  "repair_scope",
   "allowed_scope",
   "forbidden_scope",
   "route",
@@ -2027,8 +2057,11 @@ export function buildWorkerJobPayloadContract(input: {
   payload?: Record<string, unknown> | null;
   result?: Record<string, unknown> | null;
   projectDomain?: string | null;
+  taskType?: string | null;
   taskMode?: string | null;
   readOnlyMode?: boolean | null;
+  repairMode?: boolean | null;
+  repairScope?: unknown;
   allowedScope?: unknown;
   exactAllowedScope?: unknown;
   exactAllowedScopeCount?: unknown;
@@ -2100,8 +2133,11 @@ export function buildWorkerJobPayloadContract(input: {
   );
   const originalRequestTextFields: Record<string, string | null> = {
     project_domain: readTextContextField(fallbackOriginalRequest, "project_domain"),
+    task_type: readTextContextField(fallbackOriginalRequest, "task_type"),
     task_mode: readTextContextField(fallbackOriginalRequest, "task_mode"),
     read_only_mode: readTextContextField(fallbackOriginalRequest, "read_only_mode"),
+    repair_mode: readTextContextField(fallbackOriginalRequest, "repair_mode"),
+    repair_scope: readTextContextField(fallbackOriginalRequest, "repair_scope"),
     allowed_scope: readTextContextField(fallbackOriginalRequest, "allowed_scope"),
     exact_allowed_scope: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope"),
     exact_allowed_scope_count: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope_count"),
@@ -2118,8 +2154,11 @@ export function buildWorkerJobPayloadContract(input: {
   };
   const requestTextFields: Record<string, string | null> = {
     project_domain: readTextContextField(requestText, "project_domain"),
+    task_type: readTextContextField(requestText, "task_type"),
     task_mode: readTextContextField(requestText, "task_mode"),
     read_only_mode: readTextContextField(requestText, "read_only_mode"),
+    repair_mode: readTextContextField(requestText, "repair_mode"),
+    repair_scope: readTextContextField(requestText, "repair_scope"),
     allowed_scope: readTextContextField(requestText, "allowed_scope"),
     exact_allowed_scope: readTextContextField(requestText, "exact_allowed_scope"),
     exact_allowed_scope_count: readTextContextField(requestText, "exact_allowed_scope_count"),
@@ -2136,8 +2175,11 @@ export function buildWorkerJobPayloadContract(input: {
   };
   const overrideFields: Record<string, unknown> = {
     project_domain: input.projectDomain,
+    task_type: input.taskType,
     task_mode: input.taskMode,
     read_only_mode: input.readOnlyMode,
+    repair_mode: input.repairMode,
+    repair_scope: readScopeText(input.repairScope),
     allowed_scope: readScopeText(input.allowedScope),
     exact_allowed_scope: readScopeText(input.exactAllowedScope),
     exact_allowed_scope_count: input.exactAllowedScopeCount,
@@ -2204,8 +2246,21 @@ export function buildWorkerJobPayloadContract(input: {
   const projectDomain =
     readString(readPriorityField("project_domain")) ??
     classifyWorkerTaskDomain([originalRequestText, requestText].filter(Boolean).join("\n"));
-  const allowedScope = readString(readPriorityField("allowed_scope")) ?? null;
-  const exactAllowedScope = readString(readPriorityField("exact_allowed_scope")) ?? null;
+  const taskType = readString(readPriorityField("task_type")) ?? null;
+  const explicitRepairMode = readNullableBooleanFlag(readPriorityField("repair_mode"));
+  const systemRepairMode = isSystemRepairMode({
+    projectDomain,
+    taskType,
+    batchCode,
+  });
+  const repairMode = systemRepairMode && explicitRepairMode !== false;
+  const repairScope = repairMode
+    ? readString(readPriorityField("repair_scope")) ?? SYSTEM_REPAIR_SCOPE_TEXT
+    : readString(readPriorityField("repair_scope")) ?? null;
+  const rawAllowedScope = readString(readPriorityField("allowed_scope")) ?? null;
+  const rawExactAllowedScope = readString(readPriorityField("exact_allowed_scope")) ?? null;
+  const allowedScope = repairMode ? SYSTEM_REPAIR_SCOPE_TEXT : rawAllowedScope;
+  const exactAllowedScope = repairMode ? SYSTEM_REPAIR_SCOPE_TEXT : rawExactAllowedScope;
   const exactAllowedScopeCountValue = readPriorityField("exact_allowed_scope_count");
   const exactAllowedScopeCount =
     (exactAllowedScopeCountValue !== null &&
@@ -2299,8 +2354,11 @@ export function buildWorkerJobPayloadContract(input: {
     context_reconstruct_failed: contextReconstructFailed,
     context_warnings: contextWarnings,
     project_domain: projectDomain,
+    task_type: taskType,
     task_mode: taskMode,
     read_only_mode: readOnlyMode,
+    repair_mode: repairMode,
+    repair_scope: repairScope,
     allowed_scope: allowedScope,
     exact_allowed_scope: exactAllowedScope,
     exact_allowed_scope_count: exactAllowedScopeCount,

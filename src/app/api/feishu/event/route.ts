@@ -1242,6 +1242,27 @@ function projectDomainForTaskMode(taskMode: string | null): string | null {
   return null;
 }
 
+const SYSTEM_REPAIR_BATCH_PREFIX = "BATCH-ARCH-COMPLETE";
+const SYSTEM_REPAIR_TASK_TYPE = "system_repair";
+const SYSTEM_REPAIR_SCOPE = [
+  "src/app/api/feishu/event/route.ts",
+  "src/lib/project-director-console.ts",
+  "src/lib/worker-jobs.ts",
+];
+
+function isSystemRepairApprovalMode(input: {
+  projectDomain: string | null;
+  taskType: unknown;
+  batchCode: unknown;
+}): boolean {
+  return (
+    input.projectDomain === "automation_system" &&
+    input.taskType === SYSTEM_REPAIR_TASK_TYPE &&
+    typeof input.batchCode === "string" &&
+    input.batchCode.startsWith(SYSTEM_REPAIR_BATCH_PREFIX)
+  );
+}
+
 function isWriteAllowedApprovalText(text: string): boolean {
   return /(?:requested_mode|final_mode|执行模式)\s*[:：=]\s*write_allowed\b|task_mode\s*[:=]\s*automation_system_write_allowed\b/i.test(
     normalizeFeishuTaskText(text)
@@ -1251,9 +1272,11 @@ function isWriteAllowedApprovalText(text: string): boolean {
 function assertApprovedWriteRequestHasExactScope(
   requestText: string,
   taskMode: string | null,
-  exactAllowedScope: string[]
+  exactAllowedScope: string[],
+  options: { repairMode?: boolean } = {}
 ) {
   if (
+    !options.repairMode &&
     taskMode === "automation_system_write_allowed" &&
     isWriteAllowedApprovalText(requestText) &&
     exactAllowedScope.length === 0
@@ -1298,20 +1321,38 @@ async function insertApprovedAgentDispatchJobsWithContract(
   const rows = buildResult.tasks.map((task: any, index) => {
     const requestText = buildResult.requestTexts[index] ?? "";
     const taskMode = inferApprovedTaskMode(task);
+    const projectDomain = projectDomainForTaskMode(taskMode);
+    const taskType = readDirectWorkerContextField(requestText, "task_type") ?? task.task_type;
+    const repairMode = isSystemRepairApprovalMode({
+      projectDomain,
+      taskType,
+      batchCode: task.dispatch_batch,
+    });
     const exactAllowedScope = extractExactAllowedScopePaths(requestText);
+    const effectiveExactAllowedScope = repairMode ? SYSTEM_REPAIR_SCOPE : exactAllowedScope;
     const readOnlyMode = taskMode ? false : null;
     assertApprovedWriteRequestModeMatches(requestText, taskMode, readOnlyMode);
-    assertApprovedWriteRequestHasExactScope(requestText, taskMode, exactAllowedScope);
-    assertNoScopeContractConflict(exactAllowedScope, task.forbidden_files);
-    const allowedScope = exactAllowedScope.length > 0 ? exactAllowedScope : task.allowed_files;
+    assertApprovedWriteRequestHasExactScope(requestText, taskMode, effectiveExactAllowedScope, {
+      repairMode,
+    });
+    if (repairMode) {
+      assertNoScopeContractConflict(effectiveExactAllowedScope, task.forbidden_files);
+    } else {
+      assertNoScopeContractConflict(exactAllowedScope, task.forbidden_files);
+    }
+    const allowedScope =
+      effectiveExactAllowedScope.length > 0 ? effectiveExactAllowedScope : task.allowed_files;
     const contractPayload = buildWorkerJobPayloadContract({
       requestText,
       originalRequestText: requestText,
-      projectDomain: projectDomainForTaskMode(taskMode),
+      projectDomain,
+      taskType: repairMode ? SYSTEM_REPAIR_TASK_TYPE : taskType,
       taskMode,
       readOnlyMode,
+      repairMode,
+      repairScope: repairMode ? SYSTEM_REPAIR_SCOPE : null,
       allowedScope,
-      exactAllowedScope,
+      exactAllowedScope: effectiveExactAllowedScope,
       forbiddenScope: task.forbidden_files,
       route: "approved_execution",
       approvedBatch: task.dispatch_batch,
@@ -1369,12 +1410,14 @@ async function insertApprovedAgentDispatchJobsWithContract(
         project_title: buildResult.projectTitle,
         batch_code: task.dispatch_batch,
         role: task.agent_role,
-        task_type: task.task_type,
+        task_type: repairMode ? SYSTEM_REPAIR_TASK_TYPE : taskType,
+        repair_mode: repairMode,
+        repair_scope: repairMode ? SYSTEM_REPAIR_SCOPE : null,
         task_key: task.task_key,
         task_title: task.task_title,
         dependency_keys: task.dependency_keys,
         allowed_files: allowedScope,
-        exact_allowed_scope: exactAllowedScope,
+        exact_allowed_scope: effectiveExactAllowedScope,
         forbidden_files: task.forbidden_files,
         acceptance_criteria: task.acceptance_criteria,
         requires_boss_approval: task.requires_boss_approval,
@@ -2145,6 +2188,9 @@ export async function POST(req: NextRequest) {
         code: 0,
         project_director_intake: true,
         state: "approved_execution_dispatched",
+        approval_context_saved: true,
+        worker_created: insertResult.insertedCount > 0,
+        next_stage_allowed: insertResult.insertedCount > 0,
         inserted_jobs: insertResult.insertedCount,
       });
     }

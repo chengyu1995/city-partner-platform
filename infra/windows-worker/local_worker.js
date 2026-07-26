@@ -1051,6 +1051,14 @@ const TASK_MODES = {
   AUTOMATION_SYSTEM_WRITE_ALLOWED: "automation_system_write_allowed",
   PRODUCT_WRITE_ALLOWED: "product_write_allowed",
 };
+const SYSTEM_REPAIR_BATCH_PREFIX = "BATCH-ARCH-COMPLETE";
+const SYSTEM_REPAIR_TASK_TYPE = "system_repair";
+const SYSTEM_REPAIR_SCOPE = [
+  "src/app/api/feishu/event/route.ts",
+  "src/lib/project-director-console.ts",
+  "src/lib/worker-jobs.ts",
+];
+const SYSTEM_REPAIR_SCOPE_TEXT = SYSTEM_REPAIR_SCOPE.join(", ");
 
 const PRODUCT_WRITE_ALLOWED_SCOPE_TEXT =
   "src/app/**, docs/NEXT_TASK_CARD.md, docs/projects/city-partner-website.md";
@@ -2242,7 +2250,7 @@ function isExplicitAutomationAllowedDocPath(filePath) {
 }
 
 const HERMES_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|route|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|task_mode|read_only_mode|repair_mode|repair_scope|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|route|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName) {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -2409,6 +2417,15 @@ function isReadOnlyTaskMode(taskMode) {
     taskMode === TASK_MODES.READ_ONLY ||
     taskMode === TASK_MODES.MANAGER_READ_ONLY ||
     taskMode === TASK_MODES.WORKER_READ_ONLY
+  );
+}
+
+function isSystemRepairMode(input) {
+  return (
+    input?.projectDomain === "automation_system" &&
+    input?.taskType === SYSTEM_REPAIR_TASK_TYPE &&
+    typeof input?.batchCode === "string" &&
+    input.batchCode.startsWith(SYSTEM_REPAIR_BATCH_PREFIX)
   );
 }
 
@@ -2580,8 +2597,11 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "context_source",
   "context_reconstruct_failed",
   "project_domain",
+  "task_type",
   "task_mode",
   "read_only_mode",
+  "repair_mode",
+  "repair_scope",
   "allowed_scope",
   "exact_allowed_scope",
   "exact_allowed_scope_count",
@@ -2615,8 +2635,11 @@ const WORKER_CONTEXT_FIELD_NAMES = [
 
 const WORKER_CONTEXT_CORE_FIELDS = [
   "project_domain",
+  "task_type",
   "task_mode",
   "read_only_mode",
+  "repair_mode",
+  "repair_scope",
   "allowed_scope",
   "forbidden_scope",
   "route",
@@ -2955,8 +2978,11 @@ function normalizeWorkerContext(job, overrides = {}) {
   );
   const originalRequestTextFields = {
     project_domain: readTextContextField(fallbackOriginalRequest, "project_domain"),
+    task_type: readTextContextField(fallbackOriginalRequest, "task_type"),
     task_mode: readTextContextField(fallbackOriginalRequest, "task_mode"),
     read_only_mode: readTextContextField(fallbackOriginalRequest, "read_only_mode"),
+    repair_mode: readTextContextField(fallbackOriginalRequest, "repair_mode"),
+    repair_scope: readTextContextField(fallbackOriginalRequest, "repair_scope"),
     allowed_scope: readTextContextField(fallbackOriginalRequest, "allowed_scope"),
     exact_allowed_scope: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope"),
     exact_allowed_scope_count: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope_count"),
@@ -2973,8 +2999,11 @@ function normalizeWorkerContext(job, overrides = {}) {
   };
   const requestTextFields = {
     project_domain: readTextContextField(requestText, "project_domain"),
+    task_type: readTextContextField(requestText, "task_type"),
     task_mode: readTextContextField(requestText, "task_mode"),
     read_only_mode: readTextContextField(requestText, "read_only_mode"),
+    repair_mode: readTextContextField(requestText, "repair_mode"),
+    repair_scope: readTextContextField(requestText, "repair_scope"),
     allowed_scope: readTextContextField(requestText, "allowed_scope"),
     exact_allowed_scope: readTextContextField(requestText, "exact_allowed_scope"),
     exact_allowed_scope_count: readTextContextField(requestText, "exact_allowed_scope_count"),
@@ -2991,8 +3020,11 @@ function normalizeWorkerContext(job, overrides = {}) {
   };
   const overrideFields = {
     project_domain: overrides.projectDomain,
+    task_type: overrides.taskType,
     task_mode: overrides.taskMode,
     read_only_mode: overrides.readOnlyMode,
+    repair_mode: overrides.repairMode,
+    repair_scope: readScopeValue(overrides.repairScope),
     allowed_scope: readScopeValue(overrides.allowedScope),
     exact_allowed_scope: readScopeValue(overrides.exactAllowedScope),
     exact_allowed_scope_count: overrides.exactAllowedScopeCount,
@@ -3058,8 +3090,21 @@ function normalizeWorkerContext(job, overrides = {}) {
   const projectDomain =
     readString(readPriorityField("project_domain")) ||
     classifyWorkerTaskDomain([originalRequestText, requestText].join("\n"));
-  const allowedScope = readString(readPriorityField("allowed_scope")) || null;
-  const exactAllowedScope = readString(readPriorityField("exact_allowed_scope")) || null;
+  const taskType = readString(readPriorityField("task_type")) || null;
+  const explicitRepairMode = readNullableBooleanFlag(readPriorityField("repair_mode"));
+  const systemRepairMode = isSystemRepairMode({
+    projectDomain,
+    taskType,
+    batchCode: approvedBatch,
+  });
+  const repairMode = systemRepairMode && explicitRepairMode !== false;
+  const repairScope = repairMode
+    ? readString(readPriorityField("repair_scope")) || SYSTEM_REPAIR_SCOPE_TEXT
+    : readString(readPriorityField("repair_scope")) || null;
+  const rawAllowedScope = readString(readPriorityField("allowed_scope")) || null;
+  const rawExactAllowedScope = readString(readPriorityField("exact_allowed_scope")) || null;
+  const allowedScope = repairMode ? SYSTEM_REPAIR_SCOPE_TEXT : rawAllowedScope;
+  const exactAllowedScope = repairMode ? SYSTEM_REPAIR_SCOPE_TEXT : rawExactAllowedScope;
   const exactAllowedScopeCountValue = readPriorityField("exact_allowed_scope_count");
   const exactAllowedScopeCount =
     (exactAllowedScopeCountValue !== null &&
@@ -3155,8 +3200,11 @@ function normalizeWorkerContext(job, overrides = {}) {
     context_reconstruct_failed: contextReconstructFailed,
     context_warnings: contextWarnings,
     project_domain: projectDomain,
+    task_type: taskType,
     ["task_" + "mode"]: taskMode,
     read_only_mode: readOnlyMode,
+    repair_mode: repairMode,
+    repair_scope: repairScope,
     allowed_scope: allowedScope,
     exact_allowed_scope: exactAllowedScope,
     exact_allowed_scope_count: exactAllowedScopeCount,
