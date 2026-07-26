@@ -415,7 +415,9 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
     assert.match(routeSource, /extractExactAllowedScopePaths/);
     assert.match(routeSource, /original_request_text/);
     assert.match(routeSource, /exact_allowed_scope/);
-    assert.match(routeSource, /DIRECT_WRITE_ALLOWED_REQUIRES_APPROVAL/);
+    assert.doesNotMatch(routeSource, /DIRECT_WRITE_ALLOWED_REQUIRES_APPROVAL/);
+    assert.match(routeSource, /automation_system_write_allowed/);
+    assert.match(routeSource, /DIRECT_WORKER_CONTEXT_MISSING/);
   });
 });
 
@@ -4089,21 +4091,46 @@ test("Codex spawn preflight guard", async (t) => {
     assert.equal(args[sandboxIndex + 1], "workspace-write");
   });
 
-  await t.test("direct worker route enforces worker_read_only three-mode boundaries", () => {
+  await t.test("direct worker route handles complete direct write requests before generic intake", () => {
     const routeSource = fs.readFileSync(
       path.join(workerRoot, "..", "..", "src", "app", "api", "feishu", "event", "route.ts"),
       "utf8"
     );
+    const directBranchIndex = routeSource.indexOf("if (isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text))");
+    const planningChoiceIndex = routeSource.indexOf("const planningChoice = parseProjectDirectorPlanningChoice(text)");
+    const genericDemandIndex = routeSource.indexOf('const demandKind = classifyProjectDirectorDemand(text)');
+    const directBranch = routeSource.slice(
+      directBranchIndex,
+      routeSource.indexOf("if (isPlanChangeReply(text))", directBranchIndex)
+    );
 
+    assert.notEqual(directBranchIndex, -1);
+    assert.ok(directBranchIndex < planningChoiceIndex);
+    assert.ok(directBranchIndex < genericDemandIndex);
     assert.match(routeSource, /isExplicitDirectWorkerCreateCommand/);
     assert.match(routeSource, /resolveDirectWorkerReadOnlyContract/);
+    assert.match(routeSource, /\\u76f4\\u63a5\\s\*\\u5206\\u53d1\\s\*\\u7ed9\\s\*Worker/);
+    assert.match(routeSource, /\\u65e0\\u9700\\s\*\\u518d\\u6b21\\s\*\\u89c4\\u5212/);
+    assert.match(routeSource, /automation_system_write_allowed/);
+    assert.doesNotMatch(routeSource, /DIRECT_WRITE_ALLOWED_REQUIRES_APPROVAL/);
     assert.match(routeSource, /DIRECT_MANAGER_READ_ONLY_REJECTED/);
-    assert.match(routeSource, /DIRECT_WRITE_ALLOWED_REQUIRES_APPROVAL/);
-    assert.match(routeSource, /PROJECT_DIRECTOR_WORKER_READ_ONLY_TASK_CREATED/);
+    assert.match(routeSource, /DIRECT_WORKER_CONTEXT_MISSING/);
+    assert.match(routeSource, /missingFields\.push\("approved_batch"\)/);
+    assert.match(routeSource, /"exact_allowed_scope"/);
+    assert.match(routeSource, /PROJECT_DIRECTOR_DIRECT_WORKER_TASK_CREATED/);
+    assert.match(routeSource, /worker_created=true/);
+    assert.match(routeSource, /hermes_jobs_created: yes/);
+    assert.match(routeSource, /skip_planning_choice: true/);
     assert.match(routeSource, /PROJECT_DIRECTOR_DIRECT_WORKER_TASK_DUPLICATE/);
+    assert.ok(directBranch.indexOf("findRecentDuplicateFeishuJob") < directBranch.indexOf("insertDirectWorkerTask"));
+    assert.doesNotMatch(directBranch, /buildProjectDirectorReply|buildTaskTreeDraftSummary|approval_context_saved=false/);
     assert.match(routeSource, /taskMode: modeContract\.taskMode/);
     assert.match(routeSource, /readOnlyMode: modeContract\.readOnlyMode/);
     assert.match(routeSource, /approvedBatch: modeContract\.batchCode/);
+    assert.match(routeSource, /original_request_text_base64:\s*Buffer\.from\(input\.rawText/);
+    assert.match(routeSource, /task_goal:\s*contractPayload\.task_goal/);
+    assert.match(routeSource, /required_output_fields:\s*contractPayload\.required_output_fields/);
+    assert.match(routeSource, /acceptance_conditions:\s*contractPayload\.acceptance_conditions/);
   });
 
   await t.test("detects executable file types", () => {

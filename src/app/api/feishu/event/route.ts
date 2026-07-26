@@ -191,14 +191,15 @@ function extractPrimaryRouteBatchCode(text: string): string | null {
 
 function isExplicitDirectWorkerCreateCommand(text: string): boolean {
   const normalized = normalizeFeishuTaskText(text);
-  return /direct\s+create\s+Worker\s+task|create\s+Worker\s+task|Worker\s+task/i.test(normalized) ||
-    /(?:\u8bf7\s*)?\u76f4\u63a5\s*\u521b\u5efa\s*Worker\s*\u4efb\u52a1|\u7acb\u5373\s*\u521b\u5efa\s*Worker\s*\u4efb\u52a1|(?:\u8bf7\s*)?\u7acb\u5373\s*\u6392\u961f\s*Worker\s*\u4efb\u52a1/i.test(normalized);
+  return /direct\s+create\s+Worker\s+task|create\s+Worker\s+task|direct\s+dispatch\s+to\s+Worker/i.test(normalized) ||
+    /(?:\u8bf7\s*)?\u76f4\u63a5\s*\u521b\u5efa\s*Worker\s*\u4efb\u52a1|(?:\u8bf7\s*)?\u521b\u5efa\s*Worker\s*\u4efb\u52a1|\u7acb\u5373\s*\u521b\u5efa\s*Worker\s*\u4efb\u52a1|(?:\u8bf7\s*)?\u7acb\u5373\s*\u6392\u961f\s*Worker\s*\u4efb\u52a1|\u76f4\u63a5\s*\u5206\u53d1\s*\u7ed9\s*Worker/i.test(normalized) ||
+    /(?:\u65e0\u9700\s*\u518d\u6b21\s*\u89c4\u5212|\u65e0\u9700\s*\u518d\u6b21\s*\u5ba1\u6279|\u65e0\u9700\s*\u518d\u6b21\s*\u6279\u51c6)[\s\S]*(?:Worker|\bBATCH-)/i.test(normalized);
 }
 
 function parseDirectRequestedMode(text: string, batchCode: string | null): string | null {
   const normalized = normalizeFeishuTaskText(text);
   const explicit = normalized.match(
-    /(?:execution_mode|requested_mode|final_mode|task_mode|\u6267\u884c\u6a21\u5f0f)\s*[:\uFF1A=]\s*(manager_read_only|worker_read_only|write_allowed)\b/i
+    /(?:execution_mode|requested_mode|final_mode|task_mode|\u6267\u884c\u6a21\u5f0f)\s*[:\uFF1A=]\s*(manager_read_only|worker_read_only|read_only|write_allowed|automation_system_write_allowed|automation_system_worker_read_only)\b/i
   );
   if (explicit) return explicit[1].toLowerCase();
   if (batchCode && /\bBATCH-GM-MODE-SMOKE-MANAGER(?:-[A-Z0-9]+)*\b/i.test(batchCode)) return "manager_read_only";
@@ -207,27 +208,98 @@ function parseDirectRequestedMode(text: string, batchCode: string | null): strin
   return null;
 }
 
+function readDirectWorkerContextField(text: string, fieldName: string): string | null {
+  const pattern = new RegExp(`^\\s*${fieldName}\\s*[:\uFF1A=]\\s*(.+?)\\s*$`, "im");
+  const match = text.match(pattern);
+  return match?.[1]?.trim() || null;
+}
+
+function hasDirectWorkerContextField(text: string, fieldName: string): boolean {
+  const pattern = new RegExp(`^\\s*${fieldName}\\s*[:\uFF1A=]`, "im");
+  return pattern.test(text);
+}
+
+function readDirectWorkerBooleanField(text: string, fieldName: string): boolean | null {
+  const value = readDirectWorkerContextField(text, fieldName);
+  if (!value) return null;
+  if (/^(true|yes|1)$/i.test(value)) return true;
+  if (/^(false|no|0)$/i.test(value)) return false;
+  return null;
+}
+
+function normalizeDirectWorkerWriteMode(mode: string | null): "write" | "read_only" | "manager_read_only" | null {
+  const normalized = mode?.trim().toLowerCase() ?? null;
+  if (!normalized || normalized === "not_provided") return null;
+  if (normalized === "write_allowed" || normalized === "automation_system_write_allowed") return "write";
+  if (
+    normalized === "worker_read_only" ||
+    normalized === "read_only" ||
+    normalized === "automation_system_worker_read_only"
+  ) {
+    return "read_only";
+  }
+  if (normalized === "manager_read_only") return "manager_read_only";
+  return null;
+}
+
 function resolveDirectWorkerReadOnlyContract(text: string) {
-  const batchCode = extractPrimaryRouteBatchCode(text);
-  const requestedMode = parseDirectRequestedMode(text, batchCode);
-  const projectDomain = batchCode && /^BATCH-GM-/i.test(batchCode) ? "automation_system" : classifyFeishuWorkerTaskDomain(text);
+  const explicitApprovedBatch = readDirectWorkerContextField(text, "approved_batch");
+  const batchCode = explicitApprovedBatch?.toUpperCase() ?? extractPrimaryRouteBatchCode(text);
+  const requestedMode = readDirectWorkerContextField(text, "requested_mode") ?? parseDirectRequestedMode(text, batchCode);
+  const explicitTaskMode = readDirectWorkerContextField(text, "task_mode");
+  const finalMode = readDirectWorkerContextField(text, "final_mode") ?? explicitTaskMode ?? requestedMode;
+  const taskMode = explicitTaskMode ?? finalMode;
+  const readOnlyMode = readDirectWorkerBooleanField(text, "read_only_mode");
+  const explicitProjectDomain = readDirectWorkerContextField(text, "project_domain");
+  const projectDomain = explicitProjectDomain ??
+    (batchCode && /^BATCH-GM-/i.test(batchCode) ? "automation_system" : classifyFeishuWorkerTaskDomain(text));
+  const approvalRequired = readDirectWorkerBooleanField(text, "approval_required") ?? false;
+  const allowedScopeText = readDirectWorkerContextField(text, "allowed_scope");
+  const forbiddenScopeText = readDirectWorkerContextField(text, "forbidden_scope");
+  const hasExactAllowedScope = hasDirectWorkerContextField(text, "exact_allowed_scope");
+  const exactAllowedScope = extractExactAllowedScopePaths(text);
+  const finalIntent = normalizeDirectWorkerWriteMode(finalMode);
+  const taskIntent = normalizeDirectWorkerWriteMode(taskMode);
+  const requestedIntent = normalizeDirectWorkerWriteMode(requestedMode);
   const readOnlyAllowedScope = "Worker read-only static inspection; no file writes; no git add/commit/push";
   const readOnlyForbiddenScope = "file writes, git add, git commit, git push, dev server, database, env, deploy";
+  const missingFields: string[] = [];
 
-  if (!batchCode || !/^BATCH-GM-/i.test(batchCode)) {
-    return { ok: false, error: "DIRECT_WORKER_BATCH_MISSING", batchCode, projectDomain, requestedMode, finalMode: requestedMode, taskMode: requestedMode, readOnlyMode: true, approvalRequired: false, allowedScope: readOnlyAllowedScope, forbiddenScope: readOnlyForbiddenScope };
-  }
-  if (requestedMode === "manager_read_only") {
-    return { ok: false, error: "DIRECT_MANAGER_READ_ONLY_REJECTED", batchCode, projectDomain, requestedMode, finalMode: "manager_read_only", taskMode: "manager_read_only", readOnlyMode: true, approvalRequired: false, allowedScope: readOnlyAllowedScope, forbiddenScope: readOnlyForbiddenScope };
-  }
-  if (requestedMode === "write_allowed") {
-    return { ok: false, error: "DIRECT_WRITE_ALLOWED_REQUIRES_APPROVAL", batchCode, projectDomain, requestedMode, finalMode: "write_allowed", taskMode: "automation_system_write_allowed", readOnlyMode: false, approvalRequired: true, allowedScope: "automation system allowed_scope from approved request only", forbiddenScope: readOnlyForbiddenScope };
-  }
-  if (requestedMode !== "worker_read_only") {
-    return { ok: false, error: "DIRECT_WORKER_MODE_UNSUPPORTED", batchCode, projectDomain, requestedMode, finalMode: requestedMode, taskMode: requestedMode, readOnlyMode: true, approvalRequired: false, allowedScope: readOnlyAllowedScope, forbiddenScope: readOnlyForbiddenScope };
+  if (!batchCode) missingFields.push("approved_batch");
+  if (!explicitProjectDomain) missingFields.push("project_domain");
+  if (!taskMode) missingFields.push("task_mode");
+  if (readOnlyMode === null) missingFields.push("read_only_mode");
+  if (!forbiddenScopeText) missingFields.push("forbidden_scope");
+
+  if (missingFields.length > 0) {
+    return { ok: false, error: "DIRECT_WORKER_CONTEXT_MISSING", missingFields, batchCode, projectDomain, requestedMode, finalMode, taskMode, readOnlyMode: readOnlyMode ?? true, approvalRequired, allowedScope: allowedScopeText ?? readOnlyAllowedScope, forbiddenScope: forbiddenScopeText ?? readOnlyForbiddenScope };
   }
 
-  return { ok: true, batchCode, projectDomain: "automation_system", requestedMode: "worker_read_only", finalMode: "worker_read_only", taskMode: "worker_read_only", readOnlyMode: true, approvalRequired: false, allowedScope: readOnlyAllowedScope, forbiddenScope: readOnlyForbiddenScope };
+  if (requestedIntent === "manager_read_only" || finalIntent === "manager_read_only" || taskIntent === "manager_read_only") {
+    return { ok: false, error: "DIRECT_MANAGER_READ_ONLY_REJECTED", missingFields, batchCode, projectDomain, requestedMode, finalMode: "manager_read_only", taskMode: "manager_read_only", readOnlyMode: true, approvalRequired: false, allowedScope: readOnlyAllowedScope, forbiddenScope: forbiddenScopeText ?? readOnlyForbiddenScope };
+  }
+  if (!finalIntent || !taskIntent || finalIntent !== taskIntent) {
+    return { ok: false, error: "DIRECT_WORKER_MODE_UNSUPPORTED", missingFields, batchCode, projectDomain, requestedMode, finalMode, taskMode, readOnlyMode, approvalRequired, allowedScope: allowedScopeText ?? readOnlyAllowedScope, forbiddenScope: forbiddenScopeText ?? readOnlyForbiddenScope };
+  }
+  if (requestedIntent && requestedIntent !== finalIntent) {
+    return { ok: false, error: "DIRECT_WORKER_MODE_CONFLICT", missingFields, batchCode, projectDomain, requestedMode, finalMode, taskMode, readOnlyMode, approvalRequired, allowedScope: allowedScopeText ?? readOnlyAllowedScope, forbiddenScope: forbiddenScopeText ?? readOnlyForbiddenScope };
+  }
+  if (finalIntent === "write") {
+    const writeMissing = [
+      !hasExactAllowedScope || exactAllowedScope.length === 0 ? "exact_allowed_scope" : null,
+      !readDirectWorkerContextField(text, "task_goal") ? "task_goal" : null,
+      !readDirectWorkerContextField(text, "required_output_fields") ? "required_output_fields" : null,
+      !readDirectWorkerContextField(text, "acceptance_conditions") ? "acceptance_conditions" : null,
+    ].filter((item): item is string => Boolean(item));
+    if (readOnlyMode !== false) writeMissing.push("read_only_mode=false");
+    if (writeMissing.length > 0) {
+      return { ok: false, error: "DIRECT_WORKER_CONTEXT_MISSING", missingFields: writeMissing, batchCode, projectDomain, requestedMode, finalMode, taskMode, readOnlyMode, approvalRequired, allowedScope: allowedScopeText ?? readOnlyAllowedScope, forbiddenScope: forbiddenScopeText ?? readOnlyForbiddenScope };
+    }
+
+    return { ok: true, missingFields, batchCode, projectDomain, requestedMode: requestedMode ?? "not_provided", finalMode: finalMode === "write_allowed" ? "write_allowed" : "automation_system_write_allowed", taskMode: taskMode === "write_allowed" ? "automation_system_write_allowed" : taskMode, readOnlyMode: false, approvalRequired, allowedScope: allowedScopeText ?? exactAllowedScope, forbiddenScope: forbiddenScopeText ?? readOnlyForbiddenScope };
+  }
+
+  return { ok: true, missingFields, batchCode, projectDomain: "automation_system", requestedMode: requestedMode ?? "worker_read_only", finalMode: "worker_read_only", taskMode: "worker_read_only", readOnlyMode: true, approvalRequired: false, allowedScope: allowedScopeText ?? readOnlyAllowedScope, forbiddenScope: forbiddenScopeText ?? readOnlyForbiddenScope };
 }
 
 function classifyProjectDirectorDemand(
@@ -831,7 +903,12 @@ const DIRECT_WORKER_CONTEXT_REQUIRED_FIELDS = [
   "approval_required",
   "allowed_scope",
   "exact_allowed_scope",
+  "exact_allowed_scope_count",
   "forbidden_scope",
+  "forbidden_operations",
+  "task_goal",
+  "required_output_fields",
+  "acceptance_conditions",
   "original_request_text",
   "original_request_text_base64",
   "approved_batch",
@@ -1032,6 +1109,11 @@ async function insertDirectWorkerTask(
   const exactAllowedScope = extractExactAllowedScopePaths(input.rawText);
   assertNoScopeContractConflict(exactAllowedScope, input.rawText);
   const allowedScope = exactAllowedScope.length > 0 ? exactAllowedScope : modeContract.allowedScope;
+  const exactAllowedScopeCount = readDirectWorkerContextField(input.rawText, "exact_allowed_scope_count");
+  const forbiddenOperations = readDirectWorkerContextField(input.rawText, "forbidden_operations");
+  const taskGoal = readDirectWorkerContextField(input.rawText, "task_goal");
+  const requiredOutputFields = readDirectWorkerContextField(input.rawText, "required_output_fields");
+  const acceptanceConditions = readDirectWorkerContextField(input.rawText, "acceptance_conditions");
   const contractPayload = buildWorkerJobPayloadContract({
     requestText: input.requestText,
     originalRequestText: input.rawText,
@@ -1040,7 +1122,12 @@ async function insertDirectWorkerTask(
     readOnlyMode: modeContract.readOnlyMode,
     allowedScope,
     exactAllowedScope,
+    exactAllowedScopeCount,
+    forbiddenOperations,
     forbiddenScope: modeContract.forbiddenScope,
+    taskGoal,
+    requiredOutputFields,
+    acceptanceConditions,
     approvedBatch: modeContract.batchCode,
     route: "direct_worker_create",
     workerStage: "queued",
@@ -1057,6 +1144,12 @@ async function insertDirectWorkerTask(
     final_mode: modeContract.finalMode,
     approval_required: modeContract.approvalRequired,
     exact_allowed_scope: exactAllowedScope,
+    exact_allowed_scope_count: contractPayload.exact_allowed_scope_count,
+    task_goal: contractPayload.task_goal,
+    required_output_fields: contractPayload.required_output_fields,
+    acceptance_conditions: contractPayload.acceptance_conditions,
+    forbidden_operations: contractPayload.forbidden_operations,
+    forbidden_scope: contractPayload.forbidden_scope,
     original_request_text_base64: Buffer.from(input.rawText, "utf8").toString("base64"),
     approved_batch: modeContract.batchCode,
     chat_id: input.feishuChatId,
@@ -1534,8 +1627,9 @@ export async function POST(req: NextRequest) {
             `task_mode=${modeContract.taskMode ?? "not_provided"}`,
             `read_only_mode=${modeContract.readOnlyMode ? "true" : "false"}`,
             `approval_required=${modeContract.approvalRequired ? "true" : "false"}`,
+            `missing_fields=${modeContract.missingFields?.length ? modeContract.missingFields.join(",") : "none"}`,
             "worker_created=false",
-            "manager_read_only does not create Worker; write_allowed requires exact approval.",
+            "direct Worker create requires complete approved context and exact scope for write tasks.",
           ].join("\n");
           await saveSystemRecordedReply(
             supabase,
@@ -1547,6 +1641,7 @@ export async function POST(req: NextRequest) {
               `state: ${modeContract.error}`,
               `batch: ${modeContract.batchCode ?? "missing"}`,
               `requested_mode: ${modeContract.requestedMode ?? "not_provided"}`,
+              `missing_fields: ${modeContract.missingFields?.length ? modeContract.missingFields.join(",") : "none"}`,
             ].join("\n"),
             "project_director_direct_worker_task_rejected",
             ev.message.message_id
@@ -1625,13 +1720,13 @@ export async function POST(req: NextRequest) {
           feishuUserId: userId,
         });
         const reply = [
-          "PROJECT_DIRECTOR_WORKER_READ_ONLY_TASK_CREATED",
+          "PROJECT_DIRECTOR_DIRECT_WORKER_TASK_CREATED",
+          "state: queued",
+          "worker_created=true",
+          "hermes_jobs_created: yes",
+          `approved_batch: ${modeContract.batchCode}`,
           `job_id: ${insertResult.jobId ?? "pending"}`,
-          `batch: ${modeContract.batchCode}`,
-          "status: queued",
-          "task_mode: worker_read_only",
-          "read_only_mode: true",
-          "codex_sandbox: read-only",
+          "skip_planning_choice: true",
         ].join("\n");
         await saveSystemRecordedReply(
           supabase,
