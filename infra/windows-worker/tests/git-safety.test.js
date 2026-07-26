@@ -51,26 +51,34 @@ const {
   buildFailureReport,
   buildAutoIterationSuggestion,
   buildWorkerGuardedPrompt,
+  buildTerminalStatusSnapshot,
   classifyWorkerFetchError,
   classifyWorkerTaskDomain,
+  createTerminalReportState,
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
   formatCodexSpawnError,
   formatWorkerFetchError,
+  getTerminalReportSnapshot,
   getCodexFileType,
   getWorkerPollBackoffMs,
   getTaskMode,
+  isRunningJobNotFoundOrNotOwned,
   isTrueTaskFailureCode,
   isReadOnlyTask,
   isReadOnlyTaskText,
+  lockAcceptedTerminalReportSnapshot,
   normalizeWorkerContext,
   normalizeWorkerFinalResult,
+  recordPostCompletionTransportWarning,
   recordFailureMemoryForFinalResult,
   recordFailureMemory,
   recordTerminalJobIndex,
+  registerTerminalTimerStopper,
   resolveCodexExecutable,
   resolveWorkerJobContract,
   runCodexPreflight,
+  resetTerminalReportState,
 } = require("../local_worker");
 
 const workerRoot = path.resolve(__dirname, "..");
@@ -3180,6 +3188,315 @@ test("BATCH-ARCH-09 terminal final result rules", async (t) => {
       reason: "cancelled",
     });
   });
+});
+
+test("post-completion 404 transport warnings keep accepted terminal result", async (t) => {
+  function lockCanarySuccess(state = createTerminalReportState()) {
+    const snapshot = lockAcceptedTerminalReportSnapshot(
+      {
+        status: "succeeded",
+        reportBody: {
+          job_id: "job-canary-02",
+          worker_execution_status: "succeeded",
+          task_goal_status: "succeeded",
+          effective_final_status: "succeeded",
+          failure_code: null,
+          failure_stage: null,
+          changed_files: [],
+          git_commit_sha: null,
+          git_push: false,
+        },
+        acceptedFinalReportResponse: {
+          ok: true,
+          project_director_report: {
+            data: {
+              worker_execution_status: "succeeded",
+              task_goal_status: "succeeded",
+              effective_final_status: "succeeded",
+              failure_code: null,
+              failure_stage: null,
+              changed_files: [],
+              git_commit_sha: null,
+              pushed: false,
+            },
+          },
+        },
+      },
+      state
+    );
+    return { state, snapshot };
+  }
+
+  function normalizeAfterPostCompletion404(snapshot, errorText) {
+    return normalizeWorkerFinalResult({
+      job: { id: "job-canary-02" },
+      status: "failed",
+      effectiveFinalStatus: "failed",
+      terminalStatusSnapshot: snapshot,
+      errorText,
+      failureCode: "not_provided",
+      failureStage: "worker_progress",
+    });
+  }
+
+  await t.test("progress 404 after accepted success is a warning and does not override", () => {
+    const { state } = lockCanarySuccess();
+    assert.equal(
+      recordPostCompletionTransportWarning(
+        { status: 404, text: "RUNNING_JOB_NOT_FOUND_OR_NOT_OWNED" },
+        "worker_progress",
+        "job-canary-02",
+        state
+      ),
+      true
+    );
+
+    const finalResult = normalizeAfterPostCompletion404(
+      getTerminalReportSnapshot(state),
+      "worker_progress HTTP 404 RUNNING_JOB_NOT_FOUND_OR_NOT_OWNED"
+    );
+
+    assert.equal(finalResult.worker_execution_status, "succeeded");
+    assert.equal(finalResult.task_goal_status, "succeeded");
+    assert.equal(finalResult.effective_final_status, "succeeded");
+    assert.equal(finalResult.failure_code, null);
+    assert.equal(finalResult.failure_stage, null);
+    assert.equal(finalResult.post_completion_transport_warning, true);
+  });
+
+  await t.test("heartbeat 404 after accepted success is a warning and does not override", () => {
+    const { state } = lockCanarySuccess();
+    assert.equal(
+      recordPostCompletionTransportWarning(
+        { status: 404, text: "RUNNING_JOB_NOT_FOUND_OR_NOT_OWNED" },
+        "worker_heartbeat",
+        "job-canary-02",
+        state
+      ),
+      true
+    );
+
+    const finalResult = normalizeAfterPostCompletion404(
+      getTerminalReportSnapshot(state),
+      "worker_heartbeat HTTP 404 RUNNING_JOB_NOT_FOUND_OR_NOT_OWNED"
+    );
+
+    assert.equal(finalResult.effective_final_status, "succeeded");
+    assert.equal(finalResult.failure_code, null);
+    assert.equal(finalResult.failure_stage, null);
+  });
+
+  await t.test("multiple post-completion 404s only increment warnings", () => {
+    const { state } = lockCanarySuccess();
+    for (const stage of ["worker_progress", "worker_heartbeat", "worker_progress"]) {
+      assert.equal(
+        recordPostCompletionTransportWarning(
+          new Error(`HTTP 404 RUNNING_JOB_NOT_FOUND_OR_NOT_OWNED stage=${stage}`),
+          stage,
+          "job-canary-02",
+          state
+        ),
+        true
+      );
+    }
+
+    const snapshot = getTerminalReportSnapshot(state);
+    const finalResult = normalizeAfterPostCompletion404(
+      snapshot,
+      "multiple HTTP 404 RUNNING_JOB_NOT_FOUND_OR_NOT_OWNED"
+    );
+
+    assert.equal(snapshot.post_completion_warning_count, 3);
+    assert.equal(finalResult.effective_final_status, "succeeded");
+    assert.equal(finalResult.failure_code, null);
+  });
+
+  await t.test("accepted final report stops heartbeat and progress timers", () => {
+    const state = createTerminalReportState();
+    const stopped = [];
+    registerTerminalTimerStopper("heartbeat", () => stopped.push("heartbeat"), state);
+    registerTerminalTimerStopper("progress", () => stopped.push("progress"), state);
+
+    lockCanarySuccess(state);
+
+    assert.deepEqual(stopped.sort(), ["heartbeat", "progress"]);
+  });
+
+  await t.test("final report failure still fails closed without accepted snapshot", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-report-failed" },
+      status: "failed",
+      effectiveFinalStatus: "failed",
+      errorText: "final report HTTP 500",
+      failureStage: "report",
+    });
+
+    assert.equal(finalResult.effective_final_status, "failed");
+    assert.notEqual(finalResult.effective_final_status, "succeeded");
+  });
+
+  await t.test("true task goal failure is preserved", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-goal-failed" },
+      approvedBatch: "BATCH-ARCH-COMPLETE-01",
+      status: "succeeded",
+      finalReportStatus: "succeeded",
+      effectiveFinalStatus: "failed",
+      worker_execution_status: "succeeded_until_task_goal_validation",
+      task_goal_status: "failed_no_fix_applied",
+      failureCode: NO_FIX_APPLIED,
+      failureStage: "task_goal_validation",
+      changed_files: [],
+      pushed: false,
+    });
+
+    assert.equal(finalResult.worker_execution_status, "succeeded_until_task_goal_validation");
+    assert.equal(finalResult.task_goal_status, "failed_no_fix_applied");
+    assert.equal(finalResult.effective_final_status, "failed");
+    assert.equal(finalResult.failure_code, NO_FIX_APPLIED);
+  });
+
+  await t.test("worker_read_only success keeps empty changed_files and no push", () => {
+    const snapshot = buildTerminalStatusSnapshot({
+      status: "succeeded",
+      reportBody: {
+        job_id: "job-read-only",
+        worker_execution_status: "succeeded",
+        task_goal_status: "completed_read_only_no_file_changes",
+        effective_final_status: "succeeded",
+        changed_files: [],
+        git_commit_sha: null,
+        git_push: false,
+      },
+    });
+
+    assert.deepEqual(snapshot.changed_files, []);
+    assert.equal(snapshot.git_commit_sha, null);
+    assert.equal(snapshot.git_push, false);
+    assert.equal(snapshot.task_goal_status, "completed_read_only_no_file_changes");
+  });
+
+  await t.test("write_allowed success keeps commit and push fields", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      status: "succeeded",
+      effectiveFinalStatus: "succeeded",
+      worker_execution_status: "succeeded",
+      task_goal_status: "completed_with_file_changes",
+      changed_files: ["infra/windows-worker/local_worker.js"],
+      gitCommitSha: "abc123",
+      github_push_status: "succeeded",
+    });
+
+    assert.deepEqual(finalResult.changed_files, ["infra/windows-worker/local_worker.js"]);
+    assert.equal(finalResult.git_commit_sha, "abc123");
+    assert.equal(finalResult.pushed, true);
+    assert.equal(finalResult.git_push, true);
+  });
+
+  await t.test("worker process success with task goal failure stays failed", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      status: "succeeded",
+      finalReportStatus: "succeeded",
+      effectiveFinalStatus: "failed",
+      worker_execution_status: "succeeded_until_task_goal_validation",
+      task_goal_status: "failed_no_fix_applied",
+      resultText: "NO_FIX_APPLIED: yes",
+      failureCode: NO_FIX_APPLIED,
+      failureStage: "task_goal_validation",
+    });
+
+    assert.equal(finalResult.effective_final_status, "failed");
+    assert.equal(finalResult.worker_execution_status, "succeeded_until_task_goal_validation");
+    assert.equal(finalResult.task_goal_status, "failed_no_fix_applied");
+  });
+
+  await t.test("failure_code not_provided is normalized to null for success", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      status: "succeeded",
+      effectiveFinalStatus: "succeeded",
+      resultText: "failure_code: not_provided\nfailure_stage: worker_progress",
+      failureCode: "not_provided",
+      failureStage: "worker_progress",
+    });
+
+    assert.equal(finalResult.failure_code, null);
+    assert.equal(finalResult.failure_stage, null);
+  });
+
+  await t.test("terminal snapshot fields are complete", () => {
+    const snapshot = buildTerminalStatusSnapshot({
+      status: "succeeded",
+      reportBody: {
+        job_id: "job-snapshot",
+        worker_execution_status: "succeeded",
+        task_goal_status: "succeeded",
+        effective_final_status: "succeeded",
+        failure_code: null,
+        failure_stage: null,
+        changed_files: [],
+        git_commit_sha: null,
+        git_push: false,
+      },
+    });
+
+    for (const field of [
+      "worker_execution_status",
+      "task_goal_status",
+      "effective_final_status",
+      "failure_code",
+      "failure_stage",
+      "changed_files",
+      "git_commit_sha",
+      "git_push",
+    ]) {
+      assert.ok(Object.prototype.hasOwnProperty.call(snapshot, field), field);
+    }
+  });
+
+  await t.test("CANARY-02 log scenario finally displays succeeded", () => {
+    const { state } = lockCanarySuccess();
+    assert.equal(isRunningJobNotFoundOrNotOwned("HTTP 404 RUNNING_JOB_NOT_FOUND_OR_NOT_OWNED"), true);
+    recordPostCompletionTransportWarning(
+      { status: 404, text: "worker_progress RUNNING_JOB_NOT_FOUND_OR_NOT_OWNED" },
+      "worker_progress",
+      "job-canary-02",
+      state
+    );
+    recordPostCompletionTransportWarning(
+      { status: 404, text: "worker_heartbeat RUNNING_JOB_NOT_FOUND_OR_NOT_OWNED" },
+      "worker_heartbeat",
+      "job-canary-02",
+      state
+    );
+
+    const finalResult = normalizeAfterPostCompletion404(
+      getTerminalReportSnapshot(state),
+      [
+        "Worker execution status: failed",
+        "Task goal status: failed",
+        "Final status: failed",
+        "failure_code: not_provided",
+      ].join("\n")
+    );
+
+    assert.equal(finalResult.worker_execution_status, "succeeded");
+    assert.equal(finalResult.task_goal_status, "succeeded");
+    assert.equal(finalResult.effective_final_status, "succeeded");
+    assert.equal(finalResult.failure_code, null);
+    assert.equal(finalResult.failure_stage, null);
+    assert.equal(finalResult.post_completion_warning_count, 2);
+  });
+
+  await t.test("worker-jobs source keeps accepted report and terminal snapshot priority", () => {
+    const workerJobsSource = readRepoFile("src/lib/worker-jobs.ts");
+
+    assert.match(workerJobsSource, /readAcceptedFinalReportData/);
+    assert.match(workerJobsSource, /readTerminalStatusSnapshot/);
+    assert.match(workerJobsSource, /terminalChangedFiles/);
+    assert.match(workerJobsSource, /post_completion_transport_warning/);
+  });
+
+  resetTerminalReportState(createTerminalReportState());
 });
 
 test("path normalization and path-set comparison", async (t) => {

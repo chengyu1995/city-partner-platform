@@ -67,9 +67,275 @@ let stopping = false;
 let working = false;
 let currentAttemptId = null;
 let currentReadOnlyMode = false;
+const terminalReportState = createTerminalReportState();
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readPlainRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function readNullableReportString(value) {
+  const text = readString(value);
+  return text && !/^(null|none|n\/a|not[_ -]?provided|undefined)$/i.test(text)
+    ? text
+    : null;
+}
+
+function firstReportString(...values) {
+  for (const value of values) {
+    const text = readNullableReportString(value);
+    if (text) return text;
+  }
+  return null;
+}
+
+function readProjectDirectorReportData(value) {
+  const record = readPlainRecord(value);
+  if (!record) return null;
+  return readPlainRecord(record.data) || record;
+}
+
+function readAcceptedFinalReportData(responseBody) {
+  const body = readPlainRecord(responseBody);
+  if (!body) return null;
+
+  return (
+    readProjectDirectorReportData(body.project_director_report) ||
+    readProjectDirectorReportData(readPlainRecord(body.job)?.result?.project_director_report) ||
+    null
+  );
+}
+
+function readReportPushFlag(...values) {
+  for (const value of values) {
+    if (typeof value === "boolean") return value;
+    const booleanValue = readNullableBooleanFlag(value);
+    if (booleanValue !== null) return booleanValue;
+    const text = readString(value);
+    if (/^(success|succeeded|pushed|pending|true|yes)$/i.test(String(text || "").trim())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildTerminalStatusSnapshot(input = {}) {
+  const reportBody = readPlainRecord(input.reportBody) || readPlainRecord(input.body) || {};
+  const acceptedResponse =
+    readPlainRecord(input.acceptedFinalReportResponse) ||
+    readPlainRecord(input.accepted_final_report_response) ||
+    readPlainRecord(input.responseBody) ||
+    null;
+  const acceptedData = readAcceptedFinalReportData(acceptedResponse) || {};
+  const explicitSnapshot =
+    readPlainRecord(input.terminalStatusSnapshot) ||
+    readPlainRecord(input.terminal_status_snapshot) ||
+    readPlainRecord(input.effectiveFinalStatusSnapshot) ||
+    readPlainRecord(input.effective_final_status_snapshot) ||
+    {};
+  const sources = [acceptedData, explicitSnapshot, reportBody, input];
+  const sourceRawValue = (...keys) => {
+    for (const source of sources) {
+      if (!source || typeof source !== "object") continue;
+      for (const key of keys) {
+        if (Object.prototype.hasOwnProperty.call(source, key)) {
+          const value = source[key];
+          if (value !== undefined && value !== null) return value;
+        }
+      }
+    }
+    return null;
+  };
+  const sourceValue = (...keys) => {
+    for (const source of sources) {
+      if (!source || typeof source !== "object") continue;
+      for (const key of keys) {
+        if (Object.prototype.hasOwnProperty.call(source, key)) {
+          const value = source[key];
+          if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+        }
+      }
+    }
+    return null;
+  };
+
+  const effectiveFinalStatus =
+    normalizeTerminalStatus(sourceValue("effective_final_status", "effectiveFinalStatus")) ||
+    normalizeTerminalStatus(input.status) ||
+    "running";
+  const finalReportStatus =
+    normalizeTerminalStatus(sourceValue("final_report_status", "finalReportStatus")) ||
+    normalizeTerminalStatus(input.status) ||
+    null;
+  const failureCode =
+    effectiveFinalStatus === "failed"
+      ? normalizeFailureCodeValue(sourceValue("failure_code", "failureCode", "error_code", "errorCode"))
+      : null;
+  const failureStage =
+    effectiveFinalStatus === "failed"
+      ? firstReportString(sourceValue("failure_stage", "failureStage"))
+      : null;
+  const changedFiles = uniqueSortedPaths(
+    readStringList(sourceRawValue("changed_files", "changedFiles", "files_changed", "filesChanged"))
+  );
+  const gitCommitSha = firstReportString(
+    sourceValue("git_commit_sha", "gitCommitSha"),
+    acceptedResponse?.git_commit_sha
+  );
+  const gitPush = readReportPushFlag(
+    sourceValue("git_push", "gitPush", "pushed"),
+    sourceValue("github_push_status", "githubPushStatus"),
+    sourceValue("deploy_status", "deployStatus")
+  );
+
+  return {
+    final_report_accepted: readNullableBooleanFlag(input.finalReportAccepted) !== false,
+    job_id: firstReportString(sourceValue("job_id", "jobId", "id")),
+    worker_execution_status:
+      firstReportString(sourceValue("worker_execution_status", "workerExecutionStatus")) ||
+      (effectiveFinalStatus === "succeeded"
+        ? "succeeded"
+        : effectiveFinalStatus === "failed"
+        ? "failed"
+        : effectiveFinalStatus),
+    task_goal_status:
+      firstReportString(sourceValue("task_goal_status", "taskGoalStatus")) ||
+      (effectiveFinalStatus === "succeeded"
+        ? "completed"
+        : effectiveFinalStatus === "failed"
+        ? "failed"
+        : effectiveFinalStatus),
+    final_report_status: finalReportStatus,
+    effective_final_status: effectiveFinalStatus,
+    failure_code: failureCode,
+    failure_stage: failureStage,
+    changed_files: changedFiles,
+    git_commit_sha: gitCommitSha,
+    git_push: gitPush,
+    pushed: gitPush,
+    post_completion_transport_warning: readBooleanFlag(
+      sourceValue("post_completion_transport_warning", "postCompletionTransportWarning")
+    ),
+    post_completion_warning_count:
+      Number(sourceValue("post_completion_warning_count", "postCompletionWarningCount")) || 0,
+  };
+}
+
+function createTerminalReportState() {
+  return {
+    snapshot: null,
+    postCompletionWarningCount: 0,
+    heartbeatStopper: null,
+    progressStopper: null,
+  };
+}
+
+function resetTerminalReportState(state = terminalReportState) {
+  stopTerminalReportTimers(state);
+  state.snapshot = null;
+  state.postCompletionWarningCount = 0;
+  state.heartbeatStopper = null;
+  state.progressStopper = null;
+}
+
+function registerTerminalTimerStopper(kind, stop, state = terminalReportState) {
+  if (typeof stop !== "function") return () => {};
+
+  let stopped = false;
+  const stopOnce = () => {
+    if (stopped) return;
+    stopped = true;
+    stop();
+  };
+
+  if (kind === "heartbeat") {
+    state.heartbeatStopper = stopOnce;
+  } else if (kind === "progress") {
+    state.progressStopper = stopOnce;
+  }
+
+  if (state.snapshot?.final_report_accepted) {
+    stopOnce();
+  }
+
+  return stopOnce;
+}
+
+function stopTerminalReportTimers(state = terminalReportState) {
+  const heartbeatStopper = state.heartbeatStopper;
+  const progressStopper = state.progressStopper;
+  state.heartbeatStopper = null;
+  state.progressStopper = null;
+
+  if (heartbeatStopper) heartbeatStopper();
+  if (progressStopper) progressStopper();
+}
+
+function lockAcceptedTerminalReportSnapshot(snapshotInput = {}, state = terminalReportState) {
+  const snapshot = buildTerminalStatusSnapshot({
+    ...snapshotInput,
+    finalReportAccepted: true,
+  });
+  state.snapshot = Object.freeze(snapshot);
+  stopTerminalReportTimers(state);
+  return getTerminalReportSnapshot(state);
+}
+
+function getTerminalReportSnapshot(state = terminalReportState) {
+  if (!state.snapshot) return null;
+  return {
+    ...state.snapshot,
+    post_completion_transport_warning: state.postCompletionWarningCount > 0 ||
+      Boolean(state.snapshot.post_completion_transport_warning),
+    post_completion_warning_count: state.postCompletionWarningCount,
+  };
+}
+
+function isTerminalReportLockedForJob(jobId, state = terminalReportState) {
+  const snapshot = state.snapshot;
+  if (!snapshot?.final_report_accepted) return false;
+  if (!jobId || !snapshot.job_id) return true;
+  return String(snapshot.job_id) === String(jobId);
+}
+
+function describeTransportError(value) {
+  if (value instanceof Error) return value.message;
+  const record = readPlainRecord(value);
+  if (!record) return String(value || "");
+  return [
+    record.status ? `HTTP ${record.status}` : "",
+    record.text,
+    record.message,
+    record.error,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function isRunningJobNotFoundOrNotOwned(value) {
+  return /RUNNING_JOB_NOT_FOUND_OR_NOT_OWNED|running_job_not_found|running job not found|not found or not owned/i.test(
+    describeTransportError(value)
+  );
+}
+
+function recordPostCompletionTransportWarning(value, stage, jobId, state = terminalReportState) {
+  if (!isTerminalReportLockedForJob(jobId, state) || !isRunningJobNotFoundOrNotOwned(value)) {
+    return false;
+  }
+
+  state.postCompletionWarningCount += 1;
+  state.snapshot = Object.freeze({
+    ...state.snapshot,
+    post_completion_transport_warning: true,
+    post_completion_warning_count: state.postCompletionWarningCount,
+  });
+  console.warn(
+    `[worker] post_completion_transport_warning stage=${stage} job=${jobId || "unknown"} count=${state.postCompletionWarningCount}: ${describeTransportError(value)}`
+  );
+  return true;
 }
 
 function quoteWindowsCmdArg(value) {
@@ -487,6 +753,10 @@ async function request(path, options = {}) {
 }
 
 async function sendHeartbeat(jobId, attemptId = null) {
+  if (isTerminalReportLockedForJob(jobId)) {
+    return { ok: true, skipped: "terminal_report_locked" };
+  }
+
   const response = await request("/api/worker/heartbeat", {
     method: "POST",
     body: JSON.stringify({
@@ -499,10 +769,21 @@ async function sendHeartbeat(jobId, attemptId = null) {
 
   if (!response.ok) {
     const text = await response.text();
+    if (
+      recordPostCompletionTransportWarning(
+        { status: response.status, text },
+        "worker_heartbeat",
+        jobId
+      )
+    ) {
+      return { ok: true, warning: "post_completion_transport_warning" };
+    }
     throw new Error(
       `心跳上报失败 HTTP ${response.status}: ${text}`
     );
   }
+
+  return { ok: true };
 }
 
 function startHeartbeat(jobId, attemptId = null) {
@@ -516,6 +797,9 @@ function startHeartbeat(jobId, attemptId = null) {
     try {
       await sendHeartbeat(jobId, attemptId);
     } catch (error) {
+      if (recordPostCompletionTransportWarning(error, "worker_heartbeat", jobId)) {
+        return;
+      }
       console.error(
         `任务 ${jobId} 心跳失败：`,
         error instanceof Error ? error.message : error
@@ -527,10 +811,10 @@ function startHeartbeat(jobId, attemptId = null) {
 
   const timer = setInterval(send, 60 * 1000);
 
-  return () => {
+  return registerTerminalTimerStopper("heartbeat", () => {
     stopped = true;
     clearInterval(timer);
-  };
+  });
 }
 const GIT_AUTO_COMMIT =
   String(process.env.GIT_AUTO_COMMIT || "true").toLowerCase() === "true";
@@ -3258,7 +3542,7 @@ function normalizeTerminalStatus(value) {
 
 function normalizeFailureCodeValue(value) {
   const text = String(value || "").trim();
-  if (!text || /^null|none|n\/a$/i.test(text)) {
+  if (!text || /^(null|none|n\/a|not[_ -]?provided|undefined)$/i.test(text)) {
     return null;
   }
 
@@ -3414,7 +3698,48 @@ function normalizeWorkerFinalResult(input = {}) {
   ]
     .filter(Boolean)
     .join("\n");
+  const jobResult = readPlainRecord(job.result);
+  const acceptedFinalReportData =
+    readAcceptedFinalReportData(
+      input.acceptedFinalReportResponse ||
+        input.accepted_final_report_response ||
+        input.finalReportResponse ||
+        input.final_report_response
+    ) ||
+    readProjectDirectorReportData(jobResult?.project_director_report) ||
+    null;
+  const terminalSnapshot =
+    readPlainRecord(input.terminalStatusSnapshot) ||
+    readPlainRecord(input.terminal_status_snapshot) ||
+    readPlainRecord(input.effectiveFinalStatusSnapshot) ||
+    readPlainRecord(input.effective_final_status_snapshot) ||
+    null;
+  const readSnapshotRawField = (...keys) => {
+    for (const source of [acceptedFinalReportData, terminalSnapshot]) {
+      if (!source) continue;
+      for (const key of keys) {
+        if (Object.prototype.hasOwnProperty.call(source, key)) {
+          const value = source[key];
+          if (value !== undefined && value !== null) return value;
+        }
+      }
+    }
+    return null;
+  };
+  const readSnapshotField = (...keys) => {
+    for (const source of [acceptedFinalReportData, terminalSnapshot]) {
+      if (!source) continue;
+      for (const key of keys) {
+        const value = source[key];
+        if (value !== undefined && value !== null && String(value).trim() !== "") {
+          return value;
+        }
+      }
+    }
+    return null;
+  };
   const requestedStatus =
+    readSnapshotField("effective_final_status", "effectiveFinalStatus") ||
     input.effective_final_status ||
     input.effectiveFinalStatus ||
     readStructuredResultField(reportText, "effective_final_status") ||
@@ -3427,12 +3752,14 @@ function normalizeWorkerFinalResult(input = {}) {
       ? normalizeTerminalStatus(input.previousEffectiveFinalStatus) || "running"
       : normalizeTerminalStatus(requestedStatus) || "running";
   const approvedBatch =
+    readNullableReportString(readSnapshotField("approved_batch", "approvedBatch", "batch_code", "batchCode")) ||
     readString(input.approved_batch) ||
     readString(input.approvedBatch) ||
     readStructuredResultField(reportText, "approved_batch") ||
     getJobBatchCode(job) ||
     null;
   const rawFailureCode =
+    readSnapshotField("failure_code", "failureCode", "error_code", "errorCode") ||
     input.failure_code ||
     input.failureCode ||
     readStructuredResultField(reportText, "failure_code") ||
@@ -3446,7 +3773,8 @@ function normalizeWorkerFinalResult(input = {}) {
       : null;
   const failureStage =
     effectiveFinalStatus === "failed"
-      ? readString(input.failure_stage) ||
+      ? readNullableReportString(readSnapshotField("failure_stage", "failureStage")) ||
+        readString(input.failure_stage) ||
         readString(input.failureStage) ||
         readStructuredResultField(reportText, "failure_stage") ||
         (failureCode === "GIT_SYNC_FAILED" ? "git_sync_preflight" : null) ||
@@ -3456,6 +3784,7 @@ function normalizeWorkerFinalResult(input = {}) {
         null
       : null;
   const nextBatch =
+    readNullableReportString(readSnapshotField("next_batch", "nextBatch")) ||
     readString(input.next_batch) ||
     readString(input.nextBatch) ||
     extractNextBatchFromText(reportText) ||
@@ -3470,29 +3799,73 @@ function normalizeWorkerFinalResult(input = {}) {
       null,
     approved_batch: approvedBatch,
     worker_execution_status:
+      readNullableReportString(readSnapshotField("worker_execution_status", "workerExecutionStatus")) ||
       readString(input.worker_execution_status) ||
       readStructuredResultField(reportText, "worker_execution_status") ||
       null,
     task_goal_status:
+      readNullableReportString(readSnapshotField("task_goal_status", "taskGoalStatus")) ||
       readString(input.task_goal_status) ||
       readStructuredResultField(reportText, "task_goal_status") ||
       null,
     final_report_status:
-      normalizeTerminalStatus(input.final_report_status || input.finalReportStatus || input.status) ||
+      normalizeTerminalStatus(
+        readSnapshotField("final_report_status", "finalReportStatus") ||
+          input.final_report_status ||
+          input.finalReportStatus ||
+          input.status
+      ) ||
       null,
     effective_final_status: effectiveFinalStatus,
     failure_code: failureCode,
     failure_stage: failureStage,
-    changed_files: uniqueSortedPaths(readStringList(input.changed_files || input.files_changed)),
+    changed_files: uniqueSortedPaths(
+      readStringList(
+        readSnapshotRawField("changed_files", "changedFiles", "files_changed", "filesChanged") ||
+          input.changed_files ||
+          input.files_changed
+      )
+    ),
     git_commit_sha:
+      readNullableReportString(readSnapshotField("git_commit_sha", "gitCommitSha")) ||
       readString(input.git_commit_sha) ||
       readString(input.gitCommitSha) ||
       readString(job.git_commit_sha) ||
       null,
     pushed:
-      typeof input.pushed === "boolean"
-        ? input.pushed
-        : readNullableBooleanFlag(input.pushed) || false,
+      readReportPushFlag(
+        readSnapshotField("git_push", "gitPush", "pushed"),
+        readSnapshotField("github_push_status", "githubPushStatus"),
+        readSnapshotField("deploy_status", "deployStatus"),
+        input.git_push,
+        input.gitPush,
+        input.pushed,
+        input.github_push_status,
+        input.githubPushStatus,
+        input.deploy_status,
+        input.deployStatus
+      ),
+    git_push:
+      readReportPushFlag(
+        readSnapshotField("git_push", "gitPush", "pushed"),
+        readSnapshotField("github_push_status", "githubPushStatus"),
+        readSnapshotField("deploy_status", "deployStatus"),
+        input.git_push,
+        input.gitPush,
+        input.pushed,
+        input.github_push_status,
+        input.githubPushStatus,
+        input.deploy_status,
+        input.deployStatus
+      ),
+    post_completion_transport_warning:
+      readBooleanFlag(readSnapshotField("post_completion_transport_warning", "postCompletionTransportWarning")) ||
+      readBooleanFlag(input.post_completion_transport_warning) ||
+      readBooleanFlag(input.postCompletionTransportWarning),
+    post_completion_warning_count:
+      Number(readSnapshotField("post_completion_warning_count", "postCompletionWarningCount")) ||
+      Number(input.post_completion_warning_count || input.postCompletionWarningCount) ||
+      0,
     next_batch: nextBatch,
     next_stage_allowed:
       typeof input.next_stage_allowed === "boolean"
@@ -3529,12 +3902,23 @@ function buildTerminalJobIndex(finalResult) {
       typeof finalResult?.pushed === "boolean"
         ? finalResult.pushed
         : readNullableBooleanFlag(finalResult?.pushed) || false,
+    git_push:
+      typeof finalResult?.git_push === "boolean"
+        ? finalResult.git_push
+        : readNullableBooleanFlag(finalResult?.git_push) ||
+          readNullableBooleanFlag(finalResult?.pushed) ||
+          false,
     next_batch: finalResult?.next_batch || null,
     next_stage_allowed:
       typeof finalResult?.next_stage_allowed === "boolean"
         ? finalResult.next_stage_allowed
         : readNullableBooleanFlag(finalResult?.next_stage_allowed) || false,
     reply_error: finalResult?.reply_error || null,
+    post_completion_transport_warning: readBooleanFlag(
+      finalResult?.post_completion_transport_warning
+    ),
+    post_completion_warning_count:
+      Number(finalResult?.post_completion_warning_count) || 0,
     completed_at: finalResult?.completed_at || null,
   };
 }
@@ -5645,6 +6029,11 @@ function startCodexHeartbeat(job) {
     if (stopped) {
       return;
     }
+    if (isTerminalReportLockedForJob(jobId)) {
+      stopped = true;
+      clearInterval(timer);
+      return;
+    }
 
     try {
       await updateProgress(
@@ -5654,6 +6043,9 @@ function startCodexHeartbeat(job) {
         "Codex 仍在运行，Worker 心跳正常"
       );
     } catch (error) {
+      if (recordPostCompletionTransportWarning(error, "worker_progress", jobId)) {
+        return;
+      }
       console.warn(
         "Codex 执行期间心跳上报异常：",
         error instanceof Error ? error.message : String(error)
@@ -5661,10 +6053,10 @@ function startCodexHeartbeat(job) {
     }
   }, CODEX_PROGRESS_HEARTBEAT_INTERVAL_MS);
 
-  return () => {
+  return registerTerminalTimerStopper("progress", () => {
     stopped = true;
     clearInterval(timer);
-  };
+  });
 }
 
 function runCodex(prompt, job) {
@@ -5815,6 +6207,10 @@ async function updateProgress(
   statusMessage = "",
   attemptId = null
 ) {
+  if (isTerminalReportLockedForJob(jobId)) {
+    return true;
+  }
+
   try {
     const response = await request("/api/worker/progress", {
       method: "POST",
@@ -5832,6 +6228,15 @@ async function updateProgress(
     const text = await response.text();
 
     if (!response.ok) {
+      if (
+        recordPostCompletionTransportWarning(
+          { status: response.status, text },
+          "worker_progress",
+          jobId
+        )
+      ) {
+        return true;
+      }
       console.warn(
         `任务进度上报失败 HTTP ${response.status}: ${text}`
       );
@@ -5844,6 +6249,9 @@ async function updateProgress(
 
     return true;
   } catch (error) {
+    if (recordPostCompletionTransportWarning(error, "worker_progress", jobId)) {
+      return true;
+    }
     console.warn(
       "任务进度上报异常：",
       error instanceof Error ? error.message : String(error)
@@ -5893,7 +6301,28 @@ async function report(jobId, status, payload, extra = {}) {
     throw new Error(`上报失败 HTTP ${response.status}: ${text}`);
   }
 
+  let responseBody = null;
+  try {
+    responseBody = text ? JSON.parse(text) : null;
+  } catch (_) {
+    responseBody = null;
+  }
+
+  const terminalStatus = normalizeTerminalStatus(status);
+  if (["succeeded", "failed", "cancelled"].includes(terminalStatus)) {
+    lockAcceptedTerminalReportSnapshot({
+      status,
+      reportBody: body,
+      acceptedFinalReportResponse: responseBody,
+    });
+  }
+
   console.log(`任务 ${jobId} 已上报为 ${status}`);
+  return {
+    ok: true,
+    response: responseBody,
+    terminal_snapshot: getTerminalReportSnapshot(),
+  };
 }
 
 async function pollOnce() {
@@ -5925,6 +6354,7 @@ async function pollOnce() {
 
   working = true;
   currentAttemptId = attemptId;
+  resetTerminalReportState();
 
   console.log(`领取任务： ${job.id}`);
   console.log(`执行尝试： ${attemptId || "legacy-no-attempt-id"}`);
@@ -6124,14 +6554,24 @@ async function pollOnce() {
 
     const completedAt = new Date().toISOString();
     const approvedBatchForReport = initialContract.approved_batch || getJobBatchCode(job);
+    const successWorkerExecutionStatus = "succeeded";
+    const successTaskGoalStatus = readOnlyMode
+      ? "completed_read_only_no_file_changes"
+      : gitResult.filesChanged?.length
+      ? "completed_with_file_changes"
+      : "completed_no_file_change_required";
     const normalizedFinalResult = normalizeWorkerFinalResult({
       job,
       status: "succeeded",
       finalReportStatus: "succeeded",
       effectiveFinalStatus: "succeeded",
+      worker_execution_status: successWorkerExecutionStatus,
+      task_goal_status: successTaskGoalStatus,
       resultText: result,
       approvedBatch: approvedBatchForReport,
+      changed_files: gitResult.filesChanged || [],
       gitCommitSha: gitResult.commitSha || null,
+      pushed: pushResult.pushed,
       nextBatch: extractNextBatchFromText(result),
       completedAt,
     });
@@ -6163,17 +6603,9 @@ async function pollOnce() {
       "",
       "Worker / task status:",
       "Worker execution: succeeded",
-      "Worker execution status: succeeded",
-      readOnlyMode
-        ? "Task goal: completed_read_only_no_file_changes"
-        : gitResult.filesChanged?.length
-        ? "Task goal: completed_with_file_changes"
-        : "Task goal: completed_no_file_change_required",
-      readOnlyMode
-        ? "Task goal status: completed_read_only_no_file_changes"
-        : gitResult.filesChanged?.length
-        ? "Task goal status: completed_with_file_changes"
-        : "Task goal status: completed_no_file_change_required",
+      `Worker execution status: ${successWorkerExecutionStatus}`,
+      `Task goal: ${successTaskGoalStatus}`,
+      `Task goal status: ${successTaskGoalStatus}`,
       `task_domain: ${classifyWorkerTaskDomain(getJobText(job))}`,
       `task_mode: ${taskModeForReport}`,
       `read_only_mode: ${readOnlyMode ? "true" : "false"}`,
@@ -6281,6 +6713,8 @@ async function pollOnce() {
         read_only_mode: readOnlyMode,
         task_mode: taskModeForReport,
         original_worker_status: "succeeded",
+        worker_execution_status: successWorkerExecutionStatus,
+        task_goal_status: successTaskGoalStatus,
         effective_final_status: normalizedFinalResult.effective_final_status,
         failure_memory_status: normalizedFinalResult.failure_memory_status,
         failure_code: normalizedFinalResult.failure_code,
@@ -6294,6 +6728,8 @@ async function pollOnce() {
         out_of_scope_business_change: false,
         git_commit_sha:
           gitResult.commitSha || null,
+        git_push: pushResult.pushed,
+        pushed: pushResult.pushed,
         deploy_status:
           pushResult.pushed
             ? "pending"
@@ -6344,15 +6780,62 @@ async function pollOnce() {
 
     const completedAt = new Date().toISOString();
     const approvedBatchForReport = initialContract.approved_batch || getJobBatchCode(job);
+    const failureWorkerExecutionStatus =
+      errorCode === NO_FIX_APPLIED
+        ? "succeeded_until_task_goal_validation"
+        : errorCode === MISSING_REQUIRED_DOCS ||
+          errorCode === INSUFFICIENT_DOC_OUTPUT
+        ? "succeeded_until_required_docs_validation"
+        : errorCode === WORKER_READONLY_CONTEXT_INCOMPLETE
+        ? "succeeded_until_worker_readonly_context_validation"
+        : errorCode === READ_ONLY_MODE_VIOLATION
+        ? "succeeded_until_read_only_validation"
+        : errorCode === INCOMPLETE_QA_REPORT
+        ? "succeeded_until_qa_report_validation"
+        : errorCode === ORIGINAL_BATCH_CONTEXT_MISSING
+        ? "failed_before_codex_original_context_missing"
+        : errorCode === TASK_MODE_MISMATCH
+        ? "succeeded_until_task_mode_validation"
+        : errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+          errorCode === OUT_OF_SCOPE_SYSTEM_CHANGE ||
+          errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION"
+        ? "succeeded_until_scope_validation"
+        : "failed";
+    const failureTaskGoalStatus =
+      errorCode === NO_FIX_APPLIED
+        ? "failed_no_fix_applied"
+        : errorCode === MISSING_REQUIRED_DOCS
+        ? "failed_missing_required_docs"
+        : errorCode === INSUFFICIENT_DOC_OUTPUT
+        ? "failed_insufficient_doc_output"
+        : errorCode === WORKER_READONLY_CONTEXT_INCOMPLETE
+        ? "failed_worker_readonly_context_incomplete"
+        : errorCode === READ_ONLY_MODE_VIOLATION
+        ? "failed_read_only_mode_violation"
+        : errorCode === INCOMPLETE_QA_REPORT
+        ? "failed_incomplete_qa_report"
+        : errorCode === ORIGINAL_BATCH_CONTEXT_MISSING
+        ? "failed_original_batch_context_missing"
+        : errorCode === TASK_MODE_MISMATCH
+        ? "failed_task_mode_mismatch"
+        : errorCode === OUT_OF_SCOPE_BUSINESS_CHANGE ||
+          errorCode === OUT_OF_SCOPE_SYSTEM_CHANGE ||
+          errorCode === "BUSINESS_PAGE_BOUNDARY_VIOLATION"
+        ? "failed_out_of_scope_business_change"
+        : "failed";
     const normalizedFinalResult = normalizeWorkerFinalResult({
       job,
       status: "failed",
       finalReportStatus: "failed",
       effectiveFinalStatus: "failed",
+      worker_execution_status: failureWorkerExecutionStatus,
+      task_goal_status: failureTaskGoalStatus,
       error,
       errorText: error instanceof Error ? error.message : String(error),
       approvedBatch: approvedBatchForReport,
+      changed_files: failureChangedPaths,
       gitCommitSha: null,
+      pushed: false,
       completedAt,
     });
 
@@ -6398,6 +6881,8 @@ async function pollOnce() {
         read_only_mode: readOnlyMode,
         task_mode: taskModeForReport,
         original_worker_status: "failed",
+        worker_execution_status: failureWorkerExecutionStatus,
+        task_goal_status: failureTaskGoalStatus,
         effective_final_status: normalizedFinalResult.effective_final_status,
         no_fix_applied: errorCode === NO_FIX_APPLIED,
         read_only_mode_violation: errorCode === READ_ONLY_MODE_VIOLATION,
@@ -6525,6 +7010,8 @@ async function pollOnce() {
         next_batch: normalizedFinalResult.next_batch,
         completed_at: normalizedFinalResult.completed_at,
         git_commit_sha: null,
+        git_push: false,
+        pushed: false,
         deploy_status: null,
       }
     );
@@ -6641,27 +7128,37 @@ module.exports = {
   buildFailureReport,
   buildAutoIterationSuggestion,
   buildTerminalJobIndex,
+  buildTerminalStatusSnapshot,
   buildWorkerGuardedPrompt,
   classifyWorkerTaskDomain,
   classifyFailure,
   commitGitTask,
+  createTerminalReportState,
   extractCurrentExecutionBatchCode,
   extractRequiredChangePaths,
   formatCodexSpawnError,
   formatWorkerFetchError,
+  getTerminalReportSnapshot,
   getCodexFileType,
   getWorkerPollBackoffMs,
   getTaskMode,
   isTrueTaskFailureCode,
+  isRunningJobNotFoundOrNotOwned,
+  isTerminalReportLockedForJob,
+  lockAcceptedTerminalReportSnapshot,
   normalizeWorkerContext,
   normalizeWorkerFinalResult,
   recordFailureMemoryForFinalResult,
   recordFailureMemory,
+  recordPostCompletionTransportWarning,
   recordTerminalJobIndex,
+  registerTerminalTimerStopper,
   resolveCodexExecutable,
   resolveWorkerJobContract,
   runCodexPreflight,
   spawnCodexProcess,
+  resetTerminalReportState,
+  stopTerminalReportTimers,
   getTaskChangedPaths,
   isReadOnlyTask,
   isReadOnlyTaskText,

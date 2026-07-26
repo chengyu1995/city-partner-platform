@@ -1284,7 +1284,7 @@ function normalizeTerminalStatus(value: unknown): "queued" | "running" | "succee
 
 function normalizeFailureCodeValue(value: unknown): string | null {
   const text = readString(value);
-  if (!text || /^(null|none|n\/a)$/i.test(text)) return null;
+  if (!text || /^(null|none|n\/a|not[_ -]?provided|undefined)$/i.test(text)) return null;
   const code = text
     .replace(/([a-z])([A-Z])/g, "$1_$2")
     .replace(/[^A-Za-z0-9]+/g, "_")
@@ -1394,12 +1394,20 @@ export function buildTerminalJobIndex(finalResult: Record<string, unknown>): Rec
       typeof finalResult.pushed === "boolean"
         ? finalResult.pushed
         : readNullableBooleanFlag(finalResult.pushed) ?? false,
+    git_push:
+      typeof finalResult.git_push === "boolean"
+        ? finalResult.git_push
+        : readNullableBooleanFlag(finalResult.git_push) ??
+          readNullableBooleanFlag(finalResult.pushed) ??
+          false,
     next_batch: readString(finalResult.next_batch),
     next_stage_allowed:
       typeof finalResult.next_stage_allowed === "boolean"
         ? finalResult.next_stage_allowed
         : readNullableBooleanFlag(finalResult.next_stage_allowed) ?? false,
     reply_error: readString(finalResult.reply_error),
+    post_completion_transport_warning: readBooleanFlag(finalResult.post_completion_transport_warning),
+    post_completion_warning_count: Number(finalResult.post_completion_warning_count) || 0,
     completed_at: readString(finalResult.completed_at),
   };
 }
@@ -1440,6 +1448,93 @@ export function buildAutoIterationSuggestion(finalResult: Record<string, unknown
   return { action: "none", reason: "non_terminal" };
 }
 
+function readNullableReportString(value: unknown): string | null {
+  const text = readString(value);
+  return text && !/^(null|none|n\/a|not[_ -]?provided|undefined)$/i.test(text)
+    ? text
+    : null;
+}
+
+function readProjectDirectorReportData(value: unknown): Record<string, unknown> | null {
+  const record = readRecord(value);
+  if (!record) return null;
+  return readRecord(record.data) ?? record;
+}
+
+function readAcceptedFinalReportData(
+  input: Record<string, unknown>,
+  jobResult: Record<string, unknown> | null
+): Record<string, unknown> | null {
+  const response = readRecord(
+    input.accepted_final_report_response ??
+      input.acceptedFinalReportResponse ??
+      input.final_report_response ??
+      input.finalReportResponse
+  );
+
+  return (
+    readProjectDirectorReportData(response?.project_director_report) ??
+    readProjectDirectorReportData(readRecord(readRecord(response?.job)?.result)?.project_director_report) ??
+    readProjectDirectorReportData(jobResult?.project_director_report)
+  );
+}
+
+function readTerminalStatusSnapshot(input: Record<string, unknown>): Record<string, unknown> | null {
+  return readRecord(
+    input.terminal_status_snapshot ??
+      input.terminalStatusSnapshot ??
+      input.effective_final_status_snapshot ??
+      input.effectiveFinalStatusSnapshot ??
+      input.terminal_snapshot ??
+      input.terminalSnapshot
+  );
+}
+
+function readPriorityReportField(
+  sources: Array<Record<string, unknown> | null>,
+  ...keys: string[]
+): unknown {
+  for (const source of sources) {
+    if (!source) continue;
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(source, key)) {
+        const value = source[key];
+        if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+      }
+    }
+  }
+  return null;
+}
+
+function readPriorityReportRawField(
+  sources: Array<Record<string, unknown> | null>,
+  ...keys: string[]
+): unknown {
+  for (const source of sources) {
+    if (!source) continue;
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(source, key)) {
+        const value = source[key];
+        if (value !== undefined && value !== null) return value;
+      }
+    }
+  }
+  return null;
+}
+
+function readReportPushFlag(...values: unknown[]): boolean {
+  for (const value of values) {
+    if (typeof value === "boolean") return value;
+    const booleanValue = readNullableBooleanFlag(value);
+    if (booleanValue !== null) return booleanValue;
+    const text = readString(value);
+    if (/^(success|succeeded|pushed|pending|true|yes)$/i.test(String(text ?? "").trim())) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
   job?: JobRecord | null;
   job_id?: string | null;
@@ -1458,17 +1553,39 @@ export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
   failure_stage?: string | null;
   gitCommitSha?: string | null;
   git_commit_sha?: string | null;
+  gitPush?: boolean | string | null;
+  git_push?: boolean | string | null;
+  githubPushStatus?: string | null;
+  github_push_status?: string | null;
+  deployStatus?: string | null;
+  deploy_status?: string | null;
   nextBatch?: string | null;
   next_batch?: string | null;
   completedAt?: string | null;
   completed_at?: string | null;
   approvedBatch?: string | null;
+  terminalStatusSnapshot?: Record<string, unknown> | null;
+  terminal_status_snapshot?: Record<string, unknown> | null;
+  terminalSnapshot?: Record<string, unknown> | null;
+  terminal_snapshot?: Record<string, unknown> | null;
+  acceptedFinalReportResponse?: Record<string, unknown> | null;
+  accepted_final_report_response?: Record<string, unknown> | null;
+  finalReportResponse?: Record<string, unknown> | null;
+  final_report_response?: Record<string, unknown> | null;
+  postCompletionTransportWarning?: boolean | string | null;
+  post_completion_transport_warning?: boolean | string | null;
+  postCompletionWarningCount?: number | string | null;
+  post_completion_warning_count?: number | string | null;
 }): Record<string, unknown> {
   const job = input.job ?? null;
   const jobResult = readRecord(job?.result);
   const projectDirectorReport = readRecord(jobResult?.project_director_report);
+  const acceptedFinalReportData = readAcceptedFinalReportData(input, jobResult);
+  const terminalSnapshot = readTerminalStatusSnapshot(input);
+  const terminalSources = [acceptedFinalReportData, terminalSnapshot];
   const reportText = [input.resultText, input.errorText].filter(Boolean).join("\n");
   const requestedStatus =
+    readPriorityReportField(terminalSources, "effective_final_status", "effectiveFinalStatus") ??
     input.effectiveFinalStatus ??
     input.effective_final_status ??
     readString(projectDirectorReport?.effective_final_status) ??
@@ -1482,6 +1599,9 @@ export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
       ? normalizeTerminalStatus(input.previousEffectiveFinalStatus) ?? "running"
       : normalizeTerminalStatus(requestedStatus) ?? "running";
   const approvedBatch =
+    readNullableReportString(
+      readPriorityReportField(terminalSources, "approved_batch", "approvedBatch", "batch_code", "batchCode")
+    ) ??
     readString(input.approvedBatch) ??
     readString(input.approved_batch) ??
     readString(projectDirectorReport?.approved_batch) ??
@@ -1489,7 +1609,8 @@ export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
   const failureCode =
     effectiveFinalStatus === "failed"
       ? normalizeFailureCodeValue(
-          input.failureCode ??
+          readPriorityReportField(terminalSources, "failure_code", "failureCode", "error_code", "errorCode") ??
+            input.failureCode ??
             input.failure_code ??
             readString(projectDirectorReport?.failure_code) ??
             readDiagnosticLine(reportText, "failure_code") ??
@@ -1499,7 +1620,8 @@ export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
       : null;
   const failureStage =
     effectiveFinalStatus === "failed"
-      ? readString(input.failureStage) ??
+      ? readNullableReportString(readPriorityReportField(terminalSources, "failure_stage", "failureStage")) ??
+        readString(input.failureStage) ??
         readString(input.failure_stage) ??
         readString(projectDirectorReport?.failure_stage) ??
         readDiagnosticLine(reportText, "failure_stage") ??
@@ -1507,6 +1629,7 @@ export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
         readDiagnosticLine(reportText, "失败阶段")
       : null;
   const nextBatch =
+    readNullableReportString(readPriorityReportField(terminalSources, "next_batch", "nextBatch")) ??
     readString(input.nextBatch) ??
     readString(input.next_batch) ??
     readString(projectDirectorReport?.next_batch) ??
@@ -1516,34 +1639,75 @@ export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
     job_id: readString(input.job_id) ?? readString(job?.id) ?? readString(job?.job_id),
     approved_batch: approvedBatch,
     worker_execution_status:
+      readNullableReportString(readPriorityReportField(terminalSources, "worker_execution_status", "workerExecutionStatus")) ??
       readString(input.worker_execution_status) ??
       readString(projectDirectorReport?.worker_execution_status) ??
       readDiagnosticLine(reportText, "worker_execution_status"),
     task_goal_status:
+      readNullableReportString(readPriorityReportField(terminalSources, "task_goal_status", "taskGoalStatus")) ??
       readString(input.task_goal_status) ??
       readString(projectDirectorReport?.task_goal_status) ??
       readDiagnosticLine(reportText, "task_goal_status"),
-    final_report_status: normalizeTerminalStatus(input.final_report_status ?? input.finalReportStatus ?? input.status),
+    final_report_status: normalizeTerminalStatus(
+      readPriorityReportField(terminalSources, "final_report_status", "finalReportStatus") ??
+        input.final_report_status ??
+        input.finalReportStatus ??
+        input.status
+    ),
     effective_final_status: effectiveFinalStatus,
     failure_code: failureCode,
     failure_stage: failureStage,
     changed_files: readStringArray(
-      input.changed_files ??
+      readPriorityReportRawField(terminalSources, "changed_files", "changedFiles", "files_changed", "filesChanged") ??
+        input.changed_files ??
         input.files_changed ??
         projectDirectorReport?.changed_files ??
         projectDirectorReport?.files_changed
     ),
     git_commit_sha:
+      readNullableReportString(readPriorityReportField(terminalSources, "git_commit_sha", "gitCommitSha")) ??
       readString(input.gitCommitSha) ??
       readString(input.git_commit_sha) ??
       readString(projectDirectorReport?.git_commit_sha) ??
       readString(job?.git_commit_sha),
     pushed:
-      typeof input.pushed === "boolean"
-        ? input.pushed
-        : readNullableBooleanFlag(input.pushed) ??
-          readNullableBooleanFlag(projectDirectorReport?.pushed) ??
-          false,
+      readReportPushFlag(
+        readPriorityReportField(terminalSources, "git_push", "gitPush", "pushed"),
+        readPriorityReportField(terminalSources, "github_push_status", "githubPushStatus"),
+        readPriorityReportField(terminalSources, "deploy_status", "deployStatus"),
+        input.git_push,
+        input.gitPush,
+        input.pushed,
+        input.github_push_status,
+        input.githubPushStatus,
+        input.deploy_status,
+        input.deployStatus,
+        projectDirectorReport?.pushed
+      ),
+    git_push:
+      readReportPushFlag(
+        readPriorityReportField(terminalSources, "git_push", "gitPush", "pushed"),
+        readPriorityReportField(terminalSources, "github_push_status", "githubPushStatus"),
+        readPriorityReportField(terminalSources, "deploy_status", "deployStatus"),
+        input.git_push,
+        input.gitPush,
+        input.pushed,
+        input.github_push_status,
+        input.githubPushStatus,
+        input.deploy_status,
+        input.deployStatus,
+        projectDirectorReport?.pushed
+      ),
+    post_completion_transport_warning:
+      readBooleanFlag(
+        readPriorityReportField(terminalSources, "post_completion_transport_warning", "postCompletionTransportWarning")
+      ) ||
+      readBooleanFlag(input.post_completion_transport_warning) ||
+      readBooleanFlag(input.postCompletionTransportWarning),
+    post_completion_warning_count:
+      Number(readPriorityReportField(terminalSources, "post_completion_warning_count", "postCompletionWarningCount")) ||
+      Number(input.post_completion_warning_count ?? input.postCompletionWarningCount) ||
+      0,
     next_batch: nextBatch,
     next_stage_allowed:
       typeof input.next_stage_allowed === "boolean"
@@ -2397,6 +2561,7 @@ export function buildProjectDirectorWorkerReport(input: {
     approvedBatch: readString(contract.approved_batch) ?? batchCode,
   });
   const effectiveFinalStatus = readString(normalizedFinalResult.effective_final_status) ?? legacyEffectiveFinalStatus;
+  const finalReportStatus = readString(normalizedFinalResult.final_report_status) ?? input.status;
   const failureCode = readString(normalizedFinalResult.failure_code);
   const nextBatch = readString(normalizedFinalResult.next_batch);
   const failureMemoryStatus = readString(normalizedFinalResult.failure_memory_status) ?? "skipped_non_terminal";
@@ -2405,6 +2570,10 @@ export function buildProjectDirectorWorkerReport(input: {
   const autoIterationSuggestion =
     readRecord(normalizedFinalResult.auto_iteration_suggestion) ??
     buildAutoIterationSuggestion(normalizedFinalResult);
+  const terminalChangedFiles = readStringArray(normalizedFinalResult.changed_files);
+  const terminalGitCommitSha = readString(normalizedFinalResult.git_commit_sha) ?? gitCommitSha;
+  const terminalGitPush = readReportPushFlag(normalizedFinalResult.git_push, normalizedFinalResult.pushed, pushed);
+  const terminalCommitted = Boolean(terminalGitCommitSha);
   needsBossConfirmation = effectiveFinalStatus === "succeeded";
   const failureStage = effectiveFinalStatus === "failed"
     ? readString(normalizedFinalResult.failure_stage) ?? "task_goal_validation"
@@ -2425,7 +2594,9 @@ export function buildProjectDirectorWorkerReport(input: {
   const failureSuggestion = effectiveFinalStatus === "failed"
     ? buildFailureNextStep(sanitizedError)
     : null;
-  const reportedWorkerExecutionStatus = readString(input.workerExecutionStatus);
+  const reportedWorkerExecutionStatus =
+    readString(normalizedFinalResult.worker_execution_status) ??
+    readString(input.workerExecutionStatus);
   const workerExecutionStatus =
     reportedWorkerExecutionStatus ??
     (workerReadOnlyContextIncomplete
@@ -2443,7 +2614,9 @@ export function buildProjectDirectorWorkerReport(input: {
               : input.status === "succeeded"
                 ? "succeeded"
                 : input.status);
-  const reportedTaskGoalStatus = readString(input.taskGoalStatus);
+  const reportedTaskGoalStatus =
+    readString(normalizedFinalResult.task_goal_status) ??
+    readString(input.taskGoalStatus);
   const taskGoalStatus =
     reportedTaskGoalStatus ??
     (workerReadOnlyContextIncomplete
@@ -2499,7 +2672,7 @@ export function buildProjectDirectorWorkerReport(input: {
     attempt_id: input.attemptId,
     status: input.status,
     original_worker_status: input.status,
-    final_report_status: input.status,
+    final_report_status: finalReportStatus,
     effective_final_status: effectiveFinalStatus,
     failure_memory_status: failureMemoryStatus,
     failure_code: failureCode,
@@ -2550,14 +2723,17 @@ export function buildProjectDirectorWorkerReport(input: {
     missing_required_docs: missingRequiredDocs,
     insufficient_doc_output: insufficientDocOutput,
     no_op_run: noOpRun,
-    committed,
-    pushed,
+    committed: terminalCommitted,
+    pushed: terminalGitPush,
+    git_push: terminalGitPush,
+    post_completion_transport_warning: readBooleanFlag(normalizedFinalResult.post_completion_transport_warning),
+    post_completion_warning_count: Number(normalizedFinalResult.post_completion_warning_count) || 0,
     what_changed: sanitizeReportText(summary),
-    changed_files: filesChanged,
-    files_changed: filesChanged,
+    changed_files: terminalChangedFiles,
+    files_changed: terminalChangedFiles,
     validation_result: validation,
-    git_commit_sha: gitCommitSha ?? null,
-    commit_hash: gitCommitSha ?? null,
+    git_commit_sha: terminalGitCommitSha ?? null,
+    commit_hash: terminalGitCommitSha ?? null,
     github_push_status: githubPushStatus,
     deploy_status: input.deployStatus ?? null,
     safety_boundary: safetyBoundary,
@@ -2608,15 +2784,20 @@ export function buildProjectDirectorWorkerReport(input: {
     `batch_code: ${placeholder(readString(contract.approved_batch) ?? batchCode)}`,
     `worker_stage: ${placeholder(readString(contract.worker_stage))}`,
     `workflow_stage: ${data.workflow_stage}`,
-    `final_report_status: ${input.status}`,
+    `final_report_status: ${finalReportStatus}`,
     `effective_final_status: ${effectiveFinalStatus}`,
     `failure_memory_status: ${failureMemoryStatus}`,
     `failure_code: ${failureCode ?? "null"}`,
     `next_batch: ${nextBatch ?? "null"}`,
     `completed_at: ${readString(normalizedFinalResult.completed_at) ?? "null"}`,
-    `changed_files: ${filesChanged.length ? filesChanged.join(", ") : "[]"}`,
-    `git_commit_sha: ${gitCommitSha ?? "null"}`,
-    `pushed: ${pushed ? "true" : "false"}`,
+    `changed_files: ${terminalChangedFiles.length ? terminalChangedFiles.join(", ") : "[]"}`,
+    `git_commit_sha: ${terminalGitCommitSha ?? "null"}`,
+    `pushed: ${terminalGitPush ? "true" : "false"}`,
+    `git_push: ${terminalGitPush ? "true" : "false"}`,
+    `post_completion_transport_warning: ${
+      readBooleanFlag(normalizedFinalResult.post_completion_transport_warning) ? "true" : "false"
+    }`,
+    `post_completion_warning_count: ${Number(normalizedFinalResult.post_completion_warning_count) || 0}`,
     `deploy_status: ${input.deployStatus ?? "null"}`,
     `Worker execution status: ${workerExecutionStatus}`,
     `Task goal status: ${taskGoalStatus}`,
@@ -2637,8 +2818,8 @@ export function buildProjectDirectorWorkerReport(input: {
     `missing_required_docs: ${missingRequiredDocs}`,
     `insufficient_doc_output: ${insufficientDocOutput ? "yes" : "no"}`,
     `No-op run: ${noOpRun ? "yes" : "no"}`,
-    `Committed: ${committed ? "yes" : "no"}`,
-    `Pushed: ${pushed ? "yes" : "no"}`,
+    `Committed: ${terminalCommitted ? "yes" : "no"}`,
+    `Pushed: ${terminalGitPush ? "yes" : "no"}`,
     "",
     "本阶段性质：",
     batchCode
@@ -2651,7 +2832,7 @@ export function buildProjectDirectorWorkerReport(input: {
     input.status === "failed" ? `关键错误：${keyError || "未提供"}` : "",
     "",
     "修改文件：",
-    ...listLines(filesChanged, "未提供"),
+    ...listLines(terminalChangedFiles, "未提供"),
     "",
     "完成内容：",
     ...numberedLines(completionItems, input.status === "failed" ? "任务失败，未生成完成内容" : "未提供"),
@@ -2663,7 +2844,7 @@ export function buildProjectDirectorWorkerReport(input: {
     ...listLines(safetyBoundary, "未提供"),
     "",
     "Git 自动备份：",
-    `commit SHA：${gitCommitSha || "未生成"}`,
+    `commit SHA：${terminalGitCommitSha || "未生成"}`,
     `GitHub 推送状态：${placeholder(githubPushStatus)}`,
     "",
     "下一步建议：",
