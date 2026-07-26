@@ -36,11 +36,13 @@ const {
   INSUFFICIENT_DOC_OUTPUT,
   INCOMPLETE_QA_REPORT,
   INCOMPLETE_ARCHITECTURE_REPORT,
+  WORKER_READONLY_CONTEXT_INCOMPLETE,
   CONTEXT_MISSING_WARNING,
   TASK_MODES,
   assertGitOperationAllowed,
   assertOriginalBatchContextAvailable,
   assertQaTaskOutcome,
+  assertWorkerReadOnlyTaskGoalComplete,
   assertTaskGoalApplied,
   assertExplicitTaskFieldsNotOverridden,
   buildCodexPrompt,
@@ -3552,6 +3554,158 @@ test("Codex prompt git operation guard", async (t) => {
       prompt,
       /Codex 应理解为外层 Worker 的验收目标，而不是自己执行 Git/
     );
+  });
+});
+
+test("worker_read_only context preservation and goal validation", async (t) => {
+  const batchCode = "BATCH-ARCH-COMPLETE-01-WORKER-READONLY-CONTEXT-PRESERVATION-FIX-04";
+  const originalRequest = [
+    `Original task: execute ${batchCode}`,
+    "task_goal: complete a read-only audit for remote branch refs, production file hashes, and patched directory contents.",
+    "required_output_fields: remote_branch_audit, production_file_hashes, patched_directory_audit",
+    "acceptance_conditions: all required audit sections are present and no write operation is performed.",
+    "forbidden_scope: file writes, Git writes, database writes, deployment",
+    "read_only_operations: inspect remote branch refs; inspect production file hashes; inspect patched directory contents",
+  ].join("\n");
+  const job = {
+    id: "job-worker-readonly-context",
+    request_text: `Approved execution for ${batchCode}.`,
+    payload: {
+      project_domain: "automation_system",
+      task_mode: "worker_read_only",
+      read_only_mode: true,
+      original_request_text: originalRequest,
+      approved_batch: batchCode,
+      exact_allowed_scope_count: 0,
+      readable_scope: "origin/master refs, production file hashes, patched/**",
+      read_only_operations: [
+        "remote branch refs audit",
+        "production file hashes audit",
+        "patched directory audit",
+      ],
+      forbidden_operations: [
+        "file writes",
+        "apply_patch",
+        "git add",
+        "git commit",
+        "git push",
+        "checkout",
+        "merge",
+        "rebase",
+        "reset",
+        "deployment",
+        "database writes",
+      ],
+      forbidden_scope: "file writes, Git writes, database writes, deployment",
+      task_goal: "complete a read-only audit for remote branch refs, production file hashes, and patched directory contents.",
+      required_output_fields: [
+        "remote_branch_audit",
+        "production_file_hashes",
+        "patched_directory_audit",
+      ],
+      acceptance_conditions: "all required audit sections are present and no write operation is performed.",
+    },
+  };
+
+  await t.test("exact_allowed_scope_count zero preserves full original_request_text in Codex prompt", () => {
+    const contract = resolveWorkerJobContract(job);
+    const prompt = buildCodexPrompt(job);
+
+    assert.equal(contract.task_mode, "worker_read_only");
+    assert.equal(contract.read_only_mode, true);
+    assert.equal(contract.exact_allowed_scope_count, "0");
+    assert.equal(contract.writable_scope, "[]");
+    assert.equal(contract.original_request_text, originalRequest);
+    assert.equal(contract.original_request_text_preserved, true);
+    assert.match(prompt, /Original task: execute BATCH-ARCH-COMPLETE-01-WORKER-READONLY-CONTEXT-PRESERVATION-FIX-04/);
+    assert.match(prompt, /exact_allowed_scope_count: 0/);
+    assert.match(prompt, /writable_scope: \[\]/);
+  });
+
+  await t.test("remote branch, production hash and patched audit do not fall back to generic git status diff", () => {
+    const prompt = buildCodexPrompt(job);
+
+    assert.match(prompt, /remote branch refs audit/);
+    assert.match(prompt, /production file hashes audit/);
+    assert.match(prompt, /patched directory audit/);
+    assert.doesNotMatch(prompt, /【原始任务内容】\s*(?:git status|git diff)\s*$/i);
+  });
+
+  await t.test("required_output_fields are passed intact", () => {
+    const contract = resolveWorkerJobContract(job);
+    const prompt = buildCodexPrompt(job);
+
+    assert.match(contract.required_output_fields, /remote_branch_audit/);
+    assert.match(contract.required_output_fields, /production_file_hashes/);
+    assert.match(contract.required_output_fields, /patched_directory_audit/);
+    assert.match(prompt, /required_output_fields:[\s\S]*remote_branch_audit/);
+    assert.match(prompt, /required_output_fields:[\s\S]*production_file_hashes/);
+    assert.match(prompt, /required_output_fields:[\s\S]*patched_directory_audit/);
+  });
+
+  await t.test("missing original_request_text fails closed", () => {
+    const missingOriginalJob = {
+      ...job,
+      payload: {
+        ...job.payload,
+        original_request_text: undefined,
+        originalRequestText: undefined,
+        original_request_text_base64: undefined,
+      },
+    };
+
+    assert.throws(
+      () => buildCodexPrompt(missingOriginalJob),
+      (error) =>
+        error.code === WORKER_READONLY_CONTEXT_INCOMPLETE &&
+        error.missingWorkerReadonlyContextFields.includes("original_request_text")
+    );
+  });
+
+  await t.test("missing required output fields fail task goal", () => {
+    assert.doesNotThrow(() =>
+      assertWorkerReadOnlyTaskGoalComplete(
+        job,
+        [
+          "remote_branch_audit: complete",
+          "production_file_hashes: complete",
+          "patched_directory_audit: complete",
+        ].join("\n")
+      )
+    );
+
+    assert.throws(
+      () =>
+        assertWorkerReadOnlyTaskGoalComplete(
+          job,
+          [
+            "remote_branch_audit: complete",
+            "production_file_hashes: complete",
+          ].join("\n")
+        ),
+      (error) =>
+        error.code === WORKER_READONLY_CONTEXT_INCOMPLETE &&
+        error.failureStage === "worker_readonly_required_output_validation" &&
+        error.missingRequiredOutputFields.includes("patched_directory_audit")
+    );
+  });
+
+  await t.test("git write and history commands stay blocked in worker_read_only", () => {
+    const blocked = ["add", "commit", "push", "checkout", "merge", "rebase", "reset"];
+    for (const subcommand of blocked) {
+      assert.throws(
+        () =>
+          assertGitOperationAllowed([subcommand, "target"], {
+            readOnlyMode: true,
+          }),
+        (error) => error.code === READ_ONLY_MODE_VIOLATION
+      );
+    }
+
+    const prompt = buildCodexPrompt(job);
+    assert.match(prompt, /apply_patch/);
+    assert.match(prompt, /deployment/);
+    assert.match(prompt, /database writes/);
   });
 });
 

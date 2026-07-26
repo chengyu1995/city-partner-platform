@@ -756,6 +756,7 @@ const MISSING_REQUIRED_DOCS = "MISSING_REQUIRED_DOCS";
 const INSUFFICIENT_DOC_OUTPUT = "INSUFFICIENT_DOC_OUTPUT";
 const INCOMPLETE_QA_REPORT = "INCOMPLETE_QA_REPORT";
 const INCOMPLETE_ARCHITECTURE_REPORT = "INCOMPLETE_ARCHITECTURE_REPORT";
+const WORKER_READONLY_CONTEXT_INCOMPLETE = "WORKER_READONLY_CONTEXT_INCOMPLETE";
 const CONTEXT_MISSING_WARNING = "CONTEXT_MISSING_WARNING";
 
 const TASK_MODES = {
@@ -1093,6 +1094,7 @@ const TRUE_TASK_FAILURE_CODES = new Set([
   "INSUFFICIENT_DOC_OUTPUT",
   "INCOMPLETE_QA_REPORT",
   "INCOMPLETE_ARCHITECTURE_REPORT",
+  "WORKER_READONLY_CONTEXT_INCOMPLETE",
   "TEST_FAILED",
   "TYPESCRIPT_FAILED",
   "OUT_OF_SCOPE_CHANGE",
@@ -1137,6 +1139,17 @@ const NON_TASK_FAILURE_PATTERNS = [
     pattern: /progress.*(?:report|上报).*(?:fail|failed|失败)|任务进度上报失败|\/api\/worker\/progress/i,
   },
 ];
+
+const READ_ONLY_BLOCKED_GIT_SUBCOMMANDS = new Set([
+  "add",
+  "commit",
+  "push",
+  "checkout",
+  "switch",
+  "merge",
+  "rebase",
+  "reset",
+]);
 
 function readTextValue(value) {
   if (value == null) return "";
@@ -1945,7 +1958,7 @@ function isExplicitAutomationAllowedDocPath(filePath) {
 }
 
 const HERMES_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|exact_allowed_scope|forbidden_scope|route|original_request_text(?:_base64)?|approved_batch|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_mode|read_only_mode|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|route|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName) {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -2142,6 +2155,143 @@ function readScopeValue(value) {
   return readString(value);
 }
 
+function readContractTextValue(value) {
+  const items = readStringList(value);
+  if (items.length > 0) return items.join("\n");
+  const text = readTextValue(value).trim();
+  return text || null;
+}
+
+function firstPresentValue(...values) {
+  return values.find(
+    (value) =>
+      value !== null &&
+      value !== undefined &&
+      !(typeof value === "string" && value.trim() === "")
+  );
+}
+
+function stripListMarker(value) {
+  return String(value || "")
+    .replace(/^\s*(?:[-*]|\d+[.)、])\s*/, "")
+    .trim();
+}
+
+function lineIsTaskSectionHeading(line) {
+  const text = stripListMarker(line).trim();
+  if (!text) return false;
+  if (/^(?:[A-Za-z_][A-Za-z0-9_\s-]{2,60}|[\u4e00-\u9fffA-Za-z0-9_\s/-]{2,60})\s*[:：]\s*$/.test(text)) {
+    return true;
+  }
+  return /^【[^】]+】$/.test(text);
+}
+
+function extractTaskSection(text, headingPatterns, options = {}) {
+  const lines = String(text || "").split(/\r?\n/);
+  const collected = [];
+  let collecting = false;
+  const maxLines = options.maxLines || 30;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!collecting) {
+      const heading = headingPatterns.find((pattern) => pattern.test(line));
+      if (!heading) continue;
+
+      const inlineValue = line.split(/[:：]/).slice(1).join(":").trim();
+      if (inlineValue) return stripListMarker(inlineValue);
+      collecting = true;
+      continue;
+    }
+
+    if (!line) {
+      if (collected.length > 0) break;
+      continue;
+    }
+
+    if (lineIsTaskSectionHeading(line) && !/^\s*(?:[-*]|\d+[.)、])\s+/.test(rawLine)) {
+      break;
+    }
+
+    collected.push(stripListMarker(line));
+    if (collected.length >= maxLines) break;
+  }
+
+  return collected.filter(Boolean).join("\n").trim() || null;
+}
+
+function extractTaskGoalFromText(text) {
+  return extractTaskSection(
+    text,
+    [
+      /\btask[_\s-]*goal\b/i,
+      /\btask[_\s-]*objective\b/i,
+      /本批次唯一目标/,
+      /任务目标/,
+      /修复目标/,
+    ],
+    { maxLines: 6 }
+  );
+}
+
+function extractRequiredOutputFieldsFromText(text) {
+  return extractTaskSection(
+    text,
+    [
+      /\brequired[_\s-]*output[_\s-]*fields\b/i,
+      /\boutput[_\s-]*fields\b/i,
+      /必填输出字段/,
+      /^返回\s*[:：]?\s*$/,
+      /必须输出/,
+    ],
+    { maxLines: 30 }
+  );
+}
+
+function extractAcceptanceConditionsFromText(text) {
+  return extractTaskSection(
+    text,
+    [
+      /\bacceptance[_\s-]*(?:conditions|criteria)\b/i,
+      /验收条件/,
+      /完成条件/,
+    ],
+    { maxLines: 40 }
+  );
+}
+
+function parseRequiredOutputFieldList(value) {
+  return readStringList(value)
+    .flatMap((item) => String(item || "").split(/\r?\n/))
+    .map((item) => stripListMarker(item).replace(/^`|`$/g, "").trim())
+    .map((item) => item.split(/[:：=]/)[0].trim() || item)
+    .filter(Boolean);
+}
+
+function requiredOutputFieldMatchesReport(field, reportText) {
+  const label = String(field || "").trim();
+  if (!label) return true;
+  const report = String(reportText || "");
+  if (report.includes(label)) return true;
+
+  const normalizedLabel = label
+    .replace(/^`|`$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalizedLabel) return true;
+
+  const pattern = new RegExp(
+    escapeRegExp(normalizedLabel).replace(/[_\s-]+/g, "[_\\s-]+"),
+    "i"
+  );
+  return pattern.test(report);
+}
+
+function getMissingWorkerReadOnlyRequiredOutputFields(contract, reportText) {
+  const requiredFields = parseRequiredOutputFieldList(contract.required_output_fields);
+  return requiredFields.filter((field) => !requiredOutputFieldMatchesReport(field, reportText));
+}
+
 const WORKER_CONTEXT_FIELD_NAMES = [
   "context_source",
   "context_reconstruct_failed",
@@ -2150,11 +2300,20 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "read_only_mode",
   "allowed_scope",
   "exact_allowed_scope",
+  "exact_allowed_scope_count",
+  "writable_scope",
+  "readable_scope",
+  "read_only_operations",
+  "forbidden_operations",
   "forbidden_scope",
+  "task_goal",
+  "required_output_fields",
+  "acceptance_conditions",
   "original_request_text",
   "original_request_text_base64",
   "route",
   "approved_batch",
+  "batch_code",
   "attempt_id",
   "worker_stage",
   "workflow_stage",
@@ -2180,6 +2339,7 @@ const WORKER_CONTEXT_CORE_FIELDS = [
 ];
 
 function canonicalWorkerContextFieldName(fieldName) {
+  if (fieldName === "batch_code") return "approved_batch";
   return fieldName === "workflow_stage" ? "worker_stage" : fieldName;
 }
 
@@ -2381,7 +2541,15 @@ function readPayloadContextField(payload, fieldName) {
     read_only_mode: ["read_only_mode", "readOnlyMode", "readonly", "read_only"],
     allowed_scope: ["allowed_scope", "allowedScope", "allowed_files", "allowedFiles"],
     exact_allowed_scope: ["exact_allowed_scope", "exactAllowedScope", "exact_allowed_paths", "exactAllowedPaths"],
+    exact_allowed_scope_count: ["exact_allowed_scope_count", "exactAllowedScopeCount"],
+    writable_scope: ["writable_scope", "writableScope", "writable_files", "writableFiles"],
+    readable_scope: ["readable_scope", "readableScope", "readable_files", "readableFiles"],
+    read_only_operations: ["read_only_operations", "readOnlyOperations", "readonly_operations", "readonlyOperations"],
+    forbidden_operations: ["forbidden_operations", "forbiddenOperations"],
     forbidden_scope: ["forbidden_scope", "forbiddenScope", "forbidden_files", "forbiddenFiles"],
+    task_goal: ["task_goal", "taskGoal", "goal", "objective", "task_objective", "taskObjective"],
+    required_output_fields: ["required_output_fields", "requiredOutputFields", "output_fields", "outputFields"],
+    acceptance_conditions: ["acceptance_conditions", "acceptanceConditions", "acceptance_criteria", "acceptanceCriteria"],
     original_request_text: [
       "original_request_text",
       "originalRequestText",
@@ -2495,13 +2663,27 @@ function normalizeWorkerContext(job, overrides = {}) {
     readTextContextField(requestText, "original_request_text") ||
     readString(requestText) ||
     "";
+  const originalRequestTextPreserved = Boolean(
+    readString(explicitFields.original_request_text) ||
+      explicitOriginalRequestText ||
+      readString(fallbackOriginalRequest) ||
+      readTextContextField(requestText, "original_request_text")
+  );
   const originalRequestTextFields = {
     project_domain: readTextContextField(fallbackOriginalRequest, "project_domain"),
     task_mode: readTextContextField(fallbackOriginalRequest, "task_mode"),
     read_only_mode: readTextContextField(fallbackOriginalRequest, "read_only_mode"),
     allowed_scope: readTextContextField(fallbackOriginalRequest, "allowed_scope"),
     exact_allowed_scope: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope"),
+    exact_allowed_scope_count: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope_count"),
+    writable_scope: readTextContextField(fallbackOriginalRequest, "writable_scope"),
+    readable_scope: readTextContextField(fallbackOriginalRequest, "readable_scope"),
+    read_only_operations: readTextContextField(fallbackOriginalRequest, "read_only_operations"),
+    forbidden_operations: readTextContextField(fallbackOriginalRequest, "forbidden_operations"),
     forbidden_scope: readTextContextField(fallbackOriginalRequest, "forbidden_scope"),
+    task_goal: readTextContextField(fallbackOriginalRequest, "task_goal"),
+    required_output_fields: readTextContextField(fallbackOriginalRequest, "required_output_fields"),
+    acceptance_conditions: readTextContextField(fallbackOriginalRequest, "acceptance_conditions"),
     route: readTextContextField(fallbackOriginalRequest, "route"),
     approved_batch: readTextContextField(fallbackOriginalRequest, "approved_batch"),
   };
@@ -2511,7 +2693,15 @@ function normalizeWorkerContext(job, overrides = {}) {
     read_only_mode: readTextContextField(requestText, "read_only_mode"),
     allowed_scope: readTextContextField(requestText, "allowed_scope"),
     exact_allowed_scope: readTextContextField(requestText, "exact_allowed_scope"),
+    exact_allowed_scope_count: readTextContextField(requestText, "exact_allowed_scope_count"),
+    writable_scope: readTextContextField(requestText, "writable_scope"),
+    readable_scope: readTextContextField(requestText, "readable_scope"),
+    read_only_operations: readTextContextField(requestText, "read_only_operations"),
+    forbidden_operations: readTextContextField(requestText, "forbidden_operations"),
     forbidden_scope: readTextContextField(requestText, "forbidden_scope"),
+    task_goal: readTextContextField(requestText, "task_goal"),
+    required_output_fields: readTextContextField(requestText, "required_output_fields"),
+    acceptance_conditions: readTextContextField(requestText, "acceptance_conditions"),
     route: readTextContextField(requestText, "route"),
     approved_batch: readTextContextField(requestText, "approved_batch"),
   };
@@ -2521,7 +2711,15 @@ function normalizeWorkerContext(job, overrides = {}) {
     read_only_mode: overrides.readOnlyMode,
     allowed_scope: readScopeValue(overrides.allowedScope),
     exact_allowed_scope: readScopeValue(overrides.exactAllowedScope),
+    exact_allowed_scope_count: overrides.exactAllowedScopeCount,
+    writable_scope: readContractTextValue(overrides.writableScope),
+    readable_scope: readContractTextValue(overrides.readableScope),
+    read_only_operations: readContractTextValue(overrides.readOnlyOperations),
+    forbidden_operations: readContractTextValue(overrides.forbiddenOperations),
     forbidden_scope: readScopeValue(overrides.forbiddenScope),
+    task_goal: readContractTextValue(overrides.taskGoal),
+    required_output_fields: readContractTextValue(overrides.requiredOutputFields),
+    acceptance_conditions: readContractTextValue(overrides.acceptanceConditions),
     route: overrides.route,
     approved_batch: overrides.approvedBatch,
   };
@@ -2534,12 +2732,14 @@ function normalizeWorkerContext(job, overrides = {}) {
     return readPayloadContextField(result, fieldName);
   };
   const readPriorityField = (fieldName) =>
-    readString(explicitFields[fieldName]) ||
-    (structuredPayload ? payloadField(fieldName) : null) ||
-    readString(originalRequestTextFields[fieldName]) ||
-    readString(requestTextFields[fieldName]) ||
-    (!structuredPayload ? payloadField(fieldName) : null) ||
-    readString(overrideFields[fieldName]);
+    firstPresentValue(
+      readString(explicitFields[fieldName]),
+      structuredPayload ? payloadField(fieldName) : null,
+      readString(originalRequestTextFields[fieldName]),
+      readString(requestTextFields[fieldName]),
+      !structuredPayload ? payloadField(fieldName) : null,
+      overrideFields[fieldName]
+    );
   const explicitTaskMode = normalizeTaskModeValue(readPriorityField("task_mode"));
   const explicitReadOnlyMode =
     readNullableBooleanFlag(explicitFields.read_only_mode) ??
@@ -2576,7 +2776,46 @@ function normalizeWorkerContext(job, overrides = {}) {
     classifyWorkerTaskDomain([originalRequestText, requestText].join("\n"));
   const allowedScope = readString(readPriorityField("allowed_scope")) || null;
   const exactAllowedScope = readString(readPriorityField("exact_allowed_scope")) || null;
+  const exactAllowedScopeCountValue = readPriorityField("exact_allowed_scope_count");
+  const exactAllowedScopeCount =
+    (exactAllowedScopeCountValue !== null &&
+    exactAllowedScopeCountValue !== undefined &&
+    String(exactAllowedScopeCountValue).trim() !== ""
+      ? String(exactAllowedScopeCountValue).trim()
+      : null) ||
+    (exactAllowedScope ? String(extractExactAllowedScopePaths(exactAllowedScope).length) : null);
   const forbiddenScope = readString(readPriorityField("forbidden_scope")) || null;
+  const workerReadOnlyMode = taskMode === TASK_MODES.WORKER_READ_ONLY;
+  const writableScope = workerReadOnlyMode
+    ? "[]"
+    : readContractTextValue(readPriorityField("writable_scope")) || allowedScope || null;
+  const readableScope =
+    readContractTextValue(readPriorityField("readable_scope")) ||
+    (workerReadOnlyMode
+      ? "code, configuration, logs, and explicitly specified external read-only resources required by the original task"
+      : null);
+  const readOnlyOperations =
+    readContractTextValue(readPriorityField("read_only_operations")) ||
+    (workerReadOnlyMode
+      ? "non-destructive diagnostics requested by original_request_text"
+      : null);
+  const forbiddenOperations =
+    readContractTextValue(readPriorityField("forbidden_operations")) ||
+    (workerReadOnlyMode
+      ? "file writes, apply_patch, git add, git commit, git push, checkout, merge, rebase, reset, deployment, database writes"
+      : null);
+  const taskGoal =
+    readContractTextValue(readPriorityField("task_goal")) ||
+    extractTaskGoalFromText(originalRequestText) ||
+    null;
+  const requiredOutputFields =
+    readContractTextValue(readPriorityField("required_output_fields")) ||
+    extractRequiredOutputFieldsFromText(originalRequestText) ||
+    null;
+  const acceptanceConditions =
+    readContractTextValue(readPriorityField("acceptance_conditions")) ||
+    extractAcceptanceConditionsFromText(originalRequestText) ||
+    null;
   const route = readString(readPriorityField("route")) || null;
   const contextSource = explicitContext
     ? "explicit_hermes_worker_context"
@@ -2591,11 +2830,25 @@ function normalizeWorkerContext(job, overrides = {}) {
     contextSource === "explicit_hermes_worker_context"
       ? []
       : [`${CONTEXT_MISSING_WARNING}: explicit HERMES_WORKER_CONTEXT missing; using ${contextSource}`];
+  const workerReadOnlyContextIncomplete = Boolean(
+    workerReadOnlyMode &&
+      (!approvedBatch ||
+        !projectDomain ||
+        taskMode !== TASK_MODES.WORKER_READ_ONLY ||
+        readOnlyMode !== true ||
+        !originalRequestTextPreserved ||
+        !originalRequestText ||
+        !taskGoal ||
+        !requiredOutputFields ||
+        !acceptanceConditions ||
+        !forbiddenScope)
+  );
   const contextReconstructFailed = Boolean(
       !projectDomain ||
       !taskMode ||
       readOnlyMode === null ||
-      (!isReadOnlyTaskMode(taskMode) && !allowedScope)
+      (!isReadOnlyTaskMode(taskMode) && !allowedScope) ||
+      workerReadOnlyContextIncomplete
   );
   const changedFiles = uniqueSortedPaths(
     readStringList(
@@ -2622,8 +2875,17 @@ function normalizeWorkerContext(job, overrides = {}) {
     read_only_mode: readOnlyMode,
     allowed_scope: allowedScope,
     exact_allowed_scope: exactAllowedScope,
+    exact_allowed_scope_count: exactAllowedScopeCount,
+    writable_scope: writableScope,
+    readable_scope: readableScope,
+    read_only_operations: readOnlyOperations,
+    forbidden_operations: forbiddenOperations,
     forbidden_scope: forbiddenScope,
+    task_goal: taskGoal,
+    required_output_fields: requiredOutputFields,
+    acceptance_conditions: acceptanceConditions,
     original_request_text: originalRequestText,
+    original_request_text_preserved: originalRequestTextPreserved,
     original_request_text_base64: Buffer.from(originalRequestText, "utf8").toString("base64"),
     route,
     payload: payload || null,
@@ -2699,6 +2961,77 @@ function resolveWorkerJobContract(job, overrides = {}) {
   return normalizeWorkerContext(job, overrides);
 }
 
+function getMissingWorkerReadOnlyContextFields(contract) {
+  if (!contract || contract.task_mode !== TASK_MODES.WORKER_READ_ONLY) {
+    return [];
+  }
+
+  const missing = [];
+  if (!readString(contract.approved_batch)) missing.push("batch_code");
+  if (!readString(contract.project_domain)) missing.push("project_domain");
+  if (contract.task_mode !== TASK_MODES.WORKER_READ_ONLY) missing.push("task_mode");
+  if (contract.read_only_mode !== true) missing.push("read_only_mode");
+  if (!contract.original_request_text_preserved || !readString(contract.original_request_text)) {
+    missing.push("original_request_text");
+  }
+  if (!readString(contract.task_goal)) missing.push("task_goal");
+  if (!readString(contract.required_output_fields)) missing.push("required_output_fields");
+  if (!readString(contract.acceptance_conditions)) missing.push("acceptance_conditions");
+  if (!readString(contract.forbidden_scope)) missing.push("forbidden_scope");
+  return missing;
+}
+
+function createWorkerReadOnlyContextIncompleteError(missingFields, details = {}) {
+  const missing = uniqueSortedPaths(missingFields || []);
+  const error = new Error(
+    [
+      WORKER_READONLY_CONTEXT_INCOMPLETE,
+      "worker_read_only context is incomplete; refusing to downgrade the task to generic git status/git diff.",
+      missing.length
+        ? `missing_worker_readonly_context_fields: ${missing.join(", ")}`
+        : "missing_worker_readonly_context_fields: none",
+      details.missingRequiredOutputFields?.length
+        ? `missing_required_output_fields: ${details.missingRequiredOutputFields.join(", ")}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
+
+  error.code = WORKER_READONLY_CONTEXT_INCOMPLETE;
+  error.failureStage = details.failureStage || "worker_readonly_context_validation";
+  error.missingWorkerReadonlyContextFields = missing;
+  error.missingRequiredOutputFields = details.missingRequiredOutputFields || [];
+  return error;
+}
+
+function assertWorkerReadOnlyContextComplete(contract) {
+  const missingFields = getMissingWorkerReadOnlyContextFields(contract);
+  if (missingFields.length > 0) {
+    throw createWorkerReadOnlyContextIncompleteError(missingFields);
+  }
+}
+
+function assertWorkerReadOnlyTaskGoalComplete(job, reportText) {
+  const contract = resolveWorkerJobContract(job);
+  if (contract.task_mode !== TASK_MODES.WORKER_READ_ONLY) {
+    return;
+  }
+
+  assertWorkerReadOnlyContextComplete(contract);
+
+  const missingRequiredOutputFields = getMissingWorkerReadOnlyRequiredOutputFields(
+    contract,
+    reportText
+  );
+  if (missingRequiredOutputFields.length > 0) {
+    throw createWorkerReadOnlyContextIncompleteError([], {
+      failureStage: "worker_readonly_required_output_validation",
+      missingRequiredOutputFields,
+    });
+  }
+}
+
 function formatWorkerJobContractLines(contract, options = {}) {
   const originalRequestValue = options.includeOriginalRequest === false
     ? contract.original_request_text
@@ -2714,12 +3047,22 @@ function formatWorkerJobContractLines(contract, options = {}) {
     `read_only_mode: ${contract.read_only_mode ? "true" : "false"}`,
     `allowed_scope: ${contract.allowed_scope || "null"}`,
     `exact_allowed_scope: ${contract.exact_allowed_scope || "null"}`,
+    `exact_allowed_scope_count: ${contract.exact_allowed_scope_count || "null"}`,
+    `writable_scope: ${contract.writable_scope || "null"}`,
+    `readable_scope: ${contract.readable_scope || "null"}`,
+    `read_only_operations: ${contract.read_only_operations || "null"}`,
+    `forbidden_operations: ${contract.forbidden_operations || "null"}`,
     `forbidden_scope: ${contract.forbidden_scope || "null"}`,
+    `task_goal: ${contract.task_goal || "null"}`,
+    `required_output_fields: ${contract.required_output_fields || "null"}`,
+    `acceptance_conditions: ${contract.acceptance_conditions || "null"}`,
     `original_request_text: ${originalRequestValue}`,
+    `original_request_text_preserved: ${contract.original_request_text_preserved ? "true" : "false"}`,
     `original_request_text_base64: ${contract.original_request_text_base64 ? "[present]" : "null"}`,
     `route: ${contract.route || "null"}`,
     "payload: hermes_jobs.payload",
     `approved_batch: ${contract.approved_batch || "null"}`,
+    `batch_code: ${contract.approved_batch || "null"}`,
     `attempt_id: ${contract.attempt_id || "null"}`,
     `worker_stage: ${contract.worker_stage || "null"}`,
     `workflow_stage: ${contract.workflow_stage || "null"}`,
@@ -2747,8 +3090,17 @@ function buildWorkerReportContractExtra(contract) {
     read_only_mode: contract.read_only_mode,
     allowed_scope: contract.allowed_scope,
     exact_allowed_scope: contract.exact_allowed_scope,
+    exact_allowed_scope_count: contract.exact_allowed_scope_count,
+    writable_scope: contract.writable_scope,
+    readable_scope: contract.readable_scope,
+    read_only_operations: contract.read_only_operations,
+    forbidden_operations: contract.forbidden_operations,
     forbidden_scope: contract.forbidden_scope,
+    task_goal: contract.task_goal,
+    required_output_fields: contract.required_output_fields,
+    acceptance_conditions: contract.acceptance_conditions,
     original_request_text: contract.original_request_text,
+    original_request_text_preserved: contract.original_request_text_preserved,
     original_request_text_base64: contract.original_request_text_base64,
     route: contract.route,
     approved_batch: contract.approved_batch,
@@ -2931,6 +3283,8 @@ function normalizeFailureCodeValue(value) {
     NO_OP_RUN: "NO_FIX_APPLIED",
     NO_FILE_CHANGE: "NO_FIX_APPLIED",
     NO_FILE_CHANGES: "NO_FIX_APPLIED",
+    WORKER_READONLY_CONTEXT_INCOMPLETE: "WORKER_READONLY_CONTEXT_INCOMPLETE",
+    WORKER_READ_ONLY_CONTEXT_INCOMPLETE: "WORKER_READONLY_CONTEXT_INCOMPLETE",
     CONTEXT_FAILED: "CONTEXT_RECONSTRUCT_FAILED",
     ORIGINAL_BATCH_CONTEXT_MISSING: "CONTEXT_RECONSTRUCT_FAILED",
     COMMIT_FAILED: "GIT_COMMIT_FAILED",
@@ -2984,6 +3338,9 @@ function classifyFailureCodeFromText(text) {
   }
   if (/INCOMPLETE_ARCHITECTURE_REPORT|incomplete_architecture_report\s*[:=]\s*(true|yes)|Task goal status:\s*failed_incomplete_architecture_report/i.test(raw)) {
     return "INCOMPLETE_ARCHITECTURE_REPORT";
+  }
+  if (/WORKER_READONLY_CONTEXT_INCOMPLETE|worker_readonly_context_incomplete|missing_worker_readonly_context_fields|Task goal status:\s*failed_worker_readonly_context_incomplete/i.test(raw)) {
+    return "WORKER_READONLY_CONTEXT_INCOMPLETE";
   }
   if (/node\s+--test|tests?\s+failed|test\s+failure|测试失败/i.test(raw)) {
     return "TEST_FAILED";
@@ -3899,7 +4256,7 @@ function createReadOnlyGitCommandError(args, details = {}) {
   const error = new Error(
     [
       READ_ONLY_MODE_VIOLATION,
-      `read_only_mode=true blocks ${command}; Worker refused git add/commit/push before any write.`,
+      `read_only_mode=true blocks ${command}; Worker refused git write/branch-history commands before any write.`,
       changedPaths.length
         ? `changed_paths: ${changedPaths.join(", ")}`
         : "changed_paths: none",
@@ -3927,7 +4284,7 @@ function assertGitOperationAllowed(args, options = {}) {
 
   const subcommand = getGitSubcommand(args);
 
-  if (subcommand === "add" || subcommand === "commit" || subcommand === "push") {
+  if (READ_ONLY_BLOCKED_GIT_SUBCOMMANDS.has(subcommand)) {
     throw createReadOnlyGitCommandError(args, options);
   }
 }
@@ -4343,6 +4700,7 @@ function buildReadOnlyGuard(taskText, options = {}) {
     "任务正文出现只读 / 不修改 / 禁止 git add / 禁止 commit / 禁止 push 指令。",
     "Codex 只能读取、分析、静态验证并汇报结果。",
     "Codex 不得修改任何文件，不得调用 apply_patch，不得执行会写入工作区的命令。",
+    "Codex 不得执行 git add、git commit、git push、checkout、merge、rebase、reset，不得部署，不得写数据库。",
     "Worker 将跳过 preflight 写入、Git 同步、git add、git commit、git push 和本地预览恢复。",
   ].join("\n");
 }
@@ -4450,6 +4808,33 @@ function sanitizeProductTaskTextForPrompt(taskText, taskMode) {
     .trim();
 }
 
+function buildWorkerReadOnlyContextPrompt(contract) {
+  if (!contract || contract.task_mode !== TASK_MODES.WORKER_READ_ONLY) {
+    return null;
+  }
+
+  return [
+    "【worker_read_only 完整上下文契约】",
+    `batch_code: ${contract.approved_batch || "null"}`,
+    `project_domain: ${contract.project_domain || "null"}`,
+    `task_mode: ${contract.task_mode || "null"}`,
+    `read_only_mode: ${contract.read_only_mode ? "true" : "false"}`,
+    "writable_scope: []",
+    `readable_scope: ${contract.readable_scope || "null"}`,
+    `read_only_operations: ${contract.read_only_operations || "null"}`,
+    `forbidden_operations: ${contract.forbidden_operations || "null"}`,
+    `forbidden_scope: ${contract.forbidden_scope || "null"}`,
+    `task_goal: ${contract.task_goal || "null"}`,
+    `required_output_fields: ${contract.required_output_fields || "null"}`,
+    `acceptance_conditions: ${contract.acceptance_conditions || "null"}`,
+    `exact_allowed_scope_count: ${contract.exact_allowed_scope_count || "null"}`,
+    "exact_allowed_scope_count=0 对 worker_read_only 只能表示没有可写文件，不能解释为只允许 git status 或 git diff。",
+    "不得把复杂 worker_read_only 任务统一替换为通用 Git 工作区检查。",
+    `如果 original_request_text、任务目标、required_output_fields 或验收条件缺失，必须 fail closed：failure_code=${WORKER_READONLY_CONTEXT_INCOMPLETE}，task_goal_status 不得为 succeeded。`,
+    "Codex 输出必须覆盖 required_output_fields 中的每一个字段；缺任何字段都不能把 task_goal_status 标记为 succeeded。",
+  ].join("\n");
+}
+
 function buildWorkerGuardedPrompt(requestText, options = {}) {
   const taskText = String(requestText || "").trim();
   const taskDomain = classifyWorkerTaskDomain(taskText);
@@ -4468,6 +4853,7 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
   const effectiveTaskMode = contract.task_mode || taskMode;
   const effectiveReadOnlyMode = contract.read_only_mode === true;
   const promptTaskText = sanitizeProductTaskTextForPrompt(taskText, effectiveTaskMode);
+  assertWorkerReadOnlyContextComplete(contract);
   const readOnlyGuard =
     isReadOnlyTaskMode(effectiveTaskMode)
       ? buildReadOnlyGuard(taskText, {
@@ -4477,6 +4863,7 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
   const qaReviewGuard = buildQaReviewGuard(taskText);
   const architectureReviewGuard = buildArchitectureReviewGuard(taskText, effectiveTaskMode);
   const productWriteGuard = buildProductWriteGuard(taskText, effectiveTaskMode);
+  const workerReadOnlyContextPrompt = buildWorkerReadOnlyContextPrompt(contract);
   const domainGuard = isAutomationSystemTask(taskText)
     ? [
         "【自动化系统任务边界】",
@@ -4498,6 +4885,8 @@ function buildWorkerGuardedPrompt(requestText, options = {}) {
     architectureReviewGuard ? "" : null,
     productWriteGuard,
     productWriteGuard ? "" : null,
+    workerReadOnlyContextPrompt,
+    workerReadOnlyContextPrompt ? "" : null,
     domainGuard,
     "",
     "【统一任务模式】",
@@ -4529,7 +4918,8 @@ function buildCodexPrompt(job) {
     workerStage: "codex_prompt",
     workflowStage: "codex_prompt",
   });
-  return buildWorkerGuardedPrompt(job?.request_text || "", {
+  const taskText = contract.original_request_text || job?.request_text || "";
+  return buildWorkerGuardedPrompt(taskText, {
     readOnlyMode: isReadOnlyTask(job),
     taskMode: getTaskMode(job),
     payload: job?.payload || null,
@@ -4797,10 +5187,13 @@ function buildFailureReport(job, error, context = {}) {
   const taskModeMismatch = errorCode === TASK_MODE_MISMATCH;
   const missingRequiredDocs = errorCode === MISSING_REQUIRED_DOCS;
   const insufficientDocOutput = errorCode === INSUFFICIENT_DOC_OUTPUT;
+  const workerReadOnlyContextIncomplete = errorCode === WORKER_READONLY_CONTEXT_INCOMPLETE;
   const workerExecutionStatus = noFixApplied
     ? "succeeded_until_task_goal_validation"
     : missingRequiredDocs || insufficientDocOutput
     ? "succeeded_until_required_docs_validation"
+    : workerReadOnlyContextIncomplete
+    ? "succeeded_until_worker_readonly_context_validation"
     : readOnlyViolation
     ? "succeeded_until_read_only_validation"
     : taskModeMismatch
@@ -4810,6 +5203,8 @@ function buildFailureReport(job, error, context = {}) {
     : "failed";
   const taskGoalStatus = readOnlyViolation
     ? "failed_read_only_mode_violation"
+    : workerReadOnlyContextIncomplete
+    ? "failed_worker_readonly_context_incomplete"
     : noFixApplied
     ? "failed_no_fix_applied"
     : missingRequiredDocs
@@ -5554,6 +5949,7 @@ async function pollOnce() {
 
   try {
     assertOriginalBatchContextAvailable(job);
+    assertWorkerReadOnlyContextComplete(initialContract);
 
     if (readOnlyMode) {
       await updateProgress(
@@ -5681,6 +6077,7 @@ async function pollOnce() {
     );
 
     const gitResult = await commitGitTask(job);
+    assertWorkerReadOnlyTaskGoalComplete(job, result);
     assertQaTaskOutcome(job, gitResult.filesChanged || [], result);
 
     await updateProgress(
@@ -6005,6 +6402,11 @@ async function pollOnce() {
         no_fix_applied: errorCode === NO_FIX_APPLIED,
         read_only_mode_violation: errorCode === READ_ONLY_MODE_VIOLATION,
         task_mode_mismatch: errorCode === TASK_MODE_MISMATCH,
+        worker_readonly_context_incomplete: errorCode === WORKER_READONLY_CONTEXT_INCOMPLETE,
+        missing_worker_readonly_context_fields:
+          error?.missingWorkerReadonlyContextFields || [],
+        missing_required_output_fields:
+          error?.missingRequiredOutputFields || [],
         missing_required_docs: error?.missingDocs || [],
         incomplete_qa_report: errorCode === INCOMPLETE_QA_REPORT,
         missing_qa_report_fields: error?.missingQaReportFields || [],
@@ -6024,6 +6426,8 @@ async function pollOnce() {
               : errorCode === MISSING_REQUIRED_DOCS ||
                 errorCode === INSUFFICIENT_DOC_OUTPUT
               ? "succeeded_until_required_docs_validation"
+              : errorCode === WORKER_READONLY_CONTEXT_INCOMPLETE
+              ? "succeeded_until_worker_readonly_context_validation"
               : errorCode === READ_ONLY_MODE_VIOLATION
               ? "succeeded_until_read_only_validation"
               : errorCode === INCOMPLETE_QA_REPORT
@@ -6045,6 +6449,8 @@ async function pollOnce() {
               ? "failed_missing_required_docs"
               : errorCode === INSUFFICIENT_DOC_OUTPUT
               ? "failed_insufficient_doc_output"
+              : errorCode === WORKER_READONLY_CONTEXT_INCOMPLETE
+              ? "failed_worker_readonly_context_incomplete"
               : errorCode === READ_ONLY_MODE_VIOLATION
               ? "failed_read_only_mode_violation"
               : errorCode === INCOMPLETE_QA_REPORT
@@ -6072,6 +6478,17 @@ async function pollOnce() {
           `No-op run: ${errorCode === NO_FIX_APPLIED ? "yes" : "no"}`,
           `Task mode mismatch: ${errorCode === TASK_MODE_MISMATCH ? "yes" : "no"}`,
           `Incomplete QA report: ${errorCode === INCOMPLETE_QA_REPORT ? "yes" : "no"}`,
+          `Worker read-only context incomplete: ${errorCode === WORKER_READONLY_CONTEXT_INCOMPLETE ? "yes" : "no"}`,
+          `missing_worker_readonly_context_fields: ${
+            error?.missingWorkerReadonlyContextFields?.length
+              ? error.missingWorkerReadonlyContextFields.join(", ")
+              : "none"
+          }`,
+          `missing_required_output_fields: ${
+            error?.missingRequiredOutputFields?.length
+              ? error.missingRequiredOutputFields.join(", ")
+              : "none"
+          }`,
           `Original batch context missing: ${errorCode === ORIGINAL_BATCH_CONTEXT_MISSING ? "yes" : "no"}`,
           `missing_qa_report_fields: ${
             error?.missingQaReportFields?.length
@@ -6204,6 +6621,7 @@ module.exports = {
   INSUFFICIENT_DOC_OUTPUT,
   INCOMPLETE_QA_REPORT,
   INCOMPLETE_ARCHITECTURE_REPORT,
+  WORKER_READONLY_CONTEXT_INCOMPLETE,
   CONTEXT_MISSING_WARNING,
   FAILURE_FINGERPRINTS,
   TASK_MODES,
@@ -6211,6 +6629,8 @@ module.exports = {
   assertExplicitTaskFieldsNotOverridden,
   assertOriginalBatchContextAvailable,
   assertQaReportComplete,
+  assertWorkerReadOnlyContextComplete,
+  assertWorkerReadOnlyTaskGoalComplete,
   assertQaTaskOutcome,
   classifyWorkerFetchError,
   assertGitOperationAllowed,
