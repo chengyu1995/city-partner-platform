@@ -1248,6 +1248,10 @@ const SYSTEM_REPAIR_SCOPE = [
   "src/app/api/feishu/event/route.ts",
   "src/lib/project-director-console.ts",
   "src/lib/worker-jobs.ts",
+  "infra/windows-worker/local_worker.js",
+  "infra/windows-worker/tests/git-safety.test.js",
+  "infra/windows-worker/tests/worker-attempt-lifecycle.test.mjs",
+  "infra/windows-worker/tests/worker-diagnostics-contract.test.mjs",
 ];
 
 function isSystemRepairApprovalMode(input: {
@@ -1261,6 +1265,152 @@ function isSystemRepairApprovalMode(input: {
     typeof input.batchCode === "string" &&
     input.batchCode.startsWith(SYSTEM_REPAIR_BATCH_PREFIX)
   );
+}
+
+function resolveSystemRepairIntakeContext(text: string) {
+  const normalized = normalizeFeishuTaskText(text);
+  const parsedProjectDomain =
+    readDirectWorkerContextField(text, "project_domain") ?? classifyFeishuWorkerTaskDomain(normalized);
+  const parsedTaskType = readDirectWorkerContextField(text, "task_type");
+  const parsedBatchCode = (
+    readDirectWorkerContextField(text, "batch_code") ??
+    readDirectWorkerContextField(text, "approved_batch") ??
+    extractPrimaryRouteBatchCode(normalized) ??
+    ""
+  ).toUpperCase();
+  const parsedRequestedMode =
+    readDirectWorkerContextField(text, "requested_mode") ??
+    parseDirectRequestedMode(normalized, parsedBatchCode || null);
+  const parsedFinalMode =
+    readDirectWorkerContextField(text, "final_mode") ??
+    readDirectWorkerContextField(text, "task_mode") ??
+    parsedRequestedMode;
+  const parsedTaskMode = readDirectWorkerContextField(text, "task_mode") ?? parsedFinalMode;
+  const explicitModeOrDomainPresent = Boolean(
+    readDirectWorkerContextField(text, "project_domain") ||
+    readDirectWorkerContextField(text, "task_type") ||
+    readDirectWorkerContextField(text, "requested_mode") ||
+    readDirectWorkerContextField(text, "final_mode") ||
+    readDirectWorkerContextField(text, "task_mode")
+  );
+  const repairModeCandidate =
+    parsedProjectDomain === "automation_system" &&
+    parsedTaskType === SYSTEM_REPAIR_TASK_TYPE &&
+    parsedBatchCode.startsWith(SYSTEM_REPAIR_BATCH_PREFIX);
+  const writeAllowed =
+    normalizeDirectWorkerWriteMode(parsedRequestedMode) === "write" ||
+    normalizeDirectWorkerWriteMode(parsedFinalMode) === "write" ||
+    normalizeDirectWorkerWriteMode(parsedTaskMode) === "write";
+  const exactAllowedScope = extractExactAllowedScopePaths(text);
+
+  if (!repairModeCandidate && !(explicitModeOrDomainPresent && parsedProjectDomain === "automation_system" && writeAllowed)) {
+    return null;
+  }
+
+  if (repairModeCandidate) {
+    return {
+      ok: true,
+      parsedProjectDomain,
+      parsedTaskType,
+      parsedBatchCode,
+      parsedRequestedMode: parsedRequestedMode ?? "not_provided",
+      parsedFinalMode: parsedFinalMode ?? "write_allowed",
+      parsedTaskMode: parsedTaskMode ?? "automation_system_write_allowed",
+      repairModeCandidate,
+      repairModeApplied: true,
+      repairScope: SYSTEM_REPAIR_SCOPE,
+      exactAllowedScope: SYSTEM_REPAIR_SCOPE,
+      failureCode: null,
+      failureStage: null,
+      validationPath: "repair_mode_before_exact_scope_validation",
+    };
+  }
+
+  if (writeAllowed && exactAllowedScope.length === 0) {
+    return {
+      ok: false,
+      parsedProjectDomain,
+      parsedTaskType: parsedTaskType ?? "not_provided",
+      parsedBatchCode: parsedBatchCode || "missing",
+      parsedRequestedMode: parsedRequestedMode ?? "not_provided",
+      parsedFinalMode: parsedFinalMode ?? "not_provided",
+      parsedTaskMode: parsedTaskMode ?? "not_provided",
+      repairModeCandidate,
+      repairModeApplied: false,
+      repairScope: [],
+      exactAllowedScope,
+      failureCode: parsedTaskType === SYSTEM_REPAIR_TASK_TYPE ? "REPAIR_MODE_NOT_MATCHED" : "EXACT_SCOPE_PARSE_FAILED",
+      failureStage: "approval_context_validation",
+      validationPath: "normal_write_allowed_exact_scope_validation",
+    };
+  }
+
+  return null;
+}
+
+function buildSystemRepairIntakeRecord(
+  inputText: string,
+  context: NonNullable<ReturnType<typeof resolveSystemRepairIntakeContext>>,
+  feishuMessageId: string
+): string {
+  const originalRequestTextBase64 = Buffer.from(inputText, "utf8").toString("base64");
+  return [
+    context.ok ? "PROJECT_GENERAL_MANAGER_INTAKE_REPAIR_MODE_CONTEXT_SAVED" : "PROJECT_GENERAL_MANAGER_INTAKE_BLOCKED",
+    `parsed_project_domain=${context.parsedProjectDomain}`,
+    `parsed_task_type=${context.parsedTaskType}`,
+    `parsed_batch_code=${context.parsedBatchCode}`,
+    `parsed_requested_mode=${context.parsedRequestedMode}`,
+    `repair_mode_candidate=${context.repairModeCandidate ? "true" : "false"}`,
+    `repair_mode_applied=${context.repairModeApplied ? "true" : "false"}`,
+    `repair_mode=${context.repairModeApplied ? "true" : "false"}`,
+    `repair_scope=${context.repairScope.join(", ")}`,
+    `repair_scope_count=${context.repairScope.length}`,
+    `allowed_scope=${context.exactAllowedScope.join(", ")}`,
+    `exact_allowed_scope=${context.exactAllowedScope.join(", ")}`,
+    `exact_allowed_scope_count=${context.exactAllowedScope.length}`,
+    `approval_context_saved=${context.ok ? "true" : "false"}`,
+    `validation_path=${context.validationPath}`,
+    `failure_code=${context.failureCode ?? "null"}`,
+    `failure_stage=${context.failureStage ?? "null"}`,
+    `project_domain=${context.parsedProjectDomain}`,
+    `task_type=${context.repairModeApplied ? SYSTEM_REPAIR_TASK_TYPE : context.parsedTaskType}`,
+    `batch_code=${context.parsedBatchCode}`,
+    `approved_batch=${context.parsedBatchCode}`,
+    `requested_mode=${context.parsedRequestedMode}`,
+    `final_mode=${context.parsedFinalMode}`,
+    `task_mode=${context.parsedTaskMode}`,
+    "read_only_mode=false",
+    "approval_required=true",
+    "context_source=project_director_gm_intake_repair_mode",
+    `context_id=${context.parsedBatchCode}:${feishuMessageId}`,
+    "consumed=false",
+    `original_request_text_base64=${originalRequestTextBase64}`,
+    `original_request_text=${inputText}`,
+    "worker_created=false",
+    "next_stage_allowed=false",
+  ].join("\n");
+}
+
+function buildSystemRepairIntakeReply(
+  context: NonNullable<ReturnType<typeof resolveSystemRepairIntakeContext>>
+): string {
+  return [
+    context.ok ? "PROJECT_GENERAL_MANAGER_REPAIR_MODE_CONTEXT_SAVED" : "PROJECT_GENERAL_MANAGER_INTAKE_BLOCKED",
+    `parsed_project_domain=${context.parsedProjectDomain}`,
+    `parsed_task_type=${context.parsedTaskType}`,
+    `parsed_batch_code=${context.parsedBatchCode}`,
+    `parsed_requested_mode=${context.parsedRequestedMode}`,
+    `repair_mode_candidate=${context.repairModeCandidate ? "true" : "false"}`,
+    `repair_mode_applied=${context.repairModeApplied ? "true" : "false"}`,
+    `repair_scope_count=${context.repairScope.length}`,
+    `exact_allowed_scope_count=${context.exactAllowedScope.length}`,
+    `approval_context_saved=${context.ok ? "true" : "false"}`,
+    `validation_path=${context.validationPath}`,
+    `failure_code=${context.failureCode ?? "null"}`,
+    `failure_stage=${context.failureStage ?? "null"}`,
+    "worker_created=false",
+    "next_stage_allowed=false",
+  ].join("\n");
 }
 
 function isWriteAllowedApprovalText(text: string): boolean {
@@ -1803,6 +1953,49 @@ export async function POST(req: NextRequest) {
           state: "queued",
           hermes_jobs_created: true,
           job_id: insertResult.jobId,
+        });
+      }
+
+      const systemRepairIntakeContext = resolveSystemRepairIntakeContext(text);
+      if (systemRepairIntakeContext) {
+        const reply = buildSystemRepairIntakeReply(systemRepairIntakeContext);
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          buildSystemRepairIntakeRecord(text, systemRepairIntakeContext, ev.message.message_id),
+          systemRepairIntakeContext.ok
+            ? "project_director_repair_mode_approval_context"
+            : "project_director_repair_mode_intake_blocked",
+          ev.message.message_id
+        );
+        const token = await getFeishuToken();
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: systemRepairIntakeContext.ok ? "repair_mode_context_saved" : "intake_blocked",
+          parsed_project_domain: systemRepairIntakeContext.parsedProjectDomain,
+          parsed_task_type: systemRepairIntakeContext.parsedTaskType,
+          parsed_batch_code: systemRepairIntakeContext.parsedBatchCode,
+          parsed_requested_mode: systemRepairIntakeContext.parsedRequestedMode,
+          repair_mode_candidate: systemRepairIntakeContext.repairModeCandidate,
+          repair_mode_applied: systemRepairIntakeContext.repairModeApplied,
+          repair_scope_count: systemRepairIntakeContext.repairScope.length,
+          exact_allowed_scope_count: systemRepairIntakeContext.exactAllowedScope.length,
+          approval_context_saved: systemRepairIntakeContext.ok,
+          validation_path: systemRepairIntakeContext.validationPath,
+          failure_code: systemRepairIntakeContext.failureCode,
+          failure_stage: systemRepairIntakeContext.failureStage,
+          worker_created: false,
+          next_stage_allowed: false,
         });
       }
 

@@ -1057,6 +1057,10 @@ const SYSTEM_REPAIR_SCOPE = [
   "src/app/api/feishu/event/route.ts",
   "src/lib/project-director-console.ts",
   "src/lib/worker-jobs.ts",
+  "infra/windows-worker/local_worker.js",
+  "infra/windows-worker/tests/git-safety.test.js",
+  "infra/windows-worker/tests/worker-attempt-lifecycle.test.mjs",
+  "infra/windows-worker/tests/worker-diagnostics-contract.test.mjs",
 ];
 const SYSTEM_REPAIR_SCOPE_TEXT = SYSTEM_REPAIR_SCOPE.join(", ");
 

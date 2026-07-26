@@ -419,6 +419,60 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
     assert.match(routeSource, /automation_system_write_allowed/);
     assert.match(routeSource, /DIRECT_WORKER_CONTEXT_MISSING/);
   });
+
+  await t.test("system repair intake injects repair scope before generic planning and exact scope validation", () => {
+    const directWorkerIndex = routeSource.indexOf("if (isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text))");
+    const repairIntakeIndex = routeSource.indexOf("const systemRepairIntakeContext = resolveSystemRepairIntakeContext(text)");
+    const planChangeIndex = routeSource.indexOf("if (isPlanChangeReply(text))");
+    const planningChoiceIndex = routeSource.indexOf("const planningChoice = parseProjectDirectorPlanningChoice(text)");
+    const genericDemandIndex = routeSource.indexOf("const demandKind = classifyProjectDirectorDemand(text)");
+    const repairContextHelper = routeSource.slice(
+      routeSource.indexOf("function resolveSystemRepairIntakeContext"),
+      routeSource.indexOf("function buildSystemRepairIntakeRecord")
+    );
+
+    assert.notEqual(repairIntakeIndex, -1);
+    assert.ok(directWorkerIndex < repairIntakeIndex);
+    assert.ok(repairIntakeIndex < planChangeIndex);
+    assert.ok(repairIntakeIndex < planningChoiceIndex);
+    assert.ok(repairIntakeIndex < genericDemandIndex);
+    assert.match(repairContextHelper, /readDirectWorkerContextField\(text, "project_domain"\)/);
+    assert.match(repairContextHelper, /readDirectWorkerContextField\(text, "task_type"\)/);
+    assert.match(repairContextHelper, /extractPrimaryRouteBatchCode\(normalized\)/);
+    assert.match(repairContextHelper, /repairModeCandidate/);
+    assert.match(repairContextHelper, /SYSTEM_REPAIR_SCOPE/);
+    assert.match(routeSource, /PROJECT_GENERAL_MANAGER_REPAIR_MODE_CONTEXT_SAVED/);
+    assert.match(routeSource, /PROJECT_GENERAL_MANAGER_INTAKE_BLOCKED/);
+    assert.match(routeSource, /parsed_project_domain=/);
+    assert.match(routeSource, /parsed_task_type=/);
+    assert.match(routeSource, /parsed_batch_code=/);
+    assert.match(routeSource, /parsed_requested_mode=/);
+    assert.match(routeSource, /repair_mode_candidate=/);
+    assert.match(routeSource, /repair_mode_applied=/);
+    assert.match(routeSource, /validation_path=/);
+    assert.match(routeSource, /failure_code=/);
+    assert.match(routeSource, /failure_stage=/);
+    assert.match(routeSource, /REPAIR_MODE_NOT_MATCHED/);
+    assert.match(routeSource, /EXACT_SCOPE_PARSE_FAILED/);
+    assert.match(routeSource, /normal_write_allowed_exact_scope_validation/);
+  });
+
+  await t.test("system repair scope is shared by route and worker contract", () => {
+    const requiredRepairScope = [
+      "src/app/api/feishu/event/route.ts",
+      "src/lib/project-director-console.ts",
+      "src/lib/worker-jobs.ts",
+      "infra/windows-worker/local_worker.js",
+      "infra/windows-worker/tests/git-safety.test.js",
+      "infra/windows-worker/tests/worker-attempt-lifecycle.test.mjs",
+      "infra/windows-worker/tests/worker-diagnostics-contract.test.mjs",
+    ];
+
+    for (const item of requiredRepairScope) {
+      assert.match(routeSource, new RegExp(item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.match(workerJobsSource, new RegExp(item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    }
+  });
 });
 
 test("Git porcelain v1 -z status parsing", async (t) => {
