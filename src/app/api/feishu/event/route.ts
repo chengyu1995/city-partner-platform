@@ -1308,6 +1308,28 @@ function resolveSystemRepairIntakeContext(text: string) {
   }
 
   if (repairModeCandidate) {
+    try {
+      assertNoScopeContractConflict(SYSTEM_REPAIR_SCOPE, text);
+    } catch (error) {
+      const scopedError = error as Error & { code?: string; stage?: string };
+      return {
+        ok: false,
+        parsedProjectDomain,
+        parsedTaskType,
+        parsedBatchCode,
+        parsedRequestedMode: parsedRequestedMode ?? "not_provided",
+        parsedFinalMode: parsedFinalMode ?? "write_allowed",
+        parsedTaskMode: parsedTaskMode ?? "automation_system_write_allowed",
+        repairModeCandidate,
+        repairModeApplied: true,
+        repairScope: SYSTEM_REPAIR_SCOPE,
+        exactAllowedScope: SYSTEM_REPAIR_SCOPE,
+        failureCode: scopedError.code ?? "SCOPE_CONTRACT_CONFLICT",
+        failureStage: scopedError.stage ?? "scope_contract_validation",
+        validationPath: "repair_mode_before_exact_scope_validation",
+      };
+    }
+
     return {
       ok: true,
       parsedProjectDomain,
@@ -1346,6 +1368,36 @@ function resolveSystemRepairIntakeContext(text: string) {
   }
 
   return null;
+}
+
+function isSystemRepairContextSaveOnlyRequest(text: string): boolean {
+  const normalized = normalizeFeishuTaskText(text);
+  return (
+    /classification[-_\s]?only|analysis[-_\s]?only|advice[-_\s]?only|context[-_\s]?save[-_\s]?only/i.test(normalized) ||
+    /(?:\u4ec5|\u53ea)\s*(?:\u5206\u7c7b|\u5206\u6790|\u7ed9\u51fa\u5206\u53d1\u5efa\u8bae|\u4fdd\u5b58\s*approval\s*context|\u4fdd\u5b58\u4e0a\u4e0b\u6587)/i.test(normalized)
+  );
+}
+
+function hasSystemRepairExecutionIntent(
+  text: string,
+  context: NonNullable<ReturnType<typeof resolveSystemRepairIntakeContext>>
+): boolean {
+  if (!context.ok || !context.repairModeApplied) return false;
+  if (normalizeDirectWorkerWriteMode(context.parsedTaskMode) !== "write") return false;
+  if (normalizeDirectWorkerWriteMode(context.parsedFinalMode) !== "write") return false;
+  if (normalizeDirectWorkerWriteMode(context.parsedRequestedMode) === "manager_read_only") return false;
+  if (isSystemRepairContextSaveOnlyRequest(text)) return false;
+  if (readDirectWorkerBooleanField(text, "direct_worker_create") === true) return true;
+  if (isExplicitDirectWorkerCreateCommand(text)) return true;
+  if (isApprovedExecutionReply(text)) return true;
+
+  const normalized = normalizeFeishuTaskText(text);
+  return (
+    /\bexecute\s+BATCH-ARCH-COMPLETE-/i.test(normalized) ||
+    /\u65b0\u9700\u6c42[\s\S]{0,100}\u6267\u884c[\s\S]{0,100}\bBATCH-ARCH-COMPLETE-/i.test(normalized) ||
+    /(?:\u603b\u7ba1\s*)?\u6279\u51c6\u6267\u884c[\s\S]{0,100}\bBATCH-ARCH-COMPLETE-/i.test(normalized) ||
+    /(?:\u4ec5|\u53ea)\u6279\u51c6[\s\S]{0,100}\bBATCH-ARCH-COMPLETE-/i.test(normalized)
+  );
 }
 
 function buildSystemRepairIntakeRecord(
@@ -1411,6 +1463,225 @@ function buildSystemRepairIntakeReply(
     "worker_created=false",
     "next_stage_allowed=false",
   ].join("\n");
+}
+
+function buildSystemRepairWorkerCreatedReply(
+  context: NonNullable<ReturnType<typeof resolveSystemRepairIntakeContext>>,
+  input: { jobId: string | null; existingWorker?: boolean }
+): string {
+  return [
+    input.existingWorker
+      ? "PROJECT_GENERAL_MANAGER_REPAIR_MODE_WORKER_TASK_DUPLICATE"
+      : "PROJECT_GENERAL_MANAGER_REPAIR_MODE_WORKER_TASK_CREATED",
+    "state: queued",
+    "repair_mode_applied=true",
+    "approval_context_saved=true",
+    "approval_context_readback_verified=true",
+    `approved_batch: ${context.parsedBatchCode}`,
+    `worker_task_id: ${input.jobId ?? "pending"}`,
+    `job_id: ${input.jobId ?? "pending"}`,
+    `existing_worker=${input.existingWorker ? "true" : "false"}`,
+    `worker_created=${input.existingWorker ? "false" : "true"}`,
+    `next_stage_allowed=${input.existingWorker ? "false" : "true"}`,
+    "skip_planning_choice: true",
+    "failure_code=null",
+    "failure_stage=null",
+  ].join("\n");
+}
+
+async function saveSystemRepairApprovalContextRecord(
+  supabase: SupabaseClient,
+  convId: string,
+  systemRecord: string
+): Promise<void> {
+  const { error } = await supabase.from("hermes_messages").insert([
+    {
+      conversation_id: convId,
+      role: "system",
+      content: systemRecord,
+      feishu_message_id: null,
+      tool_call_id: null,
+      name: "project_director_repair_mode_approval_context",
+    },
+  ]);
+  if (error) {
+    const saveError = new Error(`approval context persistence write failed: ${error.message}`);
+    (saveError as Error & { code?: string; stage?: string }).code = "APPROVAL_CONTEXT_PERSISTENCE_FAILED";
+    (saveError as Error & { code?: string; stage?: string }).stage = "approval_context_persistence_write";
+    throw saveError;
+  }
+
+  const { data, error: readbackError } = await supabase
+    .from("hermes_messages")
+    .select("id, content, name")
+    .eq("conversation_id", convId)
+    .eq("name", "project_director_repair_mode_approval_context")
+    .eq("content", systemRecord)
+    .order("id", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (readbackError || !data || (data as { content?: string | null }).content !== systemRecord) {
+    const saveError = new Error(
+      `approval context readback failed: ${readbackError?.message ?? "record not found"}`
+    );
+    (saveError as Error & { code?: string; stage?: string }).code = "APPROVAL_CONTEXT_READBACK_FAILED";
+    (saveError as Error & { code?: string; stage?: string }).stage = "approval_context_readback";
+    throw saveError;
+  }
+}
+
+async function saveUserAssistantRepairModeReply(
+  supabase: SupabaseClient,
+  convId: string,
+  userText: string,
+  reply: string,
+  feishuMessageId: string
+): Promise<void> {
+  const { error } = await supabase.from("hermes_messages").insert([
+    {
+      conversation_id: convId,
+      role: "user",
+      content: userText,
+      feishu_message_id: feishuMessageId,
+      tool_call_id: null,
+      name: null,
+    },
+    {
+      conversation_id: convId,
+      role: "assistant",
+      content: reply,
+      feishu_message_id: null,
+      tool_call_id: null,
+      name: null,
+    },
+  ]);
+  if (error) throw new Error(`save repair mode worker reply failed: ${error.message}`);
+}
+
+async function findActiveSystemRepairWorkerJobByBatch(
+  supabase: SupabaseClient,
+  batchCode: string
+): Promise<{ data: { id: string; job_id?: string | null; status?: string | null } | null; error: { message?: string } | null }> {
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .select("id, job_id, status")
+    .eq("dispatch_batch", batchCode)
+    .in("status", ["queued", "pending", "claimed", "running", "in_progress"])
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return { data: data as { id: string; job_id?: string | null; status?: string | null } | null, error };
+}
+
+async function insertSystemRepairWorkerTask(
+  supabase: SupabaseClient,
+  input: {
+    requestText: string;
+    rawText: string;
+    context: NonNullable<ReturnType<typeof resolveSystemRepairIntakeContext>>;
+    feishuMessageId: string;
+    feishuEventId: string;
+    feishuChatId: string;
+    feishuUserId: string;
+  }
+): Promise<{ jobId: string | null }> {
+  const taskGoal =
+    readDirectWorkerContextField(input.rawText, "task_goal") ??
+    `Execute approved automation system repair batch ${input.context.parsedBatchCode}.`;
+  const requiredOutputFields = readDirectWorkerContextField(input.rawText, "required_output_fields");
+  const acceptanceConditions = readDirectWorkerContextField(input.rawText, "acceptance_conditions");
+  const forbiddenOperations = readDirectWorkerContextField(input.rawText, "forbidden_operations");
+  const forbiddenScope = readDirectWorkerContextField(input.rawText, "forbidden_scope") ?? input.rawText;
+  assertNoScopeContractConflict(input.context.exactAllowedScope, forbiddenScope);
+
+  const contractPayload = buildWorkerJobPayloadContract({
+    requestText: input.requestText,
+    originalRequestText: input.rawText,
+    projectDomain: "automation_system",
+    taskType: SYSTEM_REPAIR_TASK_TYPE,
+    taskMode: "automation_system_write_allowed",
+    readOnlyMode: false,
+    repairMode: true,
+    repairScope: input.context.repairScope,
+    allowedScope: input.context.exactAllowedScope,
+    exactAllowedScope: input.context.exactAllowedScope,
+    exactAllowedScopeCount: input.context.exactAllowedScope.length,
+    forbiddenOperations,
+    forbiddenScope,
+    taskGoal,
+    requiredOutputFields,
+    acceptanceConditions,
+    approvedBatch: input.context.parsedBatchCode,
+    route: "repair_mode_direct_worker_create",
+    workerStage: "queued",
+    workflowStage: "execution",
+    finalReportStatus: "pending",
+    effectiveFinalStatus: "pending",
+    changedFiles: [],
+    pushed: false,
+    deployStatus: null,
+  });
+  const repairWorkerPayload = {
+    ...contractPayload,
+    requested_mode: input.context.parsedRequestedMode,
+    final_mode: "write_allowed",
+    task_mode: "automation_system_write_allowed",
+    read_only_mode: false,
+    approval_required: false,
+    approval_satisfied: true,
+    repair_mode: true,
+    repair_scope: input.context.repairScope,
+    allowed_scope: input.context.exactAllowedScope,
+    exact_allowed_scope: input.context.exactAllowedScope,
+    exact_allowed_scope_count: input.context.exactAllowedScope.length,
+    original_request_text_base64: Buffer.from(input.rawText, "utf8").toString("base64"),
+    approved_batch: input.context.parsedBatchCode,
+    batch_code: input.context.parsedBatchCode,
+    context_source: "project_director_gm_intake_repair_mode",
+    chat_id: input.feishuChatId,
+    root_id: input.feishuMessageId,
+    message_id: input.feishuMessageId,
+    created_at: new Date().toISOString(),
+    consumed: false,
+    context_id: `${input.context.parsedBatchCode}:${input.feishuMessageId}`,
+    skip_planning_choice: true,
+  };
+  const contextualRequestText = withHermesWorkerContext(input.requestText, repairWorkerPayload);
+  const row = {
+    source: "feishu",
+    job_type: "agent_dispatch",
+    title: `System repair Worker task: ${input.context.parsedBatchCode}`,
+    description: contextualRequestText,
+    prompt: contextualRequestText,
+    request_text: contextualRequestText,
+    status: "queued",
+    priority: 10,
+    plan_status: "approved",
+    workflow_stage: "execution",
+    source_message_id: input.feishuMessageId,
+    source_chat_id: input.feishuChatId,
+    source_event_id: input.feishuEventId,
+    feishu_message_id: input.feishuMessageId,
+    feishu_event_id: input.feishuEventId,
+    feishu_chat_id: input.feishuChatId,
+    feishu_user_id: input.feishuUserId,
+    repo: "city-partner-platform",
+    dispatch_batch: input.context.parsedBatchCode,
+    task_code: input.context.parsedBatchCode,
+    payload: {
+      ...repairWorkerPayload,
+      route: "repair_mode_direct_worker_create",
+      raw_message: input.rawText,
+    },
+  };
+  const insertResult = await createHermesJob(
+    supabase,
+    row,
+    "insert system repair worker task failed"
+  );
+  return { jobId: insertResult.jobIds[0] ?? null };
 }
 
 function isWriteAllowedApprovalText(text: string): boolean {
@@ -1958,6 +2229,224 @@ export async function POST(req: NextRequest) {
 
       const systemRepairIntakeContext = resolveSystemRepairIntakeContext(text);
       if (systemRepairIntakeContext) {
+        if (
+          systemRepairIntakeContext.ok &&
+          hasSystemRepairExecutionIntent(text, systemRepairIntakeContext)
+        ) {
+          const token = await getFeishuToken();
+          const requestText = buildDirectWorkerTaskText(text) || normalizeFeishuTaskText(text);
+          const systemRecord = buildSystemRepairIntakeRecord(
+            text,
+            systemRepairIntakeContext,
+            ev.message.message_id
+          );
+
+          try {
+            await saveSystemRepairApprovalContextRecord(supabase, convId, systemRecord);
+          } catch (error) {
+            const typedError = error as Error & { code?: string; stage?: string };
+            const reply = [
+              "PROJECT_GENERAL_MANAGER_REPAIR_MODE_WORKER_TASK_BLOCKED",
+              "state: approval_context_not_verified",
+              "repair_mode_applied=true",
+              "approval_context_saved=false",
+              "approval_context_readback_verified=false",
+              `approved_batch: ${systemRepairIntakeContext.parsedBatchCode}`,
+              "worker_created=false",
+              "next_stage_allowed=false",
+              `failure_code=${typedError.code ?? "APPROVAL_CONTEXT_PERSISTENCE_FAILED"}`,
+              `failure_stage=${typedError.stage ?? "approval_context_persistence_write"}`,
+            ].join("\n");
+            await saveUserAssistantRepairModeReply(
+              supabase,
+              convId,
+              text,
+              reply,
+              ev.message.message_id
+            );
+            await sendFeishuMessage(
+              token,
+              ev.message.chat_id,
+              ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+              reply
+            );
+            await markReceiptCompleted(supabase, eventId);
+            return NextResponse.json({
+              code: 0,
+              project_director_intake: true,
+              state: "repair_mode_worker_blocked",
+              approval_context_saved: false,
+              approval_context_readback_verified: false,
+              worker_created: false,
+              next_stage_allowed: false,
+              failure_code: typedError.code ?? "APPROVAL_CONTEXT_PERSISTENCE_FAILED",
+              failure_stage: typedError.stage ?? "approval_context_persistence_write",
+            });
+          }
+
+          const existingWorker = await findActiveSystemRepairWorkerJobByBatch(
+            supabase,
+            systemRepairIntakeContext.parsedBatchCode
+          );
+          if (existingWorker.error) {
+            const reply = [
+              "PROJECT_GENERAL_MANAGER_REPAIR_MODE_WORKER_TASK_BLOCKED",
+              "state: duplicate_check_failed",
+              "repair_mode_applied=true",
+              "approval_context_saved=true",
+              "approval_context_readback_verified=true",
+              `approved_batch: ${systemRepairIntakeContext.parsedBatchCode}`,
+              "worker_created=false",
+              "next_stage_allowed=false",
+              "failure_code=DUPLICATE_WORKER_CHECK_FAILED",
+              "failure_stage=worker_duplicate_guard",
+            ].join("\n");
+            await saveUserAssistantRepairModeReply(
+              supabase,
+              convId,
+              text,
+              reply,
+              ev.message.message_id
+            );
+            await sendFeishuMessage(
+              token,
+              ev.message.chat_id,
+              ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+              reply
+            );
+            await markReceiptCompleted(supabase, eventId);
+            return NextResponse.json({
+              code: 0,
+              project_director_intake: true,
+              state: "repair_mode_worker_blocked",
+              approval_context_saved: true,
+              approval_context_readback_verified: true,
+              worker_created: false,
+              next_stage_allowed: false,
+              failure_code: "DUPLICATE_WORKER_CHECK_FAILED",
+              failure_stage: "worker_duplicate_guard",
+            });
+          }
+
+          if (existingWorker.data) {
+            const existingJobId = existingWorker.data.job_id ?? existingWorker.data.id;
+            const reply = buildSystemRepairWorkerCreatedReply(systemRepairIntakeContext, {
+              jobId: existingJobId,
+              existingWorker: true,
+            });
+            await saveUserAssistantRepairModeReply(
+              supabase,
+              convId,
+              text,
+              reply,
+              ev.message.message_id
+            );
+            await sendFeishuMessage(
+              token,
+              ev.message.chat_id,
+              ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+              reply
+            );
+            await markReceiptCompleted(supabase, eventId);
+            return NextResponse.json({
+              code: 0,
+              project_director_intake: true,
+              state: "repair_mode_worker_duplicate_skipped",
+              approval_context_saved: true,
+              approval_context_readback_verified: true,
+              worker_created: false,
+              next_stage_allowed: false,
+              existing_worker: true,
+              worker_task_id: existingJobId,
+              job_id: existingJobId,
+              failure_code: null,
+              failure_stage: null,
+            });
+          }
+
+          try {
+            const insertResult = await insertSystemRepairWorkerTask(supabase, {
+              requestText,
+              rawText: text,
+              context: systemRepairIntakeContext,
+              feishuMessageId: ev.message.message_id,
+              feishuEventId: eventId,
+              feishuChatId: ev.message.chat_id,
+              feishuUserId: userId,
+            });
+            const reply = buildSystemRepairWorkerCreatedReply(systemRepairIntakeContext, {
+              jobId: insertResult.jobId,
+            });
+            await saveUserAssistantRepairModeReply(
+              supabase,
+              convId,
+              text,
+              reply,
+              ev.message.message_id
+            );
+            await sendFeishuMessage(
+              token,
+              ev.message.chat_id,
+              ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+              reply
+            );
+            await markReceiptCompleted(supabase, eventId);
+            return NextResponse.json({
+              code: 0,
+              project_director_intake: true,
+              state: "repair_mode_worker_queued",
+              repair_mode_applied: true,
+              approval_context_saved: true,
+              approval_context_readback_verified: true,
+              worker_created: true,
+              next_stage_allowed: true,
+              worker_task_id: insertResult.jobId,
+              job_id: insertResult.jobId,
+              failure_code: null,
+              failure_stage: null,
+            });
+          } catch (error) {
+            const typedError = error as Error & { code?: string; stage?: string };
+            const reply = [
+              "PROJECT_GENERAL_MANAGER_REPAIR_MODE_WORKER_TASK_BLOCKED",
+              "state: worker_create_failed",
+              "repair_mode_applied=true",
+              "approval_context_saved=true",
+              "approval_context_readback_verified=true",
+              `approved_batch: ${systemRepairIntakeContext.parsedBatchCode}`,
+              "worker_created=false",
+              "next_stage_allowed=false",
+              `failure_code=${typedError.code ?? "WORKER_CREATE_FAILED"}`,
+              `failure_stage=${typedError.stage ?? "worker_create"}`,
+            ].join("\n");
+            await saveUserAssistantRepairModeReply(
+              supabase,
+              convId,
+              text,
+              reply,
+              ev.message.message_id
+            );
+            await sendFeishuMessage(
+              token,
+              ev.message.chat_id,
+              ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+              reply
+            );
+            await markReceiptCompleted(supabase, eventId);
+            return NextResponse.json({
+              code: 0,
+              project_director_intake: true,
+              state: "repair_mode_worker_create_failed",
+              approval_context_saved: true,
+              approval_context_readback_verified: true,
+              worker_created: false,
+              next_stage_allowed: false,
+              failure_code: typedError.code ?? "WORKER_CREATE_FAILED",
+              failure_stage: typedError.stage ?? "worker_create",
+            });
+          }
+        }
+
         const reply = buildSystemRepairIntakeReply(systemRepairIntakeContext);
         await saveSystemRecordedReply(
           supabase,

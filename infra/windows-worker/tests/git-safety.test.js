@@ -473,6 +473,61 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
       assert.match(workerJobsSource, new RegExp(item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     }
   });
+
+  await t.test("system repair execution continues after approval context save and readback", () => {
+    const repairBranch = routeSource.slice(
+      routeSource.indexOf("const systemRepairIntakeContext = resolveSystemRepairIntakeContext(text)"),
+      routeSource.indexOf("if (isPlanChangeReply(text))")
+    );
+
+    assert.match(routeSource, /function hasSystemRepairExecutionIntent/);
+    assert.match(routeSource, /function isSystemRepairContextSaveOnlyRequest/);
+    assert.match(routeSource, /function saveSystemRepairApprovalContextRecord/);
+    assert.match(routeSource, /function findActiveSystemRepairWorkerJobByBatch/);
+    assert.match(routeSource, /function insertSystemRepairWorkerTask/);
+    assert.match(repairBranch, /hasSystemRepairExecutionIntent\(text, systemRepairIntakeContext\)/);
+    assert.ok(
+      repairBranch.indexOf("saveSystemRepairApprovalContextRecord") <
+        repairBranch.indexOf("findActiveSystemRepairWorkerJobByBatch")
+    );
+    assert.ok(
+      repairBranch.indexOf("findActiveSystemRepairWorkerJobByBatch") <
+        repairBranch.indexOf("insertSystemRepairWorkerTask")
+    );
+    assert.match(repairBranch, /approval_context_readback_verified: true/);
+    assert.match(repairBranch, /worker_created: true/);
+    assert.match(repairBranch, /next_stage_allowed: true/);
+    assert.match(repairBranch, /worker_task_id: insertResult\.jobId/);
+  });
+
+  await t.test("system repair continuation preserves idempotency and fail-closed guards", () => {
+    assert.match(routeSource, /duplicate_check_failed/);
+    assert.match(routeSource, /DUPLICATE_WORKER_CHECK_FAILED/);
+    assert.match(routeSource, /repair_mode_worker_duplicate_skipped/);
+    assert.match(routeSource, /existing_worker: true/);
+    assert.match(routeSource, /APPROVAL_CONTEXT_PERSISTENCE_FAILED/);
+    assert.match(routeSource, /APPROVAL_CONTEXT_READBACK_FAILED/);
+    assert.match(routeSource, /assertNoScopeContractConflict\(SYSTEM_REPAIR_SCOPE, text\)/);
+    assert.match(routeSource, /assertNoScopeContractConflict\(input\.context\.exactAllowedScope, forbiddenScope\)/);
+    assert.match(routeSource, /normal_write_allowed_exact_scope_validation/);
+    assert.match(routeSource, /EXACT_SCOPE_PARSE_FAILED/);
+  });
+
+  await t.test("system repair explicit execution intent is narrower than context save", () => {
+    const intentHelper = routeSource.slice(
+      routeSource.indexOf("function hasSystemRepairExecutionIntent"),
+      routeSource.indexOf("function buildSystemRepairIntakeRecord")
+    );
+
+    assert.match(intentHelper, /direct_worker_create/);
+    assert.match(intentHelper, /isExplicitDirectWorkerCreateCommand/);
+    assert.match(intentHelper, /isApprovedExecutionReply/);
+    assert.match(intentHelper, /BATCH-ARCH-COMPLETE-/);
+    assert.match(intentHelper, /isSystemRepairContextSaveOnlyRequest/);
+    assert.match(intentHelper, /manager_read_only/);
+    assert.match(routeSource, /PROJECT_GENERAL_MANAGER_REPAIR_MODE_CONTEXT_SAVED/);
+    assert.match(routeSource, /PROJECT_GENERAL_MANAGER_REPAIR_MODE_WORKER_TASK_CREATED/);
+  });
 });
 
 test("Git porcelain v1 -z status parsing", async (t) => {
@@ -4155,7 +4210,7 @@ test("Codex spawn preflight guard", async (t) => {
     const genericDemandIndex = routeSource.indexOf('const demandKind = classifyProjectDirectorDemand(text)');
     const directBranch = routeSource.slice(
       directBranchIndex,
-      routeSource.indexOf("if (isPlanChangeReply(text))", directBranchIndex)
+      routeSource.indexOf("const systemRepairIntakeContext = resolveSystemRepairIntakeContext(text)", directBranchIndex)
     );
 
     assert.notEqual(directBranchIndex, -1);
