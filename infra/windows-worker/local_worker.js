@@ -2254,7 +2254,7 @@ function isExplicitAutomationAllowedDocPath(filePath) {
 }
 
 const HERMES_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|task_mode|read_only_mode|repair_mode|repair_scope|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|route|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|task_mode|read_only_mode|repair_mode|repair_scope|verification_only|allow_no_change_success|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|route|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName) {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -2606,6 +2606,8 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "read_only_mode",
   "repair_mode",
   "repair_scope",
+  "verification_only",
+  "allow_no_change_success",
   "allowed_scope",
   "exact_allowed_scope",
   "exact_allowed_scope_count",
@@ -2987,6 +2989,8 @@ function normalizeWorkerContext(job, overrides = {}) {
     read_only_mode: readTextContextField(fallbackOriginalRequest, "read_only_mode"),
     repair_mode: readTextContextField(fallbackOriginalRequest, "repair_mode"),
     repair_scope: readTextContextField(fallbackOriginalRequest, "repair_scope"),
+    verification_only: readTextContextField(fallbackOriginalRequest, "verification_only"),
+    allow_no_change_success: readTextContextField(fallbackOriginalRequest, "allow_no_change_success"),
     allowed_scope: readTextContextField(fallbackOriginalRequest, "allowed_scope"),
     exact_allowed_scope: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope"),
     exact_allowed_scope_count: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope_count"),
@@ -3008,6 +3012,8 @@ function normalizeWorkerContext(job, overrides = {}) {
     read_only_mode: readTextContextField(requestText, "read_only_mode"),
     repair_mode: readTextContextField(requestText, "repair_mode"),
     repair_scope: readTextContextField(requestText, "repair_scope"),
+    verification_only: readTextContextField(requestText, "verification_only"),
+    allow_no_change_success: readTextContextField(requestText, "allow_no_change_success"),
     allowed_scope: readTextContextField(requestText, "allowed_scope"),
     exact_allowed_scope: readTextContextField(requestText, "exact_allowed_scope"),
     exact_allowed_scope_count: readTextContextField(requestText, "exact_allowed_scope_count"),
@@ -3029,6 +3035,8 @@ function normalizeWorkerContext(job, overrides = {}) {
     read_only_mode: overrides.readOnlyMode,
     repair_mode: overrides.repairMode,
     repair_scope: readScopeValue(overrides.repairScope),
+    verification_only: overrides.verificationOnly,
+    allow_no_change_success: overrides.allowNoChangeSuccess,
     allowed_scope: readScopeValue(overrides.allowedScope),
     exact_allowed_scope: readScopeValue(overrides.exactAllowedScope),
     exact_allowed_scope_count: overrides.exactAllowedScopeCount,
@@ -3105,6 +3113,12 @@ function normalizeWorkerContext(job, overrides = {}) {
   const repairScope = repairMode
     ? readString(readPriorityField("repair_scope")) || SYSTEM_REPAIR_SCOPE_TEXT
     : readString(readPriorityField("repair_scope")) || null;
+  const explicitVerificationOnly = readNullableBooleanFlag(readPriorityField("verification_only"));
+  const explicitAllowNoChangeSuccess = readNullableBooleanFlag(
+    readPriorityField("allow_no_change_success")
+  );
+  const verificationOnly = explicitVerificationOnly === true;
+  const allowNoChangeSuccess = repairMode && (verificationOnly || explicitAllowNoChangeSuccess === true);
   const rawAllowedScope = readString(readPriorityField("allowed_scope")) || null;
   const rawExactAllowedScope = readString(readPriorityField("exact_allowed_scope")) || null;
   const allowedScope = repairMode ? SYSTEM_REPAIR_SCOPE_TEXT : rawAllowedScope;
@@ -3209,6 +3223,8 @@ function normalizeWorkerContext(job, overrides = {}) {
     read_only_mode: readOnlyMode,
     repair_mode: repairMode,
     repair_scope: repairScope,
+    verification_only: verificationOnly,
+    allow_no_change_success: allowNoChangeSuccess,
     allowed_scope: allowedScope,
     exact_allowed_scope: exactAllowedScope,
     exact_allowed_scope_count: exactAllowedScopeCount,
@@ -3297,6 +3313,15 @@ function resolveWorkerJobContract(job, overrides = {}) {
   return normalizeWorkerContext(job, overrides);
 }
 
+function allowsVerificationOnlyNoChangeSuccess(contract) {
+  return Boolean(
+    contract?.repair_mode === true &&
+      contract?.read_only_mode === false &&
+      contract?.task_mode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED &&
+      (contract?.verification_only === true || contract?.allow_no_change_success === true)
+  );
+}
+
 function getMissingWorkerReadOnlyContextFields(contract) {
   if (!contract || contract.task_mode !== TASK_MODES.WORKER_READ_ONLY) {
     return [];
@@ -3381,6 +3406,8 @@ function formatWorkerJobContractLines(contract, options = {}) {
     `project_domain: ${contract.project_domain || "null"}`,
     `task_mode: ${contract.task_mode || "null"}`,
     `read_only_mode: ${contract.read_only_mode ? "true" : "false"}`,
+    `verification_only: ${contract.verification_only ? "true" : "false"}`,
+    `allow_no_change_success: ${contract.allow_no_change_success ? "true" : "false"}`,
     `allowed_scope: ${contract.allowed_scope || "null"}`,
     `exact_allowed_scope: ${contract.exact_allowed_scope || "null"}`,
     `exact_allowed_scope_count: ${contract.exact_allowed_scope_count || "null"}`,
@@ -3424,6 +3451,8 @@ function buildWorkerReportContractExtra(contract) {
     project_domain: contract.project_domain,
     task_mode: contract.task_mode,
     read_only_mode: contract.read_only_mode,
+    verification_only: contract.verification_only,
+    allow_no_change_success: contract.allow_no_change_success,
     allowed_scope: contract.allowed_scope,
     exact_allowed_scope: contract.exact_allowed_scope,
     exact_allowed_scope_count: contract.exact_allowed_scope_count,
@@ -4736,6 +4765,7 @@ function assertTaskGoalApplied(job, changedPaths) {
   const taskDomain = classifyWorkerTaskDomain(requestText);
   const taskMode = contract.task_mode;
   const exactAllowedScope = contract.exact_allowed_scope;
+  const allowNoChangeSuccess = allowsVerificationOnlyNoChangeSuccess(contract);
   const requiredPaths = filterRequiredChangePathsForTask(
     extractRequiredChangePaths(requestText),
     normalizedScopeText || requestText,
@@ -4883,6 +4913,10 @@ function assertTaskGoalApplied(job, changedPaths) {
 
     const automationChangedPaths = normalizedChangedPaths.filter(isAllowedAutomationPath);
     if (automationChangedPaths.length === 0) {
+      if (allowNoChangeSuccess) {
+        return;
+      }
+
       throw createNoFixAppliedError(
         "automation_system_write_allowed task produced no automation-system diff; refusing succeeded.",
         {
@@ -6314,6 +6348,10 @@ async function updateProgress(
 
 async function report(jobId, status, payload, extra = {}) {
   const attemptId = extra.attempt_id || currentAttemptId || null;
+  const terminalStatus = normalizeTerminalStatus(status);
+  if (["succeeded", "failed", "cancelled"].includes(terminalStatus)) {
+    stopTerminalReportTimers();
+  }
   const normalizedExtra = { ...extra };
   if (normalizedExtra.changed_files === undefined && normalizedExtra.files_changed !== undefined) {
     normalizedExtra.changed_files = normalizedExtra.files_changed;
@@ -6360,7 +6398,6 @@ async function report(jobId, status, payload, extra = {}) {
     responseBody = null;
   }
 
-  const terminalStatus = normalizeTerminalStatus(status);
   if (["succeeded", "failed", "cancelled"].includes(terminalStatus)) {
     lockAcceptedTerminalReportSnapshot({
       status,
@@ -6606,11 +6643,14 @@ async function pollOnce() {
 
     const completedAt = new Date().toISOString();
     const approvedBatchForReport = initialContract.approved_batch || getJobBatchCode(job);
+    const allowNoChangeSuccessForReport = allowsVerificationOnlyNoChangeSuccess(initialContract);
     const successWorkerExecutionStatus = "succeeded";
     const successTaskGoalStatus = readOnlyMode
       ? "completed_read_only_no_file_changes"
       : gitResult.filesChanged?.length
       ? "completed_with_file_changes"
+      : allowNoChangeSuccessForReport
+      ? "completed_verification_only_no_file_changes"
       : "completed_no_file_change_required";
     const normalizedFinalResult = normalizeWorkerFinalResult({
       job,
@@ -6632,6 +6672,8 @@ async function pollOnce() {
       attemptId,
       taskMode: taskModeForReport,
       readOnlyMode,
+      verificationOnly: initialContract.verification_only,
+      allowNoChangeSuccess: initialContract.allow_no_change_success,
       workerStage: "completed",
       workflowStage: "completed",
       finalReportStatus: "succeeded",
@@ -6661,13 +6703,18 @@ async function pollOnce() {
       `task_domain: ${classifyWorkerTaskDomain(getJobText(job))}`,
       `task_mode: ${taskModeForReport}`,
       `read_only_mode: ${readOnlyMode ? "true" : "false"}`,
+      `verification_only: ${successContract.verification_only ? "true" : "false"}`,
+      `allow_no_change_success: ${successContract.allow_no_change_success ? "true" : "false"}`,
       "original_worker_status: succeeded",
       "effective_final_status: succeeded",
       "read_only_violation: false",
       "no_fix_applied: false",
       "out_of_scope_business_change: false",
       `no_op_run: ${
-        !readOnlyMode && taskRequiresFileChanges(getJobText(job)) && !gitResult.filesChanged?.length
+        !readOnlyMode &&
+        !allowNoChangeSuccessForReport &&
+        taskRequiresFileChanges(getJobText(job)) &&
+        !gitResult.filesChanged?.length
           ? "true"
           : "false"
       }`,
@@ -6723,17 +6770,23 @@ async function pollOnce() {
           "Worker execution status: succeeded",
           readOnlyMode
             ? "任务目标验收：通过（read_only_mode，无文件变更）"
+            : allowNoChangeSuccessForReport
+            ? "任务目标验收：通过（verification_only，无文件变更）"
             : gitResult.filesChanged?.length
             ? "任务目标验收：通过（已产生文件变更）"
             : "任务目标验收：通过（任务不要求文件变更）",
           readOnlyMode
             ? "Task goal status: completed_read_only_no_file_changes"
+            : allowNoChangeSuccessForReport
+            ? "Task goal status: completed_verification_only_no_file_changes"
             : gitResult.filesChanged?.length
             ? "Task goal status: completed_with_file_changes"
             : "Task goal status: completed_no_file_change_required",
           `任务分类：${classifyWorkerTaskDomain(getJobText(job))}`,
           `task_mode: ${taskModeForReport}`,
           `read_only_mode：${readOnlyMode ? "true" : "false"}`,
+          `verification_only: ${successContract.verification_only ? "true" : "false"}`,
+          `allow_no_change_success: ${successContract.allow_no_change_success ? "true" : "false"}`,
           "original_worker_status: succeeded",
           "effective_final_status: succeeded",
           `failure_memory_status: ${normalizedFinalResult.failure_memory_status}`,
@@ -6743,7 +6796,10 @@ async function pollOnce() {
           "NO_FIX_APPLIED: no",
           "OUT_OF_SCOPE_BUSINESS_CHANGE: no",
           `No-op run: ${
-            !readOnlyMode && taskRequiresFileChanges(getJobText(job)) && !gitResult.filesChanged?.length
+            !readOnlyMode &&
+            !allowNoChangeSuccessForReport &&
+            taskRequiresFileChanges(getJobText(job)) &&
+            !gitResult.filesChanged?.length
               ? "yes"
               : "no"
           }`,
@@ -6764,6 +6820,8 @@ async function pollOnce() {
         github_push_status: buildGithubPushStatus(pushResult),
         read_only_mode: readOnlyMode,
         task_mode: taskModeForReport,
+        verification_only: successContract.verification_only,
+        allow_no_change_success: successContract.allow_no_change_success,
         original_worker_status: "succeeded",
         worker_execution_status: successWorkerExecutionStatus,
         task_goal_status: successTaskGoalStatus,
@@ -7165,6 +7223,7 @@ module.exports = {
   FAILURE_FINGERPRINTS,
   TASK_MODES,
   assertTaskGoalApplied,
+  allowsVerificationOnlyNoChangeSuccess,
   assertExplicitTaskFieldsNotOverridden,
   assertOriginalBatchContextAvailable,
   assertQaReportComplete,

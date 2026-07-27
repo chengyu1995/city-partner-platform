@@ -31,6 +31,15 @@ test("diagnostics separates worker, goal, and effective statuses", () => {
   assert.match(workerJobs, /effective_final_status:\s*effectiveStatus/);
 });
 
+test("worker contract carries verification-only no-change success flags", () => {
+  assert.match(workerJobs, /"verification_only"/);
+  assert.match(workerJobs, /"allow_no_change_success"/);
+  assert.match(workerJobs, /verification_only:\s*verificationOnly/);
+  assert.match(workerJobs, /allow_no_change_success:\s*allowNoChangeSuccess/);
+  assert.match(reportRoute, /verification_only:\s*body\.verification_only \?\? null/);
+  assert.match(reportRoute, /allow_no_change_success:\s*body\.allow_no_change_success \?\? null/);
+});
+
 test("diagnostics preserves context without original request text", () => {
   assert.match(workerJobs, /project_domain:/);
   assert.match(workerJobs, /requested_mode:/);

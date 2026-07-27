@@ -44,6 +44,8 @@ interface WorkerReportBody {
   deploy_status?: string | null;
   failure_code?: string | null;
   failure_stage?: string | null;
+  verification_only?: boolean | string | null;
+  allow_no_change_success?: boolean | string | null;
   worker_execution_status?: string | null;
   task_goal_status?: string | null;
   effective_final_status?: string | null;
@@ -84,6 +86,8 @@ function buildResult(body: WorkerReportBody): Record<string, unknown> {
     git_commit_sha: body.git_commit_sha ?? null,
     github_push_status: body.github_push_status ?? null,
     deploy_status: body.deploy_status ?? null,
+    verification_only: body.verification_only ?? null,
+    allow_no_change_success: body.allow_no_change_success ?? null,
     result_text: body.result_text ?? null,
     diagnostics: body.diagnostics ?? null,
   };
@@ -115,6 +119,11 @@ function getStoredDiagnostics(job: Record<string, unknown>): Record<string, unkn
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function readBooleanFlag(value: unknown): boolean {
+  if (value === true) return true;
+  return /^(true|1|yes|on)$/i.test(String(value ?? "").trim());
 }
 
 function fullReportText(job: Record<string, unknown>, body: WorkerReportBody): string {
@@ -156,6 +165,17 @@ function buildFalsePositiveSuccessGuard(
   const taskMode = readString(payload?.task_mode) ?? readContextField(text, "task_mode");
   const finalMode = readString(payload?.final_mode) ?? readContextField(text, "final_mode");
   const requestedMode = readString(payload?.requested_mode) ?? readContextField(text, "requested_mode");
+  const repairMode =
+    readBooleanFlag(payload?.repair_mode) ||
+    readBooleanFlag(readContextField(text, "repair_mode"));
+  const verificationOnly =
+    readBooleanFlag(body.verification_only) ||
+    readBooleanFlag(payload?.verification_only) ||
+    readBooleanFlag(readContextField(text, "verification_only"));
+  const allowNoChangeSuccess =
+    readBooleanFlag(body.allow_no_change_success) ||
+    readBooleanFlag(payload?.allow_no_change_success) ||
+    readBooleanFlag(readContextField(text, "allow_no_change_success"));
   const approvedBatch = readString(payload?.approved_batch) ?? readContextField(text, "approved_batch");
   const workerBatch = body.batch_code ?? readContextField(text, "batch_code");
   const exactAllowedScope =
@@ -163,6 +183,8 @@ function buildFalsePositiveSuccessGuard(
       ? normalizePathList(payload?.exact_allowed_scope)
       : normalizePathList(readContextField(text, "exact_allowed_scope"));
   const changedFiles = normalizePathList(body.files_changed);
+  const verificationOnlyNoChangeSuccess =
+    repairMode && (verificationOnly || allowNoChangeSuccess) && changedFiles.length === 0;
   const writeAllowed =
     finalMode === "write_allowed" ||
     requestedMode === "write_allowed" ||
@@ -201,6 +223,10 @@ function buildFalsePositiveSuccessGuard(
     };
   }
   if (writeAllowed && changedFiles.length === 0) {
+    if (verificationOnlyNoChangeSuccess) {
+      return null;
+    }
+
     return {
       failureCode: "NO_FIX_APPLIED",
       failureStage: "task_goal_validation",
@@ -208,6 +234,10 @@ function buildFalsePositiveSuccessGuard(
     };
   }
   if (writeAllowed && (!body.git_commit_sha || !reportPushed(body))) {
+    if (verificationOnlyNoChangeSuccess) {
+      return null;
+    }
+
     return {
       failureCode: "GIT_PUBLISH_REQUIRED",
       failureStage: "git_publish_validation",

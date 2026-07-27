@@ -33,6 +33,8 @@ export const HERMES_JOB_CONTEXT_PAYLOAD_FIELDS = [
   "final_mode",
   "task_mode",
   "read_only_mode",
+  "verification_only",
+  "allow_no_change_success",
   "allowed_scope",
   "exact_allowed_scope",
   "forbidden_scope",

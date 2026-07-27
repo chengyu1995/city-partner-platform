@@ -79,6 +79,8 @@ export const WORKER_JOB_CONTRACT_FIELDS = [
   "read_only_mode",
   "repair_mode",
   "repair_scope",
+  "verification_only",
+  "allow_no_change_success",
   "allowed_scope",
   "exact_allowed_scope",
   "exact_allowed_scope_count",
@@ -305,7 +307,7 @@ function decodeOriginalRequestTextBase64(value: unknown): string | null {
 }
 
 const WORKER_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|task_mode|read_only_mode|repair_mode|repair_scope|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|route|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|task_mode|read_only_mode|repair_mode|repair_scope|verification_only|allow_no_change_success|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|route|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName: string): string {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -620,6 +622,8 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "read_only_mode",
   "repair_mode",
   "repair_scope",
+  "verification_only",
+  "allow_no_change_success",
   "allowed_scope",
   "exact_allowed_scope",
   "exact_allowed_scope_count",
@@ -658,6 +662,8 @@ const WORKER_CONTEXT_CORE_FIELDS = [
   "read_only_mode",
   "repair_mode",
   "repair_scope",
+  "verification_only",
+  "allow_no_change_success",
   "allowed_scope",
   "forbidden_scope",
   "route",
@@ -2066,6 +2072,8 @@ export function buildWorkerJobPayloadContract(input: {
   readOnlyMode?: boolean | null;
   repairMode?: boolean | null;
   repairScope?: unknown;
+  verificationOnly?: boolean | null;
+  allowNoChangeSuccess?: boolean | null;
   allowedScope?: unknown;
   exactAllowedScope?: unknown;
   exactAllowedScopeCount?: unknown;
@@ -2142,6 +2150,8 @@ export function buildWorkerJobPayloadContract(input: {
     read_only_mode: readTextContextField(fallbackOriginalRequest, "read_only_mode"),
     repair_mode: readTextContextField(fallbackOriginalRequest, "repair_mode"),
     repair_scope: readTextContextField(fallbackOriginalRequest, "repair_scope"),
+    verification_only: readTextContextField(fallbackOriginalRequest, "verification_only"),
+    allow_no_change_success: readTextContextField(fallbackOriginalRequest, "allow_no_change_success"),
     allowed_scope: readTextContextField(fallbackOriginalRequest, "allowed_scope"),
     exact_allowed_scope: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope"),
     exact_allowed_scope_count: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope_count"),
@@ -2163,6 +2173,8 @@ export function buildWorkerJobPayloadContract(input: {
     read_only_mode: readTextContextField(requestText, "read_only_mode"),
     repair_mode: readTextContextField(requestText, "repair_mode"),
     repair_scope: readTextContextField(requestText, "repair_scope"),
+    verification_only: readTextContextField(requestText, "verification_only"),
+    allow_no_change_success: readTextContextField(requestText, "allow_no_change_success"),
     allowed_scope: readTextContextField(requestText, "allowed_scope"),
     exact_allowed_scope: readTextContextField(requestText, "exact_allowed_scope"),
     exact_allowed_scope_count: readTextContextField(requestText, "exact_allowed_scope_count"),
@@ -2184,6 +2196,8 @@ export function buildWorkerJobPayloadContract(input: {
     read_only_mode: input.readOnlyMode,
     repair_mode: input.repairMode,
     repair_scope: readScopeText(input.repairScope),
+    verification_only: input.verificationOnly,
+    allow_no_change_success: input.allowNoChangeSuccess,
     allowed_scope: readScopeText(input.allowedScope),
     exact_allowed_scope: readScopeText(input.exactAllowedScope),
     exact_allowed_scope_count: input.exactAllowedScopeCount,
@@ -2261,6 +2275,12 @@ export function buildWorkerJobPayloadContract(input: {
   const repairScope = repairMode
     ? readString(readPriorityField("repair_scope")) ?? SYSTEM_REPAIR_SCOPE_TEXT
     : readString(readPriorityField("repair_scope")) ?? null;
+  const explicitVerificationOnly = readNullableBooleanFlag(readPriorityField("verification_only"));
+  const explicitAllowNoChangeSuccess = readNullableBooleanFlag(
+    readPriorityField("allow_no_change_success")
+  );
+  const verificationOnly = explicitVerificationOnly === true;
+  const allowNoChangeSuccess = repairMode && (verificationOnly || explicitAllowNoChangeSuccess === true);
   const rawAllowedScope = readString(readPriorityField("allowed_scope")) ?? null;
   const rawExactAllowedScope = readString(readPriorityField("exact_allowed_scope")) ?? null;
   const allowedScope = repairMode ? SYSTEM_REPAIR_SCOPE_TEXT : rawAllowedScope;
@@ -2363,6 +2383,8 @@ export function buildWorkerJobPayloadContract(input: {
     read_only_mode: readOnlyMode,
     repair_mode: repairMode,
     repair_scope: repairScope,
+    verification_only: verificationOnly,
+    allow_no_change_success: allowNoChangeSuccess,
     allowed_scope: allowedScope,
     exact_allowed_scope: exactAllowedScope,
     exact_allowed_scope_count: exactAllowedScopeCount,

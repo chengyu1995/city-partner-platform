@@ -11,6 +11,7 @@ const nextRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker",
 const heartbeatRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker", "heartbeat", "route.ts"), "utf8");
 const progressRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker", "progress", "route.ts"), "utf8");
 const reportRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker", "report", "route.ts"), "utf8");
+const localWorker = fs.readFileSync(path.join(root, "infra", "windows-worker", "local_worker.js"), "utf8");
 const workerJobs = fs.readFileSync(path.join(root, "src", "lib", "worker-jobs.ts"), "utf8");
 const feishuRoute = fs.readFileSync(path.join(root, "src", "app", "api", "feishu", "event", "route.ts"), "utf8");
 const jobBuilder = fs.readFileSync(path.join(root, "src", "lib", "project-director-job-builder.ts"), "utf8");
@@ -71,6 +72,25 @@ test("terminal report blocks false positive success after lifecycle failure", ()
   assert.match(reportRoute, /WORKER_ATTEMPT_LIFECYCLE_FAILED/);
   assert.match(reportRoute, /running_job_not_found_or_not_owned/);
   assert.match(reportRoute, /status:\s*falsePositiveGuard \? "failed" : workerStatus/);
+});
+
+test("terminal report stops periodic heartbeat and progress before report request", () => {
+  const block = functionBlock(localWorker, "report");
+  const stopIndex = block.indexOf("stopTerminalReportTimers()");
+  const requestIndex = block.indexOf('request("/api/worker/report"');
+  assert.ok(stopIndex >= 0, "terminal report should stop periodic timers");
+  assert.ok(requestIndex > stopIndex, "timer stop must happen before terminal report request");
+});
+
+test("verification-only no-change success bypasses false positive no-fix and publish guards only in repair mode", () => {
+  const block = functionBlock(reportRoute, "buildFalsePositiveSuccessGuard");
+  assert.match(block, /repairMode && \(verificationOnly \|\| allowNoChangeSuccess\) && changedFiles\.length === 0/);
+  const noFixIndex = block.indexOf('failureCode: "NO_FIX_APPLIED"');
+  const gitPublishIndex = block.indexOf('failureCode: "GIT_PUBLISH_REQUIRED"');
+  const bypassIndexes = [...block.matchAll(/if \(verificationOnlyNoChangeSuccess\)/g)].map((match) => match.index ?? -1);
+  assert.equal(bypassIndexes.length, 2);
+  assert.ok(bypassIndexes[0] >= 0 && bypassIndexes[0] < noFixIndex);
+  assert.ok(bypassIndexes[1] >= 0 && bypassIndexes[1] < gitPublishIndex);
 });
 
 test("write allowed read-only downgrade is blocked before success persistence", () => {

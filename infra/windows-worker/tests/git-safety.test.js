@@ -44,6 +44,7 @@ const {
   assertQaTaskOutcome,
   assertWorkerReadOnlyTaskGoalComplete,
   assertTaskGoalApplied,
+  allowsVerificationOnlyNoChangeSuccess,
   assertExplicitTaskFieldsNotOverridden,
   buildCodexPrompt,
   buildCodexExecArgs,
@@ -3076,6 +3077,67 @@ test("bootstrap context router contract guards", async (t) => {
           },
           []
         ),
+      (error) => error.code === NO_FIX_APPLIED
+    );
+  });
+
+  await t.test("repair verification-only write tasks can succeed with no file changes", () => {
+    const verificationOnlyJob = {
+      id: "abfc672d-9172-4312-ad3f-03aaeb11a67c",
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-REPAIR-MODE-CLOUD-SMOKE-27",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_type=system_repair",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "repair_mode=true",
+        "verification_only=true",
+        "allow_no_change_success=true",
+        "allowed_scope=infra/windows-worker/local_worker.js",
+        "exact_allowed_scope=infra/windows-worker/local_worker.js",
+        "task_goal=Run production repair_mode smoke verification without modifying files.",
+      ].join("\n"),
+      payload: {
+        project_domain: "automation_system",
+        task_type: "system_repair",
+        task_mode: "automation_system_write_allowed",
+        read_only_mode: false,
+        repair_mode: true,
+        verification_only: true,
+        allow_no_change_success: true,
+        exact_allowed_scope: ["infra/windows-worker/local_worker.js"],
+        approved_batch: "BATCH-ARCH-COMPLETE-01-REPAIR-MODE-CLOUD-SMOKE-27",
+      },
+    };
+
+    const contract = resolveWorkerJobContract(verificationOnlyJob);
+    assert.equal(contract.verification_only, true);
+    assert.equal(contract.allow_no_change_success, true);
+    assert.equal(allowsVerificationOnlyNoChangeSuccess(contract), true);
+    assert.doesNotThrow(() => assertTaskGoalApplied(verificationOnlyJob, []));
+  });
+
+  await t.test("ordinary automation write tasks cannot opt into no-change success without repair mode", () => {
+    const ordinaryJob = {
+      request_text: [
+        "BATCH-GM-WRITE-NOOP-01",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "verification_only=true",
+        "allow_no_change_success=true",
+        "allowed_scope=infra/windows-worker/local_worker.js",
+        "exact_allowed_scope=infra/windows-worker/local_worker.js",
+      ].join("\n"),
+    };
+
+    const contract = resolveWorkerJobContract(ordinaryJob);
+    assert.equal(contract.repair_mode, false);
+    assert.equal(allowsVerificationOnlyNoChangeSuccess(contract), false);
+    assert.throws(
+      () => assertTaskGoalApplied(ordinaryJob, []),
       (error) => error.code === NO_FIX_APPLIED
     );
   });
