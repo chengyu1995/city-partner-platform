@@ -11,6 +11,7 @@ const { spawn, execFile } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const {
   assertCleanStatusEntries,
   getStatusPaths,
@@ -490,10 +491,11 @@ function spawnCodexProcess(codexArgs, options = {}) {
   commandInfo.codexResolution = codexResolution;
 
   try {
-    const child = spawn(commandInfo.command, commandInfo.args, {
+    const spawnFactory = options.spawnFactory || spawn;
+    const child = spawnFactory(commandInfo.command, commandInfo.args, {
       shell: false,
       windowsHide: true,
-      stdio: options.stdio || ["ignore", "pipe", "pipe"],
+      stdio: options.stdio || ["pipe", "pipe", "pipe"],
       env: {
         ...sanitizeWindowsEnv(process.env),
         CI: "1",
@@ -506,6 +508,39 @@ function spawnCodexProcess(codexArgs, options = {}) {
     error.codexCommandInfo = commandInfo;
     throw error;
   }
+}
+
+function createCodexTransportError(code, message, details = {}) {
+  const error = new Error(message);
+  error.code = code;
+  error.failureStage =
+    code === "CODEX_STDIN_TRANSPORT_FAILED"
+      ? "codex_stdin_transport"
+      : code === "CODEX_TIMEOUT"
+      ? "codex_timeout"
+      : code === "CODEX_PROCESS_CLOSE_TIMEOUT"
+      ? "codex_process_close_timeout"
+      : code === "CODEX_PROCESS_EXIT_FAILED"
+      ? "codex_process_exit"
+      : "codex_spawn";
+  Object.assign(error, details);
+  return error;
+}
+
+function formatCodexStdinDiagnostic(details = {}) {
+  return [
+    `failure_code=${details.failure_code || "CODEX_STDIN_TRANSPORT_FAILED"}`,
+    `failure_stage=${details.failure_stage || "codex_stdin_transport"}`,
+    details.error_code ? `error_code=${details.error_code}` : null,
+    details.errno !== null && details.errno !== undefined ? `errno=${details.errno}` : null,
+    details.syscall ? `syscall=${details.syscall}` : null,
+    details.resolved_executable ? `resolved_executable=${sanitizeSpawnValue(details.resolved_executable)}` : null,
+    Number.isFinite(details.prompt_bytes) ? `prompt_bytes=${details.prompt_bytes}` : null,
+    Number.isFinite(details.retry_number) ? `retry_number=${details.retry_number}` : null,
+    "stdin_transport=true",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function createCodexOutputCapture(label = "codex") {
@@ -538,26 +573,6 @@ function closeCodexOutputCapture(capture) {
   }
 }
 
-function readCodexCaptureChunk(filePath, state) {
-  try {
-    const stat = fs.statSync(filePath);
-    const start = Number(state.position || 0);
-    if (stat.size <= start) return "";
-    const length = stat.size - start;
-    const fd = fs.openSync(filePath, "r");
-    try {
-      const buffer = Buffer.alloc(length);
-      const bytesRead = fs.readSync(fd, buffer, 0, length, start);
-      state.position = start + bytesRead;
-      return buffer.slice(0, bytesRead).toString();
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch (_) {
-    return "";
-  }
-}
-
 function runCodexPreflight(options = {}) {
   return new Promise((resolve) => {
     const codexResolution = resolveCodexExecutable(options);
@@ -567,18 +582,50 @@ function runCodexPreflight(options = {}) {
     }
 
     const mode = String(options.mode || "version").toLowerCase();
-    const codexArgs =
-      mode === "smoke"
-        ? [
-            "exec",
-            "-C",
-            PROJECT_DIR,
-            "--sandbox",
-            "read-only",
-            "--skip-git-repo-check",
-            "只输出 CODEX_WORKER_PREFLIGHT_OK，不修改文件",
-          ]
-        : ["--version"];
+    if (mode === "smoke") {
+      const timeoutMs = Number(options.timeoutMs || 30000);
+      const prompt = "只输出 CODEX_WORKER_PREFLIGHT_OK，不修改文件";
+      spawnCodexWithStdin(
+        prompt,
+        {
+          request_text: [
+            "CODEX_WORKER_PREFLIGHT",
+            "project_domain=automation_system",
+            "task_mode=read_only",
+            "read_only_mode=true",
+          ].join("\n"),
+        },
+        {
+          codexResolution,
+          timeoutMs,
+          idleTimeoutMs: timeoutMs,
+          heartbeat: false,
+          mirrorOutput: false,
+          retryNumber: 0,
+        }
+      )
+        .then((stdout) => {
+          resolve({
+            ok: true,
+            codexResolution,
+            exitCode: 0,
+            stdout: String(stdout || "").trim().slice(0, 500),
+            stderr: "",
+            error: null,
+          });
+        })
+        .catch((error) => {
+          resolve({
+            ok: false,
+            codexResolution,
+            error: error && error.message ? error.message : String(error),
+            code: error && error.code ? error.code : null,
+          });
+        });
+      return;
+    }
+
+    const codexArgs = ["--version"];
 
     let child;
     let capture;
@@ -5397,7 +5444,7 @@ function buildCodexPrompt(job) {
   });
 }
 
-function buildCodexExecArgs(prompt, job) {
+function buildCodexExecArgs(_prompt, job) {
   const contract = resolveWorkerJobContract(job, {
     taskMode: getTaskMode(job),
     readOnlyMode: isReadOnlyTask(job),
@@ -5416,7 +5463,7 @@ function buildCodexExecArgs(prompt, job) {
     "--sandbox",
     sandboxMode,
     "--skip-git-repo-check",
-    prompt,
+    "-",
   ];
 }
 
@@ -5834,7 +5881,9 @@ async function runCodexWithRetries(job) {
         );
       }
 
-      return await runCodex(prompts[index](failures[failures.length - 1]), job);
+      return await runCodex(prompts[index](failures[failures.length - 1]), job, {
+        retryNumber: index + 1,
+      });
     } catch (error) {
       failures.push(error);
     }
@@ -6145,48 +6194,110 @@ function startCodexHeartbeat(job) {
   });
 }
 
-function runCodex(prompt, job) {
+function spawnCodexWithStdin(prompt, job, options = {}) {
   return new Promise((resolve, reject) => {
+    const promptText = String(prompt || "");
+    const promptBytes = Buffer.byteLength(promptText, "utf8");
+    const promptSha256 = crypto.createHash("sha256").update(promptText).digest("hex");
+    const retryNumber = Number(options.retryNumber || 1);
+    const codexArgs = buildCodexExecArgs(null, job);
+    const timeoutMs = Number(options.timeoutMs || CODEX_TIMEOUT_MS);
+    const idleTimeoutMs = Number(options.idleTimeoutMs || CODEX_IDLE_TIMEOUT_MS);
+    let child;
+
     console.log(`开始执行 Codex，项目目录：${PROJECT_DIR}`);
 
-    let child;
-    let capture;
     try {
-      capture = createCodexOutputCapture("codex-task");
-      child = spawnCodexProcess(buildCodexExecArgs(prompt, job), {
-        stdio: capture.stdio,
+      child = spawnCodexProcess(codexArgs, {
+        ...options,
+        codexResolution: options.codexResolution,
+        stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
-      if (capture) closeCodexOutputCapture(capture);
       const diagnostic = formatCodexSpawnError(
         error,
         error && error.codexCommandInfo
       );
-      reject(
-        new Error(
-          `${diagnostic || "CODEX_SPAWN_FAILED"}\n${
-            error && error.message ? error.message : String(error)
-          }`
-        )
+      const spawnError = createCodexTransportError(
+        "CODEX_SPAWN_FAILED",
+        `${diagnostic || "CODEX_SPAWN_FAILED"}\n${
+          error && error.message ? error.message : String(error)
+        }`,
+        {
+          error_code: error && error.code ? error.code : null,
+          errno: error && Object.prototype.hasOwnProperty.call(error, "errno") ? error.errno : null,
+          syscall: error && error.syscall ? error.syscall : null,
+          prompt_bytes: promptBytes,
+          retry_number: retryNumber,
+        }
       );
+      reject(spawnError);
       return;
     }
 
+    const commandInfo = child.codexCommandInfo || {};
+    const resolvedExecutable =
+      commandInfo.codexResolution && commandInfo.codexResolution.resolvedPath;
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let stdinWriteCompleted = false;
+    let stdinEndCalled = false;
+    let exitSeen = false;
+    let closeSeen = false;
+    let pendingFailure = null;
     let lastOutputAt = Date.now();
     let stopCodexHeartbeat = () => {};
-    const stdoutCaptureState = { position: 0 };
-    const stderrCaptureState = { position: 0 };
+    let idleTimer;
+    let hardTimer;
+    let closeTimer;
 
     const cleanupTimers = () => {
       stopCodexHeartbeat();
       clearTimeout(hardTimer);
       clearTimeout(idleTimer);
-      clearInterval(outputDrainTimer);
-      closeCodexOutputCapture(capture);
+      clearTimeout(closeTimer);
     };
+
+    const rejectOnce = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanupTimers();
+      reject(error);
+    };
+
+    const resolveOnce = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanupTimers();
+      resolve(value);
+    };
+
+    const buildStdinFailure = (error, message) =>
+      createCodexTransportError(
+        "CODEX_STDIN_TRANSPORT_FAILED",
+        [
+          formatCodexStdinDiagnostic({
+            failure_code: "CODEX_STDIN_TRANSPORT_FAILED",
+            failure_stage: "codex_stdin_transport",
+            error_code: error && error.code ? error.code : null,
+            errno: error && Object.prototype.hasOwnProperty.call(error, "errno") ? error.errno : null,
+            syscall: error && error.syscall ? error.syscall : "stdin.write",
+            resolved_executable: resolvedExecutable,
+            prompt_bytes: promptBytes,
+            retry_number: retryNumber,
+          }),
+          message || (error && error.message) || String(error || "stdin unavailable"),
+        ].join("\n"),
+        {
+          error_code: error && error.code ? error.code : null,
+          errno: error && Object.prototype.hasOwnProperty.call(error, "errno") ? error.errno : null,
+          syscall: error && error.syscall ? error.syscall : "stdin.write",
+          resolved_executable: resolvedExecutable || null,
+          prompt_bytes: promptBytes,
+          retry_number: retryNumber,
+        }
+      );
 
     const appendOutput = (target, chunk) => {
       const text = chunk.toString();
@@ -6194,39 +6305,47 @@ function runCodex(prompt, job) {
 
       if (target === "stdout") {
         stdout += text;
-        if (stdout.length > 2 * 1024 * 1024) {
-          stdout = stdout.slice(-2 * 1024 * 1024);
-        }
-        process.stdout.write(text);
+        if (stdout.length > 2 * 1024 * 1024) stdout = stdout.slice(-2 * 1024 * 1024);
+        if (options.mirrorOutput !== false) process.stdout.write(text);
       } else {
         stderr += text;
-        if (stderr.length > 2 * 1024 * 1024) {
-          stderr = stderr.slice(-2 * 1024 * 1024);
-        }
-        process.stderr.write(text);
+        if (stderr.length > 2 * 1024 * 1024) stderr = stderr.slice(-2 * 1024 * 1024);
+        if (options.mirrorOutput !== false) process.stderr.write(text);
       }
 
       resetIdleTimer();
     };
 
-    const drainCapturedOutput = () => {
-      if (!capture) return;
-      const stdoutChunk = readCodexCaptureChunk(capture.stdoutPath, stdoutCaptureState);
-      if (stdoutChunk) appendOutput("stdout", Buffer.from(stdoutChunk));
-      const stderrChunk = readCodexCaptureChunk(capture.stderrPath, stderrCaptureState);
-      if (stderrChunk) appendOutput("stderr", Buffer.from(stderrChunk));
-    };
+    const requestTermination = (code, message) => {
+      if (pendingFailure || settled) return;
+      pendingFailure = createCodexTransportError(code, message, {
+        prompt_bytes: promptBytes,
+        retry_number: retryNumber,
+        resolved_executable: resolvedExecutable || null,
+      });
 
-    const failAndKill = (message) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      cleanupTimers();
+      try {
+        if (child.stdin && !child.stdin.destroyed) {
+          stdinEndCalled = true;
+          child.stdin.end();
+        }
+      } catch {}
 
       killProcessTree(child.pid, message).finally(() => {
-        reject(new Error(message));
+        if (closeSeen || settled) return;
+        closeTimer = setTimeout(() => {
+          rejectOnce(
+            createCodexTransportError(
+              "CODEX_PROCESS_CLOSE_TIMEOUT",
+              "Codex process did not emit close after termination request.",
+              {
+                prompt_bytes: promptBytes,
+                retry_number: retryNumber,
+                resolved_executable: resolvedExecutable || null,
+              }
+            )
+          );
+        }, Number(options.closeTimeoutMs || 15000));
       });
     };
 
@@ -6234,56 +6353,140 @@ function runCodex(prompt, job) {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         const idleMs = Date.now() - lastOutputAt;
-        failAndKill(`Codex 空闲超时：${idleMs}ms 无输出，已强制结束进程树`);
-      }, CODEX_IDLE_TIMEOUT_MS);
+        requestTermination(
+          "CODEX_TIMEOUT",
+          `Codex 空闲超时：${idleMs}ms 无输出，已强制结束进程树`
+        );
+      }, idleTimeoutMs);
     };
 
-    let idleTimer = setTimeout(() => {
-      const idleMs = Date.now() - lastOutputAt;
-      failAndKill(`Codex 空闲超时：${idleMs}ms 无输出，已强制结束进程树`);
-    }, CODEX_IDLE_TIMEOUT_MS);
-
-    const hardTimer = setTimeout(() => {
-      failAndKill(`Codex 执行总超时：${CODEX_TIMEOUT_MS}ms，已强制结束进程树`);
-    }, CODEX_TIMEOUT_MS);
-
-    const outputDrainTimer = setInterval(drainCapturedOutput, 1000);
-
-    child.on("spawn", () => {
-      stopCodexHeartbeat = startCodexHeartbeat(job);
-    });
-
     child.on("error", (error) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      cleanupTimers();
-      reject(error);
-    });
-
-    child.on("close", (code) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      drainCapturedOutput();
-      cleanupTimers();
-
-      if (code === 0) {
-        resolve(stdout.trim() || "Codex 执行完成");
-        return;
-      }
-
-      reject(
-        new Error(
-          `Codex 退出码 ${code}\n${stderr || stdout || "没有输出"}`
+      if (pendingFailure) return;
+      rejectOnce(
+        createCodexTransportError(
+          "CODEX_SPAWN_FAILED",
+          `${formatCodexSpawnError(error, commandInfo) || "CODEX_SPAWN_FAILED"}\n${
+            error && error.message ? error.message : String(error)
+          }`,
+          {
+            error_code: error && error.code ? error.code : null,
+            errno: error && Object.prototype.hasOwnProperty.call(error, "errno") ? error.errno : null,
+            syscall: error && error.syscall ? error.syscall : null,
+            prompt_bytes: promptBytes,
+            retry_number: retryNumber,
+            resolved_executable: resolvedExecutable || null,
+          }
         )
       );
     });
+
+    child.on("exit", () => {
+      exitSeen = true;
+    });
+
+    child.on("close", (code) => {
+      closeSeen = true;
+      if (pendingFailure) {
+        rejectOnce(pendingFailure);
+        return;
+      }
+
+      if (!exitSeen && code !== 0) {
+        rejectOnce(
+          createCodexTransportError(
+            "CODEX_PROCESS_EXIT_FAILED",
+            `Codex process closed before exit event; close code ${code}.`,
+            {
+              prompt_bytes: promptBytes,
+              retry_number: retryNumber,
+              resolved_executable: resolvedExecutable || null,
+            }
+          )
+        );
+        return;
+      }
+
+      if (code === 0) {
+        console.log(
+          [
+            "codex_stdin_transport_complete=true",
+            `fixed_spawnargs=${JSON.stringify(sanitizeSpawnArgs(commandInfo.args || []))}`,
+            `prompt_bytes=${promptBytes}`,
+            `prompt_sha256=${promptSha256}`,
+            `retry_number=${retryNumber}`,
+            "stdin_transport=true",
+            `stdin_write_completed=${stdinWriteCompleted ? "true" : "false"}`,
+            `stdin_end_called=${stdinEndCalled ? "true" : "false"}`,
+          ].join(" ")
+        );
+        resolveOnce(stdout.trim() || "Codex 执行完成");
+        return;
+      }
+
+      rejectOnce(
+        createCodexTransportError(
+          "CODEX_PROCESS_EXIT_FAILED",
+          `Codex 退出码 ${code}\n${stderr || stdout || "没有输出"}`,
+          {
+            prompt_bytes: promptBytes,
+            retry_number: retryNumber,
+            resolved_executable: resolvedExecutable || null,
+          }
+        )
+      );
+    });
+
+    if (child.stdout) child.stdout.on("data", (chunk) => appendOutput("stdout", chunk));
+    if (child.stderr) child.stderr.on("data", (chunk) => appendOutput("stderr", chunk));
+
+    if (!child.stdin || child.stdin.destroyed || child.stdin.writable === false) {
+      rejectOnce(buildStdinFailure(null, "stdin unavailable or not writable"));
+      return;
+    }
+
+    stopCodexHeartbeat = options.heartbeat === false ? () => {} : startCodexHeartbeat(job);
+    resetIdleTimer();
+    hardTimer = setTimeout(() => {
+      requestTermination(
+        "CODEX_TIMEOUT",
+        `Codex 执行总超时：${timeoutMs}ms，已强制结束进程树`
+      );
+    }, timeoutMs);
+
+    child.stdin.once("error", (error) => {
+      if (stdinWriteCompleted || pendingFailure || settled) return;
+      requestTermination(
+        "CODEX_STDIN_TRANSPORT_FAILED",
+        buildStdinFailure(error).message
+      );
+    });
+
+    try {
+      child.stdin.write(promptText, "utf8", (error) => {
+        if (error) {
+          requestTermination(
+            "CODEX_STDIN_TRANSPORT_FAILED",
+            buildStdinFailure(error).message
+          );
+          return;
+        }
+        stdinWriteCompleted = true;
+        if (!stdinEndCalled) {
+          stdinEndCalled = true;
+          child.stdin.end();
+        }
+      });
+    } catch (error) {
+      requestTermination(
+        "CODEX_STDIN_TRANSPORT_FAILED",
+        buildStdinFailure(error).message
+      );
+    }
   });
+}
+
+function runCodex(prompt, job, options = {}) {
+  return spawnCodexWithStdin(prompt, job, options);
 }
 
 async function updateProgress(
@@ -7267,6 +7470,7 @@ module.exports = {
   resolveCodexExecutable,
   resolveWorkerJobContract,
   runCodexPreflight,
+  spawnCodexWithStdin,
   spawnCodexProcess,
   resetTerminalReportState,
   stopTerminalReportTimers,

@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { EventEmitter } = require("events");
+const { PassThrough, Writable } = require("stream");
 
 const {
   assertCleanStatusEntries,
@@ -79,6 +81,7 @@ const {
   resolveCodexExecutable,
   resolveWorkerJobContract,
   runCodexPreflight,
+  spawnCodexWithStdin,
   resetTerminalReportState,
 } = require("../local_worker");
 
@@ -4237,6 +4240,8 @@ test("Codex spawn preflight guard", async (t) => {
     assert.notEqual(sandboxIndex, -1);
     assert.equal(args[sandboxIndex + 1], "read-only");
     assert.doesNotMatch(args.join(" "), /workspace-write/);
+    assert.equal(args[args.length - 1], "-");
+    assert.doesNotMatch(args.join(" "), /report only/);
   });
 
   await t.test("uses workspace-write sandbox for write-allowed tasks", () => {
@@ -4260,6 +4265,8 @@ test("Codex spawn preflight guard", async (t) => {
     const args = buildCodexExecArgs("fix safely", job);
     const sandboxIndex = args.indexOf("--sandbox");
     assert.equal(args[sandboxIndex + 1], "workspace-write");
+    assert.equal(args[args.length - 1], "-");
+    assert.doesNotMatch(args.join(" "), /fix safely/);
   });
 
   await t.test("direct worker route handles complete direct write requests before generic intake", () => {
@@ -4318,11 +4325,11 @@ test("Codex spawn preflight guard", async (t) => {
         resolvedPath: "C:\\Program Files\\OpenAI Codex\\codex.exe",
         fileType: "exe",
       },
-      ["exec", "-C", "D:\\Project With Spaces", "prompt text"]
+      ["exec", "-C", "D:\\Project With Spaces", "--sandbox", "workspace-write", "--skip-git-repo-check", "-"]
     );
 
     assert.equal(command.command, "C:\\Program Files\\OpenAI Codex\\codex.exe");
-    assert.deepEqual(command.args, ["exec", "-C", "D:\\Project With Spaces", "prompt text"]);
+    assert.deepEqual(command.args, ["exec", "-C", "D:\\Project With Spaces", "--sandbox", "workspace-write", "--skip-git-repo-check", "-"]);
     assert.equal(command.shell, false);
   });
 
@@ -4333,14 +4340,126 @@ test("Codex spawn preflight guard", async (t) => {
         resolvedPath: "C:\\Users\\admin\\AppData\\Roaming\\npm\\codex.cmd",
         fileType: "cmd",
       },
-      ["exec", "-C", "D:\\Project With Spaces", "prompt with spaces"]
+      ["exec", "-C", "D:\\Project With Spaces", "--sandbox", "workspace-write", "--skip-git-repo-check", "-"]
     );
 
     assert.equal(command.command, "cmd.exe");
     assert.deepEqual(command.args.slice(0, 3), ["/d", "/s", "/c"]);
     assert.match(command.args[3], /"C:\\Users\\admin\\AppData\\Roaming\\npm\\codex\.cmd"/);
     assert.match(command.args[3], /"D:\\Project With Spaces"/);
-    assert.match(command.args[3], /"prompt with spaces"/);
+    assert.doesNotMatch(command.args[3], /prompt with spaces/);
+    assert.match(command.args[3], /"-"$/);
+  });
+
+  await t.test("large prompts use stdin and never enter spawnargs", async () => {
+    const prompt = [
+      "original_request_text: BATCH-ARCH-COMPLETE-01-CODEX-SPAWN-ALL-PATHS-STDIN-FIX-31",
+      "任务完整正文:",
+      "x".repeat(200000),
+    ].join("\n");
+    const job = {
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-CODEX-SPAWN-ALL-PATHS-STDIN-FIX-31",
+        "project_domain=automation_system",
+        "task_type=system_repair",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "repair_mode=true",
+        "allowed_scope=infra/windows-worker/local_worker.js",
+      ].join("\n"),
+    };
+    const largeArgs = buildCodexExecArgs(prompt, job);
+    const smallArgs = buildCodexExecArgs("tiny", job);
+
+    assert.equal(Buffer.byteLength(prompt, "utf8") >= 200000, true);
+    assert.deepEqual(largeArgs, smallArgs);
+    assert.equal(largeArgs[largeArgs.length - 1], "-");
+    assert.equal(largeArgs.includes(prompt), false);
+    assert.equal(largeArgs.join(" ").includes("任务完整正文"), false);
+    assert.equal(largeArgs.join(" ").includes("original_request_text"), false);
+
+    const calls = [];
+    const writes = [];
+    let stdinEndCalled = false;
+    const spawnFactory = (command, args, options) => {
+      calls.push({ command, args, options });
+      const child = new EventEmitter();
+      child.pid = 12345;
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.stdin = new Writable({
+        write(chunk, _encoding, callback) {
+          writes.push(Buffer.from(chunk));
+          callback();
+        },
+      });
+      child.stdin.on("finish", () => {
+        stdinEndCalled = true;
+        const input = Buffer.concat(writes);
+        child.stdout.write(
+          JSON.stringify({
+            argv: args,
+            bytes: input.length,
+            chunks: writes.length,
+            text: input.toString("utf8", 0, 64),
+          })
+        );
+        child.stdout.end();
+        process.nextTick(() => {
+          child.emit("exit", 0);
+          child.emit("close", 0);
+        });
+      });
+      return child;
+    };
+
+    const output = await spawnCodexWithStdin(prompt, job, {
+      codexResolution: {
+        ok: true,
+        resolvedPath: "C:\\Program Files\\OpenAI Codex\\codex.exe",
+        fileType: "exe",
+      },
+      spawnFactory,
+      heartbeat: false,
+      mirrorOutput: false,
+      timeoutMs: 30000,
+      idleTimeoutMs: 30000,
+      retryNumber: 1,
+    });
+    const parsed = JSON.parse(output.split(/\r?\n/).filter(Boolean).pop());
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].command, "C:\\Program Files\\OpenAI Codex\\codex.exe");
+    assert.deepEqual(calls[0].args, largeArgs);
+    assert.deepEqual(calls[0].options.stdio, ["pipe", "pipe", "pipe"]);
+    assert.equal(parsed.bytes, Buffer.byteLength(prompt, "utf8"));
+    assert.deepEqual(parsed.argv, largeArgs);
+    assert.match(parsed.text, /original_request_text/);
+    assert.equal(writes.length, 1);
+    assert.equal(stdinEndCalled, true);
+  });
+
+  await t.test("all Codex retry and continuation paths route through stdin transport", () => {
+    const source = fs.readFileSync(path.join(workerRoot, "local_worker.js"), "utf8");
+    const runRetries = source.slice(
+      source.indexOf("async function runCodexWithRetries"),
+      source.indexOf("async function commitGitTask")
+    );
+    const runCodexBlock = source.slice(
+      source.indexOf("function runCodex(prompt, job, options = {})"),
+      source.indexOf("async function updateProgress", source.indexOf("function runCodex(prompt, job, options = {})"))
+    );
+
+    assert.match(runRetries, /runCodex\(prompts\[index\]\(failures\[failures\.length - 1\]\), job, \{\s*retryNumber: index \+ 1/);
+    assert.doesNotMatch(runRetries, /spawnCodexProcess\(/);
+    assert.match(runCodexBlock, /return spawnCodexWithStdin\(prompt, job, options\)/);
+    assert.match(source, /function spawnCodexWithStdin\(prompt, job, options = \{\}\)/);
+    assert.match(source, /const codexArgs = buildCodexExecArgs\(null, job\)/);
+    assert.match(source, /stdio:\s*\["pipe", "pipe", "pipe"\]/);
+    assert.match(source, /child\.stdin\.write\(promptText, "utf8"/);
+    assert.equal((source.match(/child\.stdin\.write\(promptText/g) || []).length, 1);
+    assert.doesNotMatch(source, /shell:\s*true/);
+    assert.doesNotMatch(source, /powershell\.exe\s+.*prompt|cmd\.exe\s+\/c\s+.*prompt|Start-Process[\s\S]{0,80}prompt|Invoke-Expression[\s\S]{0,80}prompt/i);
   });
 
   await t.test("rejects Windows App aliases and extensionless shims", (t) => {

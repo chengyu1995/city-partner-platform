@@ -82,6 +82,18 @@ test("terminal report stops periodic heartbeat and progress before report reques
   assert.ok(requestIndex > stopIndex, "timer stop must happen before terminal report request");
 });
 
+test("Codex timeout waits for process cleanup before retry can continue", () => {
+  const spawnBlock = functionBlock(localWorker, "spawnCodexWithStdin");
+  assert.match(spawnBlock, /requestTermination\(\s*"CODEX_TIMEOUT"/);
+  assert.match(spawnBlock, /child\.stdin\.end\(\)/);
+  assert.match(spawnBlock, /killProcessTree\(child\.pid, message\)\.finally/);
+  assert.match(spawnBlock, /child\.on\("close"/);
+  assert.match(spawnBlock, /CODEX_PROCESS_CLOSE_TIMEOUT/);
+  assert.match(spawnBlock, /pendingFailure/);
+  const retriesBlock = functionBlock(localWorker, "runCodexWithRetries");
+  assert.match(retriesBlock, /await runCodex\(/);
+});
+
 test("verification-only no-change success bypasses false positive no-fix and publish guards only in repair mode", () => {
   const block = functionBlock(reportRoute, "buildFalsePositiveSuccessGuard");
   assert.match(block, /repairMode && \(verificationOnly \|\| allowNoChangeSuccess\) && changedFiles\.length === 0/);
