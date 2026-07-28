@@ -71,6 +71,7 @@ const SYSTEM_REPAIR_SCOPE = [
 ];
 const SYSTEM_REPAIR_SCOPE_TEXT = SYSTEM_REPAIR_SCOPE.join(", ");
 const WORKER_READONLY_CONTEXT_INCOMPLETE = "WORKER_READONLY_CONTEXT_INCOMPLETE";
+export const CANONICAL_WORKER_REPORT_SCHEMA_VERSION = 2;
 export const WORKER_JOB_CONTRACT_FIELDS = [
   "context_source",
   "context_reconstruct_failed",
@@ -116,7 +117,17 @@ export const WORKER_JOB_CONTRACT_FIELDS = [
   "failure_code",
   "failure_stage",
   "changed_files",
+  "committed_files",
+  "unexpected_changed_files",
   "git_commit_sha",
+  "worker_git_push",
+  "git_push",
+  "pushed_branch",
+  "remote_contains_commit",
+  "repository_clean_after_push",
+  "terminal_state_persisted",
+  "post_completion_state_applied",
+  "final_report_source",
   "next_batch",
   "completed_at",
   "pushed",
@@ -169,6 +180,10 @@ const IMPLEMENTED_DIAGNOSTICS_FAILURE_CODES = [
   "DEPLOYMENT_FAILED",
   "TERMINAL_REPORT_DUPLICATE",
   "WORKER_REPORT_CONTRACT_INCOMPLETE",
+  "EXECUTION_POLICY_MISMATCH",
+  "EXECUTION_POLICY_PAYLOAD_MISMATCH",
+  "FINAL_REPORT_STATE_CONFLICT",
+  "WORKER_REPORT_SCHEMA_INVALID",
   "UNKNOWN_FAILURE",
 ] as const;
 const IMPLEMENTED_DIAGNOSTICS_FAILURE_STAGES = [
@@ -183,6 +198,10 @@ const IMPLEMENTED_DIAGNOSTICS_FAILURE_STAGES = [
   "git_sync_preflight",
   "push",
   "report",
+  "worker_payload_creation",
+  "worker_execution_policy_validation",
+  "worker_report_validation",
+  "post_completion_report_validation",
   "notification",
   "deployment",
   "task_goal_validation",
@@ -1691,6 +1710,136 @@ function readReportPushFlag(...values: unknown[]): boolean {
     }
   }
   return false;
+}
+
+const CANONICAL_WORKER_REPORT_REQUIRED_FIELDS = [
+  "job_id",
+  "attempt_id",
+  "worker_instance_id",
+  "batch_code",
+  "worker_execution_status",
+  "task_goal_status",
+  "effective_final_status",
+] as const;
+
+export function validateCanonicalWorkerReportSchema(
+  body: Record<string, unknown>
+): {
+  ok: boolean;
+  failure_code?: "WORKER_REPORT_SCHEMA_INVALID";
+  failure_stage?: "worker_report_validation";
+  missing_fields: string[];
+  invalid_fields: string[];
+  received_schema_version: unknown;
+  supported_schema_versions: number[];
+} {
+  const received = body.report_schema_version ?? body.reportSchemaVersion;
+  const missingFields = CANONICAL_WORKER_REPORT_REQUIRED_FIELDS.filter((field) => {
+    const value =
+      field === "worker_instance_id"
+        ? body.worker_instance_id ?? body.worker_id ?? body.worker_name
+        : body[field];
+    return value === null || value === undefined || String(value).trim() === "";
+  });
+  const invalidFields: string[] = [];
+  const schemaNumber = Number(received);
+  if (!Number.isInteger(schemaNumber) || schemaNumber !== CANONICAL_WORKER_REPORT_SCHEMA_VERSION) {
+    invalidFields.push("report_schema_version");
+  }
+  for (const field of [
+    "verification_only",
+    "allow_no_change_success",
+    "code_changes_required",
+    "codex_required",
+    "git_commit_required",
+    "git_push_required",
+    "git_push",
+    "worker_git_push",
+    "remote_contains_commit",
+    "repository_clean_after_push",
+    "terminal_state_persisted",
+    "post_completion_state_applied",
+    "next_stage_allowed",
+  ]) {
+    const value = body[field];
+    if (value !== undefined && value !== null && readNullableBooleanFlag(value) === null) {
+      invalidFields.push(field);
+    }
+  }
+  const ok = missingFields.length === 0 && invalidFields.length === 0;
+  return {
+    ok,
+    ...(ok
+      ? {}
+      : {
+          failure_code: "WORKER_REPORT_SCHEMA_INVALID" as const,
+          failure_stage: "worker_report_validation" as const,
+        }),
+    missing_fields: missingFields,
+    invalid_fields: invalidFields,
+    received_schema_version: received ?? null,
+    supported_schema_versions: [CANONICAL_WORKER_REPORT_SCHEMA_VERSION],
+  };
+}
+
+export function buildCanonicalWorkerReportSchema(input: {
+  job?: JobRecord | null;
+  body?: Record<string, unknown> | null;
+  contract?: Record<string, unknown> | null;
+  finalResult?: Record<string, unknown> | null;
+  workerId?: string | null;
+  attemptId?: string | null;
+}): Record<string, unknown> {
+  const body = input.body ?? {};
+  const contract = input.contract ?? buildWorkerJobPayloadContract({ job: input.job ?? null });
+  const finalResult = input.finalResult ?? normalizeWorkerFinalResult({ job: input.job ?? null, ...body });
+  const batchCode =
+    readString(finalResult.approved_batch) ??
+    readString(body.batch_code) ??
+    readString(contract.approved_batch) ??
+    getJobBatchCode(input.job);
+  const workerId =
+    readString(input.workerId) ??
+    readString(body.worker_instance_id) ??
+    readString(body.worker_id) ??
+    readString(body.worker_name);
+  return {
+    report_schema_version: CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
+    job_id: readString(body.job_id) ?? readString(body.id) ?? readString(input.job?.id),
+    attempt_id: readString(input.attemptId) ?? readString(body.attempt_id) ?? readString(contract.attempt_id),
+    worker_instance_id: workerId,
+    batch_code: batchCode,
+    worker_execution_status: readString(finalResult.worker_execution_status),
+    task_goal_status: readString(finalResult.task_goal_status),
+    effective_final_status: readString(finalResult.effective_final_status),
+    failure_code: readString(finalResult.failure_code),
+    failure_stage: readString(finalResult.failure_stage),
+    failure_detail: readString(body.failure_detail),
+    repair_mode: contract.repair_mode === true,
+    verification_only: contract.verification_only === true,
+    allow_no_change_success: contract.allow_no_change_success === true,
+    code_changes_required: contract.code_changes_required === true,
+    codex_required: contract.codex_required === true,
+    git_commit_required: contract.git_commit_required === true,
+    git_push_required: contract.git_push_required === true,
+    changed_files: readStringArray(finalResult.changed_files),
+    committed_files: readStringArray(finalResult.committed_files),
+    unexpected_changed_files: readStringArray(finalResult.unexpected_changed_files),
+    git_commit_sha: readString(finalResult.git_commit_sha),
+    worker_git_push: readReportPushFlag(finalResult.worker_git_push),
+    git_push: readReportPushFlag(finalResult.git_push, finalResult.pushed),
+    pushed_branch: readString(finalResult.pushed_branch),
+    remote_contains_commit: readReportPushFlag(finalResult.remote_contains_commit),
+    repository_clean_after_push: readBooleanFlag(finalResult.repository_clean_after_push),
+    terminal_state_persisted:
+      readNullableBooleanFlag(body.terminal_state_persisted) ?? true,
+    post_completion_state_applied:
+      readNullableBooleanFlag(body.post_completion_state_applied) ?? true,
+    final_report_source:
+      readString(body.final_report_source) ?? readString(body.post_completion_source) ?? "worker_runtime_report",
+    completed_at: readString(finalResult.completed_at),
+    next_stage_allowed: readNullableBooleanFlag(finalResult.next_stage_allowed) ?? false,
+  };
 }
 
 export function normalizeWorkerFinalResult(input: Record<string, unknown> & {

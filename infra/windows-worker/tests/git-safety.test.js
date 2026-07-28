@@ -53,6 +53,7 @@ const {
   buildCodexExecArgs,
   buildCodexSpawnCommand,
   buildFailureReport,
+  buildWorkerReportContractExtra,
   buildAutoIterationSuggestion,
   buildWorkerGuardedPrompt,
   buildTerminalStatusSnapshot,
@@ -3217,6 +3218,77 @@ test("bootstrap context router contract guards", async (t) => {
     assert.equal(allowsVerificationOnlyNoChangeSuccess(contract), false);
     assert.equal(isVerificationOnlyNoopTask(job, contract), false);
     assert.throws(() => assertTaskGoalApplied(job, []), (error) => error.code === NO_FIX_APPLIED);
+  });
+
+  await t.test("SMOKE-40 explicit false policy is preserved from job payload into report schema", () => {
+    const job = {
+      id: "eaaee4df-8ac7-4e5b-8267-080eb68f6b31",
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-LIVE-PRODUCTION-POLICY-SMOKE-40",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_type=system_repair",
+        "requested_mode=write_allowed",
+        "final_mode=automation_system_write_allowed",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "repair_mode=true",
+        "verification_only=false",
+        "allow_no_change_success=false",
+        "execution_intent=apply_code_changes",
+        "code_changes_required=true",
+        "codex_required=true",
+        "git_commit_required=true",
+        "git_push_required=true",
+        "execution_policy_source=current_batch_structured_fields",
+        "execution_policy_batch_code=BATCH-ARCH-COMPLETE-01-LIVE-PRODUCTION-POLICY-SMOKE-40",
+        "exact_allowed_scope=infra/windows-worker/local_worker.js",
+      ].join("\n"),
+      payload: {
+        approved_batch: "BATCH-ARCH-COMPLETE-01-LIVE-PRODUCTION-POLICY-SMOKE-40",
+        project_domain: "automation_system",
+        task_type: "system_repair",
+        final_mode: "automation_system_write_allowed",
+        task_mode: "automation_system_write_allowed",
+        repair_mode: true,
+        verification_only: "false",
+        allow_no_change_success: "false",
+        execution_intent: "apply_code_changes",
+        code_changes_required: "true",
+        codex_required: "true",
+        git_commit_required: "true",
+        git_push_required: "true",
+        execution_policy_source: "current_batch_structured_fields",
+        execution_policy_batch_code: "BATCH-ARCH-COMPLETE-01-LIVE-PRODUCTION-POLICY-SMOKE-40",
+      },
+    };
+
+    const contract = resolveWorkerJobContract(job, {
+      attemptId: "attempt-smoke-40",
+      workerStage: "claimed",
+    });
+    assert.equal(contract.repair_mode, true);
+    assert.equal(contract.verification_only, false);
+    assert.equal(contract.allow_no_change_success, false);
+    assert.equal(contract.code_changes_required, true);
+    assert.equal(contract.codex_required, true);
+    assert.equal(contract.git_commit_required, true);
+    assert.equal(contract.git_push_required, true);
+    assert.equal(contract.execution_intent, "apply_code_changes");
+    assert.equal(allowsVerificationOnlyNoChangeSuccess(contract), false);
+    assert.equal(isVerificationOnlyNoopTask(job, contract), false);
+
+    const reportExtra = buildWorkerReportContractExtra(contract);
+    assert.equal(reportExtra.report_schema_version, 2);
+    assert.equal(reportExtra.batch_code, "BATCH-ARCH-COMPLETE-01-LIVE-PRODUCTION-POLICY-SMOKE-40");
+    assert.equal(reportExtra.worker_instance_id, os.hostname());
+    assert.equal(reportExtra.repair_mode, true);
+    assert.equal(reportExtra.verification_only, false);
+    assert.equal(reportExtra.allow_no_change_success, false);
+    assert.equal(reportExtra.code_changes_required, true);
+    assert.equal(reportExtra.codex_required, true);
+    assert.equal(reportExtra.git_commit_required, true);
+    assert.equal(reportExtra.git_push_required, true);
   });
 
   await t.test("verification-only keywords alone never enable no-op success", () => {

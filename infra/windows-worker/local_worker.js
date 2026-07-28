@@ -1469,6 +1469,7 @@ const INCOMPLETE_QA_REPORT = "INCOMPLETE_QA_REPORT";
 const INCOMPLETE_ARCHITECTURE_REPORT = "INCOMPLETE_ARCHITECTURE_REPORT";
 const WORKER_READONLY_CONTEXT_INCOMPLETE = "WORKER_READONLY_CONTEXT_INCOMPLETE";
 const CONTEXT_MISSING_WARNING = "CONTEXT_MISSING_WARNING";
+const CANONICAL_WORKER_REPORT_SCHEMA_VERSION = 2;
 const CODEX_USAGE_LIMIT = "CODEX_USAGE_LIMIT";
 
 const TASK_MODES = {
@@ -4107,6 +4108,9 @@ function formatWorkerJobContractLines(contract, options = {}) {
 function buildWorkerReportContractExtra(contract) {
   const codexDiagnostics = getCodexReportDiagnostics();
   return {
+    report_schema_version: CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
+    worker_instance_id: WORKER_NAME,
+    batch_code: contract.approved_batch,
     context_source: contract.context_source,
     context_reconstruct_failed: contract.context_reconstruct_failed,
     context_warnings: contract.context_warnings || [],
@@ -4116,6 +4120,8 @@ function buildWorkerReportContractExtra(contract) {
     final_mode: contract.final_mode,
     task_mode: contract.task_mode,
     read_only_mode: contract.read_only_mode,
+    repair_mode: contract.repair_mode,
+    repair_scope: contract.repair_scope,
     verification_only: contract.verification_only,
     allow_no_change_success: contract.allow_no_change_success,
     execution_intent: contract.execution_intent,
@@ -4154,7 +4160,17 @@ function buildWorkerReportContractExtra(contract) {
     failure_code: contract.failure_code,
     failure_stage: contract.failure_stage,
     changed_files: contract.changed_files,
+    committed_files: contract.changed_files,
+    unexpected_changed_files: [],
     git_commit_sha: contract.git_commit_sha,
+    worker_git_push: contract.pushed,
+    git_push: contract.pushed,
+    pushed_branch: null,
+    remote_contains_commit: false,
+    repository_clean_after_push: false,
+    terminal_state_persisted: true,
+    post_completion_state_applied: true,
+    final_report_source: "worker_runtime_report",
     next_batch: contract.next_batch,
     completed_at: contract.completed_at,
     pushed: contract.pushed,
@@ -7347,6 +7363,31 @@ async function report(jobId, status, payload, extra = {}) {
   if (normalizedExtra.files_changed === undefined && normalizedExtra.changed_files !== undefined) {
     normalizedExtra.files_changed = normalizedExtra.changed_files;
   }
+  normalizedExtra.report_schema_version =
+    normalizedExtra.report_schema_version || CANONICAL_WORKER_REPORT_SCHEMA_VERSION;
+  normalizedExtra.worker_instance_id = normalizedExtra.worker_instance_id || WORKER_NAME;
+  normalizedExtra.batch_code =
+    normalizedExtra.batch_code ||
+    normalizedExtra.approved_batch ||
+    extractCurrentExecutionBatchCode(payload) ||
+    null;
+  normalizedExtra.worker_execution_status =
+    normalizedExtra.worker_execution_status ||
+    (terminalStatus === "failed" ? "failed" : terminalStatus === "succeeded" ? "succeeded" : status);
+  normalizedExtra.task_goal_status =
+    normalizedExtra.task_goal_status ||
+    (terminalStatus === "failed" ? "failed" : terminalStatus === "succeeded" ? "completed" : status);
+  normalizedExtra.effective_final_status =
+    normalizedExtra.effective_final_status || terminalStatus || status;
+  normalizedExtra.committed_files =
+    normalizedExtra.committed_files || normalizedExtra.changed_files || normalizedExtra.files_changed || [];
+  normalizedExtra.unexpected_changed_files = normalizedExtra.unexpected_changed_files || [];
+  normalizedExtra.terminal_state_persisted =
+    normalizedExtra.terminal_state_persisted === undefined ? true : normalizedExtra.terminal_state_persisted;
+  normalizedExtra.post_completion_state_applied =
+    normalizedExtra.post_completion_state_applied === undefined ? true : normalizedExtra.post_completion_state_applied;
+  normalizedExtra.final_report_source =
+    normalizedExtra.final_report_source || "worker_runtime_report";
   const body =
     status === "succeeded"
       ? {
@@ -7649,6 +7690,18 @@ async function pollOnce() {
     attemptId,
     workerStage: "claimed",
   });
+  [
+    `received_repair_mode=${initialContract.repair_mode === true ? "true" : "false"}`,
+    `received_verification_only=${initialContract.verification_only === true ? "true" : "false"}`,
+    `received_allow_no_change_success=${initialContract.allow_no_change_success === true ? "true" : "false"}`,
+    `received_code_changes_required=${initialContract.code_changes_required === true ? "true" : "false"}`,
+    `received_codex_required=${initialContract.codex_required === true ? "true" : "false"}`,
+    `received_git_commit_required=${initialContract.git_commit_required === true ? "true" : "false"}`,
+    `received_git_push_required=${initialContract.git_push_required === true ? "true" : "false"}`,
+    `received_execution_intent=${initialContract.execution_intent || "null"}`,
+    `received_execution_policy_source=${initialContract.execution_policy_source || "null"}`,
+    `received_execution_policy_batch_code=${initialContract.execution_policy_batch_code || "null"}`,
+  ].forEach((line) => console.log(line));
   const taskModeForReport = initialContract.task_mode;
   const readOnlyMode = initialContract.read_only_mode === true;
   currentReadOnlyMode = readOnlyMode;
@@ -8497,6 +8550,7 @@ module.exports = {
   buildCodexExecArgs,
   buildCodexSpawnCommand,
   buildFailureReport,
+  buildWorkerReportContractExtra,
   buildAutoIterationSuggestion,
   buildTerminalJobIndex,
   buildTerminalStatusSnapshot,

@@ -8,6 +8,7 @@ const dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(dirname, "..", "..", "..");
 const workerJobs = fs.readFileSync(path.join(root, "src", "lib", "worker-jobs.ts"), "utf8");
 const reportRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker", "report", "route.ts"), "utf8");
+const localWorker = fs.readFileSync(path.join(root, "infra", "windows-worker", "local_worker.js"), "utf8");
 const migrationDraft = fs.readFileSync(path.join(root, "docs", "setup-hermes-jobs-diagnostics.sql"), "utf8");
 
 test("worker reports build versioned diagnostics", () => {
@@ -103,6 +104,33 @@ test("worker report route persists diagnostics in hermes_jobs result json", () =
   assert.match(reportRoute, /diagnostics: projectDirectorReport\.data\.diagnostics \?\? null/);
   assert.match(reportRoute, /terminal && isTerminalWorkerStatus\(effectiveFinalStatus\) \? effectiveFinalStatus : workerStatus/);
   assert.match(reportRoute, /status: storedStatus/);
+});
+
+test("canonical worker report schema v2 is accepted without blind fallback exhaustion", () => {
+  assert.match(workerJobs, /CANONICAL_WORKER_REPORT_SCHEMA_VERSION\s*=\s*2/);
+  assert.match(workerJobs, /function validateCanonicalWorkerReportSchema/);
+  assert.match(workerJobs, /function buildCanonicalWorkerReportSchema/);
+  assert.match(reportRoute, /buildCanonicalWorkerReportSchema/);
+  assert.match(reportRoute, /validateCanonicalWorkerReportSchema/);
+  assert.match(reportRoute, /canonical_worker_report:\s*canonicalReport/);
+  assert.match(reportRoute, /report_schema_version:\s*CANONICAL_WORKER_REPORT_SCHEMA_VERSION/);
+  assert.match(reportRoute, /WORKER_REPORT_SCHEMA_INVALID/);
+  assert.match(reportRoute, /missing_fields/);
+  assert.match(reportRoute, /invalid_fields/);
+  assert.match(reportRoute, /supported_schema_versions/);
+  assert.doesNotMatch(reportRoute, /worker_report_schema_fallback_exhausted[^:]/);
+  assert.match(reportRoute, /worker_report_schema_fallback_exhausted:\s*false/);
+});
+
+test("local Worker submits canonical report schema and received policy diagnostics", () => {
+  assert.match(localWorker, /CANONICAL_WORKER_REPORT_SCHEMA_VERSION\s*=\s*2/);
+  assert.match(localWorker, /report_schema_version:\s*CANONICAL_WORKER_REPORT_SCHEMA_VERSION/);
+  assert.match(localWorker, /worker_instance_id:\s*WORKER_NAME/);
+  assert.match(localWorker, /received_verification_only=/);
+  assert.match(localWorker, /received_code_changes_required=/);
+  assert.match(localWorker, /received_codex_required=/);
+  assert.match(localWorker, /received_execution_policy_source=/);
+  assert.match(localWorker, /isVerificationOnlyNoopTask\(job, initialContract\)/);
 });
 
 test("missing diagnostics storage fails closed before notification side effects", () => {

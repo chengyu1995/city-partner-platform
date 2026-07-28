@@ -5,8 +5,10 @@ import {
   assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
   buildRunningJobNotFoundPayload,
+  buildCanonicalWorkerReportSchema,
   buildProjectDirectorWorkerReport,
   clampProgress,
+  CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
   DIAGNOSTICS_STORAGE_FIELD,
   DIAGNOSTICS_STORAGE_UNAVAILABLE,
   findHermesJob,
@@ -22,6 +24,7 @@ import {
   responseFromMaybe,
   terminalAttemptMatches,
   updateHermesJob,
+  validateCanonicalWorkerReportSchema,
 } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
@@ -37,6 +40,8 @@ interface WorkerReportBody {
   status_message?: string;
   worker_id?: string;
   worker_name?: string;
+  worker_instance_id?: string;
+  report_schema_version?: number | string | null;
   batch_code?: string;
   job_created_at?: string;
   created_at?: string;
@@ -44,6 +49,7 @@ interface WorkerReportBody {
   deploy_status?: string | null;
   failure_code?: string | null;
   failure_stage?: string | null;
+  failure_detail?: string | null;
   verification_only?: boolean | string | null;
   allow_no_change_success?: boolean | string | null;
   code_changes_required?: boolean | string | null;
@@ -78,6 +84,11 @@ interface WorkerReportBody {
   pushed_branch?: string | null;
   remote_contains_commit?: string | boolean | null;
   repository_clean_after_push?: string | boolean | null;
+  terminal_state_persisted?: string | boolean | null;
+  post_completion_state_applied?: string | boolean | null;
+  final_report_source?: string | null;
+  post_completion_source?: string | null;
+  next_stage_allowed?: string | boolean | null;
   build_passed?: boolean;
   test_passed?: boolean;
   duration_ms?: number;
@@ -89,9 +100,11 @@ interface WorkerReportBody {
 function buildResult(body: WorkerReportBody): Record<string, unknown> {
   return {
     attempt_id: body.attempt_id ?? null,
+    report_schema_version: body.report_schema_version ?? null,
     batch_code: body.batch_code ?? null,
     job_created_at: body.job_created_at ?? body.created_at ?? null,
-    worker_id: body.worker_id ?? body.worker_name ?? null,
+    worker_id: body.worker_id ?? body.worker_name ?? body.worker_instance_id ?? null,
+    worker_instance_id: body.worker_instance_id ?? body.worker_id ?? body.worker_name ?? null,
     output: body.output ?? null,
     pr_url: body.pr_url ?? null,
     project_name: body.project_name ?? null,
@@ -124,6 +137,13 @@ function buildResult(body: WorkerReportBody): Record<string, unknown> {
     git_commit_required: body.git_commit_required ?? null,
     git_push_required: body.git_push_required ?? null,
     approval_required: body.approval_required ?? null,
+    failure_code: body.failure_code ?? null,
+    failure_stage: body.failure_stage ?? null,
+    failure_detail: body.failure_detail ?? null,
+    terminal_state_persisted: body.terminal_state_persisted ?? null,
+    post_completion_state_applied: body.post_completion_state_applied ?? null,
+    final_report_source: body.final_report_source ?? body.post_completion_source ?? null,
+    next_stage_allowed: body.next_stage_allowed ?? null,
     result_text: body.result_text ?? null,
     diagnostics: body.diagnostics ?? null,
   };
@@ -192,6 +212,9 @@ function normalizePathList(value: unknown): string[] {
 
 function reportPushed(body: WorkerReportBody): boolean {
   return (
+    readBooleanFlag(body.git_push) ||
+    readBooleanFlag(body.worker_git_push) ||
+    readBooleanFlag(body.pushed) ||
     /^(success|succeeded|pushed|true|yes)$/i.test(String(body.github_push_status || "").trim()) ||
     /^(success|succeeded|pushed|pending)$/i.test(String(body.deploy_status || "").trim())
   );
@@ -364,6 +387,22 @@ function buildDiagnosticsStorageUnavailablePayload(input: {
   };
 }
 
+function buildWorkerReportSchemaInvalidPayload(
+  validation: ReturnType<typeof validateCanonicalWorkerReportSchema>
+) {
+  return {
+    ok: false,
+    error: "worker_report_schema_invalid",
+    failure_code: "WORKER_REPORT_SCHEMA_INVALID",
+    failure_stage: "worker_report_validation",
+    missing_fields: validation.missing_fields,
+    invalid_fields: validation.invalid_fields,
+    received_schema_version: validation.received_schema_version,
+    supported_schema_versions: validation.supported_schema_versions,
+    worker_report_schema_fallback_exhausted: false,
+  };
+}
+
 export async function POST(req: NextRequest) {
   const unauthorized = assertWorkerAuthorized(req);
   if (unauthorized) return unauthorized;
@@ -374,6 +413,14 @@ export async function POST(req: NextRequest) {
   const jobId = body.job_id ?? body.id;
   if (!jobId) {
     return NextResponse.json({ ok: false, error: "job_id is required" }, { status: 400 });
+  }
+
+  const suppliedSchemaVersion = body.report_schema_version ?? null;
+  if (suppliedSchemaVersion !== null && suppliedSchemaVersion !== undefined) {
+    const schemaValidation = validateCanonicalWorkerReportSchema(body as Record<string, unknown>);
+    if (!schemaValidation.ok) {
+      return NextResponse.json(buildWorkerReportSchemaInvalidPayload(schemaValidation), { status: 400 });
+    }
   }
 
   const supabase = await getWorkerSupabase();
@@ -436,6 +483,13 @@ export async function POST(req: NextRequest) {
   });
   const effectiveFinalStatus = normalizeWorkerStatus(projectDirectorReport.data.effective_final_status);
   const storedStatus = terminal && isTerminalWorkerStatus(effectiveFinalStatus) ? effectiveFinalStatus : workerStatus;
+  const canonicalReport = buildCanonicalWorkerReportSchema({
+    job: existingJob,
+    body: body as Record<string, unknown>,
+    finalResult: projectDirectorReport.data,
+    workerId,
+    attemptId,
+  });
 
   if (isTerminalWorkerStatus(existingJob.status)) {
     if (!terminalAttemptMatches(existingJob, attemptId)) {
@@ -504,6 +558,8 @@ export async function POST(req: NextRequest) {
       terminal_status_persisted: true,
       diagnostics_persisted: Boolean(readRecord(storedResult?.diagnostics)),
       status: storedTerminalStatus,
+      acknowledged: true,
+      canonical_report_schema_version: CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
     });
   }
 
@@ -521,6 +577,8 @@ export async function POST(req: NextRequest) {
     error_text: storedStatus === "failed" ? falsePositiveGuard?.errorText ?? errorText : null,
     result: {
       ...buildResult({ ...body, attempt_id: attemptId ?? body.attempt_id }),
+      canonical_worker_report: canonicalReport,
+      report_schema_version: CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
       project_director_report: projectDirectorReport.data,
       project_director_report_text: projectDirectorReport.text,
       diagnostics: projectDirectorReport.data.diagnostics ?? null,
@@ -575,6 +633,9 @@ export async function POST(req: NextRequest) {
     project_director_report: projectDirectorReport,
     feishu_sync: recordId ? "attempted" : "skipped_no_record_id",
     terminal_status_persisted: terminal,
+    canonical_report_schema_version: CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
+    canonical_report_submit_verified: terminal ? true : null,
+    worker_report_schema_fallback_exhausted: false,
     diagnostics_persisted: terminal ? true : null,
     diagnostics_storage_field: terminal ? DIAGNOSTICS_STORAGE_FIELD : null,
   });
