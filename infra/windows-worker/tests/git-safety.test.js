@@ -3128,6 +3128,10 @@ test("bootstrap context router contract guards", async (t) => {
         "repair_mode=true",
         "verification_only=true",
         "allow_no_change_success=true",
+        "code_changes_required=false",
+        "codex_required=false",
+        "git_commit_required=false",
+        "git_push_required=false",
         "allowed_scope=infra/windows-worker/local_worker.js",
         "exact_allowed_scope=infra/windows-worker/local_worker.js",
         "task_goal=Run production repair_mode smoke verification without modifying files.",
@@ -3140,6 +3144,10 @@ test("bootstrap context router contract guards", async (t) => {
         repair_mode: true,
         verification_only: true,
         allow_no_change_success: true,
+        code_changes_required: false,
+        codex_required: false,
+        git_commit_required: false,
+        git_push_required: false,
         exact_allowed_scope: ["infra/windows-worker/local_worker.js"],
         approved_batch: "BATCH-ARCH-COMPLETE-01-REPAIR-MODE-CLOUD-SMOKE-27",
       },
@@ -3176,6 +3184,165 @@ test("bootstrap context router contract guards", async (t) => {
       () => assertTaskGoalApplied(ordinaryJob, []),
       (error) => error.code === NO_FIX_APPLIED
     );
+  });
+
+  await t.test("write_allowed repair text mentioning verification-only remains a Codex-required write task", () => {
+    const job = {
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-POST-COMPLETION-FINAL-REPORT-SOURCE-OF-TRUTH-FIX-36",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_type=system_repair",
+        "requested_mode=write_allowed",
+        "final_mode=automation_system_write_allowed",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "repair_mode=true",
+        "verification_only=false",
+        "allow_no_change_success=false",
+        "code_changes_required=true",
+        "codex_required=true",
+        "git_commit_required=true",
+        "git_push_required=true",
+        "exact_allowed_scope=infra/windows-worker/local_worker.js",
+        "task_goal=修复 verification-only no-op 最终报告误判。",
+      ].join("\n"),
+    };
+
+    const contract = resolveWorkerJobContract(job);
+    assert.equal(contract.verification_only, false);
+    assert.equal(contract.allow_no_change_success, false);
+    assert.equal(contract.code_changes_required, true);
+    assert.equal(contract.codex_required, true);
+    assert.equal(allowsVerificationOnlyNoChangeSuccess(contract), false);
+    assert.equal(isVerificationOnlyNoopTask(job, contract), false);
+    assert.throws(() => assertTaskGoalApplied(job, []), (error) => error.code === NO_FIX_APPLIED);
+  });
+
+  await t.test("verification-only keywords alone never enable no-op success", () => {
+    const job = {
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-EXPLICIT-EXECUTION-POLICY-AND-FINAL-REPORT-FIX-37",
+        "project_domain=automation_system",
+        "task_type=system_repair",
+        "requested_mode=write_allowed",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "exact_allowed_scope=infra/windows-worker/local_worker.js",
+        "task_goal=测试 no-op 回归测试并修复 verification-only 行为。",
+      ].join("\n"),
+    };
+
+    const contract = resolveWorkerJobContract(job);
+    assert.equal(contract.verification_only, false);
+    assert.equal(contract.allow_no_change_success, false);
+    assert.equal(contract.code_changes_required, true);
+    assert.equal(contract.codex_required, true);
+    assert.equal(isVerificationOnlyNoopTask(job, contract), false);
+  });
+
+  await t.test("different batch payload cannot leak verification-only no-op policy", () => {
+    const job = {
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-CURRENT-WRITE-FIX-37",
+        "project_domain=automation_system",
+        "task_type=system_repair",
+        "requested_mode=write_allowed",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "exact_allowed_scope=infra/windows-worker/local_worker.js",
+        "task_goal=修复 Worker 最终报告。",
+      ].join("\n"),
+      payload: {
+        approved_batch: "BATCH-ARCH-COMPLETE-01-OLD-VERIFICATION-ONLY-36",
+        verification_only: true,
+        allow_no_change_success: true,
+        code_changes_required: false,
+        codex_required: false,
+        git_commit_required: false,
+        git_push_required: false,
+      },
+    };
+
+    const contract = resolveWorkerJobContract(job);
+    assert.equal(contract.approved_batch, "BATCH-ARCH-COMPLETE-01-CURRENT-WRITE-FIX-37");
+    assert.equal(contract.execution_policy_inherited, false);
+    assert.equal(contract.execution_policy_inheritance_rejected_reason, "batch_code_mismatch");
+    assert.equal(contract.verification_only, false);
+    assert.equal(contract.allow_no_change_success, false);
+    assert.equal(isVerificationOnlyNoopTask(job, contract), false);
+  });
+
+  await t.test("strict explicit verification-only no-op requires every no-change policy field", () => {
+    const missingPolicyJob = {
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-INCOMPLETE-NOOP",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_type=system_repair",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "repair_mode=true",
+        "verification_only=true",
+        "allow_no_change_success=true",
+        "exact_allowed_scope=infra/windows-worker/local_worker.js",
+      ].join("\n"),
+    };
+    const allowedNoopJob = {
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-EXPLICIT-NOOP",
+        "HERMES_WORKER_CONTEXT:",
+        "project_domain=automation_system",
+        "task_type=system_repair",
+        "task_mode=automation_system_write_allowed",
+        "read_only_mode=false",
+        "repair_mode=true",
+        "verification_only=true",
+        "allow_no_change_success=true",
+        "code_changes_required=false",
+        "codex_required=false",
+        "git_commit_required=false",
+        "git_push_required=false",
+        "exact_allowed_scope=infra/windows-worker/local_worker.js",
+      ].join("\n"),
+    };
+
+    const missingContract = resolveWorkerJobContract(missingPolicyJob);
+    assert.equal(allowsVerificationOnlyNoChangeSuccess(missingContract), false);
+    assert.equal(isVerificationOnlyNoopTask(missingPolicyJob, missingContract), false);
+    assert.throws(() => assertTaskGoalApplied(missingPolicyJob, []), (error) => error.code === NO_FIX_APPLIED);
+
+    const allowedContract = resolveWorkerJobContract(allowedNoopJob);
+    assert.equal(allowsVerificationOnlyNoChangeSuccess(allowedContract), true);
+    assert.equal(isVerificationOnlyNoopTask(allowedNoopJob, allowedContract), true);
+    assert.doesNotThrow(() => assertTaskGoalApplied(allowedNoopJob, []));
+  });
+
+  await t.test("post-completion final result preserves Worker push and committed files after clean worktree", () => {
+    const finalResult = normalizeWorkerFinalResult({
+      job: { id: "job-final-report", request_text: "BATCH-ARCH-COMPLETE-01-FINAL-REPORT" },
+      status: "succeeded",
+      effectiveFinalStatus: "succeeded",
+      changed_files: [],
+      committed_files: ["infra/windows-worker/local_worker.js"],
+      gitCommitSha: "abc123",
+      codex_git_push: "not_run_by_codex",
+      worker_git_push: true,
+      git_push: true,
+      pushed: true,
+      pushed_branch: "master",
+      remote_contains_commit: true,
+      repository_clean_after_push: true,
+    });
+
+    assert.deepEqual(finalResult.changed_files, ["infra/windows-worker/local_worker.js"]);
+    assert.deepEqual(finalResult.committed_files, ["infra/windows-worker/local_worker.js"]);
+    assert.equal(finalResult.codex_git_push, "not_run_by_codex");
+    assert.equal(finalResult.worker_git_push, true);
+    assert.equal(finalResult.git_push, true);
+    assert.equal(finalResult.pushed_branch, "master");
+    assert.equal(finalResult.remote_contains_commit, true);
+    assert.equal(finalResult.repository_clean_after_push, true);
   });
 
   await t.test("worker job source preserves exact scope and does not reintroduce generic product fallback", () => {

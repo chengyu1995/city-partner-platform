@@ -62,10 +62,19 @@ test("worker reports carry Codex executable resolution diagnostics", () => {
 test("worker contract carries verification-only no-change success flags", () => {
   assert.match(workerJobs, /"verification_only"/);
   assert.match(workerJobs, /"allow_no_change_success"/);
+  assert.match(workerJobs, /"code_changes_required"/);
+  assert.match(workerJobs, /"codex_required"/);
+  assert.match(workerJobs, /"git_commit_required"/);
+  assert.match(workerJobs, /"git_push_required"/);
+  assert.match(workerJobs, /"execution_policy_source"/);
   assert.match(workerJobs, /verification_only:\s*verificationOnly/);
   assert.match(workerJobs, /allow_no_change_success:\s*allowNoChangeSuccess/);
+  assert.match(workerJobs, /code_changes_required:\s*codeChangesRequired/);
+  assert.match(workerJobs, /codex_required:\s*codexRequired/);
   assert.match(reportRoute, /verification_only:\s*body\.verification_only \?\? null/);
   assert.match(reportRoute, /allow_no_change_success:\s*body\.allow_no_change_success \?\? null/);
+  assert.match(reportRoute, /code_changes_required:\s*body\.code_changes_required \?\? null/);
+  assert.match(reportRoute, /codex_required:\s*body\.codex_required \?\? null/);
 });
 
 test("diagnostics preserves context without original request text", () => {

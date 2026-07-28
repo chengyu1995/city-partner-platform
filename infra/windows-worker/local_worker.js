@@ -190,7 +190,10 @@ function buildTerminalStatusSnapshot(input = {}) {
       ? firstReportString(sourceValue("failure_stage", "failureStage"))
       : null;
   const changedFiles = uniqueSortedPaths(
-    readStringList(sourceRawValue("changed_files", "changedFiles", "files_changed", "filesChanged"))
+    readStringList(
+      sourceRawValue("committed_files", "committedFiles") ||
+        sourceRawValue("changed_files", "changedFiles", "files_changed", "filesChanged")
+    )
   );
   const gitCommitSha = firstReportString(
     sourceValue("git_commit_sha", "gitCommitSha"),
@@ -224,9 +227,33 @@ function buildTerminalStatusSnapshot(input = {}) {
     failure_code: failureCode,
     failure_stage: failureStage,
     changed_files: changedFiles,
+    committed_files: uniqueSortedPaths(
+      readStringList(sourceRawValue("committed_files", "committedFiles") || changedFiles)
+    ),
+    codex_changed_files: uniqueSortedPaths(
+      readStringList(sourceRawValue("codex_changed_files", "codexChangedFiles"))
+    ),
+    worktree_changed_files: uniqueSortedPaths(
+      readStringList(sourceRawValue("worktree_changed_files", "worktreeChangedFiles"))
+    ),
+    task_changed_files: uniqueSortedPaths(
+      readStringList(sourceRawValue("task_changed_files", "taskChangedFiles") || changedFiles)
+    ),
+    unexpected_changed_files: uniqueSortedPaths(
+      readStringList(sourceRawValue("unexpected_changed_files", "unexpectedChangedFiles"))
+    ),
     git_commit_sha: gitCommitSha,
+    codex_git_push: firstReportString(sourceValue("codex_git_push", "codexGitPush")),
+    worker_git_push: readReportPushFlag(sourceValue("worker_git_push", "workerGitPush")),
     git_push: gitPush,
     pushed: gitPush,
+    pushed_branch: firstReportString(sourceValue("pushed_branch", "pushedBranch")),
+    remote_contains_commit: readReportPushFlag(
+      sourceValue("remote_contains_commit", "remoteContainsCommit")
+    ),
+    repository_clean_after_push: readBooleanFlag(
+      sourceValue("repository_clean_after_push", "repositoryCleanAfterPush")
+    ),
     post_completion_transport_warning: readBooleanFlag(
       sourceValue("post_completion_transport_warning", "postCompletionTransportWarning")
     ),
@@ -2657,7 +2684,7 @@ function isExplicitAutomationAllowedDocPath(filePath) {
 }
 
 const HERMES_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|task_mode|read_only_mode|repair_mode|repair_scope|verification_only|allow_no_change_success|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|route|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|git_commit_sha|next_batch|completed_at|pushed|deploy_status)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|requested_mode|final_mode|task_mode|read_only_mode|repair_mode|repair_scope|verification_only|allow_no_change_success|execution_intent|code_changes_required|codex_required|git_commit_required|git_push_required|approval_required|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|route|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|committed_files|codex_changed_files|worktree_changed_files|task_changed_files|unexpected_changed_files|git_commit_sha|codex_git_push|worker_git_push|git_push|pushed|pushed_branch|remote_contains_commit|repository_clean_after_push|next_batch|completed_at|deploy_status|execution_policy_source|execution_policy_batch_code|execution_policy_context_id|execution_policy_request_hash|execution_policy_inherited|execution_policy_inheritance_rejected_reason)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName) {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -3005,12 +3032,20 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "context_reconstruct_failed",
   "project_domain",
   "task_type",
+  "requested_mode",
+  "final_mode",
   "task_mode",
   "read_only_mode",
   "repair_mode",
   "repair_scope",
   "verification_only",
   "allow_no_change_success",
+  "execution_intent",
+  "code_changes_required",
+  "codex_required",
+  "git_commit_required",
+  "git_push_required",
+  "approval_required",
   "allowed_scope",
   "exact_allowed_scope",
   "exact_allowed_scope_count",
@@ -3035,20 +3070,40 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "failure_code",
   "failure_stage",
   "changed_files",
+  "committed_files",
+  "codex_changed_files",
+  "worktree_changed_files",
+  "task_changed_files",
+  "unexpected_changed_files",
   "git_commit_sha",
+  "codex_git_push",
+  "worker_git_push",
+  "git_push",
+  "pushed_branch",
+  "remote_contains_commit",
+  "repository_clean_after_push",
   "next_batch",
   "completed_at",
   "pushed",
   "deploy_status",
+  "execution_policy_source",
+  "execution_policy_batch_code",
+  "execution_policy_context_id",
+  "execution_policy_request_hash",
+  "execution_policy_inherited",
+  "execution_policy_inheritance_rejected_reason",
 ];
 
 const WORKER_CONTEXT_CORE_FIELDS = [
   "project_domain",
   "task_type",
+  "requested_mode",
+  "final_mode",
   "task_mode",
   "read_only_mode",
   "repair_mode",
   "repair_scope",
+  "execution_intent",
   "allowed_scope",
   "forbidden_scope",
   "route",
@@ -3253,8 +3308,21 @@ function readPayloadContextField(payload, fieldName) {
 
   const aliases = {
     project_domain: ["project_domain", "projectDomain"],
+    task_type: ["task_type", "taskType"],
+    requested_mode: ["requested_mode", "requestedMode"],
+    final_mode: ["final_mode", "finalMode"],
     task_mode: ["task_mode", "taskMode"],
     read_only_mode: ["read_only_mode", "readOnlyMode", "readonly", "read_only"],
+    repair_mode: ["repair_mode", "repairMode"],
+    repair_scope: ["repair_scope", "repairScope"],
+    verification_only: ["verification_only", "verificationOnly"],
+    allow_no_change_success: ["allow_no_change_success", "allowNoChangeSuccess"],
+    execution_intent: ["execution_intent", "executionIntent"],
+    code_changes_required: ["code_changes_required", "codeChangesRequired"],
+    codex_required: ["codex_required", "codexRequired"],
+    git_commit_required: ["git_commit_required", "gitCommitRequired"],
+    git_push_required: ["git_push_required", "gitPushRequired"],
+    approval_required: ["approval_required", "approvalRequired"],
     allowed_scope: ["allowed_scope", "allowedScope", "allowed_files", "allowedFiles"],
     exact_allowed_scope: ["exact_allowed_scope", "exactAllowedScope", "exact_allowed_paths", "exactAllowedPaths"],
     exact_allowed_scope_count: ["exact_allowed_scope_count", "exactAllowedScopeCount"],
@@ -3281,11 +3349,31 @@ function readPayloadContextField(payload, fieldName) {
     failure_code: ["failure_code", "failureCode", "error_code", "errorCode"],
     failure_stage: ["failure_stage", "failureStage"],
     changed_files: ["changed_files", "changedFiles", "files_changed", "filesChanged"],
+    committed_files: ["committed_files", "committedFiles"],
+    codex_changed_files: ["codex_changed_files", "codexChangedFiles"],
+    worktree_changed_files: ["worktree_changed_files", "worktreeChangedFiles"],
+    task_changed_files: ["task_changed_files", "taskChangedFiles"],
+    unexpected_changed_files: ["unexpected_changed_files", "unexpectedChangedFiles"],
     git_commit_sha: ["git_commit_sha", "gitCommitSha"],
+    codex_git_push: ["codex_git_push", "codexGitPush"],
+    worker_git_push: ["worker_git_push", "workerGitPush"],
+    git_push: ["git_push", "gitPush"],
+    pushed_branch: ["pushed_branch", "pushedBranch"],
+    remote_contains_commit: ["remote_contains_commit", "remoteContainsCommit"],
+    repository_clean_after_push: ["repository_clean_after_push", "repositoryCleanAfterPush"],
     next_batch: ["next_batch", "nextBatch"],
     completed_at: ["completed_at", "completedAt"],
     pushed: ["pushed"],
     deploy_status: ["deploy_status", "deployStatus"],
+    execution_policy_source: ["execution_policy_source", "executionPolicySource"],
+    execution_policy_batch_code: ["execution_policy_batch_code", "executionPolicyBatchCode"],
+    execution_policy_context_id: ["execution_policy_context_id", "executionPolicyContextId", "context_id", "contextId"],
+    execution_policy_request_hash: ["execution_policy_request_hash", "executionPolicyRequestHash"],
+    execution_policy_inherited: ["execution_policy_inherited", "executionPolicyInherited"],
+    execution_policy_inheritance_rejected_reason: [
+      "execution_policy_inheritance_rejected_reason",
+      "executionPolicyInheritanceRejectedReason",
+    ],
   };
 
   for (const key of aliases[fieldName] || [fieldName]) {
@@ -3388,12 +3476,20 @@ function normalizeWorkerContext(job, overrides = {}) {
   const originalRequestTextFields = {
     project_domain: readTextContextField(fallbackOriginalRequest, "project_domain"),
     task_type: readTextContextField(fallbackOriginalRequest, "task_type"),
+    requested_mode: readTextContextField(fallbackOriginalRequest, "requested_mode"),
+    final_mode: readTextContextField(fallbackOriginalRequest, "final_mode"),
     task_mode: readTextContextField(fallbackOriginalRequest, "task_mode"),
     read_only_mode: readTextContextField(fallbackOriginalRequest, "read_only_mode"),
     repair_mode: readTextContextField(fallbackOriginalRequest, "repair_mode"),
     repair_scope: readTextContextField(fallbackOriginalRequest, "repair_scope"),
     verification_only: readTextContextField(fallbackOriginalRequest, "verification_only"),
     allow_no_change_success: readTextContextField(fallbackOriginalRequest, "allow_no_change_success"),
+    execution_intent: readTextContextField(fallbackOriginalRequest, "execution_intent"),
+    code_changes_required: readTextContextField(fallbackOriginalRequest, "code_changes_required"),
+    codex_required: readTextContextField(fallbackOriginalRequest, "codex_required"),
+    git_commit_required: readTextContextField(fallbackOriginalRequest, "git_commit_required"),
+    git_push_required: readTextContextField(fallbackOriginalRequest, "git_push_required"),
+    approval_required: readTextContextField(fallbackOriginalRequest, "approval_required"),
     allowed_scope: readTextContextField(fallbackOriginalRequest, "allowed_scope"),
     exact_allowed_scope: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope"),
     exact_allowed_scope_count: readTextContextField(fallbackOriginalRequest, "exact_allowed_scope_count"),
@@ -3411,12 +3507,20 @@ function normalizeWorkerContext(job, overrides = {}) {
   const requestTextFields = {
     project_domain: readTextContextField(requestText, "project_domain"),
     task_type: readTextContextField(requestText, "task_type"),
+    requested_mode: readTextContextField(requestText, "requested_mode"),
+    final_mode: readTextContextField(requestText, "final_mode"),
     task_mode: readTextContextField(requestText, "task_mode"),
     read_only_mode: readTextContextField(requestText, "read_only_mode"),
     repair_mode: readTextContextField(requestText, "repair_mode"),
     repair_scope: readTextContextField(requestText, "repair_scope"),
     verification_only: readTextContextField(requestText, "verification_only"),
     allow_no_change_success: readTextContextField(requestText, "allow_no_change_success"),
+    execution_intent: readTextContextField(requestText, "execution_intent"),
+    code_changes_required: readTextContextField(requestText, "code_changes_required"),
+    codex_required: readTextContextField(requestText, "codex_required"),
+    git_commit_required: readTextContextField(requestText, "git_commit_required"),
+    git_push_required: readTextContextField(requestText, "git_push_required"),
+    approval_required: readTextContextField(requestText, "approval_required"),
     allowed_scope: readTextContextField(requestText, "allowed_scope"),
     exact_allowed_scope: readTextContextField(requestText, "exact_allowed_scope"),
     exact_allowed_scope_count: readTextContextField(requestText, "exact_allowed_scope_count"),
@@ -3434,12 +3538,20 @@ function normalizeWorkerContext(job, overrides = {}) {
   const overrideFields = {
     project_domain: overrides.projectDomain,
     task_type: overrides.taskType,
+    requested_mode: overrides.requestedMode,
+    final_mode: overrides.finalMode,
     task_mode: overrides.taskMode,
     read_only_mode: overrides.readOnlyMode,
     repair_mode: overrides.repairMode,
     repair_scope: readScopeValue(overrides.repairScope),
     verification_only: overrides.verificationOnly,
     allow_no_change_success: overrides.allowNoChangeSuccess,
+    execution_intent: overrides.executionIntent,
+    code_changes_required: overrides.codeChangesRequired,
+    codex_required: overrides.codexRequired,
+    git_commit_required: overrides.gitCommitRequired,
+    git_push_required: overrides.gitPushRequired,
+    approval_required: overrides.approvalRequired,
     allowed_scope: readScopeValue(overrides.allowedScope),
     exact_allowed_scope: readScopeValue(overrides.exactAllowedScope),
     exact_allowed_scope_count: overrides.exactAllowedScopeCount,
@@ -3479,12 +3591,43 @@ function normalizeWorkerContext(job, overrides = {}) {
     readNullableBooleanFlag(requestTextFields.read_only_mode) ??
     (typeof overrides.readOnlyMode === "boolean" ? overrides.readOnlyMode : null);
   const approvedBatch =
-    readString(readPriorityField("approved_batch")) ||
-    getJobBatchCode(
-      Object.assign({}, job || {}, {
-        request_text: [originalRequestText, requestText].join("\n"),
-      })
+    readString(explicitFields.approved_batch) ||
+    readString(originalRequestTextFields.approved_batch) ||
+    readString(requestTextFields.approved_batch) ||
+    getJobBatchCode({
+      request_text: [originalRequestText, requestText].join("\n"),
+    }) ||
+    readString(payloadField("approved_batch"));
+  const payloadPolicyBatchCode =
+    readString(payloadField("approved_batch")) ||
+    readString(payloadField("batch_code")) ||
+    null;
+  const policyPayloadMatchesCurrentBatch =
+    !payloadPolicyBatchCode || !approvedBatch || payloadPolicyBatchCode === approvedBatch;
+  const policyInheritanceRejectedReason = policyPayloadMatchesCurrentBatch
+    ? null
+    : "batch_code_mismatch";
+  const readExecutionPolicyField = (fieldName) =>
+    firstPresentValue(
+      readString(explicitFields[fieldName]),
+      structuredPayload && policyPayloadMatchesCurrentBatch ? payloadField(fieldName) : null,
+      readString(originalRequestTextFields[fieldName]),
+      readString(requestTextFields[fieldName]),
+      !structuredPayload && policyPayloadMatchesCurrentBatch ? payloadField(fieldName) : null,
+      overrideFields[fieldName]
     );
+  const executionPolicySource = explicitContext
+    ? "current_approval_context"
+    : policyPayloadMatchesCurrentBatch && hasStructuredPayloadContext(payload)
+    ? "current_worker_payload"
+    : WORKER_CONTEXT_CORE_FIELDS.some((fieldName) => originalRequestTextFields[fieldName])
+    ? "current_original_request_text"
+    : WORKER_CONTEXT_CORE_FIELDS.some((fieldName) => requestTextFields[fieldName])
+    ? "current_request_text"
+    : "classification_default";
+  const executionPolicyRequestHash = originalRequestText
+    ? crypto.createHash("sha256").update(originalRequestText, "utf8").digest("hex")
+    : null;
   const classificationText = [originalRequestText, requestText, approvedBatch].filter(Boolean).join("\n");
   const currentBatchIsQa = approvedBatch && QA_BATCH_PATTERN.test(approvedBatch);
   const productRepairRequest =
@@ -3506,7 +3649,10 @@ function normalizeWorkerContext(job, overrides = {}) {
     readString(readPriorityField("project_domain")) ||
     classifyWorkerTaskDomain([originalRequestText, requestText].join("\n"));
   const taskType = readString(readPriorityField("task_type")) || null;
-  const explicitRepairMode = readNullableBooleanFlag(readPriorityField("repair_mode"));
+  const requestedMode = readString(readExecutionPolicyField("requested_mode")) || null;
+  const finalMode = readString(readExecutionPolicyField("final_mode")) || null;
+  const executionIntent = readString(readExecutionPolicyField("execution_intent")) || null;
+  const explicitRepairMode = readNullableBooleanFlag(readExecutionPolicyField("repair_mode"));
   const systemRepairMode = isSystemRepairMode({
     projectDomain,
     taskType,
@@ -3514,16 +3660,46 @@ function normalizeWorkerContext(job, overrides = {}) {
   });
   const repairMode = systemRepairMode && explicitRepairMode !== false;
   const repairScope = repairMode
-    ? readString(readPriorityField("repair_scope")) || SYSTEM_REPAIR_SCOPE_TEXT
-    : readString(readPriorityField("repair_scope")) || null;
-  const explicitVerificationOnly = readNullableBooleanFlag(readPriorityField("verification_only"));
+    ? readString(readExecutionPolicyField("repair_scope")) || SYSTEM_REPAIR_SCOPE_TEXT
+    : readString(readExecutionPolicyField("repair_scope")) || null;
+  const explicitVerificationOnly = readNullableBooleanFlag(readExecutionPolicyField("verification_only"));
   const explicitAllowNoChangeSuccess = readNullableBooleanFlag(
-    readPriorityField("allow_no_change_success")
+    readExecutionPolicyField("allow_no_change_success")
   );
   const verificationOnly = explicitVerificationOnly === true;
-  const allowNoChangeSuccess = repairMode && (verificationOnly || explicitAllowNoChangeSuccess === true);
+  const policyDefaults = {
+    task_type: taskType,
+    requested_mode: requestedMode,
+    final_mode: finalMode,
+    ["task_" + "mode"]: taskMode,
+    execution_intent: executionIntent,
+    task_goal: readContractTextValue(readExecutionPolicyField("task_goal")),
+    original_request_text: originalRequestText,
+  };
+  const defaultCodeChangesRequired = defaultCodeChangesRequiredForPolicy(policyDefaults);
+  const codeChangesRequired =
+    readNullableBooleanFlag(readExecutionPolicyField("code_changes_required")) ??
+    defaultCodeChangesRequired;
+  const codexRequired =
+    readNullableBooleanFlag(readExecutionPolicyField("codex_required")) ??
+    codeChangesRequired;
+  const gitCommitRequired =
+    readNullableBooleanFlag(readExecutionPolicyField("git_commit_required")) ??
+    codeChangesRequired;
+  const gitPushRequired =
+    readNullableBooleanFlag(readExecutionPolicyField("git_push_required")) ??
+    codeChangesRequired;
+  const approvalRequired =
+    readNullableBooleanFlag(readExecutionPolicyField("approval_required"));
+  const allowNoChangeSuccess =
+    explicitAllowNoChangeSuccess === true &&
+    verificationOnly &&
+    codeChangesRequired === false &&
+    codexRequired === false &&
+    gitCommitRequired === false &&
+    gitPushRequired === false;
   const rawAllowedScope = readString(readPriorityField("allowed_scope")) || null;
-  const rawExactAllowedScope = readString(readPriorityField("exact_allowed_scope")) || null;
+  const rawExactAllowedScope = readString(readExecutionPolicyField("exact_allowed_scope")) || null;
   const allowedScope = repairMode ? SYSTEM_REPAIR_SCOPE_TEXT : rawAllowedScope;
   const exactAllowedScope = repairMode ? SYSTEM_REPAIR_SCOPE_TEXT : rawExactAllowedScope;
   const exactAllowedScopeCountValue = readPriorityField("exact_allowed_scope_count");
@@ -3534,7 +3710,7 @@ function normalizeWorkerContext(job, overrides = {}) {
       ? String(exactAllowedScopeCountValue).trim()
       : null) ||
     (exactAllowedScope ? String(extractExactAllowedScopePaths(exactAllowedScope).length) : null);
-  const forbiddenScope = readString(readPriorityField("forbidden_scope")) || null;
+  const forbiddenScope = readString(readExecutionPolicyField("forbidden_scope")) || null;
   const workerReadOnlyMode = taskMode === TASK_MODES.WORKER_READ_ONLY;
   const writableScope = workerReadOnlyMode
     ? "[]"
@@ -3622,12 +3798,29 @@ function normalizeWorkerContext(job, overrides = {}) {
     context_warnings: contextWarnings,
     project_domain: projectDomain,
     task_type: taskType,
+    requested_mode: requestedMode,
+    final_mode: finalMode,
     ["task_" + "mode"]: taskMode,
     read_only_mode: readOnlyMode,
     repair_mode: repairMode,
     repair_scope: repairScope,
     verification_only: verificationOnly,
     allow_no_change_success: allowNoChangeSuccess,
+    execution_intent: executionIntent,
+    code_changes_required: codeChangesRequired,
+    codex_required: codexRequired,
+    git_commit_required: gitCommitRequired,
+    git_push_required: gitPushRequired,
+    approval_required: approvalRequired,
+    execution_policy_source: executionPolicySource,
+    execution_policy_batch_code: approvedBatch || null,
+    execution_policy_context_id:
+      readString(readExecutionPolicyField("execution_policy_context_id")) ||
+      readString(readExecutionPolicyField("context_id")) ||
+      null,
+    execution_policy_request_hash: executionPolicyRequestHash,
+    execution_policy_inherited: false,
+    execution_policy_inheritance_rejected_reason: policyInheritanceRejectedReason,
     allowed_scope: allowedScope,
     exact_allowed_scope: exactAllowedScope,
     exact_allowed_scope_count: exactAllowedScopeCount,
@@ -3716,35 +3909,63 @@ function resolveWorkerJobContract(job, overrides = {}) {
   return normalizeWorkerContext(job, overrides);
 }
 
+const CODE_CHANGE_REQUIRED_TASK_TYPES = new Set([
+  "system_repair",
+  "bug_fix",
+  "architecture_fix",
+  "implementation",
+  "feature",
+  "migration",
+  "refactor",
+]);
+
+function textHasWriteChangeIntent(text) {
+  return /修复|修改|实现|增加|新增|删除|重构|迁移|fix|repair|modify|implement|add|delete|refactor|migrat/i.test(
+    String(text || "")
+  );
+}
+
+function isWriteExecutionMode(value) {
+  return [
+    TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED,
+    TASK_MODES.PRODUCT_WRITE_ALLOWED,
+    TASK_MODES.DOCS_WRITE_ALLOWED,
+    "write_allowed",
+    "automation_system_write_allowed",
+  ].includes(String(value || "").trim());
+}
+
+function defaultCodeChangesRequiredForPolicy(contract) {
+  const taskType = String(contract?.task_type || "").trim();
+  const executionText = [
+    contract?.execution_intent,
+    contract?.task_goal,
+    contract?.original_request_text,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return Boolean(
+    CODE_CHANGE_REQUIRED_TASK_TYPES.has(taskType) ||
+      isWriteExecutionMode(contract?.task_mode) ||
+      isWriteExecutionMode(contract?.final_mode) ||
+      (isWriteExecutionMode(contract?.requested_mode) && textHasWriteChangeIntent(executionText))
+  );
+}
+
 function allowsVerificationOnlyNoChangeSuccess(contract) {
   return Boolean(
-    contract?.repair_mode === true &&
-      contract?.read_only_mode === false &&
-      contract?.task_mode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED &&
-      (contract?.verification_only === true || contract?.allow_no_change_success === true)
+    contract?.verification_only === true &&
+      contract?.allow_no_change_success === true &&
+      contract?.code_changes_required === false &&
+      contract?.codex_required === false &&
+      contract?.git_commit_required === false &&
+      contract?.git_push_required === false
   );
 }
 
 function isVerificationOnlyNoopTask(job, contract = resolveWorkerJobContract(job)) {
-  if (allowsVerificationOnlyNoChangeSuccess(contract)) {
-    return true;
-  }
-
-  const text = readTextValue([
-    contract?.original_request_text,
-    job?.request_text,
-    job?.requestText,
-    job?.prompt,
-    job?.description,
-  ]);
-
-  return Boolean(
-    contract?.repair_mode === true &&
-      contract?.read_only_mode === false &&
-      contract?.task_mode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED &&
-      /verification[_ -]?only|纯生命周期验证|静态验证|链路验证|lifecycle verification|static verification|link verification/i.test(text) &&
-      /allow_no_change_success\s*[:=]\s*(?:true|1|yes|on)|零文件变更|零变更|no[_ -]?change|no[_ -]?op|不得调用\s*Codex|不调用\s*Codex|must not call Codex/i.test(text)
-  );
+  return allowsVerificationOnlyNoChangeSuccess(contract);
 }
 
 function getMissingWorkerReadOnlyContextFields(contract) {
@@ -3829,10 +4050,25 @@ function formatWorkerJobContractLines(contract, options = {}) {
     `context_source: ${contract.context_source || "null"}`,
     `context_reconstruct_failed: ${contract.context_reconstruct_failed ? "true" : "false"}`,
     `project_domain: ${contract.project_domain || "null"}`,
+    `task_type: ${contract.task_type || "null"}`,
+    `requested_mode: ${contract.requested_mode || "null"}`,
+    `final_mode: ${contract.final_mode || "null"}`,
     `task_mode: ${contract.task_mode || "null"}`,
     `read_only_mode: ${contract.read_only_mode ? "true" : "false"}`,
     `verification_only: ${contract.verification_only ? "true" : "false"}`,
     `allow_no_change_success: ${contract.allow_no_change_success ? "true" : "false"}`,
+    `execution_intent: ${contract.execution_intent || "null"}`,
+    `code_changes_required: ${contract.code_changes_required ? "true" : "false"}`,
+    `codex_required: ${contract.codex_required ? "true" : "false"}`,
+    `git_commit_required: ${contract.git_commit_required ? "true" : "false"}`,
+    `git_push_required: ${contract.git_push_required ? "true" : "false"}`,
+    `approval_required: ${contract.approval_required === null || contract.approval_required === undefined ? "null" : contract.approval_required ? "true" : "false"}`,
+    `execution_policy_source: ${contract.execution_policy_source || "null"}`,
+    `execution_policy_batch_code: ${contract.execution_policy_batch_code || "null"}`,
+    `execution_policy_context_id: ${contract.execution_policy_context_id || "null"}`,
+    `execution_policy_request_hash: ${contract.execution_policy_request_hash || "null"}`,
+    `execution_policy_inherited: ${contract.execution_policy_inherited ? "true" : "false"}`,
+    `execution_policy_inheritance_rejected_reason: ${contract.execution_policy_inheritance_rejected_reason || "null"}`,
     `allowed_scope: ${contract.allowed_scope || "null"}`,
     `exact_allowed_scope: ${contract.exact_allowed_scope || "null"}`,
     `exact_allowed_scope_count: ${contract.exact_allowed_scope_count || "null"}`,
@@ -3875,10 +4111,26 @@ function buildWorkerReportContractExtra(contract) {
     context_reconstruct_failed: contract.context_reconstruct_failed,
     context_warnings: contract.context_warnings || [],
     project_domain: contract.project_domain,
+    task_type: contract.task_type,
+    requested_mode: contract.requested_mode,
+    final_mode: contract.final_mode,
     task_mode: contract.task_mode,
     read_only_mode: contract.read_only_mode,
     verification_only: contract.verification_only,
     allow_no_change_success: contract.allow_no_change_success,
+    execution_intent: contract.execution_intent,
+    code_changes_required: contract.code_changes_required,
+    codex_required: contract.codex_required,
+    git_commit_required: contract.git_commit_required,
+    git_push_required: contract.git_push_required,
+    approval_required: contract.approval_required,
+    execution_policy_source: contract.execution_policy_source,
+    execution_policy_batch_code: contract.execution_policy_batch_code,
+    execution_policy_context_id: contract.execution_policy_context_id,
+    execution_policy_request_hash: contract.execution_policy_request_hash,
+    execution_policy_inherited: contract.execution_policy_inherited,
+    execution_policy_inheritance_rejected_reason:
+      contract.execution_policy_inheritance_rejected_reason,
     allowed_scope: contract.allowed_scope,
     exact_allowed_scope: contract.exact_allowed_scope,
     exact_allowed_scope_count: contract.exact_allowed_scope_count,
@@ -4313,6 +4565,22 @@ function normalizeWorkerFinalResult(input = {}) {
     readString(input.nextBatch) ||
     extractNextBatchFromText(reportText) ||
     (effectiveFinalStatus === "succeeded" ? inferNextBatchFromBatchCode(approvedBatch) : null);
+  const committedFilesForFinalResult = uniqueSortedPaths(
+    readStringList(
+      readSnapshotRawField("committed_files", "committedFiles") ||
+        input.committed_files ||
+        input.committedFiles
+    )
+  );
+  const changedFilesForFinalResult = committedFilesForFinalResult.length
+    ? committedFilesForFinalResult
+    : uniqueSortedPaths(
+        readStringList(
+          readSnapshotRawField("changed_files", "changedFiles", "files_changed", "filesChanged") ||
+            input.changed_files ||
+            input.files_changed
+        )
+      );
 
   const finalResult = {
     job_id:
@@ -4343,11 +4611,38 @@ function normalizeWorkerFinalResult(input = {}) {
     effective_final_status: effectiveFinalStatus,
     failure_code: failureCode,
     failure_stage: failureStage,
-    changed_files: uniqueSortedPaths(
+    changed_files: changedFilesForFinalResult,
+    committed_files: committedFilesForFinalResult.length
+      ? committedFilesForFinalResult
+      : changedFilesForFinalResult,
+    codex_changed_files: uniqueSortedPaths(
       readStringList(
-        readSnapshotRawField("changed_files", "changedFiles", "files_changed", "filesChanged") ||
+        readSnapshotRawField("codex_changed_files", "codexChangedFiles") ||
+          input.codex_changed_files ||
+          input.codexChangedFiles
+      )
+    ),
+    worktree_changed_files: uniqueSortedPaths(
+      readStringList(
+        readSnapshotRawField("worktree_changed_files", "worktreeChangedFiles") ||
+          input.worktree_changed_files ||
+          input.worktreeChangedFiles
+      )
+    ),
+    task_changed_files: uniqueSortedPaths(
+      readStringList(
+        readSnapshotRawField("task_changed_files", "taskChangedFiles") ||
+          input.task_changed_files ||
+          input.taskChangedFiles ||
           input.changed_files ||
           input.files_changed
+      )
+    ),
+    unexpected_changed_files: uniqueSortedPaths(
+      readStringList(
+        readSnapshotRawField("unexpected_changed_files", "unexpectedChangedFiles") ||
+          input.unexpected_changed_files ||
+          input.unexpectedChangedFiles
       )
     ),
     git_commit_sha:
@@ -4369,6 +4664,16 @@ function normalizeWorkerFinalResult(input = {}) {
         input.deploy_status,
         input.deployStatus
       ),
+    codex_git_push:
+      readNullableReportString(readSnapshotField("codex_git_push", "codexGitPush")) ||
+      readString(input.codex_git_push) ||
+      readString(input.codexGitPush) ||
+      null,
+    worker_git_push: readReportPushFlag(
+      readSnapshotField("worker_git_push", "workerGitPush"),
+      input.worker_git_push,
+      input.workerGitPush
+    ),
     git_push:
       readReportPushFlag(
         readSnapshotField("git_push", "gitPush", "pushed"),
@@ -4382,6 +4687,21 @@ function normalizeWorkerFinalResult(input = {}) {
         input.deploy_status,
         input.deployStatus
       ),
+    pushed_branch:
+      readNullableReportString(readSnapshotField("pushed_branch", "pushedBranch")) ||
+      readString(input.pushed_branch) ||
+      readString(input.pushedBranch) ||
+      null,
+    remote_contains_commit: readReportPushFlag(
+      readSnapshotField("remote_contains_commit", "remoteContainsCommit"),
+      input.remote_contains_commit,
+      input.remoteContainsCommit
+    ),
+    repository_clean_after_push:
+      readNullableBooleanFlag(readSnapshotField("repository_clean_after_push", "repositoryCleanAfterPush")) ??
+      readNullableBooleanFlag(input.repository_clean_after_push) ??
+      readNullableBooleanFlag(input.repositoryCleanAfterPush) ??
+      false,
     post_completion_transport_warning:
       readBooleanFlag(readSnapshotField("post_completion_transport_warning", "postCompletionTransportWarning")) ||
       readBooleanFlag(input.post_completion_transport_warning) ||
@@ -4421,7 +4741,17 @@ function buildTerminalJobIndex(finalResult) {
     failure_code: finalResult?.failure_code || null,
     failure_stage: finalResult?.failure_stage || null,
     changed_files: uniqueSortedPaths(finalResult?.changed_files || []),
+    committed_files: uniqueSortedPaths(finalResult?.committed_files || finalResult?.changed_files || []),
+    codex_changed_files: uniqueSortedPaths(finalResult?.codex_changed_files || []),
+    worktree_changed_files: uniqueSortedPaths(finalResult?.worktree_changed_files || []),
+    task_changed_files: uniqueSortedPaths(finalResult?.task_changed_files || finalResult?.changed_files || []),
+    unexpected_changed_files: uniqueSortedPaths(finalResult?.unexpected_changed_files || []),
     git_commit_sha: finalResult?.git_commit_sha || null,
+    codex_git_push: finalResult?.codex_git_push || null,
+    worker_git_push:
+      typeof finalResult?.worker_git_push === "boolean"
+        ? finalResult.worker_git_push
+        : readNullableBooleanFlag(finalResult?.worker_git_push) || false,
     pushed:
       typeof finalResult?.pushed === "boolean"
         ? finalResult.pushed
@@ -4432,6 +4762,15 @@ function buildTerminalJobIndex(finalResult) {
         : readNullableBooleanFlag(finalResult?.git_push) ||
           readNullableBooleanFlag(finalResult?.pushed) ||
           false,
+    pushed_branch: finalResult?.pushed_branch || null,
+    remote_contains_commit:
+      typeof finalResult?.remote_contains_commit === "boolean"
+        ? finalResult.remote_contains_commit
+        : readNullableBooleanFlag(finalResult?.remote_contains_commit) || false,
+    repository_clean_after_push:
+      typeof finalResult?.repository_clean_after_push === "boolean"
+        ? finalResult.repository_clean_after_push
+        : readNullableBooleanFlag(finalResult?.repository_clean_after_push) || false,
     next_batch: finalResult?.next_batch || null,
     next_stage_allowed:
       typeof finalResult?.next_stage_allowed === "boolean"
@@ -7084,6 +7423,10 @@ async function completeVerificationOnlyNoopJob(job, attemptId, initialContract) 
     "failure_stage: null",
     "verification_only: true",
     "allow_no_change_success: true",
+    "code_changes_required: false",
+    "codex_required: false",
+    "git_commit_required: false",
+    "git_push_required: false",
     "changed_files: []",
     "git_commit_sha: null",
     "git_push: false",
@@ -7109,8 +7452,12 @@ async function completeVerificationOnlyNoopJob(job, attemptId, initialContract) 
     attemptId,
     taskMode: taskModeForReport,
     readOnlyMode: false,
-    verificationOnly: true,
-    allowNoChangeSuccess: true,
+      verificationOnly: true,
+      allowNoChangeSuccess: true,
+      codeChangesRequired: false,
+      codexRequired: false,
+      gitCommitRequired: false,
+      gitPushRequired: false,
     workerStage: "completed",
     workflowStage: "completed",
     finalReportStatus: "succeeded",
@@ -7149,6 +7496,10 @@ async function completeVerificationOnlyNoopJob(job, attemptId, initialContract) 
     "read_only_mode: false",
     "verification_only: true",
     "allow_no_change_success: true",
+    "code_changes_required: false",
+    "codex_required: false",
+    "git_commit_required: false",
+    "git_push_required: false",
     "codex_called: false",
     ...formatCodexDiagnosticLines(codexDiagnostics),
     "stdin_transport_verified: skipped_verification_only",
@@ -7209,6 +7560,10 @@ async function completeVerificationOnlyNoopJob(job, attemptId, initialContract) 
         "failure_stage: null",
         "verification_only: true",
         "allow_no_change_success: true",
+        "code_changes_required: false",
+        "codex_required: false",
+        "git_commit_required: false",
+        "git_push_required: false",
         "changed_files: []",
         "git_commit_sha: null",
         "git_push: false",
@@ -7219,6 +7574,10 @@ async function completeVerificationOnlyNoopJob(job, attemptId, initialContract) 
       task_mode: taskModeForReport,
       verification_only: true,
       allow_no_change_success: true,
+      code_changes_required: false,
+      codex_required: false,
+      git_commit_required: false,
+      git_push_required: false,
       codex_called: false,
       original_worker_status: "succeeded",
       worker_execution_status: workerExecutionStatus,
@@ -7476,6 +7835,17 @@ async function pollOnce() {
         : pushResult.message
     );
 
+    let repositoryCleanAfterPush = readOnlyMode;
+    let postPushWorktreeChangedFiles = [];
+    if (!readOnlyMode) {
+      try {
+        postPushWorktreeChangedFiles = await getTaskChangedPaths();
+        repositoryCleanAfterPush = postPushWorktreeChangedFiles.length === 0;
+      } catch (_) {
+        repositoryCleanAfterPush = false;
+      }
+    }
+
     const completedAt = new Date().toISOString();
     const approvedBatchForReport = initialContract.approved_batch || getJobBatchCode(job);
     const allowNoChangeSuccessForReport = allowsVerificationOnlyNoChangeSuccess(initialContract);
@@ -7497,8 +7867,19 @@ async function pollOnce() {
       resultText: result,
       approvedBatch: approvedBatchForReport,
       changed_files: gitResult.filesChanged || [],
+      committed_files: gitResult.filesChanged || [],
+      codex_changed_files: gitResult.filesChanged || [],
+      worktree_changed_files: postPushWorktreeChangedFiles,
+      task_changed_files: gitResult.filesChanged || [],
+      unexpected_changed_files: [],
       gitCommitSha: gitResult.commitSha || null,
       pushed: pushResult.pushed,
+      codex_git_push: "not_run_by_codex",
+      worker_git_push: pushResult.pushed,
+      git_push: pushResult.pushed,
+      pushed_branch: pushResult.branch || null,
+      remote_contains_commit: pushResult.pushed,
+      repository_clean_after_push: repositoryCleanAfterPush,
       nextBatch: extractNextBatchFromText(result),
       completedAt,
     });
@@ -7509,6 +7890,10 @@ async function pollOnce() {
       readOnlyMode,
       verificationOnly: initialContract.verification_only,
       allowNoChangeSuccess: initialContract.allow_no_change_success,
+      codeChangesRequired: initialContract.code_changes_required,
+      codexRequired: initialContract.codex_required,
+      gitCommitRequired: initialContract.git_commit_required,
+      gitPushRequired: initialContract.git_push_required,
       workerStage: "completed",
       workflowStage: "completed",
       finalReportStatus: "succeeded",
@@ -7516,6 +7901,7 @@ async function pollOnce() {
       failureCode: normalizedFinalResult.failure_code,
       failureStage: normalizedFinalResult.failure_stage,
       changedFiles: gitResult.filesChanged || [],
+      committedFiles: gitResult.filesChanged || [],
       gitCommitSha: gitResult.commitSha || null,
       nextBatch: normalizedFinalResult.next_batch,
       completedAt: normalizedFinalResult.completed_at,
@@ -7576,6 +7962,18 @@ async function pollOnce() {
       pushResult.pushed
         ? `推送成功：${pushResult.remote}/${pushResult.branch}`
         : pushResult.message,
+      "",
+      `codex_changed_files: ${gitResult.filesChanged?.length ? gitResult.filesChanged.join(", ") : "[]"}`,
+      `worktree_changed_files: ${postPushWorktreeChangedFiles.length ? postPushWorktreeChangedFiles.join(", ") : "[]"}`,
+      `task_changed_files: ${gitResult.filesChanged?.length ? gitResult.filesChanged.join(", ") : "[]"}`,
+      `committed_files: ${gitResult.filesChanged?.length ? gitResult.filesChanged.join(", ") : "[]"}`,
+      "unexpected_changed_files: []",
+      "codex_git_push: not_run_by_codex",
+      `worker_git_push: ${pushResult.pushed ? "true" : "false"}`,
+      `git_push: ${pushResult.pushed ? "true" : "false"}`,
+      `pushed_branch: ${pushResult.branch || "null"}`,
+      `remote_contains_commit: ${pushResult.pushed ? "true" : "false"}`,
+      `repository_clean_after_push: ${repositoryCleanAfterPush ? "true" : "false"}`,
     ]
       .filter(Boolean)
       .join("\n");
@@ -7603,6 +8001,12 @@ async function pollOnce() {
         project_name: "同城搭子网站",
         project_dir: PROJECT_DIR,
         files_changed: gitResult.filesChanged || [],
+        changed_files: gitResult.filesChanged || [],
+        committed_files: gitResult.filesChanged || [],
+        codex_changed_files: gitResult.filesChanged || [],
+        worktree_changed_files: postPushWorktreeChangedFiles,
+        task_changed_files: gitResult.filesChanged || [],
+        unexpected_changed_files: [],
         validation_results: [
           "Codex 执行：通过",
           "Worker 执行：通过",
@@ -7682,6 +8086,11 @@ async function pollOnce() {
           gitResult.commitSha || null,
         git_push: pushResult.pushed,
         pushed: pushResult.pushed,
+        codex_git_push: "not_run_by_codex",
+        worker_git_push: pushResult.pushed,
+        pushed_branch: pushResult.branch || null,
+        remote_contains_commit: pushResult.pushed,
+        repository_clean_after_push: repositoryCleanAfterPush,
         deploy_status:
           pushResult.pushed
             ? "pending"
@@ -7801,6 +8210,12 @@ async function pollOnce() {
       attemptId,
       taskMode: taskModeForReport,
       readOnlyMode,
+      verificationOnly: initialContract.verification_only,
+      allowNoChangeSuccess: initialContract.allow_no_change_success,
+      codeChangesRequired: initialContract.code_changes_required,
+      codexRequired: initialContract.codex_required,
+      gitCommitRequired: initialContract.git_commit_required,
+      gitPushRequired: initialContract.git_push_required,
       workerStage: "failed",
       workflowStage: "failed",
       finalReportStatus: "failed",

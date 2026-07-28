@@ -94,9 +94,15 @@ test("Codex timeout waits for process cleanup before retry can continue", () => 
   assert.match(retriesBlock, /await runCodex\(/);
 });
 
-test("verification-only no-change success bypasses false positive no-fix and publish guards only in repair mode", () => {
+test("verification-only no-change success bypasses false positive guards only with explicit strict policy", () => {
   const block = functionBlock(reportRoute, "buildFalsePositiveSuccessGuard");
-  assert.match(block, /repairMode && \(verificationOnly \|\| allowNoChangeSuccess\) && changedFiles\.length === 0/);
+  assert.match(block, /verificationOnly === true/);
+  assert.match(block, /allowNoChangeSuccess === true/);
+  assert.match(block, /codeChangesRequired === false/);
+  assert.match(block, /codexRequired === false/);
+  assert.match(block, /gitCommitRequired === false/);
+  assert.match(block, /gitPushRequired === false/);
+  assert.doesNotMatch(block, /verification\[_ -\]\?only/);
   const noFixIndex = block.indexOf('failureCode: "NO_FIX_APPLIED"');
   const gitPublishIndex = block.indexOf('failureCode: "GIT_PUBLISH_REQUIRED"');
   const bypassIndexes = [...block.matchAll(/if \(verificationOnlyNoChangeSuccess\)/g)].map((match) => match.index ?? -1);

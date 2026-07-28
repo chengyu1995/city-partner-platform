@@ -46,6 +46,11 @@ interface WorkerReportBody {
   failure_stage?: string | null;
   verification_only?: boolean | string | null;
   allow_no_change_success?: boolean | string | null;
+  code_changes_required?: boolean | string | null;
+  codex_required?: boolean | string | null;
+  git_commit_required?: boolean | string | null;
+  git_push_required?: boolean | string | null;
+  approval_required?: boolean | string | null;
   worker_execution_status?: string | null;
   task_goal_status?: string | null;
   effective_final_status?: string | null;
@@ -58,8 +63,21 @@ interface WorkerReportBody {
   project_name?: string;
   project_dir?: string;
   files_changed?: string[];
+  changed_files?: string[];
+  committed_files?: string[];
+  codex_changed_files?: string[];
+  worktree_changed_files?: string[];
+  task_changed_files?: string[];
+  unexpected_changed_files?: string[];
   validation_results?: string[];
   github_push_status?: string;
+  codex_git_push?: string | boolean | null;
+  worker_git_push?: string | boolean | null;
+  git_push?: string | boolean | null;
+  pushed?: string | boolean | null;
+  pushed_branch?: string | null;
+  remote_contains_commit?: string | boolean | null;
+  repository_clean_after_push?: string | boolean | null;
   build_passed?: boolean;
   test_passed?: boolean;
   duration_ms?: number;
@@ -78,16 +96,34 @@ function buildResult(body: WorkerReportBody): Record<string, unknown> {
     pr_url: body.pr_url ?? null,
     project_name: body.project_name ?? null,
     project_dir: body.project_dir ?? null,
-    files_changed: body.files_changed ?? null,
+    files_changed: body.files_changed ?? body.changed_files ?? null,
+    changed_files: body.changed_files ?? body.files_changed ?? null,
+    committed_files: body.committed_files ?? null,
+    codex_changed_files: body.codex_changed_files ?? null,
+    worktree_changed_files: body.worktree_changed_files ?? null,
+    task_changed_files: body.task_changed_files ?? null,
+    unexpected_changed_files: body.unexpected_changed_files ?? null,
     validation_results: body.validation_results ?? null,
     build_passed: body.build_passed ?? null,
     test_passed: body.test_passed ?? null,
     duration_ms: body.duration_ms ?? null,
     git_commit_sha: body.git_commit_sha ?? null,
     github_push_status: body.github_push_status ?? null,
+    codex_git_push: body.codex_git_push ?? null,
+    worker_git_push: body.worker_git_push ?? null,
+    git_push: body.git_push ?? null,
+    pushed: body.pushed ?? null,
+    pushed_branch: body.pushed_branch ?? null,
+    remote_contains_commit: body.remote_contains_commit ?? null,
+    repository_clean_after_push: body.repository_clean_after_push ?? null,
     deploy_status: body.deploy_status ?? null,
     verification_only: body.verification_only ?? null,
     allow_no_change_success: body.allow_no_change_success ?? null,
+    code_changes_required: body.code_changes_required ?? null,
+    codex_required: body.codex_required ?? null,
+    git_commit_required: body.git_commit_required ?? null,
+    git_push_required: body.git_push_required ?? null,
+    approval_required: body.approval_required ?? null,
     result_text: body.result_text ?? null,
     diagnostics: body.diagnostics ?? null,
   };
@@ -124,6 +160,14 @@ function readString(value: unknown): string | null {
 function readBooleanFlag(value: unknown): boolean {
   if (value === true) return true;
   return /^(true|1|yes|on)$/i.test(String(value ?? "").trim());
+}
+
+function readNullableBooleanFlag(value: unknown): boolean | null {
+  if (value === true || value === false) return value;
+  const normalized = String(value ?? "").trim();
+  if (/^(true|1|yes|on)$/i.test(normalized)) return true;
+  if (/^(false|0|no|off)$/i.test(normalized)) return false;
+  return null;
 }
 
 function fullReportText(job: Record<string, unknown>, body: WorkerReportBody): string {
@@ -165,17 +209,30 @@ function buildFalsePositiveSuccessGuard(
   const taskMode = readString(payload?.task_mode) ?? readContextField(text, "task_mode");
   const finalMode = readString(payload?.final_mode) ?? readContextField(text, "final_mode");
   const requestedMode = readString(payload?.requested_mode) ?? readContextField(text, "requested_mode");
-  const repairMode =
-    readBooleanFlag(payload?.repair_mode) ||
-    readBooleanFlag(readContextField(text, "repair_mode"));
   const verificationOnly =
-    readBooleanFlag(body.verification_only) ||
-    readBooleanFlag(payload?.verification_only) ||
-    readBooleanFlag(readContextField(text, "verification_only"));
+    readNullableBooleanFlag(body.verification_only) ??
+    readNullableBooleanFlag(payload?.verification_only) ??
+    readNullableBooleanFlag(readContextField(text, "verification_only"));
   const allowNoChangeSuccess =
-    readBooleanFlag(body.allow_no_change_success) ||
-    readBooleanFlag(payload?.allow_no_change_success) ||
-    readBooleanFlag(readContextField(text, "allow_no_change_success"));
+    readNullableBooleanFlag(body.allow_no_change_success) ??
+    readNullableBooleanFlag(payload?.allow_no_change_success) ??
+    readNullableBooleanFlag(readContextField(text, "allow_no_change_success"));
+  const codeChangesRequired =
+    readNullableBooleanFlag(body.code_changes_required) ??
+    readNullableBooleanFlag(payload?.code_changes_required) ??
+    readNullableBooleanFlag(readContextField(text, "code_changes_required"));
+  const codexRequired =
+    readNullableBooleanFlag(body.codex_required) ??
+    readNullableBooleanFlag(payload?.codex_required) ??
+    readNullableBooleanFlag(readContextField(text, "codex_required"));
+  const gitCommitRequired =
+    readNullableBooleanFlag(body.git_commit_required) ??
+    readNullableBooleanFlag(payload?.git_commit_required) ??
+    readNullableBooleanFlag(readContextField(text, "git_commit_required"));
+  const gitPushRequired =
+    readNullableBooleanFlag(body.git_push_required) ??
+    readNullableBooleanFlag(payload?.git_push_required) ??
+    readNullableBooleanFlag(readContextField(text, "git_push_required"));
   const approvedBatch = readString(payload?.approved_batch) ?? readContextField(text, "approved_batch");
   const workerBatch = body.batch_code ?? readContextField(text, "batch_code");
   const exactAllowedScope =
@@ -184,7 +241,13 @@ function buildFalsePositiveSuccessGuard(
       : normalizePathList(readContextField(text, "exact_allowed_scope"));
   const changedFiles = normalizePathList(body.files_changed);
   const verificationOnlyNoChangeSuccess =
-    repairMode && (verificationOnly || allowNoChangeSuccess) && changedFiles.length === 0;
+    verificationOnly === true &&
+    allowNoChangeSuccess === true &&
+    codeChangesRequired === false &&
+    codexRequired === false &&
+    gitCommitRequired === false &&
+    gitPushRequired === false &&
+    changedFiles.length === 0;
   const writeAllowed =
     finalMode === "write_allowed" ||
     requestedMode === "write_allowed" ||
@@ -357,7 +420,7 @@ export async function POST(req: NextRequest) {
     projectDir: body.project_dir,
     resultText: body.result_text,
     output: body.output,
-    filesChanged: body.files_changed,
+    filesChanged: body.files_changed ?? body.changed_files,
     validationResults: body.validation_results,
     gitCommitSha: body.git_commit_sha,
     githubPushStatus: body.github_push_status,
@@ -419,6 +482,25 @@ export async function POST(req: NextRequest) {
       git_commit_sha:
         body.git_commit_sha ??
         (typeof storedResult?.git_commit_sha === "string" ? storedResult.git_commit_sha : null),
+      git_push:
+        readBooleanFlag(readRecord(storedResult?.project_director_report)?.git_push) ||
+        readBooleanFlag(storedResult?.git_push),
+      worker_git_push:
+        readBooleanFlag(readRecord(storedResult?.project_director_report)?.worker_git_push) ||
+        readBooleanFlag(storedResult?.worker_git_push),
+      pushed_branch:
+        readString(readRecord(storedResult?.project_director_report)?.pushed_branch) ??
+        readString(storedResult?.pushed_branch),
+      remote_contains_commit:
+        readBooleanFlag(readRecord(storedResult?.project_director_report)?.remote_contains_commit) ||
+        readBooleanFlag(storedResult?.remote_contains_commit),
+      repository_clean_after_push:
+        readBooleanFlag(readRecord(storedResult?.project_director_report)?.repository_clean_after_push) ||
+        readBooleanFlag(storedResult?.repository_clean_after_push),
+      committed_files:
+        normalizePathList(readRecord(storedResult?.project_director_report)?.committed_files).length > 0
+          ? normalizePathList(readRecord(storedResult?.project_director_report)?.committed_files)
+          : normalizePathList(storedResult?.committed_files),
       terminal_status_persisted: true,
       diagnostics_persisted: Boolean(readRecord(storedResult?.diagnostics)),
       status: storedTerminalStatus,
