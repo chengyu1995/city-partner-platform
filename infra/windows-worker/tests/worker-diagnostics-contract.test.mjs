@@ -25,6 +25,15 @@ test("failed diagnostics require stable fallback code and stage", () => {
   assert.match(workerJobs, /normalizeTerminalStatus\(effectiveFinalStatus\) === "failed"\) return "unknown"/);
 });
 
+test("Codex usage-limit reports preserve machine-readable code stage and detail", () => {
+  assert.match(workerJobs, /"CODEX_USAGE_LIMIT"/);
+  assert.match(workerJobs, /failureCode === "CODEX_USAGE_LIMIT" \? "codex_execution"/);
+  assert.match(workerJobs, /failure_detail: failureDetail/);
+  assert.match(workerJobs, /failureCode === "CODEX_USAGE_LIMIT"[\s\S]{0,120}sanitizeDiagnosticsErrorSummary/);
+  assert.match(reportRoute, /failureCode: falsePositiveGuard\?\.failureCode \?\? body\.failure_code/);
+  assert.match(reportRoute, /failureStage: falsePositiveGuard\?\.failureStage \?\? body\.failure_stage/);
+});
+
 test("diagnostics separates worker, goal, and effective statuses", () => {
   assert.match(workerJobs, /worker_execution_status:\s*input\.workerExecutionStatus/);
   assert.match(workerJobs, /task_goal_status:\s*input\.taskGoalStatus/);

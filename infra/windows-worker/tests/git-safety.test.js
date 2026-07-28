@@ -40,6 +40,7 @@ const {
   INCOMPLETE_ARCHITECTURE_REPORT,
   WORKER_READONLY_CONTEXT_INCOMPLETE,
   CONTEXT_MISSING_WARNING,
+  CODEX_USAGE_LIMIT,
   TASK_MODES,
   assertGitOperationAllowed,
   assertOriginalBatchContextAvailable,
@@ -68,6 +69,7 @@ const {
   getTaskMode,
   isRunningJobNotFoundOrNotOwned,
   isTrueTaskFailureCode,
+  isVerificationOnlyNoopTask,
   isReadOnlyTask,
   isReadOnlyTaskText,
   lockAcceptedTerminalReportSnapshot,
@@ -82,6 +84,7 @@ const {
   resolveWorkerJobContract,
   runCodexPreflight,
   spawnCodexWithStdin,
+  toCodexUsageLimitError,
   resetTerminalReportState,
 } = require("../local_worker");
 
@@ -3028,6 +3031,33 @@ test("bootstrap context router contract guards", async (t) => {
     assert.equal(finalResult.reply_error, "feishu_rate_limited");
   });
 
+  await t.test("Codex usage limit output keeps failure code stage and sanitized retry detail", () => {
+    const rawError = [
+      "ERROR: You've hit your usage limit.",
+      "try again at Aug 2nd, 2026 10:30 AM",
+      `${joinedName("WORKER", "TOKEN")}=abc-secret-value`,
+    ].join("\n");
+    const usageLimitError = toCodexUsageLimitError(rawError);
+
+    assert.ok(usageLimitError);
+    assert.equal(usageLimitError.code, CODEX_USAGE_LIMIT);
+    assert.equal(usageLimitError.failureStage, "codex_execution");
+    assert.match(usageLimitError.failureDetail, /try again at Aug 2nd, 2026 10:30 AM/);
+    assert.doesNotMatch(usageLimitError.failureDetail, /abc-secret-value/);
+
+    const finalResult = normalizeWorkerFinalResult({
+      status: "failed",
+      effectiveFinalStatus: "failed",
+      error: usageLimitError,
+      errorText: rawError,
+      failureCode: usageLimitError.code,
+      failureStage: "not_provided",
+    });
+
+    assert.equal(finalResult.failure_code, CODEX_USAGE_LIMIT);
+    assert.equal(finalResult.failure_stage, "codex_execution");
+  });
+
   await t.test("git TLS and network sync failures map before Codex execution", () => {
     const error = Object.assign(
       new Error("git fetch failed: schannel TLS handshake timeout ECONNRESET"),
@@ -3118,6 +3148,7 @@ test("bootstrap context router contract guards", async (t) => {
     assert.equal(contract.verification_only, true);
     assert.equal(contract.allow_no_change_success, true);
     assert.equal(allowsVerificationOnlyNoChangeSuccess(contract), true);
+    assert.equal(isVerificationOnlyNoopTask(verificationOnlyJob, contract), true);
     assert.doesNotThrow(() => assertTaskGoalApplied(verificationOnlyJob, []));
   });
 
@@ -3139,6 +3170,7 @@ test("bootstrap context router contract guards", async (t) => {
     const contract = resolveWorkerJobContract(ordinaryJob);
     assert.equal(contract.repair_mode, false);
     assert.equal(allowsVerificationOnlyNoChangeSuccess(contract), false);
+    assert.equal(isVerificationOnlyNoopTask(ordinaryJob, contract), false);
     assert.throws(
       () => assertTaskGoalApplied(ordinaryJob, []),
       (error) => error.code === NO_FIX_APPLIED

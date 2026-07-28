@@ -143,6 +143,7 @@ const IMPLEMENTED_DIAGNOSTICS_FAILURE_CODES = [
   "GIT_COMMIT_FAILED",
   "GIT_PUSH_FAILED",
   "GIT_SYNC_FAILED",
+  "CODEX_USAGE_LIMIT",
   "CODEX_QUOTA_EXHAUSTED",
   "CODEX_IDLE_TIMEOUT",
   "APPROVAL_CONTEXT_SAVE_FAILED",
@@ -1250,6 +1251,7 @@ function normalizeDiagnosticsFailureCode(value: unknown, effectiveFinalStatus: u
 function normalizeDiagnosticsFailureStage(value: unknown, failureCode: unknown, effectiveFinalStatus: unknown): string | null {
   const stage = readString(value);
   if (stage && IMPLEMENTED_DIAGNOSTICS_FAILURE_STAGE_SET.has(stage)) return stage;
+  if (normalizeFailureCodeValue(failureCode) === "CODEX_USAGE_LIMIT") return "codex_execution";
   if (normalizeFailureCodeValue(failureCode) === "GIT_SYNC_FAILED") return "git_sync_preflight";
   if (normalizeTerminalStatus(effectiveFinalStatus) === "failed") return "unknown";
   return null;
@@ -1348,6 +1350,11 @@ function normalizeFailureCodeValue(value: unknown): string | null {
     NO_FILE_CHANGES: "NO_FIX_APPLIED",
     WORKER_READONLY_CONTEXT_INCOMPLETE: "WORKER_READONLY_CONTEXT_INCOMPLETE",
     WORKER_READ_ONLY_CONTEXT_INCOMPLETE: "WORKER_READONLY_CONTEXT_INCOMPLETE",
+    CODEX_QUOTA_EXHAUSTED: "CODEX_USAGE_LIMIT",
+    CODEX_CREDITS_EXHAUSTED: "CODEX_USAGE_LIMIT",
+    CODEX_USAGE_LIMIT_REACHED: "CODEX_USAGE_LIMIT",
+    USAGE_LIMIT: "CODEX_USAGE_LIMIT",
+    QUOTA_EXHAUSTED: "CODEX_USAGE_LIMIT",
     CONTEXT_FAILED: "CONTEXT_RECONSTRUCT_FAILED",
     ORIGINAL_BATCH_CONTEXT_MISSING: "CONTEXT_RECONSTRUCT_FAILED",
     COMMIT_FAILED: "GIT_COMMIT_FAILED",
@@ -1371,6 +1378,7 @@ function classifyFailureCodeFromText(text: unknown): string | null {
   const raw = String(text ?? "");
   const nonTaskFailureCode = classifyNonTaskFailureCode(raw);
   if (nonTaskFailureCode) return nonTaskFailureCode;
+  if (/You've hit your usage limit|usage limit|purchase more credits|try again at/i.test(raw)) return "CODEX_USAGE_LIMIT";
   if (
     /git\s+(?:fetch|pull|ls-remote|sync|remote)|schannel|TLS|SSL|CERT|handshake|timed?\s*out|timeout|ECONNRESET|EAI_AGAIN|ENOTFOUND|fetch failed|connection reset/i.test(
       raw
@@ -1661,10 +1669,11 @@ export function normalizeWorkerFinalResult(input: Record<string, unknown> & {
   const failureStage =
     effectiveFinalStatus === "failed"
       ? readNullableReportString(readPriorityReportField(terminalSources, "failure_stage", "failureStage")) ??
-        readString(input.failureStage) ??
-        readString(input.failure_stage) ??
-        readString(projectDirectorReport?.failure_stage) ??
-        readDiagnosticLine(reportText, "failure_stage") ??
+        readNullableReportString(input.failureStage) ??
+        readNullableReportString(input.failure_stage) ??
+        readNullableReportString(projectDirectorReport?.failure_stage) ??
+        readNullableReportString(readDiagnosticLine(reportText, "failure_stage")) ??
+        (failureCode === "CODEX_USAGE_LIMIT" ? "codex_execution" : null) ??
         (failureCode === "GIT_SYNC_FAILED" ? "git_sync_preflight" : null) ??
         readDiagnosticLine(reportText, "失败阶段")
       : null;
@@ -1992,7 +2001,7 @@ function inferTaskMode(input: {
 }
 
 function reportTextHasNoFixApplied(value: string): boolean {
-  return /NO_FIX_APPLIED|no_fix_applied\s*[:=]\s*(true|yes)|NO_FIX_APPLIED\s*(?:是否触发)?\s*[:：]\s*(?:是|yes|true)/i.test(value);
+  return /failure_code\s*[:=]\s*NO_FIX_APPLIED|error_code\s*[:=]\s*NO_FIX_APPLIED|no_fix_applied\s*[:=]\s*(true|yes)|NO_FIX_APPLIED\s*(?:是否触发)?\s*[:：]\s*(?:是|yes|true)|Task goal status:\s*failed_no_fix_applied/i.test(value);
 }
 
 function reportTextHasReadOnlyViolation(value: string): boolean {
@@ -2567,9 +2576,19 @@ export function buildProjectDirectorWorkerReport(input: {
     missingWorkerReadOnlyContextFields.length > 0 ||
     missingWorkerReadOnlyRequiredOutputFields.length > 0;
   const readOnlyViolation = reportTextHasReadOnlyViolation(combinedReportText);
+  const verificationOnlyNoChangeSuccess =
+    input.status === "succeeded" &&
+    Boolean(contract.repair_mode) &&
+    taskMode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED &&
+    readOnlyMode === false &&
+    filesChanged.length === 0 &&
+    (readBooleanFlag(contract.verification_only) ||
+      readBooleanFlag(contract.allow_no_change_success) ||
+      /verification[_ -]?only\s*[:=]\s*(?:true|1|yes|on)|allow_no_change_success\s*[:=]\s*(?:true|1|yes|on)/i.test(combinedReportText));
   const writeAllowedNoFixApplied =
     input.status === "succeeded" &&
     !isReadOnlyTaskMode(taskMode) &&
+    !verificationOnlyNoChangeSuccess &&
     filesChanged.length === 0;
   const noFixApplied =
     reportTextHasNoFixApplied(combinedReportText) || writeAllowedNoFixApplied;
@@ -2604,7 +2623,8 @@ export function buildProjectDirectorWorkerReport(input: {
     (input.status === "succeeded" &&
       taskRequiresFileChanges(taskTextForClassification || demand) &&
       filesChanged.length === 0 &&
-      !gitCommitSha);
+      !gitCommitSha &&
+      !verificationOnlyNoChangeSuccess);
   const committed = Boolean(gitCommitSha);
   const pushed = isGithubPushSuccess(githubPushStatus);
   const legacyEffectiveFinalStatus =
@@ -2678,6 +2698,16 @@ export function buildProjectDirectorWorkerReport(input: {
   const failureSuggestion = effectiveFinalStatus === "failed"
     ? buildFailureNextStep(sanitizedError)
     : null;
+  const failureDetail =
+    effectiveFinalStatus === "failed"
+      ? readDiagnosticLine(combinedReportText, "failure_detail") ??
+        (failureCode === "CODEX_USAGE_LIMIT"
+          ? sanitizeDiagnosticsErrorSummary(sanitizedError || summary)
+          : null)
+      : null;
+  const codexCalled = readNullableBooleanFlag(readDiagnosticLine(combinedReportText, "codex_called"));
+  const nextStageAllowed =
+    readNullableBooleanFlag(readDiagnosticLine(combinedReportText, "next_stage_allowed")) ?? false;
   const reportedWorkerExecutionStatus =
     readString(normalizedFinalResult.worker_execution_status) ??
     readString(input.workerExecutionStatus);
@@ -2795,6 +2825,9 @@ export function buildProjectDirectorWorkerReport(input: {
     worker_execution_status: workerExecutionStatus,
     task_goal_status: taskGoalStatus,
     read_only_mode: readOnlyMode,
+    verification_only: readBooleanFlag(contract.verification_only),
+    allow_no_change_success: readBooleanFlag(contract.allow_no_change_success),
+    codex_called: codexCalled,
     worker_readonly_context_complete: !workerReadOnlyContextIncomplete,
     missing_worker_readonly_context_fields: missingWorkerReadOnlyContextFields,
     missing_required_output_fields: missingWorkerReadOnlyRequiredOutputFields,
@@ -2820,10 +2853,12 @@ export function buildProjectDirectorWorkerReport(input: {
     commit_hash: terminalGitCommitSha ?? null,
     github_push_status: githubPushStatus,
     deploy_status: input.deployStatus ?? null,
+    next_stage_allowed: nextStageAllowed,
     safety_boundary: safetyBoundary,
     needs_boss_confirmation: needsBossConfirmation,
     next_step: iterationNextStep,
     failure_stage: failureStage,
+    failure_detail: failureDetail,
     diagnostics,
     key_error: keyError,
     repair_suggestion: failureSuggestion,
@@ -2851,6 +2886,9 @@ export function buildProjectDirectorWorkerReport(input: {
     `project_domain: ${placeholder(readString(contract.project_domain))}`,
     `task_mode: ${taskMode}`,
     `read_only_mode: ${readOnlyMode ? "true" : "false"}`,
+    `verification_only: ${readBooleanFlag(contract.verification_only) ? "true" : "false"}`,
+    `allow_no_change_success: ${readBooleanFlag(contract.allow_no_change_success) ? "true" : "false"}`,
+    `codex_called: ${codexCalled === null ? "null" : codexCalled ? "true" : "false"}`,
     `allowed_scope: ${placeholder(readString(contract.allowed_scope))}`,
     `exact_allowed_scope: ${placeholder(readString(contract.exact_allowed_scope))}`,
     `exact_allowed_scope_count: ${placeholder(readString(contract.exact_allowed_scope_count))}`,
@@ -2872,7 +2910,10 @@ export function buildProjectDirectorWorkerReport(input: {
     `effective_final_status: ${effectiveFinalStatus}`,
     `failure_memory_status: ${failureMemoryStatus}`,
     `failure_code: ${failureCode ?? "null"}`,
+    `failure_stage: ${failureStage ?? "null"}`,
+    `failure_detail: ${failureDetail ?? "null"}`,
     `next_batch: ${nextBatch ?? "null"}`,
+    `next_stage_allowed: ${nextStageAllowed ? "true" : "false"}`,
     `completed_at: ${readString(normalizedFinalResult.completed_at) ?? "null"}`,
     `changed_files: ${terminalChangedFiles.length ? terminalChangedFiles.join(", ") : "[]"}`,
     `git_commit_sha: ${terminalGitCommitSha ?? "null"}`,

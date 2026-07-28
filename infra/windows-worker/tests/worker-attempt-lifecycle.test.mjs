@@ -105,6 +105,38 @@ test("verification-only no-change success bypasses false positive no-fix and pub
   assert.ok(bypassIndexes[1] >= 0 && bypassIndexes[1] < gitPublishIndex);
 });
 
+test("verification-only dispatch returns before Codex and git publish phases", () => {
+  const pollStart = localWorker.indexOf("async function pollOnce");
+  const pollEnd = localWorker.indexOf("async function main", pollStart);
+  assert.ok(pollStart >= 0 && pollEnd > pollStart, "pollOnce block should be detectable");
+  const pollBlock = localWorker.slice(pollStart, pollEnd);
+  const noopIndex = pollBlock.indexOf("isVerificationOnlyNoopTask(job, initialContract)");
+  const codexIndex = pollBlock.indexOf('"执行 Codex"');
+  const commitIndex = pollBlock.indexOf("commitGitTask(job)");
+  const pushIndex = pollBlock.indexOf("pushGitTask(");
+
+  assert.ok(noopIndex >= 0, "verification-only no-op branch should exist");
+  assert.ok(codexIndex > noopIndex, "no-op branch must run before Codex progress");
+  assert.ok(commitIndex > noopIndex, "no-op branch must run before git commit");
+  assert.ok(pushIndex > noopIndex, "no-op branch must run before git push");
+
+  const noopBlock = functionBlock(localWorker, "completeVerificationOnlyNoopJob");
+  assert.match(noopBlock, /codex_called:\s*false/);
+  assert.match(noopBlock, /git_commit_sha:\s*null/);
+  assert.match(noopBlock, /git_push:\s*false/);
+  assert.match(noopBlock, /next_stage_allowed:\s*false/);
+});
+
+test("worker startup does not run a Codex smoke preflight before polling", () => {
+  const mainStart = localWorker.indexOf("async function main");
+  const mainEnd = localWorker.indexOf('process.on("SIGINT"', mainStart);
+  assert.ok(mainStart >= 0 && mainEnd > mainStart, "main block should be detectable");
+  const mainBlock = localWorker.slice(mainStart, mainEnd);
+
+  assert.match(mainBlock, /resolveCodexExecutable\(\)/);
+  assert.doesNotMatch(mainBlock, /runCodexPreflight\(/);
+});
+
 test("write allowed read-only downgrade is blocked before success persistence", () => {
   assert.match(reportRoute, /APPROVAL_CONTEXT_MODE_MISMATCH/);
   assert.match(reportRoute, /write_allowed task was executed with read_only context/);

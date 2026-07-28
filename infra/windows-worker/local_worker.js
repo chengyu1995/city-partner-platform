@@ -936,6 +936,34 @@ function sanitizeGitErrorMessage(message) {
     .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, "<redacted>");
 }
 
+function sanitizeCodexFailureDetail(message) {
+  const text = sanitizeGitErrorMessage(message)
+    .replace(/Authorization\s*:\s*Bearer\s+[^\s,}]+/gi, "Authorization: Bearer [redacted]")
+    .replace(/\b(token|secret|key|password)\b\s*[:=]\s*[^\s,}]+/gi, "$1=[redacted]")
+    .replace(/\b[A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD)[A-Z0-9_]*\b\s*[:=]\s*[^\s,}]+/gi, "[redacted_secret]=[redacted]")
+    .replace(/([?&](?:token|key|secret|access_token|api_key)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi, "[redacted private key]")
+    .trim();
+
+  return text.length > 1200 ? text.slice(0, 1200) : text;
+}
+
+function isCodexUsageLimitText(value) {
+  return CODEX_USAGE_LIMIT_PATTERN.test(String(value || ""));
+}
+
+function toCodexUsageLimitError(value) {
+  const raw = value instanceof Error ? value.message : String(value || "");
+  if (!isCodexUsageLimitText(raw)) return null;
+
+  const detail = sanitizeCodexFailureDetail(raw);
+  const error = new Error([CODEX_USAGE_LIMIT, detail].filter(Boolean).join("\n"));
+  error.code = CODEX_USAGE_LIMIT;
+  error.failureStage = "codex_execution";
+  error.failureDetail = detail || CODEX_USAGE_LIMIT;
+  return error;
+}
+
 async function readGitStatusEntries() {
   const status = await runGit(["status", "--porcelain=v1", "-z"], {
     trimOutput: false,
@@ -1089,6 +1117,7 @@ const INCOMPLETE_QA_REPORT = "INCOMPLETE_QA_REPORT";
 const INCOMPLETE_ARCHITECTURE_REPORT = "INCOMPLETE_ARCHITECTURE_REPORT";
 const WORKER_READONLY_CONTEXT_INCOMPLETE = "WORKER_READONLY_CONTEXT_INCOMPLETE";
 const CONTEXT_MISSING_WARNING = "CONTEXT_MISSING_WARNING";
+const CODEX_USAGE_LIMIT = "CODEX_USAGE_LIMIT";
 
 const TASK_MODES = {
   READ_ONLY: "read_only",
@@ -1153,6 +1182,8 @@ const REQUIRED_FILE_SECTION_PATTERN =
 const ALLOWED_ONLY_SECTION_PATTERN =
   /允许修改|只允许修改|allowed(?:[_\s-]*scope| files?)?|editable files?/i;
 const BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
+const CODEX_USAGE_LIMIT_PATTERN =
+  /You've hit your usage limit|usage limit|purchase more credits|try again at/i;
 const DOCS_WRITE_ALLOWED_PREFIXES = ["docs/"];
 const BATCH_37_REQUIRED_DOCS = [
   "docs/projects/reusable-assets.md",
@@ -3369,6 +3400,28 @@ function allowsVerificationOnlyNoChangeSuccess(contract) {
   );
 }
 
+function isVerificationOnlyNoopTask(job, contract = resolveWorkerJobContract(job)) {
+  if (allowsVerificationOnlyNoChangeSuccess(contract)) {
+    return true;
+  }
+
+  const text = readTextValue([
+    contract?.original_request_text,
+    job?.request_text,
+    job?.requestText,
+    job?.prompt,
+    job?.description,
+  ]);
+
+  return Boolean(
+    contract?.repair_mode === true &&
+      contract?.read_only_mode === false &&
+      contract?.task_mode === TASK_MODES.AUTOMATION_SYSTEM_WRITE_ALLOWED &&
+      /verification[_ -]?only|纯生命周期验证|静态验证|链路验证|lifecycle verification|static verification|link verification/i.test(text) &&
+      /allow_no_change_success\s*[:=]\s*(?:true|1|yes|on)|零文件变更|零变更|no[_ -]?change|no[_ -]?op|不得调用\s*Codex|不调用\s*Codex|must not call Codex/i.test(text)
+  );
+}
+
 function getMissingWorkerReadOnlyContextFields(contract) {
   if (!contract || contract.task_mode !== TASK_MODES.WORKER_READ_ONLY) {
     return [];
@@ -3697,6 +3750,11 @@ function normalizeFailureCodeValue(value) {
     NO_FILE_CHANGES: "NO_FIX_APPLIED",
     WORKER_READONLY_CONTEXT_INCOMPLETE: "WORKER_READONLY_CONTEXT_INCOMPLETE",
     WORKER_READ_ONLY_CONTEXT_INCOMPLETE: "WORKER_READONLY_CONTEXT_INCOMPLETE",
+    CODEX_QUOTA_EXHAUSTED: "CODEX_USAGE_LIMIT",
+    CODEX_CREDITS_EXHAUSTED: "CODEX_USAGE_LIMIT",
+    CODEX_USAGE_LIMIT_REACHED: "CODEX_USAGE_LIMIT",
+    USAGE_LIMIT: "CODEX_USAGE_LIMIT",
+    QUOTA_EXHAUSTED: "CODEX_USAGE_LIMIT",
     CONTEXT_FAILED: "CONTEXT_RECONSTRUCT_FAILED",
     ORIGINAL_BATCH_CONTEXT_MISSING: "CONTEXT_RECONSTRUCT_FAILED",
     COMMIT_FAILED: "GIT_COMMIT_FAILED",
@@ -3723,6 +3781,9 @@ function classifyFailureCodeFromText(text) {
   const raw = String(text || "");
   const nonTaskFailureCode = classifyNonTaskFailureCode(raw);
   if (nonTaskFailureCode) return nonTaskFailureCode;
+  if (isCodexUsageLimitText(raw)) {
+    return CODEX_USAGE_LIMIT;
+  }
   if (
     /git\s+(?:fetch|pull|ls-remote|sync|remote)|schannel|TLS|SSL|CERT|handshake|timed?\s*out|timeout|ECONNRESET|EAI_AGAIN|ENOTFOUND|fetch failed|connection reset/i.test(
       raw
@@ -3902,9 +3963,10 @@ function normalizeWorkerFinalResult(input = {}) {
   const failureStage =
     effectiveFinalStatus === "failed"
       ? readNullableReportString(readSnapshotField("failure_stage", "failureStage")) ||
-        readString(input.failure_stage) ||
-        readString(input.failureStage) ||
-        readStructuredResultField(reportText, "failure_stage") ||
+        readNullableReportString(input.failure_stage) ||
+        readNullableReportString(input.failureStage) ||
+        readNullableReportString(readStructuredResultField(reportText, "failure_stage")) ||
+        (failureCode === CODEX_USAGE_LIMIT ? "codex_execution" : null) ||
         (failureCode === "GIT_SYNC_FAILED" ? "git_sync_preflight" : null) ||
         readStructuredResultField(reportText, "失败阶段") ||
         error?.failureStage ||
@@ -5540,6 +5602,20 @@ function classifyFailure(error) {
   const errorText = error instanceof Error ? error.message : String(error);
   const lower = errorText.toLowerCase();
 
+  if (
+    error?.code === CODEX_USAGE_LIMIT ||
+    isCodexUsageLimitText(errorText)
+  ) {
+    return {
+      stage: "codex_execution",
+      keyError: sanitizeCodexFailureDetail(errorText).slice(-1200),
+      suggestion:
+        "Codex 额度耗尽；等待错误摘要中的恢复时间后重试。verification-only 任务应由 Worker no-op 完成，不应进入 Codex。",
+      recommendBossApproval: false,
+      retryable: true,
+    };
+  }
+
   if (error?.code === NO_FIX_APPLIED || errorText.includes(NO_FIX_APPLIED)) {
     return {
       stage: "任务目标完成验收",
@@ -5695,7 +5771,14 @@ function buildFailureReport(job, error, context = {}) {
   const filesChanged = uniqueSortedPaths(context.filesChanged || []);
   const uncommittedFiles = uniqueSortedPaths(context.uncommittedFiles || filesChanged);
   const taskName = String(job?.request_text || "未提供").replace(/\s+/g, " ").trim().slice(0, 120);
-  const errorCode = error?.code || "UNKNOWN_ERROR";
+  const errorText = error instanceof Error ? error.message : String(error);
+  const errorCode =
+    normalizeFailureCodeValue(error?.code) ||
+    classifyFailureCodeFromText(errorText) ||
+    "UNKNOWN_ERROR";
+  const failureDetail =
+    error?.failureDetail ||
+    (errorCode === CODEX_USAGE_LIMIT ? sanitizeCodexFailureDetail(errorText) : null);
   const readOnlyViolation = errorCode === READ_ONLY_MODE_VIOLATION;
   const noFixApplied = errorCode === NO_FIX_APPLIED;
   const outOfScopeBusinessChange =
@@ -5773,6 +5856,7 @@ function buildFailureReport(job, error, context = {}) {
     `failure_memory_status: ${normalizedFinalResult.failure_memory_status}`,
     `failure_code: ${normalizedFinalResult.failure_code || "null"}`,
     `failure_stage: ${normalizedFinalResult.failure_stage || "null"}`,
+    `failure_detail: ${failureDetail || "null"}`,
     `next_batch: ${normalizedFinalResult.next_batch || "null"}`,
     `Read-only violation: ${readOnlyViolation ? "yes" : "no"}`,
     `No-op run: ${noFixApplied ? "yes" : "no"}`,
@@ -5885,6 +5969,10 @@ async function runCodexWithRetries(job) {
         retryNumber: index + 1,
       });
     } catch (error) {
+      const usageLimitError = toCodexUsageLimitError(error);
+      if (usageLimitError) {
+        throw usageLimitError;
+      }
       failures.push(error);
     }
   }
@@ -5895,6 +5983,11 @@ async function runCodexWithRetries(job) {
       return `第 ${index + 1} 次失败：${classifyLocalError(message)} - ${message.slice(-1200)}`;
     })
     .join("\n\n");
+
+  const usageLimitError = toCodexUsageLimitError(summary);
+  if (usageLimitError) {
+    throw usageLimitError;
+  }
 
   throw new Error(
     [
@@ -6423,10 +6516,19 @@ function spawnCodexWithStdin(prompt, job, options = {}) {
         return;
       }
 
+      const combinedOutput = `${stderr || ""}\n${stdout || ""}`;
+      const usageLimitError = toCodexUsageLimitError(
+        `Codex 退出码 ${code}\n${combinedOutput || "没有输出"}`
+      );
+      if (usageLimitError) {
+        rejectOnce(usageLimitError);
+        return;
+      }
+
       rejectOnce(
         createCodexTransportError(
           "CODEX_PROCESS_EXIT_FAILED",
-          `Codex 退出码 ${code}\n${stderr || stdout || "没有输出"}`,
+          `Codex 退出码 ${code}\n${combinedOutput.trim() || "没有输出"}`,
           {
             prompt_bytes: promptBytes,
             retry_number: retryNumber,
@@ -6617,6 +6719,177 @@ async function report(jobId, status, payload, extra = {}) {
   };
 }
 
+async function completeVerificationOnlyNoopJob(job, attemptId, initialContract) {
+  const taskModeForReport = initialContract.task_mode;
+  const completedAt = new Date().toISOString();
+  const approvedBatchForReport = initialContract.approved_batch || getJobBatchCode(job);
+  const workerExecutionStatus = "completed";
+  const taskGoalStatus = "completed";
+  const noopResultText = [
+    "verification-only dispatch no-op completed by Windows Worker.",
+    "Codex was not called because verification_only=true and allow_no_change_success=true.",
+    "codex_called: false",
+    "worker_execution_status: completed",
+    "task_goal_status: completed",
+    "effective_final_status: succeeded",
+    "failure_code: null",
+    "failure_stage: null",
+    "verification_only: true",
+    "allow_no_change_success: true",
+    "changed_files: []",
+    "git_commit_sha: null",
+    "git_push: false",
+    "next_stage_allowed: false",
+  ].join("\n");
+  const normalizedFinalResult = normalizeWorkerFinalResult({
+    job,
+    status: "succeeded",
+    finalReportStatus: "succeeded",
+    effectiveFinalStatus: "succeeded",
+    worker_execution_status: workerExecutionStatus,
+    task_goal_status: taskGoalStatus,
+    resultText: noopResultText,
+    approvedBatch: approvedBatchForReport,
+    changed_files: [],
+    gitCommitSha: null,
+    pushed: false,
+    nextBatch: null,
+    next_stage_allowed: false,
+    completedAt,
+  });
+  const successContract = resolveWorkerJobContract(job, {
+    attemptId,
+    taskMode: taskModeForReport,
+    readOnlyMode: false,
+    verificationOnly: true,
+    allowNoChangeSuccess: true,
+    workerStage: "completed",
+    workflowStage: "completed",
+    finalReportStatus: "succeeded",
+    effectiveFinalStatus: normalizedFinalResult.effective_final_status,
+    failureCode: null,
+    failureStage: null,
+    changedFiles: [],
+    gitCommitSha: null,
+    nextBatch: null,
+    completedAt: normalizedFinalResult.completed_at,
+    pushed: false,
+    deployStatus: null,
+  });
+
+  await updateProgress(
+    job.id,
+    35,
+    "verification-only no-op",
+    "verification_only=true；跳过 Codex、Git commit 和 Git push"
+  );
+
+  const finalResult = [
+    noopResultText,
+    "",
+    ...formatWorkerJobContractLines(successContract, {
+      includeOriginalRequest: false,
+    }),
+    "",
+    "Worker / task status:",
+    "Worker execution: completed",
+    "Worker execution status: completed",
+    "Task goal: completed",
+    "Task goal status: completed",
+    `task_domain: ${classifyWorkerTaskDomain(getJobText(job))}`,
+    `task_mode: ${taskModeForReport}`,
+    "read_only_mode: false",
+    "verification_only: true",
+    "allow_no_change_success: true",
+    "codex_called: false",
+    "original_worker_status: succeeded",
+    "effective_final_status: succeeded",
+    "failure_code: null",
+    "failure_stage: null",
+    "read_only_violation: false",
+    "no_fix_applied: false",
+    "out_of_scope_business_change: false",
+    "no_op_run: false",
+    "committed: false",
+    "pushed: false",
+    "git_push: false",
+    "git_commit_sha: null",
+    "next_stage_allowed: false",
+    `failure_memory_status: ${normalizedFinalResult.failure_memory_status}`,
+    `completed_at: ${normalizedFinalResult.completed_at || "null"}`,
+    "",
+    "本地预览诊断：未执行（verification_only no-op）",
+    "Git 自动备份：跳过（verification_only=true）",
+    "GitHub 自动推送：跳过（verification_only=true）",
+  ].join("\n");
+
+  await updateProgress(
+    job.id,
+    100,
+    "verification-only 完成",
+    "零文件变更验证任务已完成并准备上报"
+  );
+
+  await report(
+    job.id,
+    "succeeded",
+    finalResult,
+    {
+      attempt_id: attemptId,
+      batch_code: successContract.approved_batch || approvedBatchForReport,
+      job_created_at: job.created_at || null,
+      ...buildWorkerReportContractExtra(successContract),
+      project_name: "同城搭子网站",
+      project_dir: PROJECT_DIR,
+      files_changed: [],
+      validation_results: [
+        "Worker 领取：通过",
+        "attempt_id 创建/绑定：通过",
+        "heartbeat 上报：通过",
+        "Codex 执行：跳过（verification_only=true）",
+        "codex_called: false",
+        "Worker execution status: completed",
+        "Task goal status: completed",
+        "effective_final_status: succeeded",
+        "failure_code: null",
+        "failure_stage: null",
+        "verification_only: true",
+        "allow_no_change_success: true",
+        "changed_files: []",
+        "git_commit_sha: null",
+        "git_push: false",
+        "next_stage_allowed: false",
+      ],
+      github_push_status: "verification_only=true，跳过 GitHub 推送",
+      read_only_mode: false,
+      task_mode: taskModeForReport,
+      verification_only: true,
+      allow_no_change_success: true,
+      codex_called: false,
+      original_worker_status: "succeeded",
+      worker_execution_status: workerExecutionStatus,
+      task_goal_status: taskGoalStatus,
+      effective_final_status: normalizedFinalResult.effective_final_status,
+      failure_memory_status: normalizedFinalResult.failure_memory_status,
+      failure_code: null,
+      failure_stage: null,
+      failure_detail: null,
+      terminal_index: normalizedFinalResult.terminal_index,
+      auto_iteration_suggestion: normalizedFinalResult.auto_iteration_suggestion,
+      next_batch: null,
+      next_stage_allowed: false,
+      completed_at: normalizedFinalResult.completed_at,
+      no_fix_applied: false,
+      read_only_mode_violation: false,
+      out_of_scope_business_change: false,
+      git_commit_sha: null,
+      git_push: false,
+      pushed: false,
+      deploy_status: null,
+    }
+  );
+}
+
 async function pollOnce() {
   if (working || stopping) {
     return;
@@ -6672,6 +6945,11 @@ async function pollOnce() {
   try {
     assertOriginalBatchContextAvailable(job);
     assertWorkerReadOnlyContextComplete(initialContract);
+
+    if (isVerificationOnlyNoopTask(job, initialContract)) {
+      await completeVerificationOnlyNoopJob(job, attemptId, initialContract);
+      return;
+    }
 
     if (readOnlyMode) {
       await updateProgress(
@@ -7052,8 +7330,14 @@ async function pollOnce() {
   } catch (error) {
     console.error("任务执行失败：", error);
 
+    const errorText = error instanceof Error ? error.message : String(error);
     const errorCode =
-      error && typeof error === "object" && "code" in error ? error.code : null;
+      normalizeFailureCodeValue(error && typeof error === "object" && "code" in error ? error.code : null) ||
+      classifyFailureCodeFromText(errorText) ||
+      null;
+    const failureDetail =
+      error?.failureDetail ||
+      (errorCode === CODEX_USAGE_LIMIT ? sanitizeCodexFailureDetail(errorText) : null);
     let rollbackMessage = "";
     let failureChangedPaths = [];
     let currentHead = "未提供";
@@ -7144,7 +7428,7 @@ async function pollOnce() {
       worker_execution_status: failureWorkerExecutionStatus,
       task_goal_status: failureTaskGoalStatus,
       error,
-      errorText: error instanceof Error ? error.message : String(error),
+      errorText,
       approvedBatch: approvedBatchForReport,
       changed_files: failureChangedPaths,
       gitCommitSha: null,
@@ -7197,6 +7481,7 @@ async function pollOnce() {
         worker_execution_status: failureWorkerExecutionStatus,
         task_goal_status: failureTaskGoalStatus,
         effective_final_status: normalizedFinalResult.effective_final_status,
+        failure_detail: failureDetail,
         no_fix_applied: errorCode === NO_FIX_APPLIED,
         read_only_mode_violation: errorCode === READ_ONLY_MODE_VIOLATION,
         task_mode_mismatch: errorCode === TASK_MODE_MISMATCH,
@@ -7271,6 +7556,8 @@ async function pollOnce() {
           `effective_final_status: ${normalizedFinalResult.effective_final_status}`,
           `failure_memory_status: ${normalizedFinalResult.failure_memory_status}`,
           `failure_code: ${normalizedFinalResult.failure_code || "null"}`,
+          `failure_stage: ${normalizedFinalResult.failure_stage || "null"}`,
+          `failure_detail: ${failureDetail || "null"}`,
           `next_batch: ${normalizedFinalResult.next_batch || "null"}`,
           `Read-only violation: ${errorCode === READ_ONLY_MODE_VIOLATION ? "yes" : "no"}`,
           `No-op run: ${errorCode === NO_FIX_APPLIED ? "yes" : "no"}`,
@@ -7344,24 +7631,14 @@ async function main() {
   console.log(`云端地址：${WORKER_API_URL}`);
   console.log(`项目目录：${PROJECT_DIR}`);
 
-  const codexPreflight = await runCodexPreflight({
-    mode: "smoke",
-    timeoutMs: Number(process.env.CODEX_PREFLIGHT_TIMEOUT_MS || 120000),
-  });
-  if (!codexPreflight.ok) {
-    console.error("Codex preflight failed; Worker will not poll for jobs.");
-    console.error(
-      codexPreflight.diagnostic ||
-      codexPreflight.error ||
-      "CODEX_PREFLIGHT_FAILED"
+  const codexResolution = resolveCodexExecutable();
+  if (!codexResolution.ok) {
+    console.warn(
+      `Codex executable preflight warning: ${codexResolution.reason}; write tasks will fail when Codex execution is required.`
     );
-    throw new Error(codexPreflight.error || "CODEX_PREFLIGHT_FAILED");
+  } else {
+    console.log(`Codex executable resolved: ${codexResolution.resolvedPath}`);
   }
-  console.log(
-    `Codex preflight passed: ${codexPreflight.codexResolution.resolvedPath} ${
-      codexPreflight.stdout || ""
-    }`.trim()
-  );
 
   let consecutivePollFailures = 0;
 
@@ -7423,6 +7700,7 @@ module.exports = {
   INCOMPLETE_ARCHITECTURE_REPORT,
   WORKER_READONLY_CONTEXT_INCOMPLETE,
   CONTEXT_MISSING_WARNING,
+  CODEX_USAGE_LIMIT,
   FAILURE_FINGERPRINTS,
   TASK_MODES,
   assertTaskGoalApplied,
@@ -7459,6 +7737,7 @@ module.exports = {
   isTrueTaskFailureCode,
   isRunningJobNotFoundOrNotOwned,
   isTerminalReportLockedForJob,
+  isVerificationOnlyNoopTask,
   lockAcceptedTerminalReportSnapshot,
   normalizeWorkerContext,
   normalizeWorkerFinalResult,
@@ -7470,6 +7749,7 @@ module.exports = {
   resolveCodexExecutable,
   resolveWorkerJobContract,
   runCodexPreflight,
+  toCodexUsageLimitError,
   spawnCodexWithStdin,
   spawnCodexProcess,
   resetTerminalReportState,
