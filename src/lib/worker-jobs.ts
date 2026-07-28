@@ -143,6 +143,10 @@ const IMPLEMENTED_DIAGNOSTICS_FAILURE_CODES = [
   "GIT_COMMIT_FAILED",
   "GIT_PUSH_FAILED",
   "GIT_SYNC_FAILED",
+  "CODEX_EXE_NOT_FOUND",
+  "CODEX_EXE_APP_ALIAS_OR_SHIM",
+  "CODEX_EXE_UNSUPPORTED_FILE_TYPE",
+  "CODEX_PREFLIGHT_FAILED",
   "CODEX_USAGE_LIMIT",
   "CODEX_QUOTA_EXHAUSTED",
   "CODEX_IDLE_TIMEOUT",
@@ -163,6 +167,7 @@ const IMPLEMENTED_DIAGNOSTICS_FAILURE_STAGES = [
   "approval_context",
   "worker_creation",
   "worker_claim",
+  "codex_preflight",
   "codex_execution",
   "validation",
   "git",
@@ -1286,6 +1291,12 @@ function buildWorkerFailureDiagnostics(input: {
   const reportText = [input.errorText, input.summary].filter(Boolean).join("\n");
   const failureCode = normalizeDiagnosticsFailureCode(input.failureCode, effectiveStatus, reportText);
   const failureStage = normalizeDiagnosticsFailureStage(input.failureStage, failureCode, effectiveStatus);
+  const codexExecutableExists = readNullableBooleanFlag(
+    readDiagnosticLine(reportText, "codex_executable_exists")
+  );
+  const codexExecutableIsAppAlias = readNullableBooleanFlag(
+    readDiagnosticLine(reportText, "codex_executable_is_app_alias")
+  );
   return {
     diagnostics_schema_version: DIAGNOSTICS_SCHEMA_VERSION,
     failure_code: effectiveStatus === "failed" ? failureCode : null,
@@ -1301,6 +1312,16 @@ function buildWorkerFailureDiagnostics(input: {
     retry_count: readNonNegativeInteger(input.job?.retry_count) ?? readNonNegativeInteger(jobPayload?.retry_count) ?? readNonNegativeInteger(jobResult?.retry_count),
     completed_at: input.completedAt,
     diagnostics_source: "worker_report_api",
+    codex_resolution_source: readDiagnosticLine(reportText, "codex_resolution_source"),
+    codex_requested_path: readDiagnosticLine(reportText, "codex_requested_path"),
+    codex_executable_resolved: readDiagnosticLine(reportText, "codex_executable_resolved"),
+    codex_executable_exists: codexExecutableExists,
+    codex_executable_file_type: readDiagnosticLine(reportText, "codex_executable_file_type"),
+    codex_executable_version: readDiagnosticLine(reportText, "codex_executable_version"),
+    codex_executable_is_app_alias: codexExecutableIsAppAlias,
+    codex_preflight_status: readDiagnosticLine(reportText, "codex_preflight_status"),
+    stdin_transport_verified: readDiagnosticLine(reportText, "stdin_transport_verified"),
+    prompt_in_spawnargs: readDiagnosticLine(reportText, "prompt_in_spawnargs"),
     error_summary: sanitizeDiagnosticsErrorSummary(reportText),
   };
 }
@@ -2706,6 +2727,24 @@ export function buildProjectDirectorWorkerReport(input: {
           : null)
       : null;
   const codexCalled = readNullableBooleanFlag(readDiagnosticLine(combinedReportText, "codex_called"));
+  const codexExecutableExists = readNullableBooleanFlag(
+    readDiagnosticLine(combinedReportText, "codex_executable_exists")
+  );
+  const codexExecutableIsAppAlias = readNullableBooleanFlag(
+    readDiagnosticLine(combinedReportText, "codex_executable_is_app_alias")
+  );
+  const codexDiagnostics = {
+    codex_resolution_source: readDiagnosticLine(combinedReportText, "codex_resolution_source"),
+    codex_requested_path: readDiagnosticLine(combinedReportText, "codex_requested_path"),
+    codex_executable_resolved: readDiagnosticLine(combinedReportText, "codex_executable_resolved"),
+    codex_executable_exists: codexExecutableExists,
+    codex_executable_file_type: readDiagnosticLine(combinedReportText, "codex_executable_file_type"),
+    codex_executable_version: readDiagnosticLine(combinedReportText, "codex_executable_version"),
+    codex_executable_is_app_alias: codexExecutableIsAppAlias,
+    codex_preflight_status: readDiagnosticLine(combinedReportText, "codex_preflight_status"),
+    stdin_transport_verified: readDiagnosticLine(combinedReportText, "stdin_transport_verified"),
+    prompt_in_spawnargs: readDiagnosticLine(combinedReportText, "prompt_in_spawnargs"),
+  };
   const nextStageAllowed =
     readNullableBooleanFlag(readDiagnosticLine(combinedReportText, "next_stage_allowed")) ?? false;
   const reportedWorkerExecutionStatus =
@@ -2828,6 +2867,7 @@ export function buildProjectDirectorWorkerReport(input: {
     verification_only: readBooleanFlag(contract.verification_only),
     allow_no_change_success: readBooleanFlag(contract.allow_no_change_success),
     codex_called: codexCalled,
+    ...codexDiagnostics,
     worker_readonly_context_complete: !workerReadOnlyContextIncomplete,
     missing_worker_readonly_context_fields: missingWorkerReadOnlyContextFields,
     missing_required_output_fields: missingWorkerReadOnlyRequiredOutputFields,
@@ -2889,6 +2929,28 @@ export function buildProjectDirectorWorkerReport(input: {
     `verification_only: ${readBooleanFlag(contract.verification_only) ? "true" : "false"}`,
     `allow_no_change_success: ${readBooleanFlag(contract.allow_no_change_success) ? "true" : "false"}`,
     `codex_called: ${codexCalled === null ? "null" : codexCalled ? "true" : "false"}`,
+    `codex_resolution_source: ${codexDiagnostics.codex_resolution_source ?? "null"}`,
+    `codex_requested_path: ${codexDiagnostics.codex_requested_path ?? "null"}`,
+    `codex_executable_resolved: ${codexDiagnostics.codex_executable_resolved ?? "null"}`,
+    `codex_executable_exists: ${
+      codexDiagnostics.codex_executable_exists === null
+        ? "null"
+        : codexDiagnostics.codex_executable_exists
+          ? "true"
+          : "false"
+    }`,
+    `codex_executable_file_type: ${codexDiagnostics.codex_executable_file_type ?? "null"}`,
+    `codex_executable_version: ${codexDiagnostics.codex_executable_version ?? "null"}`,
+    `codex_executable_is_app_alias: ${
+      codexDiagnostics.codex_executable_is_app_alias === null
+        ? "null"
+        : codexDiagnostics.codex_executable_is_app_alias
+          ? "true"
+          : "false"
+    }`,
+    `codex_preflight_status: ${codexDiagnostics.codex_preflight_status ?? "null"}`,
+    `stdin_transport_verified: ${codexDiagnostics.stdin_transport_verified ?? "null"}`,
+    `prompt_in_spawnargs: ${codexDiagnostics.prompt_in_spawnargs ?? "null"}`,
     `allowed_scope: ${placeholder(readString(contract.allowed_scope))}`,
     `exact_allowed_scope: ${placeholder(readString(contract.exact_allowed_scope))}`,
     `exact_allowed_scope_count: ${placeholder(readString(contract.exact_allowed_scope_count))}`,

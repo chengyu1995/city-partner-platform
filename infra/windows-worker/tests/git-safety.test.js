@@ -83,6 +83,7 @@ const {
   resolveCodexExecutable,
   resolveWorkerJobContract,
   runCodexPreflight,
+  runCodexStartupPreflight,
   spawnCodexWithStdin,
   toCodexUsageLimitError,
   resetTerminalReportState,
@@ -4381,6 +4382,241 @@ test("Codex spawn preflight guard", async (t) => {
     assert.match(command.args[3], /"D:\\Project With Spaces"/);
     assert.doesNotMatch(command.args[3], /prompt with spaces/);
     assert.match(command.args[3], /"-"$/);
+  });
+
+  await t.test("resolves Codex executable from the configured source-of-truth priority", (t) => {
+    const root = createTempRoot(t);
+    writeFile(root, "new/codex.exe", "new");
+    writeFile(root, "env/codex.exe", "env");
+    writeFile(root, "compat/codex.exe", "compat");
+    writeFile(root, "bin/codex.exe", "bin");
+    writeFile(root, "path/codex.exe", "path");
+    writeFile(root, "desktop/OpenAI/Codex/bin/69066b736e1e17a4/codex.exe", "desktop");
+
+    const optionExe = path.join(root, "new", "codex.exe");
+    const envExe = path.join(root, "env", "codex.exe");
+    const compatExe = path.join(root, "compat", "codex.exe");
+    const binDir = path.join(root, "bin");
+    const pathDir = path.join(root, "path");
+    const desktopRoot = path.join(root, "desktop", "OpenAI", "Codex");
+
+    const optionResolution = resolveCodexExecutable({
+      codexExe: optionExe,
+      env: {
+        CODEX_EXE: envExe,
+        CODEX_CLI_PATH: compatExe,
+      },
+    });
+    assert.equal(optionResolution.ok, true);
+    assert.equal(optionResolution.resolutionSource, "options.codexExe");
+    assert.equal(optionResolution.resolvedPath, path.resolve(optionExe));
+
+    const envResolution = resolveCodexExecutable({
+      env: {
+        CODEX_EXE: envExe,
+        CODEX_CLI_PATH: compatExe,
+      },
+    });
+    assert.equal(envResolution.ok, true);
+    assert.equal(envResolution.resolutionSource, "env.CODEX_EXE");
+    assert.equal(envResolution.resolvedPath, path.resolve(envExe));
+
+    for (const key of [
+      "CODEX_CLI_PATH",
+      "CODEX_EXECUTABLE",
+      "CODEX_PATH",
+    ]) {
+      const resolution = resolveCodexExecutable({
+        env: {
+          [key]: compatExe,
+        },
+      });
+      assert.equal(resolution.ok, true);
+      assert.equal(resolution.resolutionSource, `env.${key}`);
+      assert.equal(resolution.resolvedPath, path.resolve(compatExe));
+    }
+
+    const binResolution = resolveCodexExecutable({
+      env: {
+        CODEX_BIN: binDir,
+      },
+    });
+    assert.equal(binResolution.ok, true);
+    assert.equal(binResolution.resolutionSource, "env.CODEX_BIN");
+    assert.equal(binResolution.resolvedPath, path.resolve(path.join(binDir, "codex.exe")));
+
+    const desktopResolution = resolveCodexExecutable({
+      env: {
+        Path: pathDir,
+      },
+      codexDesktopRoots: [desktopRoot],
+    });
+    assert.equal(desktopResolution.ok, true);
+    assert.equal(desktopResolution.resolutionSource, "codex_desktop_runtime");
+    assert.match(desktopResolution.resolvedPath, /69066b736e1e17a4[\\/]codex\.exe$/);
+
+    const pathResolution = resolveCodexExecutable({
+      env: {
+        Path: pathDir,
+      },
+      codexDesktopRoots: [path.join(root, "missing-desktop")],
+    });
+    assert.equal(pathResolution.ok, true);
+    assert.equal(pathResolution.resolutionSource, "path");
+    assert.equal(pathResolution.resolvedPath, path.resolve(path.join(pathDir, "codex.exe")));
+  });
+
+  await t.test("explicit Codex path failures are fail-closed and never fall back", (t) => {
+    const root = createTempRoot(t);
+    writeFile(root, "valid/codex.exe", "valid");
+    writeFile(root, "shim/codex.cmd", "shim");
+    writeFile(root, "scripts/codex.ps1", "unsupported");
+
+    const validExe = path.join(root, "valid", "codex.exe");
+    const missingExe = path.join(root, "missing", "codex.exe");
+    const shimExe = path.join(root, "shim", "codex.cmd");
+    const ps1Exe = path.join(root, "scripts", "codex.ps1");
+
+    const missing = resolveCodexExecutable({
+      env: {
+        CODEX_EXE: missingExe,
+        CODEX_CLI_PATH: validExe,
+      },
+    });
+    assert.equal(missing.ok, false);
+    assert.equal(missing.reason, "CODEX_EXE_NOT_FOUND");
+    assert.equal(missing.resolutionSource, "env.CODEX_EXE");
+    assert.equal(missing.resolvedPath, path.resolve(missingExe));
+
+    const shim = resolveCodexExecutable({
+      env: {
+        CODEX_EXE: shimExe,
+        CODEX_CLI_PATH: validExe,
+      },
+    });
+    assert.equal(shim.ok, false);
+    assert.equal(shim.reason, "CODEX_EXE_APP_ALIAS_OR_SHIM");
+    assert.equal(shim.resolutionSource, "env.CODEX_EXE");
+
+    const unsupported = resolveCodexExecutable({
+      env: {
+        CODEX_EXE: ps1Exe,
+        CODEX_CLI_PATH: validExe,
+      },
+    });
+    assert.equal(unsupported.ok, false);
+    assert.equal(unsupported.reason, "CODEX_EXE_UNSUPPORTED_FILE_TYPE");
+    assert.equal(unsupported.resolutionSource, "env.CODEX_EXE");
+  });
+
+  await t.test("startup preflight runs version and stdin smoke with one resolved command", async (t) => {
+    const root = createTempRoot(t);
+    writeFile(root, "codex/codex.exe", "codex");
+    const codexExe = path.join(root, "codex", "codex.exe");
+    const calls = [];
+
+    const spawnFactory = (command, args, options) => {
+      calls.push({ command, args, options });
+      const child = new EventEmitter();
+      child.pid = 12346;
+      child.kill = () => {};
+
+      if (args.includes("--version")) {
+        fs.writeSync(options.stdio[1], "codex-cli 0.146.0-alpha.3.1\n");
+        process.nextTick(() => {
+          child.emit("exit", 0);
+          child.emit("close", 0);
+        });
+        return child;
+      }
+
+      const writes = [];
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.stdin = new Writable({
+        write(chunk, _encoding, callback) {
+          writes.push(Buffer.from(chunk));
+          callback();
+        },
+      });
+      child.stdin.on("finish", () => {
+        const prompt = Buffer.concat(writes).toString("utf8");
+        assert.match(prompt, /CODEX_WORKER_PREFLIGHT_OK/);
+        child.stdout.write("CODEX_WORKER_PREFLIGHT_OK");
+        child.stdout.end();
+        process.nextTick(() => {
+          child.emit("exit", 0);
+          child.emit("close", 0);
+        });
+      });
+      return child;
+    };
+
+    const diagnostics = await runCodexStartupPreflight({
+      codexExe,
+      spawnFactory,
+      timeoutMs: 1000,
+    });
+
+    assert.equal(diagnostics.codex_resolution_source, "options.codexExe");
+    assert.equal(diagnostics.codex_executable_resolved, path.resolve(codexExe));
+    assert.equal(diagnostics.codex_executable_exists, true);
+    assert.equal(diagnostics.codex_executable_file_type, "exe");
+    assert.equal(diagnostics.codex_executable_version, "codex-cli 0.146.0-alpha.3.1");
+    assert.equal(diagnostics.codex_executable_is_app_alias, false);
+    assert.equal(diagnostics.codex_preflight_status, "passed");
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].command, path.resolve(codexExe));
+    assert.equal(calls[1].command, path.resolve(codexExe));
+    assert.deepEqual(calls[1].options.stdio, ["pipe", "pipe", "pipe"]);
+    assert.equal(calls[1].options.shell, false);
+    assert.equal(calls[1].options.windowsHide, true);
+    assert.equal(calls[1].args.includes("CODEX_WORKER_PREFLIGHT_OK"), false);
+    assert.equal(calls[1].args[calls[1].args.length - 1], "-");
+  });
+
+  await t.test("stdin smoke fails when Codex returns anything except the OK sentinel", async () => {
+    const spawnFactory = () => {
+      const child = new EventEmitter();
+      child.pid = 12347;
+      child.kill = () => {};
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.stdin = new Writable({
+        write(_chunk, _encoding, callback) {
+          callback();
+        },
+      });
+      child.stdin.on("finish", () => {
+        child.stdout.write("not ok");
+        child.stdout.end();
+        process.nextTick(() => {
+          child.emit("exit", 0);
+          child.emit("close", 0);
+        });
+      });
+      return child;
+    };
+
+    const result = await runCodexPreflight({
+      mode: "smoke",
+      codexResolution: {
+        ok: true,
+        resolutionSource: "test",
+        requestedPath: "C:\\Codex\\codex.exe",
+        resolvedPath: "C:\\Codex\\codex.exe",
+        exists: true,
+        fileType: "exe",
+        isWindowsAppAlias: false,
+        isShim: false,
+      },
+      spawnFactory,
+      timeoutMs: 1000,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "CODEX_PREFLIGHT_FAILED");
+    assert.match(result.error, /CODEX_WORKER_PREFLIGHT_OK/);
   });
 
   await t.test("large prompts use stdin and never enter spawnargs", async () => {

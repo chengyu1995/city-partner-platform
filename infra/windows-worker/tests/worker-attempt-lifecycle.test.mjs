@@ -127,14 +127,19 @@ test("verification-only dispatch returns before Codex and git publish phases", (
   assert.match(noopBlock, /next_stage_allowed:\s*false/);
 });
 
-test("worker startup does not run a Codex smoke preflight before polling", () => {
+test("worker startup runs Codex executable preflight before polling", () => {
   const mainStart = localWorker.indexOf("async function main");
   const mainEnd = localWorker.indexOf('process.on("SIGINT"', mainStart);
   assert.ok(mainStart >= 0 && mainEnd > mainStart, "main block should be detectable");
   const mainBlock = localWorker.slice(mainStart, mainEnd);
 
-  assert.match(mainBlock, /resolveCodexExecutable\(\)/);
-  assert.doesNotMatch(mainBlock, /runCodexPreflight\(/);
+  const preflightIndex = mainBlock.indexOf("await runCodexStartupPreflight()");
+  const pollIndex = mainBlock.indexOf("await pollOnce()");
+  assert.ok(preflightIndex >= 0, "startup should run the Codex preflight");
+  assert.ok(pollIndex > preflightIndex, "preflight must complete before polling starts");
+  assert.match(localWorker, /mode:\s*"version"/);
+  assert.match(localWorker, /mode:\s*"smoke"/);
+  assert.match(localWorker, /CODEX_WORKER_PREFLIGHT_OK/);
 });
 
 test("write allowed read-only downgrade is blocked before success persistence", () => {

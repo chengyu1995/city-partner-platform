@@ -40,6 +40,25 @@ test("diagnostics separates worker, goal, and effective statuses", () => {
   assert.match(workerJobs, /effective_final_status:\s*effectiveStatus/);
 });
 
+test("worker reports carry Codex executable resolution diagnostics", () => {
+  for (const field of [
+    "codex_resolution_source",
+    "codex_requested_path",
+    "codex_executable_resolved",
+    "codex_executable_exists",
+    "codex_executable_file_type",
+    "codex_executable_version",
+    "codex_executable_is_app_alias",
+    "codex_preflight_status",
+    "stdin_transport_verified",
+    "prompt_in_spawnargs",
+  ]) {
+    assert.match(workerJobs, new RegExp(`${field}:`));
+  }
+  assert.match(workerJobs, /readDiagnosticLine\(combinedReportText,\s*"codex_resolution_source"\)/);
+  assert.match(workerJobs, /readDiagnosticLine\(reportText,\s*"codex_preflight_status"\)/);
+});
+
 test("worker contract carries verification-only no-change success flags", () => {
   assert.match(workerJobs, /"verification_only"/);
   assert.match(workerJobs, /"allow_no_change_success"/);
