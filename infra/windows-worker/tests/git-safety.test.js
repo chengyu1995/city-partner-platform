@@ -7,6 +7,8 @@ const path = require("path");
 const { EventEmitter } = require("events");
 const { PassThrough, Writable } = require("stream");
 
+process.env.PROJECT_DIR = process.env.PROJECT_DIR || path.resolve(__dirname, "..", "..", "..");
+
 const {
   assertCleanStatusEntries,
   comparePathSets,

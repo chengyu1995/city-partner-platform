@@ -155,6 +155,18 @@ test("write allowed read-only downgrade is blocked before success persistence", 
   assert.match(feishuRoute, /APPROVAL_CONTEXT_MODE_MISMATCH/);
 });
 
+test("post-push report state is persisted without commit rollback semantics", () => {
+  const pollBlock = functionBlock(localWorker, "pollOnce");
+  assert.match(pollBlock, /remote_contains_commit:\s*pushResult\.pushed/);
+  assert.match(pollBlock, /repository_clean_after_push:\s*repositoryCleanAfterPush/);
+  assert.match(pollBlock, /worker_git_push:\s*pushResult\.pushed/);
+  assert.match(pollBlock, /codex_git_push:\s*"not_run_by_codex"/);
+
+  const rollbackBlock = functionBlock(localWorker, "rollbackGitTask");
+  assert.doesNotMatch(rollbackBlock, /git\s+reset|runGit\(\["reset"|runGit\(\["revert"/);
+  assert.doesNotMatch(rollbackBlock, /runGit\(\["push"/);
+});
+
 test("approved write contexts keep original request and approved execution route", () => {
   const block = functionBlock(jobBuilder, "buildAgentDispatchContext");
   assert.match(block, /requested_mode:\s*"write_allowed"/);

@@ -11,6 +11,35 @@ const reportRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker
 const localWorker = fs.readFileSync(path.join(root, "infra", "windows-worker", "local_worker.js"), "utf8");
 const migrationDraft = fs.readFileSync(path.join(root, "docs", "setup-hermes-jobs-diagnostics.sql"), "utf8");
 
+const canonicalReportFields = [
+  "report_schema_version",
+  "worker_execution_status",
+  "task_goal_status",
+  "effective_final_status",
+  "failure_code",
+  "failure_stage",
+  "failure_detail",
+  "changed_files",
+  "git_commit_sha",
+  "git_push",
+  "pushed_branch",
+  "job_id",
+  "attempt_id",
+  "worker_instance_id",
+  "terminal_report_acknowledged",
+  "terminal_state_persisted",
+  "duplicate_terminal_report_idempotent",
+  "final_report_source",
+  "post_completion_state_applied",
+];
+
+function functionBlock(source, signature, nextSignature) {
+  const start = source.indexOf(signature);
+  assert.notEqual(start, -1, `${signature} not found`);
+  const end = nextSignature ? source.indexOf(nextSignature, start) : -1;
+  return source.slice(start, end === -1 ? source.length : end);
+}
+
 test("worker reports build versioned diagnostics", () => {
   assert.match(workerJobs, /DIAGNOSTICS_SCHEMA_VERSION\s*=\s*1/);
   assert.match(workerJobs, /DIAGNOSTICS_STORAGE_FIELD\s*=\s*"result\.diagnostics"/);
@@ -120,6 +149,52 @@ test("canonical worker report schema v2 is accepted without blind fallback exhau
   assert.match(reportRoute, /supported_schema_versions/);
   assert.doesNotMatch(reportRoute, /worker_report_schema_fallback_exhausted[^:]/);
   assert.match(reportRoute, /worker_report_schema_fallback_exhausted:\s*false/);
+});
+
+test("canonical worker report schema v2 stores one complete terminal object", () => {
+  const builder = functionBlock(
+    workerJobs,
+    "export function buildCanonicalWorkerReportSchema",
+    "export function normalizeWorkerFinalResult"
+  );
+
+  for (const field of canonicalReportFields) {
+    assert.match(builder, new RegExp(`${field}:`), field);
+  }
+
+  assert.match(builder, /codex_git_push:/);
+  assert.equal((reportRoute.match(/canonical_worker_report:\s*canonicalReport/g) || []).length, 1);
+  assert.match(reportRoute, /const canonicalReport = buildCanonicalWorkerReportSchema/);
+});
+
+test("canonical report preserves failure detail and terminal idempotency metadata", () => {
+  const builder = functionBlock(
+    workerJobs,
+    "export function buildCanonicalWorkerReportSchema",
+    "export function normalizeWorkerFinalResult"
+  );
+
+  assert.match(builder, /failure_detail:[\s\S]*body\.failure_detail[\s\S]*finalResult\.failure_detail/);
+  assert.match(builder, /terminal_report_acknowledged:[\s\S]*body\.terminal_report_acknowledged[\s\S]*finalResult\.terminal_report_acknowledged[\s\S]*true/);
+  assert.match(builder, /duplicate_terminal_report_idempotent:[\s\S]*body\.duplicate_terminal_report_idempotent[\s\S]*finalResult\.duplicate_terminal_report_idempotent[\s\S]*false/);
+  assert.match(builder, /final_report_source:[\s\S]*body\.final_report_source[\s\S]*finalResult\.final_report_source/);
+});
+
+test("effective final status has a single priority source", () => {
+  const normalizer = functionBlock(
+    workerJobs,
+    "export function normalizeWorkerFinalResult",
+    "function terminalIndexKey"
+  );
+  const statusRead = normalizer.slice(
+    normalizer.indexOf("const requestedStatus"),
+    normalizer.indexOf("const nonTaskFailureCode")
+  );
+
+  assert.match(statusRead, /readPriorityReportField\(terminalSources,\s*"effective_final_status"/);
+  assert.match(statusRead, /input\.effectiveFinalStatus/);
+  assert.match(statusRead, /input\.effective_final_status/);
+  assert.doesNotMatch(statusRead, /codex_result|git_push|changed_files|worker_execution_status/);
 });
 
 test("local Worker submits canonical report schema and received policy diagnostics", () => {

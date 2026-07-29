@@ -125,7 +125,9 @@ export const WORKER_JOB_CONTRACT_FIELDS = [
   "pushed_branch",
   "remote_contains_commit",
   "repository_clean_after_push",
+  "terminal_report_acknowledged",
   "terminal_state_persisted",
+  "duplicate_terminal_report_idempotent",
   "post_completion_state_applied",
   "final_report_source",
   "next_batch",
@@ -341,7 +343,7 @@ function decodeOriginalRequestTextBase64(value: unknown): string | null {
 }
 
 const WORKER_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|requested_mode|final_mode|task_mode|read_only_mode|repair_mode|repair_scope|verification_only|allow_no_change_success|execution_intent|code_changes_required|codex_required|git_commit_required|git_push_required|approval_required|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|route|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|committed_files|codex_changed_files|worktree_changed_files|task_changed_files|unexpected_changed_files|git_commit_sha|codex_git_push|worker_git_push|git_push|pushed|pushed_branch|remote_contains_commit|repository_clean_after_push|next_batch|completed_at|deploy_status|execution_policy_source|execution_policy_batch_code|execution_policy_context_id|execution_policy_request_hash|execution_policy_inherited|execution_policy_inheritance_rejected_reason)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|requested_mode|final_mode|task_mode|read_only_mode|repair_mode|repair_scope|verification_only|allow_no_change_success|execution_intent|code_changes_required|codex_required|git_commit_required|git_push_required|approval_required|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|route|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|committed_files|codex_changed_files|worktree_changed_files|task_changed_files|unexpected_changed_files|git_commit_sha|codex_git_push|worker_git_push|git_push|pushed|pushed_branch|remote_contains_commit|repository_clean_after_push|terminal_report_acknowledged|terminal_state_persisted|duplicate_terminal_report_idempotent|post_completion_state_applied|final_report_source|next_batch|completed_at|deploy_status|execution_policy_source|execution_policy_batch_code|execution_policy_context_id|execution_policy_request_hash|execution_policy_inherited|execution_policy_inheritance_rejected_reason)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName: string): string {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -702,6 +704,11 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "pushed_branch",
   "remote_contains_commit",
   "repository_clean_after_push",
+  "terminal_report_acknowledged",
+  "terminal_state_persisted",
+  "duplicate_terminal_report_idempotent",
+  "post_completion_state_applied",
+  "final_report_source",
   "next_batch",
   "completed_at",
   "pushed",
@@ -962,6 +969,14 @@ function readPayloadContextField(
     pushed_branch: ["pushed_branch", "pushedBranch"],
     remote_contains_commit: ["remote_contains_commit", "remoteContainsCommit"],
     repository_clean_after_push: ["repository_clean_after_push", "repositoryCleanAfterPush"],
+    terminal_report_acknowledged: ["terminal_report_acknowledged", "terminalReportAcknowledged"],
+    terminal_state_persisted: ["terminal_state_persisted", "terminalStatePersisted"],
+    duplicate_terminal_report_idempotent: [
+      "duplicate_terminal_report_idempotent",
+      "duplicateTerminalReportIdempotent",
+    ],
+    post_completion_state_applied: ["post_completion_state_applied", "postCompletionStateApplied"],
+    final_report_source: ["final_report_source", "finalReportSource", "post_completion_source", "postCompletionSource"],
     next_batch: ["next_batch", "nextBatch"],
     completed_at: ["completed_at", "completedAt"],
     pushed: ["pushed"],
@@ -1757,7 +1772,9 @@ export function validateCanonicalWorkerReportSchema(
     "worker_git_push",
     "remote_contains_commit",
     "repository_clean_after_push",
+    "terminal_report_acknowledged",
     "terminal_state_persisted",
+    "duplicate_terminal_report_idempotent",
     "post_completion_state_applied",
     "next_stage_allowed",
   ]) {
@@ -1814,7 +1831,10 @@ export function buildCanonicalWorkerReportSchema(input: {
     effective_final_status: readString(finalResult.effective_final_status),
     failure_code: readString(finalResult.failure_code),
     failure_stage: readString(finalResult.failure_stage),
-    failure_detail: readString(body.failure_detail),
+    failure_detail:
+      readString(body.failure_detail) ??
+      readString(finalResult.failure_detail) ??
+      readString(body.error_detail),
     repair_mode: contract.repair_mode === true,
     verification_only: contract.verification_only === true,
     allow_no_change_success: contract.allow_no_change_success === true,
@@ -1826,17 +1846,33 @@ export function buildCanonicalWorkerReportSchema(input: {
     committed_files: readStringArray(finalResult.committed_files),
     unexpected_changed_files: readStringArray(finalResult.unexpected_changed_files),
     git_commit_sha: readString(finalResult.git_commit_sha),
+    codex_git_push: readString(finalResult.codex_git_push),
     worker_git_push: readReportPushFlag(finalResult.worker_git_push),
     git_push: readReportPushFlag(finalResult.git_push, finalResult.pushed),
     pushed_branch: readString(finalResult.pushed_branch),
     remote_contains_commit: readReportPushFlag(finalResult.remote_contains_commit),
     repository_clean_after_push: readBooleanFlag(finalResult.repository_clean_after_push),
+    terminal_report_acknowledged:
+      readNullableBooleanFlag(body.terminal_report_acknowledged) ??
+      readNullableBooleanFlag(finalResult.terminal_report_acknowledged) ??
+      true,
     terminal_state_persisted:
-      readNullableBooleanFlag(body.terminal_state_persisted) ?? true,
+      readNullableBooleanFlag(body.terminal_state_persisted) ??
+      readNullableBooleanFlag(finalResult.terminal_state_persisted) ??
+      true,
+    duplicate_terminal_report_idempotent:
+      readNullableBooleanFlag(body.duplicate_terminal_report_idempotent) ??
+      readNullableBooleanFlag(finalResult.duplicate_terminal_report_idempotent) ??
+      false,
     post_completion_state_applied:
-      readNullableBooleanFlag(body.post_completion_state_applied) ?? true,
+      readNullableBooleanFlag(body.post_completion_state_applied) ??
+      readNullableBooleanFlag(finalResult.post_completion_state_applied) ??
+      true,
     final_report_source:
-      readString(body.final_report_source) ?? readString(body.post_completion_source) ?? "worker_runtime_report",
+      readString(body.final_report_source) ??
+      readString(finalResult.final_report_source) ??
+      readString(body.post_completion_source) ??
+      "worker_runtime_report",
     completed_at: readString(finalResult.completed_at),
     next_stage_allowed: readNullableBooleanFlag(finalResult.next_stage_allowed) ?? false,
   };
