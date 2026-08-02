@@ -28,6 +28,10 @@ const stateMachineSource = fs.readFileSync(
   path.join(root, "infra", "tencent-worker", "worker_job_state_machine.js"),
   "utf8"
 );
+const terminalFinalizerSource = fs.readFileSync(
+  path.join(root, "infra", "tencent-worker", "worker_terminal_finalizer.js"),
+  "utf8"
+);
 const require = createRequire(import.meta.url);
 const terminalPolicy = require(path.join(root, "infra", "tencent-worker", "worker_terminal_policy.js"));
 
@@ -187,8 +191,10 @@ test("terminal cleanup clears attempts, lease, running index, and retry flags", 
   assert.match(cleanup, /active_attempt:\s*null/);
   assert.match(cleanup, /active_lease:\s*null/);
   assert.match(reportRoute, /finalizeCanonicalJobReportSafely\(supabase/);
-  assert.match(workerJobs, /buildCanonicalFinalization\(currentJob/);
-  assert.match(workerJobs, /terminalJobHasRuntimeState\(currentJob\)/);
+  assert.match(terminalFinalizerSource, /finalizeJob\(currentJob/);
+  assert.match(terminalFinalizerSource, /terminalJobHasRuntimeState\(currentJob\)/);
+  assert.match(workerJobs, /finalizeSharedCanonicalJobReportSafely/);
+  assert.match(productionWorkerApi, /require\("\.\/worker_terminal_finalizer"\)/);
 });
 
 test("duplicate terminal report stays terminal and idempotent after runtime cleanup", () => {

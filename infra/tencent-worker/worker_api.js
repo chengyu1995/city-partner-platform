@@ -9,7 +9,6 @@ const {
   applyProgress: canonicalApplyProgress,
   claimJob: canonicalClaimJob,
   cleanupTerminalJob: canonicalCleanupTerminalJob,
-  finalizeJob: canonicalFinalizeJob,
   getActiveAttempt: canonicalGetActiveAttempt,
   inspectJobState: canonicalInspectJobState,
   isCanonicalClaimPersisted,
@@ -18,6 +17,9 @@ const {
   rollbackFailedClaim: canonicalRollbackFailedClaim,
   validateJobStateInvariant: canonicalValidateJobStateInvariant,
 } = require("./worker_job_state_machine");
+const {
+  finalizeCanonicalJobReportSafely,
+} = require("./worker_terminal_finalizer");
 
 if (typeof globalThis.WebSocket === "undefined") {
   globalThis.WebSocket = class DisabledRealtimeWebSocket {
@@ -4489,21 +4491,6 @@ function buildGmStabilizeTerminalDecision(finalStatus, job, body) {
   };
 }
 
-async function updateHermesJobReportWithSchemaFallback(supabaseClient, jobId, updateData) {
-  let pending = { ...updateData };
-  const skipped = [];
-  for (let attempt = 0; attempt < 16; attempt += 1) {
-    const { data, error } = await supabaseClient.from("hermes_jobs").update(pending).eq("id", jobId).in("status", ["pending", "queued", "running"]).select("*").maybeSingle();
-    if (!error) return { data, error: null, skipped };
-    const missing = parseSupabaseMissingColumnName(error);
-    if (!missing || !Object.prototype.hasOwnProperty.call(pending, missing)) return { data: null, error, skipped };
-    skipped.push(missing);
-    delete pending[missing];
-    console.warn("worker_report_schema_field_skipped", { job_id: jobId, field: missing });
-  }
-  return { data: null, error: new Error("worker_report_schema_fallback_exhausted"), skipped };
-}
-
 async function updateHermesJobDiagnosticsEnrichmentWithSchemaFallback(supabaseClient, jobId, updateData) {
   let pending = { ...updateData };
   const skipped = [];
@@ -4517,21 +4504,6 @@ async function updateHermesJobDiagnosticsEnrichmentWithSchemaFallback(supabaseCl
     console.warn("worker_report_diagnostics_enrichment_schema_field_skipped", { job_id: jobId, field: missing });
   }
   return { data: null, error: new Error("worker_report_diagnostics_enrichment_schema_fallback_exhausted"), skipped };
-}
-
-function buildDiagnosticsStorageUnavailableResponse(jobId, finalStatus, skipped, data) {
-  return {
-    ok: false,
-    error: "diagnostics_storage_unavailable",
-    failure_code: RUNTIME_DIAGNOSTICS_STORAGE_UNAVAILABLE,
-    failure_stage: "report",
-    job_id: jobId,
-    status: finalStatus,
-    diagnostics_storage_field: RUNTIME_DIAGNOSTICS_STORAGE_FIELD,
-    terminal_status_persisted: Boolean(data),
-    diagnostics_persisted: false,
-    terminal_report_idempotent: false,
-  };
 }
 
 function getStoredRuntimeDiagnostics(job) {
@@ -4701,110 +4673,15 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
 
   const prioritizedFinalStatus = getPrioritizedRuntimeFinalStatus(finalStatus, req.body || {});
   const terminalDecision = buildGmStabilizeTerminalDecision(prioritizedFinalStatus, existingJob, req.body || {});
-  const canonicalFinalization = canonicalFinalizeJob(existingJob, {
-    attempt_id: incomingAttemptId,
-    worker_execution_status: readRuntimeReportField(req.body || {}, "worker_execution_status") || finalStatus,
-    task_goal_status: readRuntimeReportField(req.body || {}, "task_goal_status") || terminalDecision.status,
-    effective_final_status: terminalDecision.status,
-    now: new Date().toISOString(),
-  });
-
-  const terminalDescriptor = runtimeGetTerminalJobDescriptor(existingJob);
-  const existingStatusIsTerminal = Boolean(terminalDescriptor);
-  const terminalAttemptMatches = runtimeTerminalAttemptMatches(existingJob, incomingAttemptId);
-  let terminalJob = existingJob;
-  let terminalRuntimeCleanupApplied = false;
-  if (existingStatusIsTerminal && runtimeTerminalJobHasRuntimeState(existingJob)) {
-    const cleanup = await runtimePersistTerminalCleanup(existingJob, terminalDescriptor);
-    if (cleanup.error) {
-      return res.status(500).json({
-        ok: false,
-        error: "terminal_job_cleanup_failed",
-        failure_code: "TERMINAL_JOB_CLEANUP_FAILED",
-        failure_stage: "duplicate_terminal_report_cleanup",
-        status_unchanged: true,
-      });
-    }
-    terminalJob = cleanup.data || existingJob;
-    terminalRuntimeCleanupApplied = Boolean(cleanup.data);
-  }
-  if (existingStatusIsTerminal && !terminalAttemptMatches) {
-    console.warn("[worker-api] stale terminal attempt rejected", {
-      job_id: jobId,
-      existing_status: existingJob.status,
-      has_incoming_attempt: Boolean(incomingAttemptId),
-      has_stored_attempt: Boolean(getRuntimeStoredTerminalAttemptId(existingJob)),
-    });
-    return res.status(409).json(runtimeBuildStaleAttemptResponse(terminalJob, incomingAttemptId, true));
-  }
-
-  if (existingStatusIsTerminal && !canonicalFinalization.ok) {
-    return res.status(409).json({
-      ok: false,
-      error: "terminal_report_conflict",
-      failure_code: canonicalFinalization.failure_code,
-      failure_stage: "job_state_machine",
-      terminal_immutable: true,
-      status_unchanged: true,
-      duplicate_report_detected: true,
-      existing_state: canonicalFinalization.existing_state || null,
-      incoming_state: canonicalFinalization.incoming_state || null,
-    });
-  }
-
-  if (existingStatusIsTerminal) {
-    console.warn("[worker-api] duplicate terminal report ignored", {
-      job_id: jobId,
-      existing_status: existingJob.status,
-      reported_status: finalStatus,
-      attempt_id: incomingAttemptId || null,
-    });
-    const diagnosticsEnrichment = await enrichTerminalDiagnosticsIfMissing(supabase, terminalJob, req.body || {}, finalStatus);
-    return res.json({
-      ok: true,
-      acknowledged: true,
-      canonical_report_schema_version: RUNTIME_CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
-      already_terminal: true,
-      duplicate_report_detected: true,
-      duplicate_report_idempotent: true,
-      second_side_effect_triggered: false,
-      diagnostics_enrichment_only: diagnosticsEnrichment.enriched === true,
-      non_diagnostic_side_effects: 0,
-      terminal_runtime_cleanup_applied: terminalRuntimeCleanupApplied,
-      retry_count_unchanged: diagnosticsEnrichment.retry_count_unchanged === true,
-      status_unchanged: diagnosticsEnrichment.status_unchanged === true,
-      completed_at_not_regressed: diagnosticsEnrichment.completed_at_not_regressed === true,
-      final_report_delivery: "skipped_duplicate_terminal",
-      diagnostics_enrichment_reason: diagnosticsEnrichment.reason || null,
-      job: terminalJob,
-    });
-  }
-
-  const reportOwnership = runtimeOwnsAndMatchesAttempt(existingJob, reportWorkerName, incomingAttemptId);
-  if (!reportOwnership.ok) return res.status(reportOwnership.status).json(reportOwnership.body);
-
-  const activeAttemptId = getRuntimeActiveAttemptId(existingJob);
-  if (activeAttemptId && incomingAttemptId !== activeAttemptId) {
-    console.warn("[worker-api] stale active attempt rejected", {
-      job_id: jobId,
-      existing_status: existingJob.status,
-      has_incoming_attempt: Boolean(incomingAttemptId),
-      has_active_attempt: true,
-    });
-    return res.status(409).json(runtimeBuildStaleAttemptResponse(existingJob, incomingAttemptId, false));
-  }
-
-  if (!["pending", "queued", "running"].includes(String(existingJob.status || "").toLowerCase())) {
-    return res.status(409).json({
-      ok: false,
-      error: "job_not_active",
-      status: existingJob.status,
-    });
-  }
-
-  const effectiveFinalStatus = terminalDecision.status;
   const effectiveErrorText = terminalDecision.errorText;
   const effectiveErrorCode = terminalDecision.code || null;
+  const structuredTerminalFields = buildRuntimeStructuredTerminalFields(
+    existingJob,
+    req.body || {},
+    terminalDecision.status,
+    effectiveErrorCode
+  );
+  const effectiveFinalStatus = structuredTerminalFields.effective_final_status || terminalDecision.status;
 
   if (effectiveFinalStatus !== finalStatus) {
     console.warn("[worker-api] coerced terminal report", {
@@ -4815,21 +4692,9 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
     });
   }
 
-  const structuredTerminalFields = buildRuntimeStructuredTerminalFields(existingJob, req.body || {}, effectiveFinalStatus, effectiveErrorCode);
   const terminalNow = new Date().toISOString();
-  if (!canonicalFinalization.ok || !canonicalFinalization.patch) {
-    return res.status(409).json({
-      ok: false,
-      error: "job_finalization_rejected",
-      failure_code: canonicalFinalization.failure_code || "JOB_STATE_INVARIANT_VIOLATION",
-      failure_stage: "job_state_machine",
-      violated_invariants: canonicalFinalization.violations || [],
-    });
-  }
-  const lifecycleResult = parseWorkerReportObject(canonicalFinalization.patch.result);
   const updateData = {
-    ...canonicalFinalization.patch,
-    status: canonicalFinalization.patch.status || effectiveFinalStatus,
+    status: effectiveFinalStatus,
     finished_at: terminalNow,
     completed_at: terminalNow,
     updated_at: terminalNow,
@@ -4849,7 +4714,6 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
   const runtimeDiagnostics = buildRuntimeFailureDiagnostics(existingJob, req.body || {}, updateData);
   const canonicalWorkerReport = buildRuntimeCanonicalWorkerReportSchema(existingJob, req.body || {}, updateData, reportWorkerName, incomingAttemptId);
   updateData.result = {
-    ...(lifecycleResult || {}),
     ...(parseWorkerReportObject(result) || {}),
     attempt_id: incomingAttemptId || getRuntimeActiveAttemptId(existingJob) || null,
     diagnostics: runtimeDiagnostics,
@@ -4875,9 +4739,6 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
     final_report_source: updateData.final_report_source || null,
     post_completion_source: updateData.post_completion_source || null,
     post_completion_state_applied: updateData.post_completion_state_applied === true,
-    ...(lifecycleResult && lifecycleResult.job_state_machine
-      ? { job_state_machine: lifecycleResult.job_state_machine }
-      : {}),
     next_stage_allowed: updateData.next_stage_allowed === true,
   };
   if (effectiveFinalStatus === "succeeded") {
@@ -4912,36 +4773,70 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
           ? error_text
           : typeof error === "string"
             ? error
-            : JSON.stringify(error ?? "Worker execution failed"));
+          : JSON.stringify(error ?? "Worker execution failed"));
   }
 
-  const { data, error: updateError, skipped } = await updateHermesJobReportWithSchemaFallback(supabase, jobId, updateData);
+  const terminalFinalization = await finalizeCanonicalJobReportSafely(supabase, {
+    job_id: jobId,
+    worker_id: reportWorkerName,
+    attempt_id: incomingAttemptId || "",
+    report_identity: `${jobId}:${incomingAttemptId || "missing"}:${RUNTIME_CANONICAL_WORKER_REPORT_SCHEMA_VERSION}:${effectiveFinalStatus}`,
+    worker_execution_status: updateData.worker_execution_status,
+    task_goal_status: updateData.task_goal_status,
+    effective_final_status: updateData.effective_final_status,
+    report_fields: updateData,
+    now: terminalNow,
+  });
+  if (!terminalFinalization.ok) {
+    return res.status(409).json({
+      ok: false,
+      error: terminalFinalization.conflict ? "terminal_report_conflict" : "job_finalization_rejected",
+      failure_code: terminalFinalization.failure_code,
+      failure_stage: terminalFinalization.failure_stage,
+      terminal_immutable: terminalFinalization.terminal_immutable,
+      status_unchanged: true,
+      duplicate_report_detected: terminalFinalization.conflict === true,
+    });
+  }
 
-  if (updateError) {
-    console.error("Report job failed:", updateError);
+  const data = terminalFinalization.job;
+  if (!data) {
     return res.status(500).json({
       ok: false,
-      error: "report_failed",
-      message: updateError.message,
+      error: "canonical_terminal_result_missing",
+      failure_code: "TERMINAL_REPORT_PERSISTED_STATE_INVALID",
+      failure_stage: "terminal_report_finalization",
     });
   }
 
-  if (!data) {
-    return res.status(404).json({
-      ok: false,
-      error: "running_job_not_found",
+  if (terminalFinalization.idempotent) {
+    const terminalRuntimeCleanupApplied = runtimeTerminalJobHasRuntimeState(existingJob)
+      && !runtimeTerminalJobHasRuntimeState(data);
+    const diagnosticsEnrichment = await enrichTerminalDiagnosticsIfMissing(
+      supabase,
+      data,
+      req.body || {},
+      effectiveFinalStatus
+    );
+    return res.json({
+      ok: true,
+      acknowledged: true,
+      canonical_report_schema_version: RUNTIME_CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
+      already_terminal: true,
+      duplicate_report_detected: true,
+      duplicate_report_idempotent: true,
+      second_side_effect_triggered: false,
+      diagnostics_enrichment_only: diagnosticsEnrichment.enriched === true,
+      non_diagnostic_side_effects: 0,
+      terminal_runtime_cleanup_applied: terminalRuntimeCleanupApplied,
+      retry_count_unchanged: diagnosticsEnrichment.retry_count_unchanged === true,
+      status_unchanged: diagnosticsEnrichment.status_unchanged === true,
+      completed_at_not_regressed: diagnosticsEnrichment.completed_at_not_regressed === true,
+      final_report_delivery: "skipped_duplicate_terminal",
+      diagnostics_enrichment_reason: diagnosticsEnrichment.reason || null,
+      job: data,
     });
   }
-
-  if (Array.isArray(skipped) && skipped.includes("result")) {
-    console.error("diagnostics_storage_unavailable", {
-      job_id: jobId,
-      storage_field: RUNTIME_DIAGNOSTICS_STORAGE_FIELD,
-      skipped_columns: skipped,
-    });
-    return res.status(500).json(buildDiagnosticsStorageUnavailableResponse(jobId, effectiveFinalStatus, skipped, data));
-  }
-
 
   await syncWorkerJobToFeishu(jobId, {
     status: effectiveFinalStatus,

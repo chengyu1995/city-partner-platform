@@ -9,6 +9,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
 const machine = require(path.join(root, "infra", "tencent-worker", "worker_job_state_machine.js"));
+const terminalFinalizer = require(path.join(root, "infra", "tencent-worker", "worker_terminal_finalizer.js"));
 const SAME_TIMESTAMP = "2026-08-02T10:00:00.000Z";
 const CLAIMED_AT = SAME_TIMESTAMP;
 const EXPIRES_AT = "2999-08-02T11:00:00.000Z";
@@ -50,6 +51,7 @@ const workerJobs = loadTypeScriptModule(path.join(root, "src", "lib", "worker-jo
   "next/server": nextServer,
   "@/lib/env": { getSupabaseService: async () => null },
   "../../infra/tencent-worker/worker_job_state_machine": machine,
+  "../../infra/tencent-worker/worker_terminal_finalizer": terminalFinalizer,
 });
 
 function queuedJob() {
@@ -551,4 +553,61 @@ test("report route has one terminal authority and no generic terminal update", (
   assert.match(route, /terminal\s*\?\s*\{[\s\S]*terminalFinalization\?\.job/);
   assert.match(route, /:\s*await updateHermesJob\(supabase, jobId, reportFields\)/);
   assert.doesNotMatch(route, /updateHermesJob\(supabase,\s*jobId,\s*\{[\s\S]*status:\s*terminal/);
+});
+
+test("shared terminal finalizer rejects a foreign worker before mutation", async () => {
+  let updateCalls = 0;
+  const store = createSupabaseStore(claimedJob(), {
+    onUpdate() {
+      updateCalls += 1;
+      return null;
+    },
+  });
+  const result = await terminalFinalizer.finalizeCanonicalJobReportSafely(
+    store,
+    terminalInput("succeeded", { worker_id: "Worker-B" })
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_code, "FOREIGN_WORKER_TERMINAL_REPORT");
+  assert.equal(updateCalls, 0);
+  assert.equal(machine.normalizeJobState(store.job), "claimed");
+});
+
+test("shared terminal finalizer fails closed on revision change without retry", async () => {
+  let updateCalls = 0;
+  const store = createSupabaseStore(claimedJob(), {
+    onUpdate({ api, job }) {
+      updateCalls += 1;
+      api.job = { ...job, updated_at: "2026-08-02T10:00:00.001Z" };
+      return { data: null, error: null };
+    },
+  });
+  const result = await terminalFinalizer.finalizeCanonicalJobReportSafely(
+    store,
+    terminalInput("succeeded")
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_code, "TERMINAL_REPORT_COMPARE_AND_SET_FAILED");
+  assert.equal(updateCalls, 1);
+  assert.equal(machine.normalizeJobState(store.job), "claimed");
+});
+
+test("Next.js and Tencent report paths share one authoritative terminal writer", () => {
+  const workerJobsSource = fs.readFileSync(path.join(root, "src", "lib", "worker-jobs.ts"), "utf8");
+  const workerApiSource = fs.readFileSync(path.join(root, "infra", "tencent-worker", "worker_api.js"), "utf8");
+  const finalizerSource = fs.readFileSync(
+    path.join(root, "infra", "tencent-worker", "worker_terminal_finalizer.js"),
+    "utf8"
+  );
+  assert.match(workerJobsSource, /finalizeSharedCanonicalJobReportSafely/);
+  assert.match(workerApiSource, /require\("\.\/worker_terminal_finalizer"\)/);
+  assert.equal((workerApiSource.match(/finalizeCanonicalJobReportSafely\(supabase/g) || []).length, 1);
+  assert.doesNotMatch(workerApiSource, /updateHermesJobReportWithSchemaFallback/);
+  assert.doesNotMatch(workerApiSource, /canonicalFinalizeJob/);
+  assert.match(finalizerSource, /\.eq\("id", input\.job_id\)/);
+  assert.match(finalizerSource, /\.eq\("status", expectedStatus\)/);
+  assert.match(finalizerSource, /\.eq\("claimed_by", input\.worker_id\)/);
+  assert.match(finalizerSource, /\.eq\("attempt_id", input\.attempt_id\)/);
+  assert.match(finalizerSource, /\.eq\("active_attempt_id", input\.attempt_id\)/);
+  assert.match(finalizerSource, /\.eq\("updated_at", expectedUpdatedAt\)/);
 });

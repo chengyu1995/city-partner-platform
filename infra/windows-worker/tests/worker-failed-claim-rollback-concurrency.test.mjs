@@ -9,6 +9,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
 const machine = require(path.join(root, "infra", "tencent-worker", "worker_job_state_machine.js"));
+const terminalFinalizer = require(path.join(root, "infra", "tencent-worker", "worker_terminal_finalizer.js"));
 const NOW = "2026-08-02T12:00:00.000Z";
 const CLAIMED_AT = "2026-08-02T11:00:00.000Z";
 const EXPIRES_AT = "2099-08-02T13:00:00.000Z";
@@ -49,6 +50,7 @@ const workerJobs = loadTypeScriptModule(path.join(root, "src", "lib", "worker-jo
   "next/server": nextServer,
   "@/lib/env": { getSupabaseService: async () => null },
   "../../infra/tencent-worker/worker_job_state_machine": machine,
+  "../../infra/tencent-worker/worker_terminal_finalizer": terminalFinalizer,
 });
 
 function queuedJob() {
