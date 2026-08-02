@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
+  buildCanonicalFinalizeTransition,
   buildTerminalJobCleanupFields,
   assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
@@ -516,6 +517,15 @@ export async function POST(req: NextRequest) {
     workerId,
     attemptId,
   });
+  const canonicalFinalization = terminal
+    ? buildCanonicalFinalizeTransition(existingJob, {
+        attempt_id: attemptId,
+        worker_execution_status: readString(projectDirectorReport.data.worker_execution_status),
+        task_goal_status: readString(projectDirectorReport.data.task_goal_status),
+        effective_final_status: readString(projectDirectorReport.data.effective_final_status),
+        now,
+      })
+    : null;
 
   let existingTerminalStatus = getCanonicalTerminalWorkerJobStatus(existingJob);
   if (isTerminalWorkerStatus(existingJob.status)) {
@@ -537,6 +547,21 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    if (canonicalFinalization && !canonicalFinalization.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "terminal_report_conflict",
+          failure_code: canonicalFinalization.failure_code,
+          failure_stage: "job_state_machine",
+          terminal_immutable: true,
+          status_unchanged: true,
+          duplicate_report_detected: true,
+        },
+        { status: 409 }
+      );
+    }
+
     const storedProjectDirectorReport =
       getStoredProjectDirectorReport(existingJob) ?? projectDirectorReport;
     const storedResult = readRecord(existingJob.result);
@@ -547,7 +572,8 @@ export async function POST(req: NextRequest) {
       const cleanupResult = await updateHermesJob(
         supabase,
         jobId,
-        buildTerminalJobCleanupFields(existingJob, existingTerminalStatus, now)
+        (canonicalFinalization?.patch as Record<string, unknown> | null) ??
+          buildTerminalJobCleanupFields(existingJob, existingTerminalStatus, now)
       );
       if (cleanupResult.error) {
         return NextResponse.json(
@@ -616,9 +642,28 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  if (terminal && canonicalFinalization && !canonicalFinalization.ok) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "job_finalization_rejected",
+        failure_code: canonicalFinalization.failure_code,
+        failure_stage: "job_state_machine",
+        violated_invariants: canonicalFinalization.violations ?? [],
+      },
+      { status: 409 }
+    );
+  }
+
+  const lifecyclePatch =
+    terminal && canonicalFinalization?.ok && canonicalFinalization.patch
+      ? (canonicalFinalization.patch as Record<string, unknown>)
+      : {};
+  const lifecycleResult = readRecord(lifecyclePatch.result);
+
   const { data, error, skippedColumns } = await updateHermesJob(supabase, jobId, {
-    ...(terminal ? buildTerminalJobCleanupFields(existingJob, storedStatus, now) : {}),
-    status: storedStatus,
+    ...lifecyclePatch,
+    status: terminal ? lifecyclePatch.status ?? storedStatus : storedStatus,
     claimed_by: terminal ? null : workerId,
     attempt_id: terminal ? null : attemptId,
     active_attempt_id: terminal ? null : attemptId,
@@ -630,12 +675,16 @@ export async function POST(req: NextRequest) {
     git_commit_sha: body.git_commit_sha ?? null,
     error_text: storedStatus === "failed" ? falsePositiveGuard?.errorText ?? errorText : null,
     result: {
+      ...(lifecycleResult ?? {}),
       ...buildResult({ ...body, attempt_id: attemptId ?? body.attempt_id }),
       canonical_worker_report: canonicalReport,
       report_schema_version: CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
       project_director_report: projectDirectorReport.data,
       project_director_report_text: projectDirectorReport.text,
       diagnostics: projectDirectorReport.data.diagnostics ?? null,
+      ...(lifecycleResult?.job_state_machine
+        ? { job_state_machine: lifecycleResult.job_state_machine }
+        : {}),
     },
     completed_at: terminal ? now : null,
     updated_at: now,

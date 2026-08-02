@@ -24,6 +24,10 @@ const terminalPolicySource = fs.readFileSync(
   path.join(root, "infra", "tencent-worker", "worker_terminal_policy.js"),
   "utf8"
 );
+const stateMachineSource = fs.readFileSync(
+  path.join(root, "infra", "tencent-worker", "worker_job_state_machine.js"),
+  "utf8"
+);
 const require = createRequire(import.meta.url);
 const terminalPolicy = require(path.join(root, "infra", "tencent-worker", "worker_terminal_policy.js"));
 
@@ -46,8 +50,8 @@ test("/next persists claim and attempt contract before returning a job", () => {
   assert.match(nextRoute, /attempt_id:\s*attemptId/);
   assert.match(nextRoute, /active_attempt_id:\s*attemptId/);
   assert.match(nextRoute, /expires_at:\s*expiresAt/);
-  assert.match(nextRoute, /request_text:\s*\[/);
-  assert.match(nextRoute, /HERMES_WORKER_ATTEMPT_CONTEXT:/);
+  assert.doesNotMatch(nextRoute, /request_text:\s*\[/);
+  assert.match(nextRoute, /isCanonicalClaimPersisted\(runnableClaimedJob, attemptId\)/);
   assert.match(nextRoute, /persistedAttemptId !== attemptId/);
   assert.match(nextRoute, /WORKER_ATTEMPT_PERSISTENCE_FAILED/);
   assert.match(nextRoute, /updateHermesJob\(supabase,\s*job\.id/);
@@ -107,10 +111,13 @@ test("canonical terminal predicate recognizes legacy semantic terminal records",
 
 test("production next filters terminal semantics before selecting and claiming", () => {
   const eligibility = productionWorkerApi.indexOf("for (const queuedJob of Array.isArray(data) ? data : [])");
-  const candidate = productionWorkerApi.indexOf("job = queuedJob", eligibility);
-  const claim = productionWorkerApi.indexOf("runtimeClaimHermesJob(job, workerName)", eligibility);
-  assert.ok(eligibility >= 0 && eligibility < candidate && candidate < claim);
+  const invariant = productionWorkerApi.indexOf("canonicalValidateJobStateInvariant(queuedJob)", eligibility);
+  const selectable = productionWorkerApi.indexOf("canonicalIsJobSelectable(queuedJob)", eligibility);
+  const claim = productionWorkerApi.indexOf("runtimeClaimHermesJob(persistedJob || job, workerName)", eligibility);
+  assert.ok(eligibility >= 0 && eligibility < invariant && invariant < selectable && selectable < claim);
   assert.match(productionWorkerApi, /runtimeGetTerminalJobDescriptor\(queuedJob\)/);
+  assert.match(productionWorkerApi, /canonicalValidateJobStateInvariant\(persistedJob \|\| job\)/);
+  assert.match(productionWorkerApi, /canonicalIsJobSelectable\(persistedJob \|\| job\)/);
   assert.match(productionWorkerApi, /runtimeFindHermesJob\(job\.id\)/);
   assert.match(productionWorkerApi, /post_claim_terminal_check_failed/);
 });
@@ -118,20 +125,25 @@ test("production next filters terminal semantics before selecting and claiming",
 test("production stale recovery cannot reactivate terminal jobs", () => {
   const recovery = functionBlock(productionWorkerApi, "recoverStaleJobs");
   assert.match(recovery, /runtimeExcludeTerminalJobsFromActiveQueue\("before_stale_recovery"\)/);
-  assert.match(recovery, /recover_stale_hermes_jobs/);
+  assert.match(recovery, /canonicalInspectJobState\(job, \{ now \}\)/);
+  assert.match(recovery, /canonicalRecoverStaleAttempt\(job/);
+  assert.match(recovery, /\.eq\("status", job\.status\)\.eq\("updated_at", job\.updated_at\)/);
+  assert.doesNotMatch(recovery, /recover_stale_hermes_jobs/);
   assert.match(recovery, /runtimeExcludeTerminalJobsFromActiveQueue\("after_stale_recovery"\)/);
   assert.match(productionWorkerApi, /terminal_jobs_excluded_from_active_queue/);
 });
 
 test("terminal cleanup is schema-aware and keeps terminal semantics persisted", () => {
   const productionCleanup = functionBlock(productionWorkerApi, "runtimeBuildTerminalCleanupFields");
-  assert.match(productionCleanup, /claimed_by:\s*null/);
-  assert.match(productionCleanup, /claimed_at:\s*null/);
-  assert.match(productionCleanup, /heartbeat_at:\s*null/);
-  assert.match(productionCleanup, /last_progress_at:\s*null/);
-  assert.match(productionCleanup, /terminal_state:\s*descriptor\.terminalState/);
+  const canonicalCleanup = functionBlock(stateMachineSource, "cleanupTerminalJob");
+  assert.match(productionCleanup, /canonicalCleanupTerminalJob/);
   assert.match(productionCleanup, /field in job/);
   assert.doesNotMatch(productionCleanup, /status:\s*["'](?:queued|pending|running)["']/);
+  assert.match(canonicalCleanup, /claimed_by:\s*null/);
+  assert.match(canonicalCleanup, /claimed_at:\s*null/);
+  assert.match(canonicalCleanup, /heartbeat_at:\s*null/);
+  assert.match(canonicalCleanup, /job_state:\s*state/);
+  assert.match(canonicalCleanup, /selectable:\s*false/);
 });
 
 test("terminal approval identity replay is suppressed before insert", () => {
@@ -143,14 +155,15 @@ test("terminal approval identity replay is suppressed before insert", () => {
 });
 
 test("repository and production runtime share one terminal status registry", () => {
-  assert.match(workerJobs, /infra\/tencent-worker\/worker_terminal_policy/);
-  assert.match(productionWorkerApi, /require\("\.\/worker_terminal_policy"\)/);
+  assert.match(workerJobs, /infra\/tencent-worker\/worker_job_state_machine/);
+  assert.match(productionWorkerApi, /require\("\.\/worker_job_state_machine"\)/);
+  assert.match(stateMachineSource, /require\("\.\/worker_terminal_policy"\)/);
   assert.doesNotMatch(workerJobs, /const TERMINAL_WORKER_STATUSES/);
   assert.doesNotMatch(productionWorkerApi, /const RUNTIME_TERMINAL_JOB_STATUSES/);
 });
 
 test("terminal cleanup clears attempts, lease, running index, and retry flags", () => {
-  const cleanup = functionBlock(workerJobs, "buildTerminalJobCleanupFields");
+  const cleanup = functionBlock(stateMachineSource, "cleanupTerminalJob");
   assert.match(cleanup, /claimed_by:\s*null/);
   assert.match(cleanup, /active_attempt_id:\s*null/);
   assert.match(cleanup, /expires_at:\s*null/);
@@ -159,7 +172,9 @@ test("terminal cleanup clears attempts, lease, running index, and retry flags", 
   assert.match(cleanup, /retry_requested:\s*false/);
   assert.match(cleanup, /retry_pending:\s*false/);
   assert.match(cleanup, /should_retry:\s*false/);
-  assert.match(reportRoute, /buildTerminalJobCleanupFields\(existingJob, storedStatus, now\)/);
+  assert.match(cleanup, /active_attempt:\s*null/);
+  assert.match(cleanup, /active_lease:\s*null/);
+  assert.match(reportRoute, /buildCanonicalFinalizeTransition\(existingJob/);
   assert.match(reportRoute, /terminalJobHasRuntimeState\(existingJob\)/);
   assert.match(reportRoute, /terminal_runtime_cleanup_applied:\s*terminalRuntimeCleanupApplied/);
 });
@@ -200,11 +215,13 @@ test("explicit no-Codex policy is checked before Codex execution", () => {
 });
 
 test("attempt identity can survive schemas without attempt_id columns or payload", () => {
-  assert.match(workerJobs, /function readAttemptContextFromRequestText/);
-  assert.match(workerJobs, /HERMES_WORKER_ATTEMPT_CONTEXT:/);
-  assert.match(workerJobs, /readString\(requestTextAttempt\?\.active_attempt_id\)/);
-  assert.match(workerJobs, /readString\(requestTextAttempt\?\.attempt_id\)/);
-  assert.match(workerJobs, /function buildAttemptRequestText/);
+  const activeAttempt = functionBlock(stateMachineSource, "getActiveAttempt");
+  assert.match(workerJobs, /getCanonicalActiveAttempt\(job\)/);
+  assert.match(activeAttempt, /machine\.active_attempt/);
+  assert.match(activeAttempt, /source:\s*"canonical_state_machine"/);
+  assert.match(activeAttempt, /parseAttemptContext\(job\.request_text\)/);
+  assert.match(stateMachineSource, /HERMES_WORKER_ATTEMPT_CONTEXT:/);
+  assert.doesNotMatch(nextRoute, /HERMES_WORKER_ATTEMPT_CONTEXT:/);
 });
 
 test("heartbeat and progress reject wrong attempts with explicit failure code", () => {

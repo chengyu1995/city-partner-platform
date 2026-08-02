@@ -3,17 +3,22 @@ import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
   buildAttemptPayload,
+  buildCanonicalClaimTransition,
   buildTerminalJobCleanupFields,
   claimHermesJob,
   createWorkerAttemptId,
   findHermesJob,
+  getActiveAttemptId,
   getBitableRecordId,
   getCanonicalTerminalWorkerJobStatus,
   getProjectDirectorJobCorrelation,
   getWorkerIdFromRequest,
   getWorkerSupabase,
+  isJobSelectable,
+  isCanonicalClaimPersisted,
   responseFromMaybe,
   updateHermesJob,
+  validateJobStateInvariant,
 } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
@@ -53,10 +58,20 @@ async function handleNext(req: NextRequest) {
   let job: (Record<string, unknown> & { id: string }) | null = null;
   for (const queuedJob of (queuedJobs ?? []) as Record<string, unknown>[]) {
     const terminalStatus = getCanonicalTerminalWorkerJobStatus(queuedJob);
-    if (!terminalStatus) {
+    const invariant = validateJobStateInvariant(queuedJob);
+    if (!invariant.ok) {
+      console.warn("[worker/next] canonical job invariant violation", {
+        job_id: queuedJob.id,
+        failure_code: invariant.failure_code,
+        violated_invariants: invariant.violations.map((item: { code: string }) => item.code),
+      });
+      continue;
+    }
+    if (!terminalStatus && isJobSelectable(queuedJob)) {
       job = queuedJob as Record<string, unknown> & { id: string };
       break;
     }
+    if (!terminalStatus) continue;
     const cleanupResult = await releaseTerminalJob(supabase, queuedJob, terminalStatus);
     if (cleanupResult.error) {
       return NextResponse.json(
@@ -115,15 +130,51 @@ async function handleNext(req: NextRequest) {
     });
   }
 
+  const preClaimInvariant = validateJobStateInvariant(preClaimJob ?? job);
+  if (!preClaimInvariant.ok || !isJobSelectable(preClaimJob ?? job)) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "job_state_invariant_violation",
+        failure_code: preClaimInvariant.failure_code ?? "JOB_NOT_SELECTABLE",
+        failure_stage: "worker_claim",
+        violated_invariants: preClaimInvariant.violations.map((item: { code: string }) => item.code),
+        worker_next_returned: false,
+      },
+      { status: 409 }
+    );
+  }
+
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
   const workerId = getWorkerIdFromRequest(req);
   const attemptId = createWorkerAttemptId(jobId, workerId);
+  const canonicalClaim = buildCanonicalClaimTransition(preClaimJob ?? job, {
+    worker_id: workerId,
+    attempt_id: attemptId,
+    lease_id: `lease:${attemptId}`,
+    now,
+    expires_at: expiresAt,
+  });
+  if (!canonicalClaim.ok || !canonicalClaim.patch) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "job_state_invariant_violation",
+        failure_code: canonicalClaim.failure_code ?? "JOB_NOT_SELECTABLE",
+        failure_stage: "worker_claim",
+        violated_invariants: canonicalClaim.violations ?? [],
+        worker_next_returned: false,
+      },
+      { status: 409 }
+    );
+  }
   const { data: claimedJob, error: updateError, skippedColumns } = await claimHermesJob(
     supabase,
     jobId,
     workerId,
     {
+      ...canonicalClaim.patch,
       status: "running",
       claimed_by: workerId,
       claimed_at: now,
@@ -141,20 +192,9 @@ async function handleNext(req: NextRequest) {
         started_at: now,
         updated_at: now,
       }),
-      request_text: [
-        String(job.request_text ?? "")
-          .replace(/\n*HERMES_WORKER_ATTEMPT_CONTEXT:\n(?:`[^`\r\n]+=[^`\r\n]*`\n?)+/g, "")
-          .trim(),
-        [
-          "HERMES_WORKER_ATTEMPT_CONTEXT:",
-          `\`attempt_id=${attemptId}\``,
-          `\`active_attempt_id=${attemptId}\``,
-          `\`worker_id=${workerId}\``,
-          `\`claimed_at=${now}\``,
-        ].join("\n"),
-      ].filter(Boolean).join("\n\n").trim(),
       updated_at: now,
-    }
+    },
+    { updated_at: String((preClaimJob ?? job).updated_at ?? "") || null }
   );
 
   if (updateError) {
@@ -219,35 +259,22 @@ async function handleNext(req: NextRequest) {
 
   const runnableClaimedJob = persistedClaimedJob ?? claimedJob;
 
-  const claimedPayload =
-    runnableClaimedJob.payload &&
-    typeof runnableClaimedJob.payload === "object" &&
-    !Array.isArray(runnableClaimedJob.payload)
-      ? (runnableClaimedJob.payload as Record<string, unknown>)
-      : null;
-  const activeAttempt =
-    claimedPayload?.active_attempt && typeof claimedPayload.active_attempt === "object"
-      ? (claimedPayload.active_attempt as Record<string, unknown>)
-      : null;
-  const persistedAttemptId =
-    runnableClaimedJob.active_attempt_id ??
-    runnableClaimedJob.attempt_id ??
-    activeAttempt?.attempt_id ??
-    claimedPayload?.attempt_id;
-  if (persistedAttemptId !== attemptId) {
+  const persistedAttemptId = getActiveAttemptId(runnableClaimedJob);
+  if (persistedAttemptId !== attemptId || !isCanonicalClaimPersisted(runnableClaimedJob, attemptId)) {
     await updateHermesJob(supabase, job.id, {
       status: job.status ?? "queued",
       claimed_by: null,
       claimed_at: null,
       attempt_id: null,
       active_attempt_id: null,
+      lease_id: null,
+      active_lease_id: null,
       expires_at: null,
       progress_percent: 0,
       current_step: null,
       status_message: null,
-      request_text: String(runnableClaimedJob.request_text ?? job.request_text ?? "")
-        .replace(/\n*HERMES_WORKER_ATTEMPT_CONTEXT:\n(?:`[^`\r\n]+=[^`\r\n]*`\n?)+/g, "")
-        .trim(),
+      payload: job.payload ?? null,
+      result: job.result ?? null,
       updated_at: new Date().toISOString(),
     });
     return NextResponse.json(

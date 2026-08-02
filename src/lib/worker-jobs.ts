@@ -3,10 +3,17 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { getSupabaseService } from "@/lib/env";
 import { createHash } from "node:crypto";
 import {
-  getTerminalWorkerJobDescriptor,
-  isTerminalWorkerJob,
-  normalizeTerminalWorkerStatus,
-} from "../../infra/tencent-worker/worker_terminal_policy";
+  claimJob as buildCanonicalClaim,
+  cleanupTerminalJob as buildCanonicalTerminalCleanup,
+  finalizeJob as buildCanonicalFinalization,
+  getActiveAttempt as getCanonicalActiveAttempt,
+  inspectJobState as inspectCanonicalJobState,
+  isCanonicalClaimPersisted as canonicalClaimIsPersisted,
+  isJobSelectable as isCanonicalJobSelectable,
+  normalizeJobState as normalizeCanonicalJobState,
+  recoverStaleAttempt as buildCanonicalStaleRecovery,
+  validateJobStateInvariant as validateCanonicalJobStateInvariant,
+} from "../../infra/tencent-worker/worker_job_state_machine";
 
 type JobRecord = Record<string, unknown>;
 
@@ -1244,19 +1251,8 @@ export function getClaimedBy(job: JobRecord | null | undefined): string | null {
 }
 
 export function getActiveAttemptId(job: JobRecord | null | undefined): string | null {
-  if (!job) return null;
-  const payload = readRecord(job.payload);
-  const activeAttempt = readRecord(payload?.active_attempt);
-  const requestTextAttempt = readAttemptContextFromRequestText(job.request_text);
-
-  return (
-    readString(job.active_attempt_id) ??
-    readString(job.attempt_id) ??
-    readString(activeAttempt?.attempt_id) ??
-    readString(payload?.attempt_id) ??
-    readString(requestTextAttempt?.active_attempt_id) ??
-    readString(requestTextAttempt?.attempt_id)
-  );
+  const attempt = getCanonicalActiveAttempt(job);
+  return readString(attempt?.id ?? attempt?.attempt_id);
 }
 
 export function getStoredTerminalAttemptId(job: JobRecord | null | undefined): string | null {
@@ -1271,7 +1267,7 @@ function stripAttemptContextFromRequestText(value: unknown): string {
     .trim();
 }
 
-function buildAttemptRequestText(job: JobRecord | null | undefined, attempt: Record<string, unknown>): string {
+export function buildAttemptRequestText(job: JobRecord | null | undefined, attempt: Record<string, unknown>): string {
   const original = stripAttemptContextFromRequestText(job?.request_text);
   const attemptId = readString(attempt.attempt_id) ?? "";
   const workerId = readString(attempt.worker_id) ?? "";
@@ -1286,7 +1282,7 @@ function buildAttemptRequestText(job: JobRecord | null | undefined, attempt: Rec
   return [original, context].filter(Boolean).join("\n\n").trim();
 }
 
-function readAttemptContextFromRequestText(value: unknown): Record<string, string> | null {
+export function readAttemptContextFromRequestText(value: unknown): Record<string, string> | null {
   const text = String(value ?? "");
   const marker = text.lastIndexOf("HERMES_WORKER_ATTEMPT_CONTEXT:");
   if (marker < 0) return null;
@@ -3716,23 +3712,94 @@ export function buildAttemptPayload(
 }
 
 export function isTerminalWorkerStatus(value: unknown): boolean {
-  return normalizeTerminalWorkerStatus(value) !== null;
+  return ["terminal_success", "terminal_failed", "terminal_cancelled"].includes(
+    normalizeCanonicalJobState(value)
+  );
 }
 
 export function getDisabledTerminalJobStatus(
   job: JobRecord | null | undefined
 ): string | null {
-  return getTerminalWorkerJobDescriptor(job)?.terminalState ?? null;
+  return getCanonicalTerminalWorkerJobStatus(job);
 }
 
 export function getCanonicalTerminalWorkerJobStatus(
   job: JobRecord | null | undefined
 ): string | null {
-  return getTerminalWorkerJobDescriptor(job)?.terminalState ?? null;
+  const state = normalizeCanonicalJobState(job);
+  if (state === "terminal_success") return "succeeded";
+  if (state === "terminal_failed") return "failed";
+  if (state === "terminal_cancelled") return "cancelled";
+  return null;
 }
 
 export function isCanonicalTerminalWorkerJob(job: JobRecord | null | undefined): boolean {
-  return isTerminalWorkerJob(job);
+  return inspectCanonicalJobState(job).terminal === true;
+}
+
+interface CanonicalInvariantResult {
+  ok: boolean;
+  failure_code: string | null;
+  violations: Array<{ code: string; detail?: string }>;
+  snapshot: Record<string, unknown>;
+}
+
+interface CanonicalTransitionResult {
+  ok: boolean;
+  failure_code?: string | null;
+  failure_stage?: string;
+  violations?: Array<{ code: string; detail?: string }>;
+  patch?: JobRecord | null;
+  attempt?: JobRecord;
+  lease?: JobRecord;
+  compare_and_set?: JobRecord;
+  idempotent?: boolean;
+  terminal_immutable?: boolean;
+  conflict?: boolean;
+  existing_state?: string;
+  incoming_state?: string;
+}
+
+export function validateJobStateInvariant(
+  job: JobRecord | null | undefined,
+  now?: string
+): CanonicalInvariantResult {
+  return validateCanonicalJobStateInvariant(job, now ? { now } : {}) as CanonicalInvariantResult;
+}
+
+export function isJobSelectable(job: JobRecord | null | undefined, now?: string): boolean {
+  return isCanonicalJobSelectable(job, now ? { now } : {});
+}
+
+export function isCanonicalClaimPersisted(job: JobRecord, attemptId: string): boolean {
+  return canonicalClaimIsPersisted(job, attemptId);
+}
+
+export function buildCanonicalClaimTransition(
+  job: JobRecord,
+  input: { worker_id: string; attempt_id: string; lease_id?: string; now: string; expires_at: string }
+) {
+  return buildCanonicalClaim(job, input) as CanonicalTransitionResult;
+}
+
+export function buildCanonicalFinalizeTransition(
+  job: JobRecord,
+  input: {
+    attempt_id?: string | null;
+    worker_execution_status?: string | null;
+    task_goal_status?: string | null;
+    effective_final_status?: string | null;
+    now?: string;
+  }
+) {
+  return buildCanonicalFinalization(job, input) as CanonicalTransitionResult;
+}
+
+export function buildCanonicalStaleAttemptRecovery(
+  job: JobRecord,
+  input: { now?: string; worker_available?: boolean; retry_allowed?: boolean; reason?: string }
+) {
+  return buildCanonicalStaleRecovery(job, input) as CanonicalTransitionResult;
 }
 
 export function buildTerminalJobCleanupFields(
@@ -3740,45 +3807,8 @@ export function buildTerminalJobCleanupFields(
   status: string,
   now = new Date().toISOString()
 ): JobRecord {
-  const payload = readRecord(job?.payload) ?? {};
-  const result = readRecord(job?.result) ?? {};
-  const descriptor = getTerminalWorkerJobDescriptor({ ...(job ?? {}), status });
-  const terminalState = descriptor?.terminalState ?? String(status || "failed").trim().toLowerCase();
-  const storageStatus = descriptor?.storageStatus ?? "failed";
-
-  const cleanupFields: JobRecord = {
-    status: storageStatus,
-    claimed_by: null,
-    claimed_at: null,
-    attempt_id: null,
-    active_attempt_id: null,
-    expires_at: null,
-    heartbeat_at: null,
-    retry_requested: false,
-    retry_pending: false,
-    should_retry: false,
-    payload: {
-      ...payload,
-      attempt_id: null,
-      active_attempt: null,
-      running_job_id: null,
-      retry_requested: false,
-      retry_pending: false,
-      should_retry: false,
-      terminal_state: terminalState,
-    },
-    result: {
-      ...result,
-      terminal_state: terminalState,
-      retry_requested: false,
-      retry_pending: false,
-      should_retry: false,
-    },
-    request_text: stripAttemptContextFromRequestText(job?.request_text),
-    completed_at: readString(job?.completed_at) ?? now,
-    finished_at: readString(job?.finished_at) ?? now,
-    updated_at: now,
-  };
+  const cleanup = buildCanonicalTerminalCleanup({ ...(job ?? {}), status }, now);
+  const cleanupFields = (cleanup.patch ?? { status }) as JobRecord;
   if (!job) return cleanupFields;
   return Object.fromEntries(
     Object.entries(cleanupFields).filter(
@@ -3789,14 +3819,12 @@ export function buildTerminalJobCleanupFields(
 
 export function terminalJobHasRuntimeState(job: JobRecord | null | undefined): boolean {
   if (!job) return false;
+  const snapshot = inspectCanonicalJobState(job);
   const payload = readRecord(job.payload);
   return Boolean(
-    readString(job.claimed_by) ||
-      readString(job.attempt_id) ||
-      readString(job.active_attempt_id) ||
-      readString(job.expires_at) ||
-      readString(job.heartbeat_at) ||
-      readRecord(payload?.active_attempt) ||
+    snapshot.claimed_by ||
+      snapshot.active_attempt ||
+      snapshot.active_lease ||
       readString(payload?.running_job_id) ||
       readBooleanFlag(job.retry_requested) ||
       readBooleanFlag(job.retry_pending) ||
@@ -4199,7 +4227,8 @@ export async function claimHermesJob(
   supabase: SupabaseClient,
   jobId: string,
   workerId: string,
-  fields: JobRecord
+  fields: JobRecord,
+  expected: { updated_at?: string | null } = {}
 ): Promise<{ data: JobRecord | null; error: SupabaseWriteError | null; skippedColumns: string[] }> {
   const claimedFields = { ...fields };
   const skippedColumns: string[] = [];
@@ -4210,6 +4239,8 @@ export async function claimHermesJob(
       .update(claimedFields)
       .eq("id", jobId)
       .in("status", ["queued", "pending"]);
+
+    if (expected.updated_at) query = query.eq("updated_at", expected.updated_at);
 
     query = isSafePostgrestFilterValue(workerId)
       ? query.or(`claimed_by.is.null,claimed_by.eq.${workerId}`)

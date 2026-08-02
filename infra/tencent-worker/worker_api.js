@@ -6,9 +6,19 @@ const { createClient } = require("@supabase/supabase-js");
 const { sendFeishuReply } = require("./feishu_reply");
 const {
   MANUALLY_CLOSED_WORKER_JOBS,
-  getTerminalWorkerJobDescriptor,
   isManuallyClosedWorkerJobIdentity,
 } = require("./worker_terminal_policy");
+const {
+  claimJob: canonicalClaimJob,
+  cleanupTerminalJob: canonicalCleanupTerminalJob,
+  finalizeJob: canonicalFinalizeJob,
+  getActiveAttempt: canonicalGetActiveAttempt,
+  inspectJobState: canonicalInspectJobState,
+  isCanonicalClaimPersisted,
+  isJobSelectable: canonicalIsJobSelectable,
+  recoverStaleAttempt: canonicalRecoverStaleAttempt,
+  validateJobStateInvariant: canonicalValidateJobStateInvariant,
+} = require("./worker_job_state_machine");
 
 if (typeof globalThis.WebSocket === "undefined") {
   globalThis.WebSocket = class DisabledRealtimeWebSocket {
@@ -2549,24 +2559,6 @@ function runtimeBuildAttemptPayloadForJob(job, attempt) {
   };
 }
 
-function runtimeStripAttemptContextFromRequestText(text) {
-  return String(text || "")
-    .replace(/\n*HERMES_WORKER_ATTEMPT_CONTEXT:\n(?:`[^`\r\n]+=[^`\r\n]*`\n?)+/g, "")
-    .trim();
-}
-
-function runtimeBuildAttemptRequestText(job, attempt) {
-  const original = runtimeStripAttemptContextFromRequestText(job && job.request_text);
-  const context = [
-    "HERMES_WORKER_ATTEMPT_CONTEXT:",
-    "`attempt_id=" + attempt.attempt_id + "`",
-    "`active_attempt_id=" + attempt.attempt_id + "`",
-    "`worker_id=" + attempt.worker_id + "`",
-    "`claimed_at=" + attempt.started_at + "`",
-  ].join("\n");
-  return [original, context].filter(Boolean).join("\n\n").trim();
-}
-
 function runtimeReadAttemptContextFromRequestText(job) {
   const text = String(job && job.request_text || "");
   const marker = text.lastIndexOf("HERMES_WORKER_ATTEMPT_CONTEXT:");
@@ -2596,18 +2588,21 @@ async function runtimeUpdateHermesJobWithSchemaFallback(jobId, updateData, build
   return { data: null, error: new Error("worker_lifecycle_schema_fallback_exhausted"), skipped };
 }
 
-async function runtimeRollbackFailedClaim(originalJob, claimedJob, workerName) {
+async function runtimeRollbackFailedClaim(originalJob, workerName) {
   const rollbackData = {
     status: originalJob && originalJob.status || "queued",
     claimed_by: null,
     claimed_at: null,
     attempt_id: null,
     active_attempt_id: null,
-    expires_at: null,
+    lease_id: originalJob && originalJob.lease_id || null,
+    active_lease_id: originalJob && originalJob.active_lease_id || null,
+    expires_at: originalJob && originalJob.expires_at || null,
     progress_percent: 0,
     current_step: null,
     status_message: null,
-    request_text: runtimeStripAttemptContextFromRequestText(claimedJob && claimedJob.request_text || originalJob && originalJob.request_text),
+    payload: originalJob && originalJob.payload || null,
+    result: originalJob && originalJob.result || null,
     updated_at: new Date().toISOString(),
   };
   return runtimeUpdateHermesJobWithSchemaFallback(originalJob.id, rollbackData, (query) =>
@@ -2619,15 +2614,33 @@ async function runtimeClaimHermesJob(job, workerName) {
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
   const attemptId = runtimeCreateWorkerAttemptId(job.id, workerName);
-  const attempt = {
-    attempt_id: attemptId,
-    job_id: job.id,
+  const canonicalClaim = canonicalClaimJob(job, {
     worker_id: workerName,
-    status: "running",
-    started_at: now,
-    updated_at: now,
+    attempt_id: attemptId,
+    lease_id: "lease:" + attemptId,
+    now,
+    expires_at: expiresAt,
+  });
+  if (!canonicalClaim.ok || !canonicalClaim.patch) {
+    const error = new Error("canonical job state rejected claim");
+    error.failure_code = canonicalClaim.failure_code || "JOB_NOT_SELECTABLE";
+    error.violations = canonicalClaim.violations || [];
+    return {
+      data: null,
+      error,
+      attempt_id: attemptId,
+      failure_code: error.failure_code,
+      violations: error.violations,
+    };
+  }
+  const attempt = {
+    ...canonicalClaim.attempt,
+    attempt_id: attemptId,
+    status: canonicalClaim.attempt.state,
+    started_at: canonicalClaim.attempt.started_at || now,
   };
   const updateData = {
+    ...canonicalClaim.patch,
     status: "running",
     claimed_by: workerName,
     claimed_at: now,
@@ -2638,16 +2651,17 @@ async function runtimeClaimHermesJob(job, workerName) {
     current_step: "waiting_worker_claim",
     status_message: "Worker claimed job",
     payload: runtimeBuildAttemptPayloadForJob(job, attempt),
-    request_text: runtimeBuildAttemptRequestText(job, attempt),
     updated_at: now,
   };
-  const result = await runtimeUpdateHermesJobWithSchemaFallback(job.id, updateData, (query) =>
-    query.in("status", ["pending", "queued"]).or("claimed_by.is.null,claimed_by.eq." + workerName)
-  );
+  const result = await runtimeUpdateHermesJobWithSchemaFallback(job.id, updateData, (query) => {
+    let guarded = query.in("status", ["pending", "queued"]);
+    if (job.updated_at) guarded = guarded.eq("updated_at", job.updated_at);
+    return guarded.or("claimed_by.is.null,claimed_by.eq." + workerName);
+  });
   if (!result.data) return { ...result, attempt_id: attemptId };
   const claimedAttemptId = getRuntimeActiveAttemptId(result.data);
-  if (claimedAttemptId !== attemptId) {
-    const rollback = await runtimeRollbackFailedClaim(job, result.data, workerName);
+  if (claimedAttemptId !== attemptId || !isCanonicalClaimPersisted(result.data, attemptId)) {
+    const rollback = await runtimeRollbackFailedClaim(job, workerName);
     return {
       data: null,
       error: new Error("claim attempt contract was not persisted"),
@@ -2711,46 +2725,42 @@ async function runtimeFindHermesJob(jobId) {
 }
 
 function runtimeGetTerminalJobDescriptor(job) {
-  const descriptor = getTerminalWorkerJobDescriptor(job);
-  return descriptor ? { ...descriptor, status: descriptor.storageStatus } : null;
+  const inspection = canonicalInspectJobState(job);
+  if (!inspection.terminal) return null;
+  const terminalState = inspection.state;
+  return {
+    terminalState,
+    storageStatus:
+      terminalState === "terminal_success"
+        ? "succeeded"
+        : terminalState === "terminal_cancelled"
+          ? "cancelled"
+          : "failed",
+    status:
+      terminalState === "terminal_success"
+        ? "succeeded"
+        : terminalState === "terminal_cancelled"
+          ? "cancelled"
+          : "failed",
+    closureCode: null,
+    source: "canonical_job_state_machine",
+  };
 }
 
 function runtimeBuildTerminalCleanupFields(job, descriptor, now = new Date().toISOString()) {
-  const result = parseWorkerReportObject(job && job.result) || {};
-  const fields = {
-    status: descriptor.status,
-    claimed_by: null,
-    claimed_at: null,
-    heartbeat_at: null,
-    last_progress_at: null,
-    result: {
-      ...result,
-      terminal_state: descriptor.terminalState,
-      manual_closure_code: descriptor.closureCode || null,
-      next_stage_allowed: false,
-      retry_requested: false,
-      retry_pending: false,
-      should_retry: false,
-    },
-    ...(descriptor.closureCode
-      ? {
-          error_text: descriptor.closureCode,
-        }
-      : {}),
-    request_text: runtimeStripAttemptContextFromRequestText(job && job.request_text),
-    finished_at: job && job.finished_at || now,
-    updated_at: now,
-  };
+  const cleanup = canonicalCleanupTerminalJob({ ...job, status: descriptor.status }, now);
+  const fields = cleanup && cleanup.patch ? cleanup.patch : { status: descriptor.status };
+  if (descriptor.closureCode) fields.error_text = descriptor.closureCode;
   return Object.fromEntries(
     Object.entries(fields).filter(([field]) => field === "status" || field === "result" || field in job)
   );
 }
 
 function runtimeTerminalJobHasRuntimeState(job) {
+  const snapshot = canonicalInspectJobState(job);
   const payload = parseWorkerReportObject(job && job.payload) || {};
   return Boolean(
-    job && (job.claimed_by || job.attempt_id || job.active_attempt_id || job.expires_at || job.heartbeat_at) ||
-      payload.active_attempt ||
+    snapshot.claimed_by || snapshot.active_attempt || snapshot.active_lease ||
       payload.running_job_id ||
       payload.retry_requested === true ||
       payload.retry_pending === true ||
@@ -2848,10 +2858,20 @@ app.get("/api/worker/next", authenticateWorker, async (req, res) => {
   let job = null;
   for (const queuedJob of Array.isArray(data) ? data : []) {
     const terminalDescriptor = runtimeGetTerminalJobDescriptor(queuedJob);
-    if (!terminalDescriptor) {
+    const invariant = canonicalValidateJobStateInvariant(queuedJob);
+    if (!invariant.ok) {
+      console.warn("[worker-api] canonical job invariant violation", {
+        job_id: queuedJob.id,
+        failure_code: invariant.failure_code,
+        violated_invariants: invariant.violations.map((item) => item.code),
+      });
+      continue;
+    }
+    if (!terminalDescriptor && canonicalIsJobSelectable(queuedJob)) {
       job = queuedJob;
       break;
     }
+    if (!terminalDescriptor) continue;
     const cleanup = await runtimePersistTerminalCleanup(queuedJob, terminalDescriptor);
     if (cleanup.error) {
       return res.status(500).json({
@@ -2893,7 +2913,19 @@ app.get("/api/worker/next", authenticateWorker, async (req, res) => {
     return res.status(204).send();
   }
 
-  const claimResult = await runtimeClaimHermesJob(job, workerName);
+  const preClaimInvariant = canonicalValidateJobStateInvariant(persistedJob || job);
+  if (!preClaimInvariant.ok || !canonicalIsJobSelectable(persistedJob || job)) {
+    return res.status(409).json({
+      ok: false,
+      error: "job_state_invariant_violation",
+      failure_code: preClaimInvariant.failure_code || "JOB_NOT_SELECTABLE",
+      failure_stage: "worker_claim",
+      violated_invariants: preClaimInvariant.violations.map((item) => item.code),
+      worker_next_returned: false,
+    });
+  }
+
+  const claimResult = await runtimeClaimHermesJob(persistedJob || job, workerName);
   if (claimResult.error) {
     console.error("Claim job failed:", claimResult.error);
     return res.status(500).json({
@@ -2902,6 +2934,7 @@ app.get("/api/worker/next", authenticateWorker, async (req, res) => {
       failure_code: claimResult.failure_code || "WORKER_CLAIM_FAILED",
       failure_stage: "worker_claim",
       message: claimResult.error.message,
+      violated_invariants: claimResult.violations || [],
     });
   }
   if (!claimResult.data) {
@@ -4274,15 +4307,8 @@ function getStoredRuntimeDiagnostics(job) {
 }
 
 function getRuntimeActiveAttemptId(job) {
-  const payload = parseWorkerReportObject(job && (job.payload || job.metadata || job.task_payload));
-  const activeAttempt = parseWorkerReportObject(payload && payload.active_attempt);
-  const requestTextAttempt = runtimeReadAttemptContextFromRequestText(job);
-  return readFinalReportString(job && job.active_attempt_id)
-    || readFinalReportString(job && job.attempt_id)
-    || readFinalReportString(activeAttempt && activeAttempt.attempt_id)
-    || readFinalReportString(payload && payload.attempt_id)
-    || readFinalReportString(requestTextAttempt && (requestTextAttempt.active_attempt_id || requestTextAttempt.attempt_id))
-    || null;
+  const attempt = canonicalGetActiveAttempt(job);
+  return readFinalReportString(attempt && (attempt.id || attempt.attempt_id)) || null;
 }
 
 function getRuntimeStoredTerminalAttemptId(job) {
@@ -4440,6 +4466,16 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
     });
   }
 
+  const prioritizedFinalStatus = getPrioritizedRuntimeFinalStatus(finalStatus, req.body || {});
+  const terminalDecision = buildGmStabilizeTerminalDecision(prioritizedFinalStatus, existingJob, req.body || {});
+  const canonicalFinalization = canonicalFinalizeJob(existingJob, {
+    attempt_id: incomingAttemptId,
+    worker_execution_status: readRuntimeReportField(req.body || {}, "worker_execution_status") || finalStatus,
+    task_goal_status: readRuntimeReportField(req.body || {}, "task_goal_status") || terminalDecision.status,
+    effective_final_status: terminalDecision.status,
+    now: new Date().toISOString(),
+  });
+
   const terminalDescriptor = runtimeGetTerminalJobDescriptor(existingJob);
   const existingStatusIsTerminal = Boolean(terminalDescriptor);
   const terminalAttemptMatches = runtimeTerminalAttemptMatches(existingJob, incomingAttemptId);
@@ -4467,6 +4503,20 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
       has_stored_attempt: Boolean(getRuntimeStoredTerminalAttemptId(existingJob)),
     });
     return res.status(409).json(runtimeBuildStaleAttemptResponse(terminalJob, incomingAttemptId, true));
+  }
+
+  if (existingStatusIsTerminal && !canonicalFinalization.ok) {
+    return res.status(409).json({
+      ok: false,
+      error: "terminal_report_conflict",
+      failure_code: canonicalFinalization.failure_code,
+      failure_stage: "job_state_machine",
+      terminal_immutable: true,
+      status_unchanged: true,
+      duplicate_report_detected: true,
+      existing_state: canonicalFinalization.existing_state || null,
+      incoming_state: canonicalFinalization.incoming_state || null,
+    });
   }
 
   if (existingStatusIsTerminal) {
@@ -4519,9 +4569,6 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
     });
   }
 
-  const prioritizedFinalStatus = getPrioritizedRuntimeFinalStatus(finalStatus, req.body || {});
-  const terminalDecision = buildGmStabilizeTerminalDecision(prioritizedFinalStatus, existingJob, req.body || {});
-
   const effectiveFinalStatus = terminalDecision.status;
   const effectiveErrorText = terminalDecision.errorText;
   const effectiveErrorCode = terminalDecision.code || null;
@@ -4537,12 +4584,19 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
 
   const structuredTerminalFields = buildRuntimeStructuredTerminalFields(existingJob, req.body || {}, effectiveFinalStatus, effectiveErrorCode);
   const terminalNow = new Date().toISOString();
+  if (!canonicalFinalization.ok || !canonicalFinalization.patch) {
+    return res.status(409).json({
+      ok: false,
+      error: "job_finalization_rejected",
+      failure_code: canonicalFinalization.failure_code || "JOB_STATE_INVARIANT_VIOLATION",
+      failure_stage: "job_state_machine",
+      violated_invariants: canonicalFinalization.violations || [],
+    });
+  }
+  const lifecycleResult = parseWorkerReportObject(canonicalFinalization.patch.result);
   const updateData = {
-    ...runtimeBuildTerminalCleanupFields(existingJob, {
-      status: effectiveFinalStatus,
-      terminalState: effectiveFinalStatus,
-    }, terminalNow),
-    status: effectiveFinalStatus,
+    ...canonicalFinalization.patch,
+    status: canonicalFinalization.patch.status || effectiveFinalStatus,
     finished_at: terminalNow,
     completed_at: terminalNow,
     updated_at: terminalNow,
@@ -4562,6 +4616,7 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
   const runtimeDiagnostics = buildRuntimeFailureDiagnostics(existingJob, req.body || {}, updateData);
   const canonicalWorkerReport = buildRuntimeCanonicalWorkerReportSchema(existingJob, req.body || {}, updateData, reportWorkerName, incomingAttemptId);
   updateData.result = {
+    ...(lifecycleResult || {}),
     ...(parseWorkerReportObject(result) || {}),
     attempt_id: incomingAttemptId || getRuntimeActiveAttemptId(existingJob) || null,
     diagnostics: runtimeDiagnostics,
@@ -4587,6 +4642,9 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
     final_report_source: updateData.final_report_source || null,
     post_completion_source: updateData.post_completion_source || null,
     post_completion_state_applied: updateData.post_completion_state_applied === true,
+    ...(lifecycleResult && lifecycleResult.job_state_machine
+      ? { job_state_machine: lifecycleResult.job_state_machine }
+      : {}),
     next_stage_allowed: updateData.next_stage_allowed === true,
   };
   if (effectiveFinalStatus === "succeeded") {
@@ -4849,32 +4907,42 @@ app.use((err, req, res, next) => {
 async function recoverStaleJobs() {
   try {
     await runtimeExcludeTerminalJobsFromActiveQueue("before_stale_recovery");
-    const { data, error } = await supabase.rpc(
-      "recover_stale_hermes_jobs",
-      {
-        p_timeout_minutes: 40,
-      }
-    );
-
-    if (error) {
-      console.error("恢复超时任务失败:", error);
-      return;
-    }
-
-    const result = Array.isArray(data) ? data[0] : data;
-    await runtimeExcludeTerminalJobsFromActiveQueue("after_stale_recovery");
-
-    if (
-      result &&
-      (Number(result.requeued_count) > 0 ||
-       Number(result.failed_count) > 0)
-    ) {
-      console.log(
-        `超时任务恢复：重新排队 ${result.requeued_count}，失败 ${result.failed_count}`
+    const now = new Date().toISOString();
+    const staleBefore = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from("hermes_jobs")
+      .select("*")
+      .eq("status", "running")
+      .lt("updated_at", staleBefore)
+      .limit(100);
+    if (error) throw error;
+    let requeuedCount = 0;
+    let failedCount = 0;
+    for (const job of data || []) {
+      const inspection = canonicalInspectJobState(job, { now });
+      if (inspection.terminal || !inspection.active_attempt || inspection.active_lease) continue;
+      const recovery = canonicalRecoverStaleAttempt(job, {
+        now,
+        worker_available: false,
+        retry_allowed: inspection.retry_allowed,
+        reason: "worker_lease_expired",
+      });
+      if (!recovery.ok || !recovery.patch) continue;
+      const recovered = await runtimeUpdateHermesJobWithSchemaFallback(
+        job.id,
+        recovery.patch,
+        (query) => query.eq("status", job.status).eq("updated_at", job.updated_at)
       );
+      if (recovered.error || !recovered.data) continue;
+      if (recovered.data.status === "queued") requeuedCount += 1;
+      else if (recovered.data.status === "failed") failedCount += 1;
+    }
+    await runtimeExcludeTerminalJobsFromActiveQueue("after_stale_recovery");
+    if (requeuedCount > 0 || failedCount > 0) {
+      console.log(`canonical stale recovery: requeued=${requeuedCount}, failed=${failedCount}`);
     }
   } catch (error) {
-    console.error("恢复超时任务异常:", error);
+    console.error("canonical stale recovery failed", error);
   }
 }
 
