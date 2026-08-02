@@ -41,7 +41,18 @@ const RECORD_ID_KEYS = [
   "recordId",
 ];
 
-const TERMINAL_WORKER_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
+const TERMINAL_WORKER_STATUSES = new Set([
+  "succeeded",
+  "failed",
+  "cancelled",
+  "canceled",
+  "completed",
+  "superseded",
+]);
+const DISABLED_TERMINAL_JOBS = new Map([
+  ["ef2453ed-2385-49f2-a618-34fcc037fb70", "cancelled"],
+  ["3ca92636-1b5a-4711-9c5d-5148c195e21b", "superseded"],
+]);
 const TASK_MUTATION_PATTERN =
   /修复|新增|更新|补齐|建立|修改|改动|创建|写入|补充|fix|repair|add|create|update|modify|patch|implement/i;
 const READ_ONLY_TASK_PATTERN =
@@ -84,8 +95,11 @@ export const WORKER_JOB_CONTRACT_FIELDS = [
   "repair_mode",
   "repair_scope",
   "verification_only",
+  "worker_only",
   "allow_no_change_success",
   "execution_intent",
+  "execution_policy_conflict",
+  "deterministic_git_operation",
   "code_changes_required",
   "codex_required",
   "git_commit_required",
@@ -343,7 +357,7 @@ function decodeOriginalRequestTextBase64(value: unknown): string | null {
 }
 
 const WORKER_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|requested_mode|final_mode|task_mode|read_only_mode|repair_mode|repair_scope|verification_only|allow_no_change_success|execution_intent|code_changes_required|codex_required|git_commit_required|git_push_required|approval_required|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|route|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|committed_files|codex_changed_files|worktree_changed_files|task_changed_files|unexpected_changed_files|git_commit_sha|codex_git_push|worker_git_push|git_push|pushed|pushed_branch|remote_contains_commit|repository_clean_after_push|terminal_report_acknowledged|terminal_state_persisted|duplicate_terminal_report_idempotent|post_completion_state_applied|final_report_source|next_batch|completed_at|deploy_status|execution_policy_source|execution_policy_batch_code|execution_policy_context_id|execution_policy_request_hash|execution_policy_inherited|execution_policy_inheritance_rejected_reason)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|requested_mode|final_mode|task_mode|read_only_mode|repair_mode|repair_scope|verification_only|worker_only|allow_no_change_success|execution_intent|execution_policy_conflict|deterministic_git_operation|code_changes_required|codex_required|git_commit_required|git_push_required|approval_required|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|route|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|committed_files|codex_changed_files|worktree_changed_files|task_changed_files|unexpected_changed_files|git_commit_sha|codex_git_push|worker_git_push|git_push|pushed|pushed_branch|remote_contains_commit|repository_clean_after_push|terminal_report_acknowledged|terminal_state_persisted|duplicate_terminal_report_idempotent|post_completion_state_applied|final_report_source|next_batch|completed_at|deploy_status|execution_policy_source|execution_policy_batch_code|execution_policy_context_id|execution_policy_request_hash|execution_policy_inherited|execution_policy_inheritance_rejected_reason)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName: string): string {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -661,8 +675,11 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "repair_mode",
   "repair_scope",
   "verification_only",
+  "worker_only",
   "allow_no_change_success",
   "execution_intent",
+  "execution_policy_conflict",
+  "deterministic_git_operation",
   "code_changes_required",
   "codex_required",
   "git_commit_required",
@@ -924,6 +941,7 @@ function readPayloadContextField(
     repair_mode: ["repair_mode", "repairMode"],
     repair_scope: ["repair_scope", "repairScope"],
     verification_only: ["verification_only", "verificationOnly"],
+    worker_only: ["worker_only", "workerOnly"],
     allow_no_change_success: ["allow_no_change_success", "allowNoChangeSuccess"],
     execution_intent: ["execution_intent", "executionIntent"],
     code_changes_required: ["code_changes_required", "codeChangesRequired"],
@@ -1837,7 +1855,11 @@ export function buildCanonicalWorkerReportSchema(input: {
       readString(body.error_detail),
     repair_mode: contract.repair_mode === true,
     verification_only: contract.verification_only === true,
+    worker_only: contract.worker_only === true,
     allow_no_change_success: contract.allow_no_change_success === true,
+    execution_policy_conflict: readString(contract.execution_policy_conflict),
+    deterministic_git_operation: contract.deterministic_git_operation === true,
+    codex_called: readNullableBooleanFlag(body.codex_called),
     code_changes_required: contract.code_changes_required === true,
     codex_required: contract.codex_required === true,
     git_commit_required: contract.git_commit_required === true,
@@ -2500,6 +2522,7 @@ export function buildWorkerJobPayloadContract(input: {
   repairMode?: boolean | null;
   repairScope?: unknown;
   verificationOnly?: boolean | null;
+  workerOnly?: boolean | null;
   allowNoChangeSuccess?: boolean | null;
   executionIntent?: string | null;
   codeChangesRequired?: boolean | null;
@@ -2586,6 +2609,7 @@ export function buildWorkerJobPayloadContract(input: {
     repair_mode: readTextContextField(fallbackOriginalRequest, "repair_mode"),
     repair_scope: readTextContextField(fallbackOriginalRequest, "repair_scope"),
     verification_only: readTextContextField(fallbackOriginalRequest, "verification_only"),
+    worker_only: readTextContextField(fallbackOriginalRequest, "worker_only"),
     allow_no_change_success: readTextContextField(fallbackOriginalRequest, "allow_no_change_success"),
     execution_intent: readTextContextField(fallbackOriginalRequest, "execution_intent"),
     code_changes_required: readTextContextField(fallbackOriginalRequest, "code_changes_required"),
@@ -2617,6 +2641,7 @@ export function buildWorkerJobPayloadContract(input: {
     repair_mode: readTextContextField(requestText, "repair_mode"),
     repair_scope: readTextContextField(requestText, "repair_scope"),
     verification_only: readTextContextField(requestText, "verification_only"),
+    worker_only: readTextContextField(requestText, "worker_only"),
     allow_no_change_success: readTextContextField(requestText, "allow_no_change_success"),
     execution_intent: readTextContextField(requestText, "execution_intent"),
     code_changes_required: readTextContextField(requestText, "code_changes_required"),
@@ -2648,6 +2673,7 @@ export function buildWorkerJobPayloadContract(input: {
     repair_mode: input.repairMode,
     repair_scope: readScopeText(input.repairScope),
     verification_only: input.verificationOnly,
+    worker_only: input.workerOnly,
     allow_no_change_success: input.allowNoChangeSuccess,
     execution_intent: input.executionIntent,
     code_changes_required: input.codeChangesRequired,
@@ -2709,14 +2735,33 @@ export function buildWorkerJobPayloadContract(input: {
   const policyInheritanceRejectedReason = policyPayloadMatchesCurrentBatch
     ? null
     : "batch_code_mismatch";
+  const booleanExecutionPolicyFields = new Set([
+    "repair_mode",
+    "verification_only",
+    "worker_only",
+    "allow_no_change_success",
+    "code_changes_required",
+    "codex_required",
+    "git_commit_required",
+    "git_push_required",
+    "approval_required",
+  ]);
+  const normalizeExecutionPolicyCandidate = (fieldName: string, value: unknown): unknown => {
+    if (!booleanExecutionPolicyFields.has(fieldName)) return readString(value);
+    return readNullableBooleanFlag(value);
+  };
   const readExecutionPolicyField = (fieldName: string): unknown =>
     firstPresentValue(
-      readString(explicitFields[fieldName]),
-      structuredPayload && policyPayloadMatchesCurrentBatch ? payloadField(fieldName) : null,
-      readString(originalRequestTextFields[fieldName]),
-      readString(requestTextFields[fieldName]),
-      !structuredPayload && policyPayloadMatchesCurrentBatch ? payloadField(fieldName) : null,
-      overrideFields[fieldName]
+      normalizeExecutionPolicyCandidate(fieldName, explicitFields[fieldName]),
+      structuredPayload && policyPayloadMatchesCurrentBatch
+        ? normalizeExecutionPolicyCandidate(fieldName, payloadField(fieldName))
+        : null,
+      normalizeExecutionPolicyCandidate(fieldName, originalRequestTextFields[fieldName]),
+      normalizeExecutionPolicyCandidate(fieldName, requestTextFields[fieldName]),
+      !structuredPayload && policyPayloadMatchesCurrentBatch
+        ? normalizeExecutionPolicyCandidate(fieldName, payloadField(fieldName))
+        : null,
+      normalizeExecutionPolicyCandidate(fieldName, overrideFields[fieldName])
     );
   const executionPolicySource = explicitContext
     ? "current_approval_context"
@@ -2769,10 +2814,12 @@ export function buildWorkerJobPayloadContract(input: {
     ? readString(readExecutionPolicyField("repair_scope")) ?? SYSTEM_REPAIR_SCOPE_TEXT
     : readString(readExecutionPolicyField("repair_scope")) ?? null;
   const explicitVerificationOnly = readNullableBooleanFlag(readExecutionPolicyField("verification_only"));
+  const explicitWorkerOnly = readNullableBooleanFlag(readExecutionPolicyField("worker_only"));
   const explicitAllowNoChangeSuccess = readNullableBooleanFlag(
     readExecutionPolicyField("allow_no_change_success")
   );
   const verificationOnly = explicitVerificationOnly === true;
+  const workerOnly = explicitWorkerOnly === true;
   const taskGoalPolicyText = readContractText(readExecutionPolicyField("task_goal"));
   const defaultCodeChangesRequired = defaultCodeChangesRequiredForPolicy({
     task_type: taskType,
@@ -2783,27 +2830,51 @@ export function buildWorkerJobPayloadContract(input: {
     task_goal: taskGoalPolicyText,
     original_request_text: originalRequestText,
   });
+  const explicitCodeChangesRequired = readNullableBooleanFlag(
+    readExecutionPolicyField("code_changes_required")
+  );
+  const explicitCodexRequired = readNullableBooleanFlag(readExecutionPolicyField("codex_required"));
+  const explicitGitCommitRequired = readNullableBooleanFlag(
+    readExecutionPolicyField("git_commit_required")
+  );
+  const explicitGitPushRequired = readNullableBooleanFlag(
+    readExecutionPolicyField("git_push_required")
+  );
   const codeChangesRequired =
-    readNullableBooleanFlag(readExecutionPolicyField("code_changes_required")) ??
-    defaultCodeChangesRequired;
+    verificationOnly || workerOnly
+      ? false
+      : explicitCodeChangesRequired ?? defaultCodeChangesRequired;
   const codexRequired =
-    readNullableBooleanFlag(readExecutionPolicyField("codex_required")) ??
-    codeChangesRequired;
+    verificationOnly || workerOnly ? false : explicitCodexRequired ?? codeChangesRequired;
   const gitCommitRequired =
-    readNullableBooleanFlag(readExecutionPolicyField("git_commit_required")) ??
-    codeChangesRequired;
-  const gitPushRequired =
-    readNullableBooleanFlag(readExecutionPolicyField("git_push_required")) ??
-    codeChangesRequired;
+    verificationOnly || workerOnly ? false : explicitGitCommitRequired ?? codeChangesRequired;
+  const gitPushRequired = verificationOnly
+    ? false
+    : explicitGitPushRequired ?? codeChangesRequired;
+  const executionPolicyConflict =
+    /^(?:code[_ -]?change[_ -]?required|code[_ -]?changes?[_ -]?required)$/i.test(executionIntent ?? "") &&
+    (verificationOnly ||
+      workerOnly ||
+      explicitCodeChangesRequired === false ||
+      explicitCodexRequired === false ||
+      explicitGitCommitRequired === false)
+      ? "EXPLICIT_FALSE_OVERRIDES_CODE_CHANGE_INTENT"
+      : null;
+  const deterministicGitOperation = Boolean(
+    codeChangesRequired === false &&
+      codexRequired === false &&
+      gitCommitRequired === false &&
+      gitPushRequired === true
+  );
   const approvalRequired =
     readNullableBooleanFlag(readExecutionPolicyField("approval_required"));
   const allowNoChangeSuccess =
     explicitAllowNoChangeSuccess === true &&
     verificationOnly &&
-    codeChangesRequired === false &&
-    codexRequired === false &&
-    gitCommitRequired === false &&
-    gitPushRequired === false;
+    explicitCodeChangesRequired === false &&
+    explicitCodexRequired === false &&
+    explicitGitCommitRequired === false &&
+    explicitGitPushRequired === false;
   const rawAllowedScope = readString(readPriorityField("allowed_scope")) ?? null;
   const rawExactAllowedScope = readString(readExecutionPolicyField("exact_allowed_scope")) ?? null;
   const allowedScope = repairMode ? SYSTEM_REPAIR_SCOPE_TEXT : rawAllowedScope;
@@ -2909,8 +2980,11 @@ export function buildWorkerJobPayloadContract(input: {
     repair_mode: repairMode,
     repair_scope: repairScope,
     verification_only: verificationOnly,
+    worker_only: workerOnly,
     allow_no_change_success: allowNoChangeSuccess,
     execution_intent: executionIntent,
+    execution_policy_conflict: executionPolicyConflict,
+    deterministic_git_operation: deterministicGitOperation,
     code_changes_required: codeChangesRequired,
     codex_required: codexRequired,
     git_commit_required: gitCommitRequired,
@@ -3647,7 +3721,70 @@ export function buildAttemptPayload(
 }
 
 export function isTerminalWorkerStatus(value: unknown): boolean {
-  return TERMINAL_WORKER_STATUSES.has(String(value || ""));
+  return TERMINAL_WORKER_STATUSES.has(String(value || "").trim().toLowerCase());
+}
+
+export function getDisabledTerminalJobStatus(
+  job: JobRecord | null | undefined
+): string | null {
+  if (!job) return null;
+  const jobId = readString(job.id) ?? readString(job.job_id);
+  return jobId ? DISABLED_TERMINAL_JOBS.get(jobId) ?? null : null;
+}
+
+export function buildTerminalJobCleanupFields(
+  job: JobRecord | null | undefined,
+  status: string,
+  now = new Date().toISOString()
+): JobRecord {
+  const payload = readRecord(job?.payload) ?? {};
+  const normalizedStatus = String(status || job?.status || "failed").trim().toLowerCase();
+
+  return {
+    status: normalizedStatus,
+    claimed_by: null,
+    claimed_at: null,
+    attempt_id: null,
+    active_attempt_id: null,
+    expires_at: null,
+    heartbeat_at: null,
+    retry_requested: false,
+    retry_pending: false,
+    should_retry: false,
+    payload: {
+      ...payload,
+      attempt_id: null,
+      active_attempt: null,
+      running_job_id: null,
+      retry_requested: false,
+      retry_pending: false,
+      should_retry: false,
+      terminal_state: normalizedStatus,
+    },
+    request_text: stripAttemptContextFromRequestText(job?.request_text),
+    completed_at: readString(job?.completed_at) ?? now,
+    updated_at: now,
+  };
+}
+
+export function terminalJobHasRuntimeState(job: JobRecord | null | undefined): boolean {
+  if (!job) return false;
+  const payload = readRecord(job.payload);
+  return Boolean(
+    readString(job.claimed_by) ||
+      readString(job.attempt_id) ||
+      readString(job.active_attempt_id) ||
+      readString(job.expires_at) ||
+      readString(job.heartbeat_at) ||
+      readRecord(payload?.active_attempt) ||
+      readString(payload?.running_job_id) ||
+      readBooleanFlag(job.retry_requested) ||
+      readBooleanFlag(job.retry_pending) ||
+      readBooleanFlag(job.should_retry) ||
+      readBooleanFlag(payload?.retry_requested) ||
+      readBooleanFlag(payload?.retry_pending) ||
+      readBooleanFlag(payload?.should_retry)
+  );
 }
 
 export function assertWorkerOwnsJob(

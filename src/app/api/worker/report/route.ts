@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
+  buildTerminalJobCleanupFields,
   assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
   buildRunningJobNotFoundPayload,
@@ -22,6 +23,7 @@ import {
   normalizeWorkerStatus,
   parseJsonBody,
   responseFromMaybe,
+  terminalJobHasRuntimeState,
   terminalAttemptMatches,
   updateHermesJob,
   validateCanonicalWorkerReportSchema,
@@ -51,7 +53,11 @@ interface WorkerReportBody {
   failure_stage?: string | null;
   failure_detail?: string | null;
   verification_only?: boolean | string | null;
+  worker_only?: boolean | string | null;
   allow_no_change_success?: boolean | string | null;
+  execution_policy_conflict?: string | null;
+  deterministic_git_operation?: boolean | string | null;
+  codex_called?: boolean | string | null;
   code_changes_required?: boolean | string | null;
   codex_required?: boolean | string | null;
   git_commit_required?: boolean | string | null;
@@ -129,6 +135,10 @@ function buildResult(body: WorkerReportBody): Record<string, unknown> {
     pushed_branch: body.pushed_branch ?? null,
     remote_contains_commit: body.remote_contains_commit ?? null,
     repository_clean_after_push: body.repository_clean_after_push ?? null,
+    worker_only: body.worker_only ?? null,
+    execution_policy_conflict: body.execution_policy_conflict ?? null,
+    deterministic_git_operation: body.deterministic_git_operation ?? null,
+    codex_called: body.codex_called ?? null,
     deploy_status: body.deploy_status ?? null,
     verification_only: body.verification_only ?? null,
     allow_no_change_success: body.allow_no_change_success ?? null,
@@ -256,6 +266,11 @@ function buildFalsePositiveSuccessGuard(
     readNullableBooleanFlag(body.git_push_required) ??
     readNullableBooleanFlag(payload?.git_push_required) ??
     readNullableBooleanFlag(readContextField(text, "git_push_required"));
+  const deterministicGitOperation =
+    readNullableBooleanFlag(body.deterministic_git_operation) ??
+    readNullableBooleanFlag(payload?.deterministic_git_operation) ??
+    readNullableBooleanFlag(readContextField(text, "deterministic_git_operation"));
+  const codexCalled = readNullableBooleanFlag(body.codex_called);
   const approvedBatch = readString(payload?.approved_batch) ?? readContextField(text, "approved_batch");
   const workerBatch = body.batch_code ?? readContextField(text, "batch_code");
   const exactAllowedScope =
@@ -270,6 +285,16 @@ function buildFalsePositiveSuccessGuard(
     codexRequired === false &&
     gitCommitRequired === false &&
     gitPushRequired === false &&
+    changedFiles.length === 0;
+  const deterministicGitSuccess =
+    deterministicGitOperation === true &&
+    codeChangesRequired === false &&
+    codexRequired === false &&
+    gitCommitRequired === false &&
+    gitPushRequired === true &&
+    codexCalled === false &&
+    readNullableBooleanFlag(body.remote_contains_commit) === true &&
+    readNullableBooleanFlag(body.repository_clean_after_push) === true &&
     changedFiles.length === 0;
   const writeAllowed =
     finalMode === "write_allowed" ||
@@ -294,7 +319,7 @@ function buildFalsePositiveSuccessGuard(
       errorText: "APPROVAL_CONTEXT_MODE_MISMATCH: write_allowed task was executed with read_only context.",
     };
   }
-  if (writeAllowed && exactAllowedScope.length === 0) {
+  if (writeAllowed && !deterministicGitSuccess && exactAllowedScope.length === 0) {
     return {
       failureCode: "APPROVAL_CONTEXT_MODE_MISMATCH",
       failureStage: "approval_context_rehydration",
@@ -309,7 +334,7 @@ function buildFalsePositiveSuccessGuard(
     };
   }
   if (writeAllowed && changedFiles.length === 0) {
-    if (verificationOnlyNoChangeSuccess) {
+    if (verificationOnlyNoChangeSuccess || deterministicGitSuccess) {
       return null;
     }
 
@@ -320,7 +345,7 @@ function buildFalsePositiveSuccessGuard(
     };
   }
   if (writeAllowed && (!body.git_commit_sha || !reportPushed(body))) {
-    if (verificationOnlyNoChangeSuccess) {
+    if (verificationOnlyNoChangeSuccess || deterministicGitSuccess) {
       return null;
     }
 
@@ -512,6 +537,28 @@ export async function POST(req: NextRequest) {
     const storedResult = readRecord(existingJob.result);
     const storedTerminalStatus =
       normalizeWorkerStatus(existingJob.status) === "failed" ? "failed" : "succeeded";
+    let terminalRuntimeCleanupApplied = false;
+    if (terminalJobHasRuntimeState(existingJob)) {
+      const cleanupResult = await updateHermesJob(
+        supabase,
+        jobId,
+        buildTerminalJobCleanupFields(existingJob, String(existingJob.status), now)
+      );
+      if (cleanupResult.error) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: cleanupResult.error.message ?? "terminal runtime cleanup failed",
+            failure_code: "TERMINAL_JOB_CLEANUP_FAILED",
+            failure_stage: "duplicate_terminal_report_cleanup",
+            status_unchanged: true,
+            duplicate_report_detected: true,
+          },
+          { status: 500 }
+        );
+      }
+      terminalRuntimeCleanupApplied = Boolean(cleanupResult.data);
+    }
     const diagnosticsEnrichment = await enrichTerminalDiagnosticsIfMissing({
       supabase,
       jobId,
@@ -531,6 +578,7 @@ export async function POST(req: NextRequest) {
       diagnostics_enrichment_only: diagnosticsEnrichment.enriched,
       diagnostics_enrichment_reason: diagnosticsEnrichment.reason,
       non_diagnostic_side_effects: 0,
+      terminal_runtime_cleanup_applied: terminalRuntimeCleanupApplied,
       skipped: "terminal_job_report_ignored",
       feishu_sync: "skipped_duplicate_terminal",
       git_commit_sha:
@@ -564,10 +612,11 @@ export async function POST(req: NextRequest) {
   }
 
   const { data, error, skippedColumns } = await updateHermesJob(supabase, jobId, {
+    ...(terminal ? buildTerminalJobCleanupFields(existingJob, storedStatus, now) : {}),
     status: storedStatus,
-    claimed_by: workerId,
-    attempt_id: attemptId,
-    active_attempt_id: attemptId,
+    claimed_by: terminal ? null : workerId,
+    attempt_id: terminal ? null : attemptId,
+    active_attempt_id: terminal ? null : attemptId,
     progress_percent: progressPercent,
     current_step:
       body.current_step ??

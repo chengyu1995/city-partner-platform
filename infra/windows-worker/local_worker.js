@@ -2685,7 +2685,7 @@ function isExplicitAutomationAllowedDocPath(filePath) {
 }
 
 const HERMES_CONTEXT_FIELD_PATTERN =
-  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|requested_mode|final_mode|task_mode|read_only_mode|repair_mode|repair_scope|verification_only|allow_no_change_success|execution_intent|code_changes_required|codex_required|git_commit_required|git_push_required|approval_required|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|route|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|committed_files|codex_changed_files|worktree_changed_files|task_changed_files|unexpected_changed_files|git_commit_sha|codex_git_push|worker_git_push|git_push|pushed|pushed_branch|remote_contains_commit|repository_clean_after_push|next_batch|completed_at|deploy_status|execution_policy_source|execution_policy_batch_code|execution_policy_context_id|execution_policy_request_hash|execution_policy_inherited|execution_policy_inheritance_rejected_reason)\s*[:=]/i;
+  /\b(?:context_source|context_reconstruct_failed|project_domain|task_type|requested_mode|final_mode|task_mode|read_only_mode|repair_mode|repair_scope|verification_only|worker_only|allow_no_change_success|execution_intent|execution_policy_conflict|deterministic_git_operation|code_changes_required|codex_required|git_commit_required|git_push_required|approval_required|allowed_scope|exact_allowed_scope|exact_allowed_scope_count|writable_scope|readable_scope|read_only_operations|forbidden_operations|forbidden_scope|route|task_goal|required_output_fields|acceptance_conditions|original_request_text(?:_base64)?|approved_batch|batch_code|attempt_id|worker_stage|workflow_stage|final_report_status|effective_final_status|failure_code|failure_stage|changed_files|committed_files|codex_changed_files|worktree_changed_files|task_changed_files|unexpected_changed_files|git_commit_sha|codex_git_push|worker_git_push|git_push|pushed|pushed_branch|remote_contains_commit|repository_clean_after_push|next_batch|completed_at|deploy_status|execution_policy_source|execution_policy_batch_code|execution_policy_context_id|execution_policy_request_hash|execution_policy_inherited|execution_policy_inheritance_rejected_reason)\s*[:=]/i;
 
 function contextFieldNamePattern(fieldName) {
   return fieldName.replace(/_/g, "[_\\s-]*");
@@ -3040,8 +3040,11 @@ const WORKER_CONTEXT_FIELD_NAMES = [
   "repair_mode",
   "repair_scope",
   "verification_only",
+  "worker_only",
   "allow_no_change_success",
   "execution_intent",
+  "execution_policy_conflict",
+  "deterministic_git_operation",
   "code_changes_required",
   "codex_required",
   "git_commit_required",
@@ -3317,6 +3320,7 @@ function readPayloadContextField(payload, fieldName) {
     repair_mode: ["repair_mode", "repairMode"],
     repair_scope: ["repair_scope", "repairScope"],
     verification_only: ["verification_only", "verificationOnly"],
+    worker_only: ["worker_only", "workerOnly"],
     allow_no_change_success: ["allow_no_change_success", "allowNoChangeSuccess"],
     execution_intent: ["execution_intent", "executionIntent"],
     code_changes_required: ["code_changes_required", "codeChangesRequired"],
@@ -3484,6 +3488,7 @@ function normalizeWorkerContext(job, overrides = {}) {
     repair_mode: readTextContextField(fallbackOriginalRequest, "repair_mode"),
     repair_scope: readTextContextField(fallbackOriginalRequest, "repair_scope"),
     verification_only: readTextContextField(fallbackOriginalRequest, "verification_only"),
+    worker_only: readTextContextField(fallbackOriginalRequest, "worker_only"),
     allow_no_change_success: readTextContextField(fallbackOriginalRequest, "allow_no_change_success"),
     execution_intent: readTextContextField(fallbackOriginalRequest, "execution_intent"),
     code_changes_required: readTextContextField(fallbackOriginalRequest, "code_changes_required"),
@@ -3515,6 +3520,7 @@ function normalizeWorkerContext(job, overrides = {}) {
     repair_mode: readTextContextField(requestText, "repair_mode"),
     repair_scope: readTextContextField(requestText, "repair_scope"),
     verification_only: readTextContextField(requestText, "verification_only"),
+    worker_only: readTextContextField(requestText, "worker_only"),
     allow_no_change_success: readTextContextField(requestText, "allow_no_change_success"),
     execution_intent: readTextContextField(requestText, "execution_intent"),
     code_changes_required: readTextContextField(requestText, "code_changes_required"),
@@ -3546,6 +3552,7 @@ function normalizeWorkerContext(job, overrides = {}) {
     repair_mode: overrides.repairMode,
     repair_scope: readScopeValue(overrides.repairScope),
     verification_only: overrides.verificationOnly,
+    worker_only: overrides.workerOnly,
     allow_no_change_success: overrides.allowNoChangeSuccess,
     execution_intent: overrides.executionIntent,
     code_changes_required: overrides.codeChangesRequired,
@@ -3608,14 +3615,33 @@ function normalizeWorkerContext(job, overrides = {}) {
   const policyInheritanceRejectedReason = policyPayloadMatchesCurrentBatch
     ? null
     : "batch_code_mismatch";
+  const booleanExecutionPolicyFields = new Set([
+    "repair_mode",
+    "verification_only",
+    "worker_only",
+    "allow_no_change_success",
+    "code_changes_required",
+    "codex_required",
+    "git_commit_required",
+    "git_push_required",
+    "approval_required",
+  ]);
+  const normalizeExecutionPolicyCandidate = (fieldName, value) => {
+    if (!booleanExecutionPolicyFields.has(fieldName)) return readString(value);
+    return readNullableBooleanFlag(value);
+  };
   const readExecutionPolicyField = (fieldName) =>
     firstPresentValue(
-      readString(explicitFields[fieldName]),
-      structuredPayload && policyPayloadMatchesCurrentBatch ? payloadField(fieldName) : null,
-      readString(originalRequestTextFields[fieldName]),
-      readString(requestTextFields[fieldName]),
-      !structuredPayload && policyPayloadMatchesCurrentBatch ? payloadField(fieldName) : null,
-      overrideFields[fieldName]
+      normalizeExecutionPolicyCandidate(fieldName, explicitFields[fieldName]),
+      structuredPayload && policyPayloadMatchesCurrentBatch
+        ? normalizeExecutionPolicyCandidate(fieldName, payloadField(fieldName))
+        : null,
+      normalizeExecutionPolicyCandidate(fieldName, originalRequestTextFields[fieldName]),
+      normalizeExecutionPolicyCandidate(fieldName, requestTextFields[fieldName]),
+      !structuredPayload && policyPayloadMatchesCurrentBatch
+        ? normalizeExecutionPolicyCandidate(fieldName, payloadField(fieldName))
+        : null,
+      normalizeExecutionPolicyCandidate(fieldName, overrideFields[fieldName])
     );
   const executionPolicySource = explicitContext
     ? "current_approval_context"
@@ -3664,10 +3690,12 @@ function normalizeWorkerContext(job, overrides = {}) {
     ? readString(readExecutionPolicyField("repair_scope")) || SYSTEM_REPAIR_SCOPE_TEXT
     : readString(readExecutionPolicyField("repair_scope")) || null;
   const explicitVerificationOnly = readNullableBooleanFlag(readExecutionPolicyField("verification_only"));
+  const explicitWorkerOnly = readNullableBooleanFlag(readExecutionPolicyField("worker_only"));
   const explicitAllowNoChangeSuccess = readNullableBooleanFlag(
     readExecutionPolicyField("allow_no_change_success")
   );
   const verificationOnly = explicitVerificationOnly === true;
+  const workerOnly = explicitWorkerOnly === true;
   const policyDefaults = {
     task_type: taskType,
     requested_mode: requestedMode,
@@ -3678,27 +3706,51 @@ function normalizeWorkerContext(job, overrides = {}) {
     original_request_text: originalRequestText,
   };
   const defaultCodeChangesRequired = defaultCodeChangesRequiredForPolicy(policyDefaults);
+  const explicitCodeChangesRequired = readNullableBooleanFlag(
+    readExecutionPolicyField("code_changes_required")
+  );
+  const explicitCodexRequired = readNullableBooleanFlag(readExecutionPolicyField("codex_required"));
+  const explicitGitCommitRequired = readNullableBooleanFlag(
+    readExecutionPolicyField("git_commit_required")
+  );
+  const explicitGitPushRequired = readNullableBooleanFlag(
+    readExecutionPolicyField("git_push_required")
+  );
   const codeChangesRequired =
-    readNullableBooleanFlag(readExecutionPolicyField("code_changes_required")) ??
-    defaultCodeChangesRequired;
+    verificationOnly || workerOnly
+      ? false
+      : explicitCodeChangesRequired ?? defaultCodeChangesRequired;
   const codexRequired =
-    readNullableBooleanFlag(readExecutionPolicyField("codex_required")) ??
-    codeChangesRequired;
+    verificationOnly || workerOnly ? false : explicitCodexRequired ?? codeChangesRequired;
   const gitCommitRequired =
-    readNullableBooleanFlag(readExecutionPolicyField("git_commit_required")) ??
-    codeChangesRequired;
-  const gitPushRequired =
-    readNullableBooleanFlag(readExecutionPolicyField("git_push_required")) ??
-    codeChangesRequired;
+    verificationOnly || workerOnly ? false : explicitGitCommitRequired ?? codeChangesRequired;
+  const gitPushRequired = verificationOnly
+    ? false
+    : explicitGitPushRequired ?? codeChangesRequired;
+  const executionPolicyConflict =
+    /^(?:code[_ -]?change[_ -]?required|code[_ -]?changes?[_ -]?required)$/i.test(executionIntent || "") &&
+    (verificationOnly ||
+      workerOnly ||
+      explicitCodeChangesRequired === false ||
+      explicitCodexRequired === false ||
+      explicitGitCommitRequired === false)
+      ? "EXPLICIT_FALSE_OVERRIDES_CODE_CHANGE_INTENT"
+      : null;
+  const deterministicGitOperation = Boolean(
+    codeChangesRequired === false &&
+      codexRequired === false &&
+      gitCommitRequired === false &&
+      gitPushRequired === true
+  );
   const approvalRequired =
     readNullableBooleanFlag(readExecutionPolicyField("approval_required"));
   const allowNoChangeSuccess =
     explicitAllowNoChangeSuccess === true &&
     verificationOnly &&
-    codeChangesRequired === false &&
-    codexRequired === false &&
-    gitCommitRequired === false &&
-    gitPushRequired === false;
+    explicitCodeChangesRequired === false &&
+    explicitCodexRequired === false &&
+    explicitGitCommitRequired === false &&
+    explicitGitPushRequired === false;
   const rawAllowedScope = readString(readPriorityField("allowed_scope")) || null;
   const rawExactAllowedScope = readString(readExecutionPolicyField("exact_allowed_scope")) || null;
   const allowedScope = repairMode ? SYSTEM_REPAIR_SCOPE_TEXT : rawAllowedScope;
@@ -3806,8 +3858,11 @@ function normalizeWorkerContext(job, overrides = {}) {
     repair_mode: repairMode,
     repair_scope: repairScope,
     verification_only: verificationOnly,
+    worker_only: workerOnly,
     allow_no_change_success: allowNoChangeSuccess,
     execution_intent: executionIntent,
+    execution_policy_conflict: executionPolicyConflict,
+    deterministic_git_operation: deterministicGitOperation,
     code_changes_required: codeChangesRequired,
     codex_required: codexRequired,
     git_commit_required: gitCommitRequired,
@@ -4057,8 +4112,11 @@ function formatWorkerJobContractLines(contract, options = {}) {
     `task_mode: ${contract.task_mode || "null"}`,
     `read_only_mode: ${contract.read_only_mode ? "true" : "false"}`,
     `verification_only: ${contract.verification_only ? "true" : "false"}`,
+    `worker_only: ${contract.worker_only ? "true" : "false"}`,
     `allow_no_change_success: ${contract.allow_no_change_success ? "true" : "false"}`,
     `execution_intent: ${contract.execution_intent || "null"}`,
+    `execution_policy_conflict: ${contract.execution_policy_conflict || "null"}`,
+    `deterministic_git_operation: ${contract.deterministic_git_operation ? "true" : "false"}`,
     `code_changes_required: ${contract.code_changes_required ? "true" : "false"}`,
     `codex_required: ${contract.codex_required ? "true" : "false"}`,
     `git_commit_required: ${contract.git_commit_required ? "true" : "false"}`,
@@ -4123,8 +4181,11 @@ function buildWorkerReportContractExtra(contract) {
     repair_mode: contract.repair_mode,
     repair_scope: contract.repair_scope,
     verification_only: contract.verification_only,
+    worker_only: contract.worker_only,
     allow_no_change_success: contract.allow_no_change_success,
     execution_intent: contract.execution_intent,
+    execution_policy_conflict: contract.execution_policy_conflict,
+    deterministic_git_operation: contract.deterministic_git_operation,
     code_changes_required: contract.code_changes_required,
     codex_required: contract.codex_required,
     git_commit_required: contract.git_commit_required,
@@ -6641,6 +6702,41 @@ function buildGithubPushStatus(pushResult) {
     : pushResult.message || "未推送";
 }
 
+function shouldCallCodexForContract(contract = {}) {
+  return (
+    contract.verification_only !== true &&
+    contract.worker_only !== true &&
+    contract.code_changes_required === true &&
+    contract.codex_required === true
+  );
+}
+
+function shouldRunDeterministicGitOperation(job, contract = {}) {
+  if (contract.deterministic_git_operation !== true) {
+    return false;
+  }
+
+  return /\b(?:git\s+push|push\s+git|fast[ -]?forward|master-fast-forward)\b/i.test(
+    getJobText(job)
+  );
+}
+
+function createExecutionPolicyError(contract, message) {
+  const error = new Error(
+    [
+      contract?.execution_policy_conflict || "DETERMINISTIC_WORKER_OPERATION_UNAVAILABLE",
+      message,
+      "codex_called: false",
+      "git_mutation_executed: false",
+    ].join("\n")
+  );
+  error.code = contract?.execution_policy_conflict
+    ? "EXECUTION_POLICY_CONFLICT"
+    : "DETERMINISTIC_WORKER_OPERATION_UNAVAILABLE";
+  error.failureStage = "execution_policy";
+  return error;
+}
+
 async function runCodexWithRetries(job) {
   const prompts = isReadOnlyTask(job)
     ? [() => buildCodexPrompt(job)]
@@ -6865,6 +6961,85 @@ async function pushGitTask(commitSha) {
     remote: REQUIRED_GIT_PUSH_REMOTE,
     branch: REQUIRED_GIT_PUSH_BRANCH,
     commitSha,
+  };
+}
+
+async function runDeterministicGitOperation(job, contract) {
+  if (!shouldRunDeterministicGitOperation(job, contract)) {
+    throw createExecutionPolicyError(
+      contract,
+      "Explicit no-Codex policy has no supported deterministic Git operation."
+    );
+  }
+
+  await runGit(["rev-parse", "--is-inside-work-tree"]);
+  await assertCleanWorktreeBeforeCodex();
+
+  const branchResult = await runGit(["branch", "--show-current"]);
+  if (branchResult.stdout !== REQUIRED_GIT_PUSH_BRANCH) {
+    throw createExecutionPolicyError(
+      contract,
+      `Deterministic Git operation requires branch ${REQUIRED_GIT_PUSH_BRANCH}.`
+    );
+  }
+
+  await runGit(["fetch", REQUIRED_GIT_PUSH_REMOTE, "--prune"]);
+
+  const localBefore = (await runGit(["rev-parse", "HEAD"])).stdout;
+  const remoteRef = `${REQUIRED_GIT_PUSH_REMOTE}/${REQUIRED_GIT_PUSH_BRANCH}`;
+  const remoteBefore = (await runGit(["rev-parse", remoteRef])).stdout;
+  const mergeBase = (await runGit(["merge-base", localBefore, remoteBefore])).stdout;
+  let operation = "already_up_to_date";
+  let pushResult = {
+    pushed: false,
+    remote: REQUIRED_GIT_PUSH_REMOTE,
+    branch: REQUIRED_GIT_PUSH_BRANCH,
+    commitSha: localBefore,
+    message: "Remote master already contains local HEAD",
+  };
+
+  if (mergeBase === localBefore && localBefore !== remoteBefore) {
+    await runGit(["merge", "--ff-only", remoteRef]);
+    operation = "fast_forward_local_master";
+  } else if (mergeBase === remoteBefore && localBefore !== remoteBefore) {
+    pushResult = await pushGitTask(localBefore);
+    if (!pushResult.pushed) {
+      throw createExecutionPolicyError(
+        contract,
+        pushResult.message || "Deterministic Git push was not executed."
+      );
+    }
+    operation = "push_local_master";
+  } else if (localBefore !== remoteBefore) {
+    throw createExecutionPolicyError(
+      contract,
+      "Local master and origin/master have diverged; fast-forward is not possible."
+    );
+  }
+
+  await assertCleanWorktreeBeforeCodex();
+  await runGit(["fetch", REQUIRED_GIT_PUSH_REMOTE, "--prune"]);
+  const localHead = (await runGit(["rev-parse", "HEAD"])).stdout;
+  const remoteHead = (await runGit(["rev-parse", remoteRef])).stdout;
+  if (localHead !== remoteHead) {
+    throw createExecutionPolicyError(
+      contract,
+      "Deterministic Git operation did not converge local HEAD and origin/master."
+    );
+  }
+
+  return {
+    operation,
+    localBefore,
+    remoteBefore,
+    mergeBase,
+    commitSha: localHead,
+    remoteContainsCommit: true,
+    pushResult: {
+      ...pushResult,
+      commitSha: localHead,
+      remoteContainsCommit: true,
+    },
   };
 }
 async function rollbackGitTask(checkpoint) {
@@ -7704,6 +7879,11 @@ async function pollOnce() {
   ].forEach((line) => console.log(line));
   const taskModeForReport = initialContract.task_mode;
   const readOnlyMode = initialContract.read_only_mode === true;
+  const codexRequired = shouldCallCodexForContract(initialContract);
+  const deterministicGitOperation = shouldRunDeterministicGitOperation(
+    job,
+    initialContract
+  );
   currentReadOnlyMode = readOnlyMode;
   const stopHeartbeat = startHeartbeat(job.id, attemptId);
   let gitCheckpoint = null;
@@ -7717,7 +7897,43 @@ async function pollOnce() {
       return;
     }
 
-    if (readOnlyMode) {
+    if (initialContract.execution_policy_conflict) {
+      console.warn(
+        `execution_policy_conflict=${initialContract.execution_policy_conflict}; explicit false preserved`
+      );
+    }
+
+    if (!codexRequired && !deterministicGitOperation) {
+      throw createExecutionPolicyError(
+        initialContract,
+        "Codex is explicitly disabled and this task has no supported deterministic Worker operation."
+      );
+    }
+
+    let deterministicResult = null;
+
+    if (deterministicGitOperation) {
+      await updateProgress(
+        job.id,
+        10,
+        "Worker deterministic Git preflight",
+        "Explicit no-Codex policy accepted; validating clean master state"
+      );
+
+      deterministicResult = await runDeterministicGitOperation(job, initialContract);
+      gitCheckpoint = {
+        enabled: false,
+        baseCommit: deterministicResult.localBefore,
+        deterministicGitOperation: true,
+      };
+
+      await updateProgress(
+        job.id,
+        30,
+        "Deterministic Git operation complete",
+        deterministicResult.operation
+      );
+    } else if (readOnlyMode) {
       await updateProgress(
         job.id,
         10,
@@ -7788,25 +8004,50 @@ async function pollOnce() {
       );
     }
 
-    await updateProgress(
-      job.id,
-      35,
-      "执行 Codex",
-      "正在启动 Codex"
-    );
+    let result;
+    if (deterministicResult) {
+      await updateProgress(
+        job.id,
+        35,
+        "Skip Codex",
+        "codex_required=false; deterministic Worker Git operation used"
+      );
+      result = [
+        "Deterministic Worker Git operation completed.",
+        `deterministic_git_operation: ${deterministicResult.operation}`,
+        "codex_called: false",
+        `execution_policy_conflict: ${initialContract.execution_policy_conflict || "null"}`,
+      ].join("\n");
+    } else {
+      await updateProgress(
+        job.id,
+        35,
+        "执行 Codex",
+        "正在启动 Codex"
+      );
 
-    const result = await runCodexWithRetries(job);
+      result = await runCodexWithRetries(job);
 
-    await updateProgress(
-      job.id,
-      65,
-      "Codex 执行完成",
-      "Codex 已完成代码修改"
-    );
+      await updateProgress(
+        job.id,
+        65,
+        "Codex 执行完成",
+        "Codex 已完成代码修改"
+      );
+    }
 
     let previewReport = null;
 
-    if (readOnlyMode) {
+    if (deterministicResult) {
+      previewReport = buildSkippedAutomationPreviewReport();
+
+      await updateProgress(
+        job.id,
+        70,
+        "Skip preview diagnostics",
+        "Deterministic Git operation does not run product preview diagnostics"
+      );
+    } else if (readOnlyMode) {
       previewReport = buildSkippedReadOnlyPreviewReport();
 
       await updateProgress(
@@ -7842,7 +8083,33 @@ async function pollOnce() {
       "正在检查 Git 修改并准备提交"
     );
 
-    const gitResult = await commitGitTask(job);
+    let gitResult;
+    if (deterministicResult) {
+      gitResult = {
+        committed: false,
+        commitSha: deterministicResult.commitSha,
+        message: `No commit created; ${deterministicResult.operation}`,
+        summary: "deterministic_git_operation=true; git_commit_required=false",
+        filesChanged: [],
+      };
+    } else if (initialContract.git_commit_required === false) {
+      const filesChanged = await getTaskChangedPaths();
+      if (filesChanged.length > 0) {
+        throw createExecutionPolicyError(
+          initialContract,
+          "git_commit_required=false but the execution produced worktree changes."
+        );
+      }
+      gitResult = {
+        committed: false,
+        commitSha: null,
+        message: "git_commit_required=false; commit skipped",
+        summary: "No worktree changes and no commit created",
+        filesChanged: [],
+      };
+    } else {
+      gitResult = await commitGitTask(job);
+    }
     assertWorkerReadOnlyTaskGoalComplete(job, result);
     assertQaTaskOutcome(job, gitResult.filesChanged || [], result);
 
@@ -7855,7 +8122,9 @@ async function pollOnce() {
         : gitResult.message
     );
 
-    let pushResult = readOnlyMode
+    let pushResult = deterministicResult
+      ? deterministicResult.pushResult
+      : readOnlyMode
       ? {
           pushed: false,
           message: "read_only_mode=true，跳过 GitHub 推送",
@@ -7866,7 +8135,12 @@ async function pollOnce() {
           message: "没有新提交，无需推送",
         };
 
-    if (!readOnlyMode && gitResult.committed) {
+    if (
+      !deterministicResult &&
+      !readOnlyMode &&
+      gitResult.committed &&
+      initialContract.git_push_required !== false
+    ) {
       await updateProgress(
         job.id,
         90,
@@ -7898,6 +8172,8 @@ async function pollOnce() {
         repositoryCleanAfterPush = false;
       }
     }
+    const remoteContainsCommit =
+      deterministicResult?.remoteContainsCommit === true || pushResult.pushed;
 
     const completedAt = new Date().toISOString();
     const approvedBatchForReport = initialContract.approved_batch || getJobBatchCode(job);
@@ -7931,7 +8207,7 @@ async function pollOnce() {
       worker_git_push: pushResult.pushed,
       git_push: pushResult.pushed,
       pushed_branch: pushResult.branch || null,
-      remote_contains_commit: pushResult.pushed,
+      remote_contains_commit: remoteContainsCommit,
       repository_clean_after_push: repositoryCleanAfterPush,
       nextBatch: extractNextBatchFromText(result),
       completedAt,
@@ -8025,7 +8301,7 @@ async function pollOnce() {
       `worker_git_push: ${pushResult.pushed ? "true" : "false"}`,
       `git_push: ${pushResult.pushed ? "true" : "false"}`,
       `pushed_branch: ${pushResult.branch || "null"}`,
-      `remote_contains_commit: ${pushResult.pushed ? "true" : "false"}`,
+      `remote_contains_commit: ${remoteContainsCommit ? "true" : "false"}`,
       `repository_clean_after_push: ${repositoryCleanAfterPush ? "true" : "false"}`,
     ]
       .filter(Boolean)
@@ -8051,6 +8327,7 @@ async function pollOnce() {
         batch_code: successContract.approved_batch || approvedBatchForReport,
         job_created_at: job.created_at || null,
         ...buildWorkerReportContractExtra(successContract),
+        codex_called: !deterministicResult,
         project_name: "同城搭子网站",
         project_dir: PROJECT_DIR,
         files_changed: gitResult.filesChanged || [],
@@ -8061,7 +8338,12 @@ async function pollOnce() {
         task_changed_files: gitResult.filesChanged || [],
         unexpected_changed_files: [],
         validation_results: [
-          "Codex 执行：通过",
+          deterministicResult
+            ? "Codex 执行：跳过（codex_required=false）"
+            : "Codex 执行：通过",
+          `codex_called: ${deterministicResult ? "false" : "true"}`,
+          `deterministic_git_operation: ${deterministicResult ? "true" : "false"}`,
+          `execution_policy_conflict: ${successContract.execution_policy_conflict || "null"}`,
           "Worker 执行：通过",
           "Worker execution status: succeeded",
           readOnlyMode
@@ -8142,7 +8424,7 @@ async function pollOnce() {
         codex_git_push: "not_run_by_codex",
         worker_git_push: pushResult.pushed,
         pushed_branch: pushResult.branch || null,
-        remote_contains_commit: pushResult.pushed,
+        remote_contains_commit: remoteContainsCommit,
         repository_clean_after_push: repositoryCleanAfterPush,
         deploy_status:
           pushResult.pushed
@@ -8571,6 +8853,8 @@ module.exports = {
   isRunningJobNotFoundOrNotOwned,
   isTerminalReportLockedForJob,
   isVerificationOnlyNoopTask,
+  shouldCallCodexForContract,
+  shouldRunDeterministicGitOperation,
   lockAcceptedTerminalReportSnapshot,
   normalizeWorkerContext,
   normalizeWorkerFinalResult,
@@ -8583,6 +8867,7 @@ module.exports = {
   resolveWorkerJobContract,
   runCodexPreflight,
   runCodexStartupPreflight,
+  runDeterministicGitOperation,
   toCodexUsageLimitError,
   spawnCodexWithStdin,
   spawnCodexProcess,

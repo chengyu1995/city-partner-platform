@@ -41,7 +41,83 @@ test("/next persists claim and attempt contract before returning a job", () => {
   assert.match(nextRoute, /WORKER_ATTEMPT_PERSISTENCE_FAILED/);
   assert.match(nextRoute, /updateHermesJob\(supabase,\s*job\.id/);
   assert.match(nextRoute, /claimed_by:\s*null/);
-  assert.match(nextRoute, /job:\s*claimedJob/);
+  assert.match(nextRoute, /job:\s*runnableClaimedJob/);
+});
+
+test("terminal jobs are excluded before and after claim using persisted state", () => {
+  const preClaimRead = nextRoute.indexOf("const { data: preClaimJob");
+  const claim = nextRoute.indexOf("claimHermesJob(");
+  const postClaimRead = nextRoute.indexOf("const { data: persistedClaimedJob");
+  const returnJob = nextRoute.indexOf("job: runnableClaimedJob");
+
+  assert.ok(preClaimRead >= 0 && preClaimRead < claim);
+  assert.ok(postClaimRead > claim && postClaimRead < returnJob);
+  assert.match(nextRoute, /isTerminalWorkerStatus\(preClaimJob\?\.status\)/);
+  assert.match(nextRoute, /isTerminalWorkerStatus\(persistedClaimedJob\?\.status\)/);
+  assert.match(nextRoute, /terminal_job_excluded_before_claim/);
+  assert.match(nextRoute, /terminal_job_detected_after_claim/);
+  assert.match(nextRoute, /execution_aborted:\s*true/);
+  assert.match(nextRoute, /codex_called:\s*false/);
+  assert.match(nextRoute, /git_mutation_executed:\s*false/);
+});
+
+test("cancelled SMOKE-44 and superseded MASTER-FAST-FORWARD-46 stay disabled", () => {
+  assert.match(workerJobs, /ef2453ed-2385-49f2-a618-34fcc037fb70["'],\s*["']cancelled/);
+  assert.match(workerJobs, /3ca92636-1b5a-4711-9c5d-5148c195e21b["'],\s*["']superseded/);
+  assert.match(workerJobs, /"completed"/);
+  assert.match(workerJobs, /"superseded"/);
+  assert.match(nextRoute, /getDisabledTerminalJobStatus\(preClaimJob \?\? job\)/);
+  assert.match(nextRoute, /worker_next_returned:\s*false/);
+});
+
+test("terminal cleanup clears attempts, lease, running index, and retry flags", () => {
+  const cleanup = functionBlock(workerJobs, "buildTerminalJobCleanupFields");
+  assert.match(cleanup, /claimed_by:\s*null/);
+  assert.match(cleanup, /active_attempt_id:\s*null/);
+  assert.match(cleanup, /expires_at:\s*null/);
+  assert.match(cleanup, /heartbeat_at:\s*null/);
+  assert.match(cleanup, /running_job_id:\s*null/);
+  assert.match(cleanup, /retry_requested:\s*false/);
+  assert.match(cleanup, /retry_pending:\s*false/);
+  assert.match(cleanup, /should_retry:\s*false/);
+  assert.match(reportRoute, /buildTerminalJobCleanupFields\(existingJob, storedStatus, now\)/);
+  assert.match(reportRoute, /terminalJobHasRuntimeState\(existingJob\)/);
+  assert.match(reportRoute, /terminal_runtime_cleanup_applied:\s*terminalRuntimeCleanupApplied/);
+});
+
+test("duplicate terminal report stays terminal and idempotent after runtime cleanup", () => {
+  const duplicateStart = reportRoute.indexOf("if (isTerminalWorkerStatus(existingJob.status))");
+  const duplicateEnd = reportRoute.indexOf("const { data, error, skippedColumns }", duplicateStart);
+  const duplicateBranch = reportRoute.slice(duplicateStart, duplicateEnd);
+
+  assert.match(duplicateBranch, /duplicate_report_idempotent:\s*true/);
+  assert.match(duplicateBranch, /second_side_effect_triggered:\s*false/);
+  assert.doesNotMatch(duplicateBranch, /status:\s*["'](?:queued|pending|running)["']/);
+});
+
+test("deterministic Git reports bypass code-diff false-positive guard only after remote verification", () => {
+  const guard = functionBlock(reportRoute, "buildFalsePositiveSuccessGuard");
+  assert.match(guard, /deterministicGitOperation === true/);
+  assert.match(guard, /codeChangesRequired === false/);
+  assert.match(guard, /codexRequired === false/);
+  assert.match(guard, /gitCommitRequired === false/);
+  assert.match(guard, /gitPushRequired === true/);
+  assert.match(guard, /codexCalled === false/);
+  assert.match(guard, /body\.remote_contains_commit/);
+  assert.match(guard, /body\.repository_clean_after_push/);
+  assert.match(guard, /verificationOnlyNoChangeSuccess \|\| deterministicGitSuccess/);
+});
+
+test("explicit no-Codex policy is checked before Codex execution", () => {
+  const pollBlock = functionBlock(localWorker, "pollOnce");
+  const policyIndex = pollBlock.indexOf("shouldCallCodexForContract(initialContract)");
+  const deterministicIndex = pollBlock.indexOf("runDeterministicGitOperation(job, initialContract)");
+  const codexIndex = pollBlock.indexOf("runCodexWithRetries(job)");
+
+  assert.ok(policyIndex >= 0 && policyIndex < codexIndex);
+  assert.ok(deterministicIndex > policyIndex && deterministicIndex < codexIndex);
+  assert.match(pollBlock, /execution_policy_conflict=/);
+  assert.match(pollBlock, /codex_required=false; deterministic Worker Git operation used/);
 });
 
 test("attempt identity can survive schemas without attempt_id columns or payload", () => {
@@ -105,7 +181,9 @@ test("verification-only no-change success bypasses false positive guards only wi
   assert.doesNotMatch(block, /verification\[_ -\]\?only/);
   const noFixIndex = block.indexOf('failureCode: "NO_FIX_APPLIED"');
   const gitPublishIndex = block.indexOf('failureCode: "GIT_PUBLISH_REQUIRED"');
-  const bypassIndexes = [...block.matchAll(/if \(verificationOnlyNoChangeSuccess\)/g)].map((match) => match.index ?? -1);
+  const bypassIndexes = [
+    ...block.matchAll(/if \(verificationOnlyNoChangeSuccess \|\| deterministicGitSuccess\)/g),
+  ].map((match) => match.index ?? -1);
   assert.equal(bypassIndexes.length, 2);
   assert.ok(bypassIndexes[0] >= 0 && bypassIndexes[0] < noFixIndex);
   assert.ok(bypassIndexes[1] >= 0 && bypassIndexes[1] < gitPublishIndex);
@@ -157,7 +235,8 @@ test("write allowed read-only downgrade is blocked before success persistence", 
 
 test("post-push report state is persisted without commit rollback semantics", () => {
   const pollBlock = functionBlock(localWorker, "pollOnce");
-  assert.match(pollBlock, /remote_contains_commit:\s*pushResult\.pushed/);
+  assert.match(pollBlock, /remote_contains_commit:\s*remoteContainsCommit/);
+  assert.match(pollBlock, /deterministicResult\?\.remoteContainsCommit === true \|\| pushResult\.pushed/);
   assert.match(pollBlock, /repository_clean_after_push:\s*repositoryCleanAfterPush/);
   assert.match(pollBlock, /worker_git_push:\s*pushResult\.pushed/);
   assert.match(pollBlock, /codex_git_push:\s*"not_run_by_codex"/);

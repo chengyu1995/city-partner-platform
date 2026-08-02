@@ -73,6 +73,8 @@ const {
   isRunningJobNotFoundOrNotOwned,
   isTrueTaskFailureCode,
   isVerificationOnlyNoopTask,
+  shouldCallCodexForContract,
+  shouldRunDeterministicGitOperation,
   isReadOnlyTask,
   isReadOnlyTaskText,
   lockAcceptedTerminalReportSnapshot,
@@ -3291,6 +3293,94 @@ test("bootstrap context router contract guards", async (t) => {
     assert.equal(reportExtra.codex_required, true);
     assert.equal(reportExtra.git_commit_required, true);
     assert.equal(reportExtra.git_push_required, true);
+  });
+
+  await t.test("explicit codex false wins over code-change execution intent", () => {
+    const job = {
+      id: "job-explicit-codex-false",
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-MASTER-FAST-FORWARD-46",
+        "project_domain=automation_system",
+        "task_type=system_repair",
+        "task_mode=automation_system_write_allowed",
+        "repair_mode=true",
+        "execution_intent=code_change_required",
+        "code_changes_required=false",
+        "codex_required=false",
+        "git_commit_required=false",
+        "git_push_required=true",
+      ].join("\n"),
+      payload: {
+        approved_batch: "BATCH-ARCH-COMPLETE-01-MASTER-FAST-FORWARD-46",
+        execution_policy_batch_code: "BATCH-ARCH-COMPLETE-01-MASTER-FAST-FORWARD-46",
+        execution_intent: "code_change_required",
+        code_changes_required: false,
+        codex_required: false,
+        git_commit_required: false,
+        git_push_required: true,
+      },
+    };
+
+    const contract = resolveWorkerJobContract(job);
+    assert.equal(contract.code_changes_required, false);
+    assert.equal(contract.codex_required, false);
+    assert.equal(contract.git_commit_required, false);
+    assert.equal(contract.git_push_required, true);
+    assert.equal(
+      contract.execution_policy_conflict,
+      "EXPLICIT_FALSE_OVERRIDES_CODE_CHANGE_INTENT"
+    );
+    assert.equal(shouldCallCodexForContract(contract), false);
+  });
+
+  await t.test("explicit no-change push task selects deterministic Git operation", () => {
+    const job = {
+      id: "job-deterministic-push",
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-MASTER-FAST-FORWARD-46",
+        "execution_intent=code_change_required",
+        "code_changes_required=false",
+        "codex_required=false",
+        "git_commit_required=false",
+        "git_push_required=true",
+      ].join("\n"),
+      payload: {
+        approved_batch: "BATCH-ARCH-COMPLETE-01-MASTER-FAST-FORWARD-46",
+        execution_policy_batch_code: "BATCH-ARCH-COMPLETE-01-MASTER-FAST-FORWARD-46",
+        execution_intent: "code_change_required",
+        code_changes_required: false,
+        codex_required: false,
+        git_commit_required: false,
+        git_push_required: true,
+      },
+    };
+
+    const contract = resolveWorkerJobContract(job);
+    assert.equal(contract.deterministic_git_operation, true);
+    assert.equal(shouldRunDeterministicGitOperation(job, contract), true);
+    assert.equal(shouldCallCodexForContract(contract), false);
+  });
+
+  await t.test("worker-only policy cannot inherit a Codex-required route", () => {
+    const job = {
+      id: "job-worker-only",
+      request_text: [
+        "BATCH-ARCH-COMPLETE-01-WORKER-ONLY",
+        "worker_only=true",
+        "execution_intent=code_change_required",
+        "code_changes_required=true",
+        "codex_required=true",
+        "git_commit_required=true",
+        "git_push_required=false",
+      ].join("\n"),
+    };
+
+    const contract = resolveWorkerJobContract(job);
+    assert.equal(contract.worker_only, true);
+    assert.equal(contract.code_changes_required, false);
+    assert.equal(contract.codex_required, false);
+    assert.equal(contract.git_commit_required, false);
+    assert.equal(shouldCallCodexForContract(contract), false);
   });
 
   await t.test("verification-only keywords alone never enable no-op success", () => {

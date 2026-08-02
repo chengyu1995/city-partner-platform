@@ -3,18 +3,35 @@ import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
   buildAttemptPayload,
+  buildTerminalJobCleanupFields,
   claimHermesJob,
   createWorkerAttemptId,
+  findHermesJob,
   getBitableRecordId,
+  getDisabledTerminalJobStatus,
   getProjectDirectorJobCorrelation,
   getWorkerIdFromRequest,
   getWorkerSupabase,
+  isTerminalWorkerStatus,
   responseFromMaybe,
   updateHermesJob,
 } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+
+async function releaseTerminalJob(
+  supabase: Awaited<ReturnType<typeof getWorkerSupabase>>,
+  job: Record<string, unknown>,
+  terminalStatus: string
+) {
+  if (responseFromMaybe(supabase)) return { data: null, error: null, skippedColumns: [] };
+  return updateHermesJob(
+    supabase,
+    String(job.id),
+    buildTerminalJobCleanupFields(job, terminalStatus)
+  );
+}
 
 async function handleNext(req: NextRequest) {
   const unauthorized = assertWorkerAuthorized(req);
@@ -37,6 +54,47 @@ async function handleNext(req: NextRequest) {
   }
   if (!job) {
     return NextResponse.json({ ok: true, job: null });
+  }
+
+  const { data: preClaimJob, error: preClaimError } = await findHermesJob(supabase, job.id);
+  if (preClaimError) {
+    return NextResponse.json(
+      { ok: false, error: preClaimError.message ?? "pre-claim terminal check failed" },
+      { status: 500 }
+    );
+  }
+  const preClaimTerminalStatus =
+    getDisabledTerminalJobStatus(preClaimJob ?? job) ??
+    (isTerminalWorkerStatus(preClaimJob?.status) ? String(preClaimJob?.status) : null);
+  if (preClaimTerminalStatus) {
+    const cleanupResult = await releaseTerminalJob(
+      supabase,
+      preClaimJob ?? job,
+      preClaimTerminalStatus
+    );
+    if (cleanupResult.error) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: cleanupResult.error.message ?? "terminal job cleanup failed",
+          failure_code: "TERMINAL_JOB_CLEANUP_FAILED",
+          failure_stage: "pre_claim_terminal_cleanup",
+          worker_next_returned: false,
+          codex_called: false,
+          git_mutation_executed: false,
+        },
+        { status: 500 }
+      );
+    }
+    return NextResponse.json({
+      ok: true,
+      job: null,
+      skipped: "terminal_job_excluded_before_claim",
+      worker_next_returned: false,
+      execution_aborted: true,
+      codex_called: false,
+      git_mutation_executed: false,
+    });
   }
 
   const now = new Date().toISOString();
@@ -94,17 +152,70 @@ async function handleNext(req: NextRequest) {
     console.log(`[worker/next] skipped missing hermes_jobs columns: ${skippedColumns.join(", ")}`);
   }
 
+
+  const { data: persistedClaimedJob, error: postClaimError } = await findHermesJob(
+    supabase,
+    job.id
+  );
+  if (postClaimError) {
+    return NextResponse.json(
+      { ok: false, error: postClaimError.message ?? "post-claim terminal check failed" },
+      { status: 500 }
+    );
+  }
+  const postClaimTerminalStatus =
+    getDisabledTerminalJobStatus(persistedClaimedJob ?? claimedJob) ??
+    (isTerminalWorkerStatus(persistedClaimedJob?.status)
+      ? String(persistedClaimedJob?.status)
+      : null);
+  if (postClaimTerminalStatus) {
+    const cleanupResult = await releaseTerminalJob(
+      supabase,
+      persistedClaimedJob ?? claimedJob,
+      postClaimTerminalStatus
+    );
+    if (cleanupResult.error) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: cleanupResult.error.message ?? "terminal job cleanup failed",
+          failure_code: "TERMINAL_JOB_CLEANUP_FAILED",
+          failure_stage: "post_claim_terminal_cleanup",
+          worker_next_returned: false,
+          execution_aborted: true,
+          codex_called: false,
+          git_mutation_executed: false,
+        },
+        { status: 500 }
+      );
+    }
+    return NextResponse.json({
+      ok: true,
+      job: null,
+      attempt_id: attemptId,
+      skipped: "terminal_job_detected_after_claim",
+      worker_next_returned: false,
+      execution_aborted: true,
+      codex_called: false,
+      git_mutation_executed: false,
+    });
+  }
+
+  const runnableClaimedJob = persistedClaimedJob ?? claimedJob;
+
   const claimedPayload =
-    claimedJob.payload && typeof claimedJob.payload === "object" && !Array.isArray(claimedJob.payload)
-      ? (claimedJob.payload as Record<string, unknown>)
+    runnableClaimedJob.payload &&
+    typeof runnableClaimedJob.payload === "object" &&
+    !Array.isArray(runnableClaimedJob.payload)
+      ? (runnableClaimedJob.payload as Record<string, unknown>)
       : null;
   const activeAttempt =
     claimedPayload?.active_attempt && typeof claimedPayload.active_attempt === "object"
       ? (claimedPayload.active_attempt as Record<string, unknown>)
       : null;
   const persistedAttemptId =
-    claimedJob.active_attempt_id ??
-    claimedJob.attempt_id ??
+    runnableClaimedJob.active_attempt_id ??
+    runnableClaimedJob.attempt_id ??
     activeAttempt?.attempt_id ??
     claimedPayload?.attempt_id;
   if (persistedAttemptId !== attemptId) {
@@ -118,7 +229,7 @@ async function handleNext(req: NextRequest) {
       progress_percent: 0,
       current_step: null,
       status_message: null,
-      request_text: String(claimedJob.request_text ?? job.request_text ?? "")
+      request_text: String(runnableClaimedJob.request_text ?? job.request_text ?? "")
         .replace(/\n*HERMES_WORKER_ATTEMPT_CONTEXT:\n(?:`[^`\r\n]+=[^`\r\n]*`\n?)+/g, "")
         .trim(),
       updated_at: new Date().toISOString(),
@@ -137,8 +248,8 @@ async function handleNext(req: NextRequest) {
     );
   }
 
-  const recordId = getBitableRecordId(claimedJob, job);
-  const projectDirector = getProjectDirectorJobCorrelation(claimedJob);
+  const recordId = getBitableRecordId(runnableClaimedJob, job);
+  const projectDirector = getProjectDirectorJobCorrelation(runnableClaimedJob);
   await syncWorkerStatusToFeishu({
     recordId,
     status: "running",
@@ -151,7 +262,7 @@ async function handleNext(req: NextRequest) {
 
   return NextResponse.json({
     ok: true,
-    job: claimedJob,
+    job: runnableClaimedJob,
     attempt_id: attemptId,
     project_director: {
       ...projectDirector,
