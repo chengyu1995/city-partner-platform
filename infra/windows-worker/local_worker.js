@@ -31,6 +31,10 @@ const {
   runPreflight,
   sanitizeWindowsEnv,
 } = require("./worker-recovery");
+const {
+  runSshCommand: runCanonicalSshCommand,
+  shutdownActiveSshProcesses,
+} = require("./ssh-execution");
 
 const WORKER_API_URL = String(process.env.WORKER_API_URL || "").replace(/\/+$/, "");
 const WORKER_AUTH_ENV_KEY = "WORKER_" + "TOKEN";
@@ -8783,13 +8787,25 @@ async function main() {
   }
 }
 
-process.on("SIGINT", () => {
+function requestWorkerStop(message) {
   stopping = true;
-  console.log("正在停止 Worker...");
+  if (message) {
+    console.log(message);
+  }
+  void shutdownActiveSshProcesses().catch((error) => {
+    console.error(
+      "停止活动 SSH 子进程失败：",
+      error instanceof Error ? error.message : error
+    );
+  });
+}
+
+process.on("SIGINT", () => {
+  requestWorkerStop("正在停止 Worker...");
 });
 
 process.on("SIGTERM", () => {
-  stopping = true;
+  requestWorkerStop();
 });
 
 if (require.main === module) {
@@ -8868,6 +8884,8 @@ module.exports = {
   runCodexPreflight,
   runCodexStartupPreflight,
   runDeterministicGitOperation,
+  runCanonicalSshCommand,
+  shutdownActiveSshProcesses,
   toCodexUsageLimitError,
   spawnCodexWithStdin,
   spawnCodexProcess,
