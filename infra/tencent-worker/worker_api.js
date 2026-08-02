@@ -15,6 +15,7 @@ const {
   isCanonicalClaimPersisted,
   isJobSelectable: canonicalIsJobSelectable,
   recoverStaleAttempt: canonicalRecoverStaleAttempt,
+  rollbackFailedClaim: canonicalRollbackFailedClaim,
   validateJobStateInvariant: canonicalValidateJobStateInvariant,
 } = require("./worker_job_state_machine");
 
@@ -2592,26 +2593,98 @@ async function runtimePersistCanonicalTransition(job, patch) {
   return query.select("*").maybeSingle();
 }
 
-async function runtimeRollbackFailedClaim(originalJob, workerName) {
-  const rollbackData = {
-    status: originalJob && originalJob.status || "queued",
-    claimed_by: null,
-    claimed_at: null,
-    attempt_id: null,
-    active_attempt_id: null,
-    lease_id: originalJob && originalJob.lease_id || null,
-    active_lease_id: originalJob && originalJob.active_lease_id || null,
-    expires_at: originalJob && originalJob.expires_at || null,
-    progress_percent: 0,
-    current_step: null,
-    status_message: null,
-    payload: originalJob && originalJob.payload || null,
-    result: originalJob && originalJob.result || null,
-    updated_at: new Date().toISOString(),
-  };
-  return runtimeUpdateHermesJobWithSchemaFallback(originalJob.id, rollbackData, (query) =>
-    query.eq("status", "running").eq("claimed_by", workerName)
-  );
+async function runtimeRollbackFailedClaim(jobId, workerName, attemptId) {
+  const currentRead = await runtimeFindHermesJob(jobId);
+  if (currentRead.error || !currentRead.data) {
+    return { ok: false, rollback_applied: false, failure_code: "ROLLBACK_STATE_READ_FAILED" };
+  }
+  const currentJob = currentRead.data;
+  const expectedUpdatedAt = readFinalReportString(currentJob.updated_at);
+  const transition = canonicalRollbackFailedClaim(currentJob, {
+    job_id: jobId,
+    worker_id: workerName,
+    attempt_id: attemptId,
+    expected_updated_at: expectedUpdatedAt,
+    now: new Date().toISOString(),
+  });
+  if (transition.terminal_report_won || transition.rollback_skipped_reason === "JOB_ALREADY_TERMINAL") {
+    return {
+      ok: true,
+      rollback_applied: false,
+      rollback_skipped_reason: "JOB_ALREADY_TERMINAL",
+      terminal_report_won: true,
+      job: currentJob,
+    };
+  }
+  if (!transition.ok || !transition.patch || !transition.compare_and_set) {
+    return {
+      ok: false,
+      rollback_applied: false,
+      failure_code: transition.failure_code || "ROLLBACK_TRANSITION_REJECTED",
+      job: currentJob,
+    };
+  }
+  const expected = transition.compare_and_set;
+  let query = supabase
+    .from("hermes_jobs")
+    .update(transition.patch)
+    .eq("id", jobId)
+    .eq("status", expected.status)
+    .eq("claimed_by", workerName)
+    .eq("attempt_id", attemptId)
+    .eq("active_attempt_id", attemptId);
+  if (expectedUpdatedAt) query = query.eq("updated_at", expectedUpdatedAt);
+  const rollbackWrite = await query.select("*").maybeSingle();
+  if (rollbackWrite.error) {
+    return { ok: false, rollback_applied: false, failure_code: "ROLLBACK_COMPARE_AND_SET_FAILED" };
+  }
+  if (rollbackWrite.data) {
+    return {
+      ok: true,
+      rollback_applied: true,
+      rollback_skipped_reason: null,
+      terminal_report_won: false,
+      job: rollbackWrite.data,
+    };
+  }
+
+  const raceRead = await runtimeFindHermesJob(jobId);
+  if (raceRead.error || !raceRead.data) {
+    return { ok: false, rollback_applied: false, failure_code: "ROLLBACK_RACE_READ_FAILED" };
+  }
+  const racedJob = raceRead.data;
+  const racedInspection = canonicalInspectJobState(racedJob);
+  if (racedInspection.terminal) {
+    return {
+      ok: true,
+      rollback_applied: false,
+      rollback_skipped_reason: "JOB_ALREADY_TERMINAL",
+      terminal_report_won: true,
+      job: racedJob,
+    };
+  }
+  const racedInvariant = canonicalValidateJobStateInvariant(racedJob);
+  if (!racedInvariant.ok) {
+    return {
+      ok: false,
+      rollback_applied: false,
+      failure_code: racedInvariant.failure_code || "JOB_STATE_INVARIANT_VIOLATION",
+      job: racedJob,
+    };
+  }
+  const racedAttempt = canonicalGetActiveAttempt(racedJob);
+  const racedLease = racedInspection.active_lease;
+  if (
+    racedInspection.claimed_by !== workerName ||
+    !racedAttempt || racedAttempt.id !== attemptId ||
+    !racedLease || racedLease.attempt_id !== attemptId || racedLease.worker_id !== workerName
+  ) {
+    return { ok: false, rollback_applied: false, failure_code: "ROLLBACK_OWNERSHIP_CHANGED", job: racedJob };
+  }
+  if (expectedUpdatedAt && racedJob.updated_at !== expectedUpdatedAt) {
+    return { ok: false, rollback_applied: false, failure_code: "ROLLBACK_VERSION_CHANGED", job: racedJob };
+  }
+  return { ok: false, rollback_applied: false, failure_code: "ROLLBACK_COMPARE_AND_SET_FAILED", job: racedJob };
 }
 
 async function runtimeClaimHermesJob(job, workerName) {
@@ -2665,7 +2738,7 @@ async function runtimeClaimHermesJob(job, workerName) {
   if (!result.data) return { ...result, attempt_id: attemptId };
   const claimedAttemptId = getRuntimeActiveAttemptId(result.data);
   if (claimedAttemptId !== attemptId || !isCanonicalClaimPersisted(result.data, attemptId)) {
-    const rollback = await runtimeRollbackFailedClaim(job, workerName);
+    const rollback = await runtimeRollbackFailedClaim(job.id, workerName, attemptId);
     return {
       data: null,
       error: new Error("claim attempt contract was not persisted"),

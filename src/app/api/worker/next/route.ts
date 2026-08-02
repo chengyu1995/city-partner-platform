@@ -17,6 +17,7 @@ import {
   isJobSelectable,
   isCanonicalClaimPersisted,
   responseFromMaybe,
+  rollbackFailedClaimSafely,
   updateHermesJob,
   validateJobStateInvariant,
 } from "@/lib/worker-jobs";
@@ -261,22 +262,29 @@ async function handleNext(req: NextRequest) {
 
   const persistedAttemptId = getActiveAttemptId(runnableClaimedJob);
   if (persistedAttemptId !== attemptId || !isCanonicalClaimPersisted(runnableClaimedJob, attemptId)) {
-    await updateHermesJob(supabase, job.id, {
-      status: job.status ?? "queued",
-      claimed_by: null,
-      claimed_at: null,
-      attempt_id: null,
-      active_attempt_id: null,
-      lease_id: null,
-      active_lease_id: null,
-      expires_at: null,
-      progress_percent: 0,
-      current_step: null,
-      status_message: null,
-      payload: job.payload ?? null,
-      result: job.result ?? null,
-      updated_at: new Date().toISOString(),
+    const rollback = await rollbackFailedClaimSafely(supabase, {
+      job_id: jobId,
+      worker_id: workerId,
+      attempt_id: attemptId,
+      now: new Date().toISOString(),
     });
+    if (!rollback.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "failed claim rollback rejected",
+          failure_code: rollback.failure_code,
+          failure_stage: rollback.failure_stage,
+          rollback_applied: false,
+          rollback_skipped_reason: rollback.rollback_skipped_reason,
+          terminal_report_won: false,
+          worker_created: false,
+          job_id: jobId,
+          attempt_id: attemptId,
+        },
+        { status: 409 }
+      );
+    }
     return NextResponse.json(
       {
         ok: false,
@@ -286,6 +294,9 @@ async function handleNext(req: NextRequest) {
         worker_created: false,
         job_id: jobId,
         attempt_id: attemptId,
+        rollback_applied: rollback.rollback_applied,
+        rollback_skipped_reason: rollback.rollback_skipped_reason,
+        terminal_report_won: rollback.terminal_report_won,
       },
       { status: 500 }
     );

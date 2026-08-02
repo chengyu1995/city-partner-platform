@@ -560,6 +560,100 @@ function claimJob(job, input) {
   };
 }
 
+function rollbackFailedClaim(job, input = {}) {
+  const now = input.now || new Date().toISOString();
+  const jobId = readString(job && job.id);
+  const workerId = readString(input.worker_id);
+  const attemptId = readString(input.attempt_id);
+  const expectedJobId = readString(input.job_id);
+  const currentState = normalizeJobState(job);
+  if (TERMINAL_JOB_STATES.has(currentState)) {
+    return {
+      ok: true,
+      rollback_applied: false,
+      rollback_skipped_reason: "JOB_ALREADY_TERMINAL",
+      terminal_report_won: true,
+      terminal_immutable: true,
+      patch: null,
+    };
+  }
+  if (!jobId || !workerId || !attemptId || (expectedJobId && expectedJobId !== jobId)) {
+    return transitionFailure("ROLLBACK_CLAIM_IDENTITY_REQUIRED");
+  }
+  const validation = validateJobStateInvariant(job, { now });
+  if (!validation.ok) return transitionFailure(validation.failure_code, validation.violations);
+  const snapshot = validation.snapshot;
+  if (!["claimed", "running"].includes(snapshot.state)) {
+    return transitionFailure("ROLLBACK_JOB_NOT_CLAIMED");
+  }
+  if (snapshot.claimed_by !== workerId) {
+    return transitionFailure("ROLLBACK_OWNERSHIP_CHANGED");
+  }
+  const activeAttemptId = readString(snapshot.active_attempt && snapshot.active_attempt.id);
+  const attemptOwner = readString(snapshot.active_attempt && snapshot.active_attempt.worker_id);
+  if (activeAttemptId !== attemptId || attemptOwner !== workerId) {
+    return transitionFailure("ROLLBACK_ATTEMPT_CHANGED");
+  }
+  const lease = snapshot.active_lease;
+  const leaseAttemptId = readString(lease && lease.attempt_id);
+  const leaseOwner = readString(lease && lease.worker_id);
+  if (!lease || leaseAttemptId !== attemptId || leaseOwner !== workerId) {
+    return transitionFailure("ROLLBACK_LEASE_CHANGED");
+  }
+  const currentUpdatedAt = readString(job && job.updated_at);
+  if (input.expected_updated_at && input.expected_updated_at !== currentUpdatedAt) {
+    return transitionFailure("ROLLBACK_VERSION_CHANGED");
+  }
+
+  const machine = getStateMachine(job);
+  const abandonedAttempt = abandonAttempt(snapshot.active_attempt, now, "failed_claim");
+  const releasedLease = releaseLease(lease, now, "released");
+  const result = buildMachineResult(job, {
+    job_state: "queued",
+    selectable: true,
+    active_attempt: null,
+    active_lease: null,
+    attempt_history: appendUnique(machine.attempt_history, abandonedAttempt),
+    lease_history: appendUnique(machine.lease_history, releasedLease),
+    last_transition: { name: "rollback_failed_claim", at: now, attempt_id: attemptId },
+  });
+  return {
+    ok: true,
+    rollback_applied: false,
+    rollback_skipped_reason: null,
+    terminal_report_won: false,
+    abandoned_attempt: abandonedAttempt,
+    released_lease: releasedLease,
+    compare_and_set: {
+      id: jobId,
+      status: readString(job.status),
+      claimed_by: workerId,
+      attempt_id: attemptId,
+      active_attempt_id: attemptId,
+      updated_at: currentUpdatedAt,
+    },
+    patch: {
+      status: "queued",
+      claimed_by: null,
+      claimed_at: null,
+      attempt_id: null,
+      active_attempt_id: null,
+      lease_id: null,
+      active_lease_id: null,
+      expires_at: null,
+      heartbeat_at: null,
+      last_progress_at: null,
+      running_job_id: null,
+      progress_percent: 0,
+      current_step: null,
+      status_message: null,
+      payload: buildReleasedRuntimePayload(job),
+      result,
+      updated_at: now,
+    },
+  };
+}
+
 function beginAttempt(job, input = {}) {
   const validation = validateJobStateInvariant(job, { now: input.now });
   if (!validation.ok) return transitionFailure(validation.failure_code, validation.violations);
@@ -878,6 +972,7 @@ module.exports = {
   normalizeLeaseState,
   recoverStaleAttempt,
   releaseLease,
+  rollbackFailedClaim,
   resolveEffectiveFinalStatus,
   validateJobStateInvariant,
 };

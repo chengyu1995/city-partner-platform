@@ -54,8 +54,10 @@ test("/next persists claim and attempt contract before returning a job", () => {
   assert.match(nextRoute, /isCanonicalClaimPersisted\(runnableClaimedJob, attemptId\)/);
   assert.match(nextRoute, /persistedAttemptId !== attemptId/);
   assert.match(nextRoute, /WORKER_ATTEMPT_PERSISTENCE_FAILED/);
-  assert.match(nextRoute, /updateHermesJob\(supabase,\s*job\.id/);
-  assert.match(nextRoute, /claimed_by:\s*null/);
+  assert.match(nextRoute, /rollbackFailedClaimSafely\(supabase/);
+  assert.match(nextRoute, /terminal_report_won:\s*rollback\.terminal_report_won/);
+  assert.doesNotMatch(nextRoute, /status:\s*job\.status \?\? "queued"/);
+  assert.doesNotMatch(nextRoute, /result:\s*job\.result \?\? null/);
   assert.match(nextRoute, /job:\s*runnableClaimedJob/);
 });
 
