@@ -527,10 +527,7 @@ export async function POST(req: NextRequest) {
       })
     : null;
 
-  let existingTerminalStatus = getCanonicalTerminalWorkerJobStatus(existingJob);
-  if (isTerminalWorkerStatus(existingJob.status)) {
-    existingTerminalStatus ??= normalizeWorkerStatus(existingJob.status);
-  }
+  const existingTerminalStatus = getCanonicalTerminalWorkerJobStatus(existingJob);
   if (existingTerminalStatus) {
     if (!terminalAttemptMatches(existingJob, attemptId)) {
       return NextResponse.json(

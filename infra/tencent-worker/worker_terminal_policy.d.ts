@@ -6,15 +6,8 @@ export interface TerminalWorkerJobDescriptor {
 }
 
 export const TERMINAL_WORKER_STATUSES: Set<string>;
-export const MANUALLY_CLOSED_WORKER_JOBS: Map<
-  string,
-  { terminalState: string; closureCode: string }
->;
 export function normalizeTerminalWorkerStatus(value: unknown): string | null;
 export function getTerminalWorkerJobDescriptor(
   job: Record<string, unknown> | null | undefined
 ): TerminalWorkerJobDescriptor | null;
 export function isTerminalWorkerJob(job: Record<string, unknown> | null | undefined): boolean;
-export function isManuallyClosedWorkerJobIdentity(
-  job: Record<string, unknown> | null | undefined
-): boolean;

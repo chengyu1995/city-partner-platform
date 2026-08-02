@@ -10,7 +10,7 @@ const reportRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker
 const workerJobs = fs.readFileSync(path.join(root, "src", "lib", "worker-jobs.ts"), "utf8");
 
 function duplicateBranch() {
-  const start = reportRoute.indexOf("if (isTerminalWorkerStatus(existingJob.status))");
+  const start = reportRoute.indexOf("if (existingTerminalStatus)");
   const end = reportRoute.indexOf("const { data, error, skippedColumns }", start);
   assert.ok(start >= 0 && end > start, "duplicate terminal branch should exist");
   return reportRoute.slice(start, end);

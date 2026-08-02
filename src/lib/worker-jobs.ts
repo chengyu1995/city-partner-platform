@@ -3,6 +3,8 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { getSupabaseService } from "@/lib/env";
 import { createHash } from "node:crypto";
 import {
+  applyHeartbeat as buildCanonicalHeartbeat,
+  applyProgress as buildCanonicalProgress,
   claimJob as buildCanonicalClaim,
   cleanupTerminalJob as buildCanonicalTerminalCleanup,
   finalizeJob as buildCanonicalFinalization,
@@ -3758,6 +3760,7 @@ interface CanonicalTransitionResult {
   conflict?: boolean;
   existing_state?: string;
   incoming_state?: string;
+  terminal?: boolean;
 }
 
 export function validateJobStateInvariant(
@@ -3795,9 +3798,43 @@ export function buildCanonicalFinalizeTransition(
   return buildCanonicalFinalization(job, input) as CanonicalTransitionResult;
 }
 
+export function buildCanonicalHeartbeatTransition(
+  job: JobRecord,
+  input: {
+    worker_id: string;
+    attempt_id: string | null;
+    now: string;
+    expires_at: string;
+    status_message?: string | null;
+  }
+) {
+  return buildCanonicalHeartbeat(job, input) as CanonicalTransitionResult;
+}
+
+export function buildCanonicalProgressTransition(
+  job: JobRecord,
+  input: {
+    worker_id: string;
+    attempt_id: string | null;
+    now: string;
+    progress_percent: number;
+    current_step: string;
+    status_message?: string | null;
+  }
+) {
+  return buildCanonicalProgress(job, input) as CanonicalTransitionResult;
+}
+
 export function buildCanonicalStaleAttemptRecovery(
   job: JobRecord,
-  input: { now?: string; worker_available?: boolean; retry_allowed?: boolean; reason?: string }
+  input: {
+    now?: string;
+    worker_available?: boolean;
+    expected_attempt_id?: string;
+    expected_worker_id?: string;
+    retry_allowed?: boolean;
+    reason?: string;
+  }
 ) {
   return buildCanonicalStaleRecovery(job, input) as CanonicalTransitionResult;
 }
@@ -4221,6 +4258,18 @@ export async function updateHermesJob(
     error: { message: "too many missing columns while updating hermes_jobs" },
     skippedColumns,
   };
+}
+
+export async function updateCanonicalHermesJob(
+  supabase: SupabaseClient,
+  jobId: string,
+  fields: JobRecord,
+  expectedUpdatedAt?: string | null
+): Promise<{ data: JobRecord | null; error: SupabaseWriteError | null }> {
+  let query = supabase.from("hermes_jobs").update(fields).eq("id", jobId);
+  if (expectedUpdatedAt) query = query.eq("updated_at", expectedUpdatedAt);
+  const { data, error } = await query.select("*").maybeSingle();
+  return { data: (data as JobRecord | null) ?? null, error };
 }
 
 export async function claimHermesJob(

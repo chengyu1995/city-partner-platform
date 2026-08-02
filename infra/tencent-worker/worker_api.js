@@ -5,10 +5,8 @@ const dotenv = require("dotenv");
 const { createClient } = require("@supabase/supabase-js");
 const { sendFeishuReply } = require("./feishu_reply");
 const {
-  MANUALLY_CLOSED_WORKER_JOBS,
-  isManuallyClosedWorkerJobIdentity,
-} = require("./worker_terminal_policy");
-const {
+  applyHeartbeat: canonicalApplyHeartbeat,
+  applyProgress: canonicalApplyProgress,
   claimJob: canonicalClaimJob,
   cleanupTerminalJob: canonicalCleanupTerminalJob,
   finalizeJob: canonicalFinalizeJob,
@@ -2588,6 +2586,12 @@ async function runtimeUpdateHermesJobWithSchemaFallback(jobId, updateData, build
   return { data: null, error: new Error("worker_lifecycle_schema_fallback_exhausted"), skipped };
 }
 
+async function runtimePersistCanonicalTransition(job, patch) {
+  let query = supabase.from("hermes_jobs").update(patch).eq("id", job.id);
+  if (job.updated_at) query = query.eq("updated_at", job.updated_at);
+  return query.select("*").maybeSingle();
+}
+
 async function runtimeRollbackFailedClaim(originalJob, workerName) {
   const rollbackData = {
     status: originalJob && originalJob.status || "queued",
@@ -2774,30 +2778,6 @@ async function runtimePersistTerminalCleanup(job, descriptor) {
     runtimeBuildTerminalCleanupFields(job, descriptor)
   );
 }
-
-async function runtimeDisableKnownTerminalJobs() {
-  for (const [jobId] of MANUALLY_CLOSED_WORKER_JOBS.entries()) {
-    const { data: job, error } = await runtimeFindHermesJob(jobId);
-    if (error) {
-      console.error("known_terminal_job_lookup_failed", { job_id: jobId, message: error.message });
-      continue;
-    }
-    if (!job) continue;
-    const descriptor = runtimeGetTerminalJobDescriptor(job);
-    if (!descriptor) continue;
-    const cleanup = await runtimePersistTerminalCleanup(job, descriptor);
-    if (cleanup.error) {
-      console.error("known_terminal_job_cleanup_failed", { job_id: jobId, message: cleanup.error.message });
-      continue;
-    }
-    console.log("known_terminal_job_disabled", {
-      job_id: jobId,
-      status: descriptor.status,
-      terminal_state: descriptor.terminalState,
-    });
-  }
-}
-
 
 // RUNTIME_CONTRACT_PATCH_WORKER_STATS_OBSERVABILITY_V1
 const RUNTIME_PATCH_WORKER_STATS_PENDING_STATUSES = ["pending", "queued"];
@@ -3001,7 +2981,7 @@ app.post("/api/worker/heartbeat", authenticateWorker, async (req, res) => {
     console.error("Heartbeat lookup failed:", findError);
     return res.status(500).json({ ok: false, error: "heartbeat_lookup_failed", message: findError.message });
   }
-  if (!existingJob || String(existingJob.status || "").toLowerCase() !== "running") {
+  if (!existingJob) {
     return res.status(404).json({
       ok: false,
       error: "running_job_not_found",
@@ -3010,26 +2990,32 @@ app.post("/api/worker/heartbeat", authenticateWorker, async (req, res) => {
       attempt_id: attemptId,
     });
   }
-  const ownership = runtimeOwnsAndMatchesAttempt(existingJob, workerName, attemptId);
-  if (!ownership.ok) return res.status(ownership.status).json(ownership.body);
-
-  const updatePayload = attemptId ? runtimeBuildAttemptPayloadForJob(existingJob, {
-    attempt_id: attemptId,
-    job_id: jobId,
+  const transition = canonicalApplyHeartbeat(existingJob, {
     worker_id: workerName,
-    status: "running",
-    heartbeat_at: now,
-    updated_at: now,
-  }) : existingJob.payload;
-  const { data, error } = await runtimeUpdateHermesJobWithSchemaFallback(jobId, {
-      heartbeat_at: now,
-      expires_at: expiresAt,
-      claimed_by: workerName,
+    attempt_id: attemptId,
+    now,
+    expires_at: expiresAt,
+    status_message: req.body?.status_message,
+  });
+  if (transition.terminal) {
+    return res.json({
+      ok: true,
+      job: existingJob,
       attempt_id: attemptId,
-      active_attempt_id: attemptId,
-      payload: updatePayload,
-      updated_at: now,
-    }, (query) => query.eq("status", "running"));
+      idempotent: true,
+      terminal_heartbeat_is_noop: true,
+    });
+  }
+  if (!transition.ok || !transition.patch) {
+    return res.status(409).json({
+      ok: false,
+      error: "canonical_heartbeat_rejected",
+      failure_code: transition.failure_code,
+      failure_stage: transition.failure_stage,
+      violated_invariants: transition.violations || [],
+    });
+  }
+  const { data, error } = await runtimePersistCanonicalTransition(existingJob, transition.patch);
 
   if (error) {
     console.error("Heartbeat failed:", error);
@@ -3045,7 +3031,7 @@ app.post("/api/worker/heartbeat", authenticateWorker, async (req, res) => {
     return res.status(404).json({
       ok: false,
       error: "running_job_not_found",
-      failure_code: "RUNNING_JOB_NOT_FOUND",
+      failure_code: "CANONICAL_HEARTBEAT_RACE_LOST",
       failure_stage: "worker_heartbeat",
     });
   }
@@ -3108,7 +3094,7 @@ app.post("/api/worker/progress", authenticateWorker, async (req, res) => {
     console.error("Progress lookup failed:", findError);
     return res.status(500).json({ ok: false, error: "progress_lookup_failed", message: findError.message });
   }
-  if (!existingJob || String(existingJob.status || "").toLowerCase() !== "running") {
+  if (!existingJob) {
     return res.status(404).json({
       ok: false,
       error: "running_job_not_found_or_not_owned",
@@ -3117,34 +3103,35 @@ app.post("/api/worker/progress", authenticateWorker, async (req, res) => {
       attempt_id: attemptId,
     });
   }
-  const ownership = runtimeOwnsAndMatchesAttempt(existingJob, workerName, attemptId);
-  if (!ownership.ok) return res.status(ownership.status).json(ownership.body);
-
-  const updateData = {
+  const transition = canonicalApplyProgress(existingJob, {
+    worker_id: workerName,
+    attempt_id: attemptId,
+    now,
     progress_percent: progressPercent,
     current_step: currentStep.slice(0, 500),
     status_message: statusMessage
       ? statusMessage.slice(0, 2000)
       : null,
-    last_progress_at: now,
-    heartbeat_at: now,
-    claimed_by: workerName,
-    attempt_id: attemptId,
-    active_attempt_id: attemptId,
-    payload: attemptId ? runtimeBuildAttemptPayloadForJob(existingJob, {
+  });
+  if (transition.terminal) {
+    return res.json({
+      ok: true,
+      job: existingJob,
       attempt_id: attemptId,
-      job_id: jobId,
-      worker_id: workerName,
-      status: "running",
-      heartbeat_at: now,
-      updated_at: now,
-    }) : existingJob.payload,
-    updated_at: now,
-  };
-
-  const { data, error } = await runtimeUpdateHermesJobWithSchemaFallback(jobId, updateData, (query) =>
-    query.eq("status", "running")
-  );
+      idempotent: true,
+      terminal_progress_is_noop: true,
+    });
+  }
+  if (!transition.ok || !transition.patch) {
+    return res.status(409).json({
+      ok: false,
+      error: "canonical_progress_rejected",
+      failure_code: transition.failure_code,
+      failure_stage: transition.failure_stage,
+      violated_invariants: transition.violations || [],
+    });
+  }
+  const { data, error } = await runtimePersistCanonicalTransition(existingJob, transition.patch);
 
   if (error) {
     console.error("Progress update failed:", error);
@@ -4481,7 +4468,7 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
   const terminalAttemptMatches = runtimeTerminalAttemptMatches(existingJob, incomingAttemptId);
   let terminalJob = existingJob;
   let terminalRuntimeCleanupApplied = false;
-  if (existingStatusIsTerminal && (runtimeTerminalJobHasRuntimeState(existingJob) || isManuallyClosedWorkerJobIdentity(existingJob))) {
+  if (existingStatusIsTerminal && runtimeTerminalJobHasRuntimeState(existingJob)) {
     const cleanup = await runtimePersistTerminalCleanup(existingJob, terminalDescriptor);
     if (cleanup.error) {
       return res.status(500).json({
@@ -4924,10 +4911,18 @@ async function recoverStaleJobs() {
       const recovery = canonicalRecoverStaleAttempt(job, {
         now,
         worker_available: false,
+        expected_attempt_id: inspection.active_attempt.id,
+        expected_worker_id: inspection.claimed_by,
         retry_allowed: inspection.retry_allowed,
         reason: "worker_lease_expired",
       });
-      if (!recovery.ok || !recovery.patch) continue;
+      if (!recovery.ok || !recovery.patch) {
+        console.warn("canonical stale recovery rejected", {
+          job_id: job.id,
+          failure_code: recovery.failure_code || "STALE_RECOVERY_REJECTED",
+        });
+        continue;
+      }
       const recovered = await runtimeUpdateHermesJobWithSchemaFallback(
         job.id,
         recovery.patch,
@@ -4970,7 +4965,7 @@ const recoveryTimer = setInterval(
 );
 
 recoveryTimer.unref();
-runtimeDisableKnownTerminalJobs().then(recoverStaleJobs).catch((error) => {
+recoverStaleJobs().catch((error) => {
   console.error("known_terminal_job_startup_cleanup_failed", error && error.message ? error.message : error);
 });
 

@@ -76,12 +76,22 @@ test("terminal jobs are excluded before and after claim using persisted state", 
   assert.match(nextRoute, /git_mutation_executed:\s*false/);
 });
 
-test("cancelled SMOKE-44 and superseded MASTER-FAST-FORWARD-46 stay disabled", () => {
-  assert.match(terminalPolicySource, /eaaee4df-8ac7-4e5b-8267-080eb68f6b31/);
-  assert.match(terminalPolicySource, /ef2453ed-2385-49f2-a618-34fcc037fb70/);
-  assert.match(terminalPolicySource, /3ca92636-1b5a-4711-9c5d-5148c195e21b/);
-  assert.match(terminalPolicySource, /terminalState:\s*"superseded"/);
-  assert.match(terminalPolicySource, /terminalState:\s*"completed"/);
+test("persisted terminal jobs stay disabled without historical job identity rules", () => {
+  assert.doesNotMatch(terminalPolicySource, /eaaee4df-8ac7-4e5b-8267-080eb68f6b31/);
+  assert.doesNotMatch(terminalPolicySource, /ef2453ed-2385-49f2-a618-34fcc037fb70/);
+  assert.doesNotMatch(terminalPolicySource, /3ca92636-1b5a-4711-9c5d-5148c195e21b/);
+  assert.equal(
+    terminalPolicy.isTerminalWorkerJob({ id: "arbitrary-job", status: "failed" }),
+    true
+  );
+  assert.equal(
+    terminalPolicy.isTerminalWorkerJob({
+      id: "another-job",
+      status: "queued",
+      result: { terminal_state: "superseded" },
+    }),
+    true
+  );
   assert.match(nextRoute, /worker_next_returned:\s*false/);
 });
 
@@ -180,7 +190,7 @@ test("terminal cleanup clears attempts, lease, running index, and retry flags", 
 });
 
 test("duplicate terminal report stays terminal and idempotent after runtime cleanup", () => {
-  const duplicateStart = reportRoute.indexOf("if (isTerminalWorkerStatus(existingJob.status))");
+  const duplicateStart = reportRoute.indexOf("if (existingTerminalStatus)");
   const duplicateEnd = reportRoute.indexOf("const { data, error, skippedColumns }", duplicateStart);
   const duplicateBranch = reportRoute.slice(duplicateStart, duplicateEnd);
 
@@ -225,18 +235,20 @@ test("attempt identity can survive schemas without attempt_id columns or payload
 });
 
 test("heartbeat and progress reject wrong attempts with explicit failure code", () => {
-  assert.match(heartbeatRoute, /assertWorkerAttemptMatchesJob\(existingJob, attemptId\)/);
-  assert.match(progressRoute, /assertWorkerAttemptMatchesJob\(existingJob, attemptId\)/);
-  assert.match(workerJobs, /failure_code:\s*"WORKER_ATTEMPT_MISMATCH"/);
-  assert.match(workerJobs, /failure_stage:\s*"worker_attempt_validation"/);
-  assert.match(workerJobs, /stale_attempt:\s*true/);
+  assert.match(heartbeatRoute, /buildCanonicalHeartbeatTransition\(existingJob/);
+  assert.match(progressRoute, /buildCanonicalProgressTransition\(existingJob/);
+  assert.match(stateMachineSource, /transitionFailure\("WORKER_ATTEMPT_MISMATCH"\)/);
+  assert.match(heartbeatRoute, /failure_code:\s*transition\.failure_code/);
+  assert.match(progressRoute, /failure_code:\s*transition\.failure_code/);
 });
 
 test("heartbeat and progress update the active attempt payload for the correct attempt", () => {
-  assert.match(heartbeatRoute, /payload:\s*buildAttemptPayload\(existingJob/);
-  assert.match(progressRoute, /payload:\s*buildAttemptPayload\(existingJob/);
-  assert.match(heartbeatRoute, /active_attempt_id:\s*attemptId/);
-  assert.match(progressRoute, /active_attempt_id:\s*attemptId/);
+  assert.match(stateMachineSource, /function applyHeartbeat\(job, input = \{\}\)/);
+  assert.match(stateMachineSource, /function applyProgress\(job, input = \{\}\)/);
+  assert.match(heartbeatRoute, /updateCanonicalHermesJob\(/);
+  assert.match(progressRoute, /updateCanonicalHermesJob\(/);
+  assert.match(heartbeatRoute, /transition\.patch/);
+  assert.match(progressRoute, /transition\.patch/);
 });
 
 test("terminal report blocks false positive success after lifecycle failure", () => {

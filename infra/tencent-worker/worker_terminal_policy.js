@@ -10,21 +10,6 @@ const TERMINAL_WORKER_STATUSES = new Set([
   "superseded",
 ]);
 
-const MANUALLY_CLOSED_WORKER_JOBS = new Map([
-  [
-    "eaaee4df-8ac7-4e5b-8267-080eb68f6b31",
-    { terminalState: "superseded", closureCode: "JOB_SUPERSEDED" },
-  ],
-  [
-    "ef2453ed-2385-49f2-a618-34fcc037fb70",
-    { terminalState: "superseded", closureCode: "JOB_SUPERSEDED" },
-  ],
-  [
-    "3ca92636-1b5a-4711-9c5d-5148c195e21b",
-    { terminalState: "completed", closureCode: "JOB_COMPLETED" },
-  ],
-]);
-
 function asRecord(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) return value;
   if (typeof value !== "string") return {};
@@ -51,17 +36,6 @@ function readBoolean(value) {
 
 function getTerminalWorkerJobDescriptor(job) {
   if (!job || typeof job !== "object") return null;
-
-  const jobId = String(job.id || job.job_id || "").trim();
-  const manuallyClosed = MANUALLY_CLOSED_WORKER_JOBS.get(jobId);
-  if (manuallyClosed) {
-    return {
-      terminalState: manuallyClosed.terminalState,
-      storageStatus: manuallyClosed.terminalState === "completed" ? "completed" : "failed",
-      closureCode: manuallyClosed.closureCode,
-      source: "manual_terminal_registry",
-    };
-  }
 
   const payload = asRecord(job.payload || job.metadata || job.task_payload);
   const result = asRecord(job.result);
@@ -116,17 +90,9 @@ function isTerminalWorkerJob(job) {
   return Boolean(getTerminalWorkerJobDescriptor(job));
 }
 
-function isManuallyClosedWorkerJobIdentity(job) {
-  if (!job || typeof job !== "object") return false;
-  const jobId = String(job.id || job.job_id || "").trim();
-  return MANUALLY_CLOSED_WORKER_JOBS.has(jobId);
-}
-
 module.exports = {
-  MANUALLY_CLOSED_WORKER_JOBS,
   TERMINAL_WORKER_STATUSES,
   getTerminalWorkerJobDescriptor,
-  isManuallyClosedWorkerJobIdentity,
   isTerminalWorkerJob,
   normalizeTerminalWorkerStatus,
 };

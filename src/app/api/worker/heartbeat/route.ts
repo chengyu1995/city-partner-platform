@@ -1,9 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   assertWorkerAuthorized,
-  assertWorkerAttemptMatchesJob,
-  assertWorkerOwnsJob,
-  buildAttemptPayload,
+  buildCanonicalHeartbeatTransition,
   buildRunningJobNotFoundPayload,
   findHermesJob,
   getAttemptIdFromBody,
@@ -12,10 +10,9 @@ import {
   getWorkerIdFromBody,
   getWorkerIdFromRequest,
   getWorkerSupabase,
-  isTerminalWorkerStatus,
   parseJsonBody,
   responseFromMaybe,
-  updateHermesJob,
+  updateCanonicalHermesJob,
 } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
@@ -68,51 +65,50 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
-  if (ownershipError) return ownershipError;
-
-  const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
-  if (attemptError) return attemptError;
-
-  if (isTerminalWorkerStatus(existingJob.status)) {
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  const transition = buildCanonicalHeartbeatTransition(existingJob, {
+    worker_id: workerId,
+    attempt_id: attemptId,
+    now,
+    expires_at: expiresAt,
+    status_message: body.status_message,
+  });
+  if (transition.terminal) {
     return NextResponse.json({
       ok: true,
       job: existingJob,
       idempotent: true,
-      skipped: "terminal_job_heartbeat_ignored",
+      terminal_heartbeat_is_noop: true,
     });
   }
-
-  const now = new Date().toISOString();
-  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-  const { data, error, skippedColumns } = await updateHermesJob(supabase, jobId, {
-    status: "running",
-    claimed_by: workerId,
-    heartbeat_at: now,
-    expires_at: expiresAt,
-    status_message: body.status_message ?? "Worker heartbeat ok",
-    ...(attemptId
-      ? {
-          attempt_id: attemptId,
-          active_attempt_id: attemptId,
-          payload: buildAttemptPayload(existingJob, {
-            attempt_id: attemptId,
-            job_id: jobId,
-            worker_id: workerId,
-            status: "running",
-            heartbeat_at: now,
-            updated_at: now,
-          }),
-        }
-      : {}),
-    updated_at: now,
-  });
+  if (!transition.ok || !transition.patch) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "canonical_heartbeat_rejected",
+        failure_code: transition.failure_code,
+        failure_stage: transition.failure_stage,
+        violated_invariants: transition.violations ?? [],
+      },
+      { status: 409 }
+    );
+  }
+  const { data, error } = await updateCanonicalHermesJob(
+    supabase,
+    jobId,
+    transition.patch,
+    typeof existingJob.updated_at === "string" ? existingJob.updated_at : null
+  );
 
   if (error) {
     return NextResponse.json({ ok: false, error: error.message ?? "heartbeat update failed" }, { status: 500 });
   }
-  if (skippedColumns.length > 0) {
-    console.log(`[worker/heartbeat] skipped missing hermes_jobs columns: ${skippedColumns.join(", ")}`);
+  if (!data) {
+    return NextResponse.json(
+      { ok: false, error: "canonical_heartbeat_race_lost" },
+      { status: 409 }
+    );
   }
 
   return NextResponse.json({ ok: true, job: data, attempt_id: attemptId });

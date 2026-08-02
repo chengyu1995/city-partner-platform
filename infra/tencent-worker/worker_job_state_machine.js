@@ -125,6 +125,7 @@ function normalizeLeaseState(value) {
 function getActiveAttempt(job) {
   if (!job) return null;
   const machine = getStateMachine(job);
+  const hasCanonicalState = Boolean(readString(machine.job_state));
   const machineAttempt = asRecord(machine.active_attempt);
   const machineAttemptId = readString(machineAttempt.id || machineAttempt.attempt_id);
   const machineAttemptState = normalizeAttemptState(machineAttempt.state || machineAttempt.status);
@@ -136,6 +137,7 @@ function getActiveAttempt(job) {
       source: "canonical_state_machine",
     };
   }
+  if (hasCanonicalState) return null;
 
   const payload = asRecord(job.payload || job.metadata || job.task_payload);
   const payloadAttempt = asRecord(payload.active_attempt);
@@ -161,6 +163,7 @@ function getActiveAttempt(job) {
 function getLease(job, now = new Date().toISOString()) {
   if (!job) return null;
   const machine = getStateMachine(job);
+  const hasCanonicalState = Boolean(readString(machine.job_state));
   const machineLease = asRecord(machine.active_lease);
   const state = normalizeLeaseState(machineLease.state || machineLease.status);
   const expiresAt = readString(machineLease.expires_at);
@@ -174,6 +177,7 @@ function getLease(job, now = new Date().toISOString()) {
       source: "canonical_state_machine",
     };
   }
+  if (hasCanonicalState) return null;
 
   const legacyExpiresAt = readString(job.lease_expires_at || job.expires_at);
   const legacyLeaseId = readString(job.lease_id || job.lease) || (legacyExpiresAt ? `legacy:${job.id || "job"}` : null);
@@ -249,6 +253,25 @@ function validateJobStateInvariant(job, options = {}) {
   if (snapshot.state === "running" && !snapshot.active_lease) {
     add("RUNNING_WITHOUT_ACTIVE_LEASE", "running job has no valid lease");
   }
+  if (["claimed", "running"].includes(snapshot.state) && snapshot.active_attempt && snapshot.claimed_by) {
+    const attemptOwner = readString(snapshot.active_attempt.worker_id);
+    if (!attemptOwner) add("ACTIVE_ATTEMPT_OWNER_MISSING", "active attempt has no worker owner");
+    else if (attemptOwner !== snapshot.claimed_by) {
+      add("ACTIVE_ATTEMPT_OWNER_MISMATCH", "active attempt owner does not match claimed_by");
+    }
+  }
+  if (["claimed", "running"].includes(snapshot.state) && snapshot.active_attempt && snapshot.active_lease) {
+    const attemptId = readString(snapshot.active_attempt.id);
+    const attemptOwner = readString(snapshot.active_attempt.worker_id);
+    const leaseAttemptId = readString(snapshot.active_lease.attempt_id);
+    const leaseOwner = readString(snapshot.active_lease.worker_id);
+    if (leaseAttemptId !== attemptId) {
+      add("ACTIVE_LEASE_ATTEMPT_MISMATCH", "active lease does not belong to the active attempt");
+    }
+    if (!leaseOwner || !attemptOwner || leaseOwner !== attemptOwner) {
+      add("ACTIVE_LEASE_OWNER_MISMATCH", "active lease owner does not match the active attempt owner");
+    }
+  }
   if (snapshot.terminal && snapshot.claimed_by) {
     add("TERMINAL_WITH_OWNER", "terminal job still has claimed_by");
   }
@@ -286,6 +309,10 @@ function isJobSelectable(job, options = {}) {
     && !snapshot.active_attempt
     && !snapshot.active_lease
     && snapshot.retry_allowed;
+}
+
+function isTerminalJob(job) {
+  return inspectJobState(job).terminal;
 }
 
 function isCanonicalClaimPersisted(job, attemptId) {
@@ -350,6 +377,116 @@ function buildReleasedRuntimePayload(job, terminalState = null) {
     should_retry: false,
     ...(terminalState ? { terminal_state: terminalState } : {}),
   };
+}
+
+function validateRuntimeSignalOwnership(job, snapshot, input) {
+  const attempt = snapshot.active_attempt;
+  const lease = snapshot.active_lease;
+  const jobId = readString(job && job.id);
+  const claimedBy = snapshot.claimed_by;
+  const attemptId = readString(attempt && attempt.id);
+  const attemptOwner = readString(attempt && attempt.worker_id);
+  const leaseJobId = readString(lease && lease.job_id);
+  const leaseAttemptId = readString(lease && lease.attempt_id);
+  const leaseOwner = readString(lease && lease.worker_id);
+  if (!readString(input.worker_id) || !readString(input.attempt_id)) {
+    return transitionFailure("RUNTIME_SIGNAL_IDENTITY_REQUIRED");
+  }
+  if (!claimedBy || !attemptId || !attemptOwner || !lease) {
+    return transitionFailure("RUNTIME_OWNERSHIP_UNVERIFIABLE");
+  }
+  if (attemptOwner !== claimedBy || (input.worker_id && input.worker_id !== claimedBy)) {
+    return transitionFailure("RUNTIME_ATTEMPT_OWNER_MISMATCH");
+  }
+  if (input.attempt_id && input.attempt_id !== attemptId) {
+    return transitionFailure("WORKER_ATTEMPT_MISMATCH");
+  }
+  if ((leaseJobId && jobId && leaseJobId !== jobId) || leaseAttemptId !== attemptId) {
+    return transitionFailure("RUNTIME_LEASE_IDENTITY_MISMATCH");
+  }
+  if (!leaseOwner || leaseOwner !== attemptOwner) {
+    return transitionFailure("RUNTIME_LEASE_OWNER_MISMATCH");
+  }
+  return { ok: true, attempt, lease, claimed_by: claimedBy };
+}
+
+function applyRuntimeSignal(job, input, signal) {
+  const now = input.now || new Date().toISOString();
+  const validation = validateJobStateInvariant(job, { now });
+  const snapshot = validation.snapshot;
+  if (snapshot.terminal) {
+    return {
+      ok: true,
+      idempotent: true,
+      terminal: true,
+      terminal_immutable: true,
+      violations: validation.violations,
+      patch: null,
+    };
+  }
+  if (!validation.ok) return transitionFailure(validation.failure_code, validation.violations);
+  if (!["claimed", "running"].includes(snapshot.state)) {
+    return transitionFailure("RUNTIME_SIGNAL_JOB_NOT_ACTIVE");
+  }
+  const ownership = validateRuntimeSignalOwnership(job, snapshot, input);
+  if (!ownership.ok) return ownership;
+  const machine = getStateMachine(job);
+  const attempt = {
+    ...ownership.attempt,
+    state: "running",
+    started_at: ownership.attempt.started_at || now,
+    ...(signal === "heartbeat" ? { heartbeat_at: now } : { last_progress_at: now }),
+    updated_at: now,
+  };
+  const lease = {
+    ...ownership.lease,
+    state: "active",
+    expires_at: input.expires_at || ownership.lease.expires_at,
+    updated_at: now,
+  };
+  const result = buildMachineResult(job, {
+    job_state: "running",
+    selectable: false,
+    active_attempt: attempt,
+    active_lease: lease,
+    attempt_history: appendUnique(machine.attempt_history, attempt),
+    lease_history: appendUnique(machine.lease_history, lease),
+    last_transition: { name: signal, at: now, attempt_id: attempt.id },
+  });
+  return {
+    ok: true,
+    idempotent: false,
+    terminal: false,
+    patch: {
+      status: compatibilityStatus("running"),
+      claimed_by: ownership.claimed_by,
+      attempt_id: attempt.id,
+      active_attempt_id: attempt.id,
+      lease_id: lease.id,
+      active_lease_id: lease.id,
+      expires_at: lease.expires_at,
+      heartbeat_at: signal === "heartbeat" ? now : job.heartbeat_at || null,
+      ...(signal === "progress"
+        ? {
+            progress_percent: input.progress_percent,
+            current_step: input.current_step,
+            status_message: input.status_message || null,
+            last_progress_at: now,
+          }
+        : { status_message: input.status_message || job.status_message || null }),
+      payload: buildClaimedPayload(job, attempt),
+      result,
+      updated_at: now,
+    },
+  };
+}
+
+function applyHeartbeat(job, input = {}) {
+  return applyRuntimeSignal(job, input, "heartbeat");
+}
+
+function applyProgress(job, input = {}) {
+  return applyRuntimeSignal(job, input, "progress");
 }
 
 function transitionFailure(code, violations = [], detail = null) {
@@ -629,12 +766,39 @@ function recoverStaleAttempt(job, input = {}) {
   }
   const snapshot = inspectJobState(job, { now });
   if (!snapshot.active_attempt) return transitionFailure("ACTIVE_ATTEMPT_REQUIRED");
-  if (snapshot.active_lease && input.worker_available !== false) {
-    return transitionFailure("ACTIVE_LEASE_NOT_EXPIRED");
+  const attemptId = readString(snapshot.active_attempt.id);
+  const attemptOwner = readString(snapshot.active_attempt.worker_id);
+  const claimedBy = snapshot.claimed_by;
+  const lease = snapshot.lease;
+  const leaseId = readString(lease && lease.id);
+  const leaseJobId = readString(lease && lease.job_id);
+  const leaseAttemptId = readString(lease && lease.attempt_id);
+  const leaseOwner = readString(lease && lease.worker_id);
+  const leaseExpiresAt = readString(lease && lease.expires_at);
+  if (!attemptId || (input.expected_attempt_id && input.expected_attempt_id !== attemptId)) {
+    return transitionFailure("STALE_ATTEMPT_IDENTITY_MISMATCH");
   }
+  if (!attemptOwner || !claimedBy) {
+    return transitionFailure("STALE_ATTEMPT_OWNERSHIP_UNVERIFIABLE");
+  }
+  if (attemptOwner !== claimedBy || (input.expected_worker_id && input.expected_worker_id !== attemptOwner)) {
+    return transitionFailure("STALE_ATTEMPT_OWNER_MISMATCH");
+  }
+  if (!leaseId || !leaseAttemptId || !leaseOwner || !leaseExpiresAt) {
+    return transitionFailure("STALE_ATTEMPT_LEASE_UNVERIFIABLE");
+  }
+  if ((leaseJobId && readString(job.id) && leaseJobId !== readString(job.id)) || leaseAttemptId !== attemptId) {
+    return transitionFailure("STALE_ATTEMPT_LEASE_IDENTITY_MISMATCH");
+  }
+  if (leaseOwner !== attemptOwner) {
+    return transitionFailure("STALE_ATTEMPT_LEASE_OWNER_MISMATCH");
+  }
+  const leaseExpiry = Date.parse(leaseExpiresAt);
+  if (!Number.isFinite(leaseExpiry)) return transitionFailure("STALE_ATTEMPT_LEASE_UNVERIFIABLE");
+  if (leaseExpiry > Date.parse(now)) return transitionFailure("STALE_ATTEMPT_LEASE_ACTIVE");
   const machine = getStateMachine(job);
   const abandoned = abandonAttempt(snapshot.active_attempt, now, input.reason || "stale_attempt");
-  const released = releaseLease(snapshot.lease, now, snapshot.lease && snapshot.lease.state === "expired" ? "expired" : "released");
+  const released = releaseLease(lease, now, "expired");
   const retryAllowed = input.retry_allowed !== undefined ? input.retry_allowed === true : snapshot.retry_allowed;
   const nextState = retryAllowed ? "queued" : "terminal_failed";
   const result = buildMachineResult(job, {
@@ -693,6 +857,8 @@ module.exports = {
   TERMINAL_ATTEMPT_STATES,
   TERMINAL_JOB_STATES,
   abandonAttempt,
+  applyHeartbeat,
+  applyProgress,
   beginAttempt,
   claimJob,
   cleanupTerminalJob,
@@ -705,6 +871,7 @@ module.exports = {
   isCanonicalClaimPersisted,
   isJobSelectable,
   isRetryAllowed,
+  isTerminalJob,
   mergeExecutionPolicy,
   normalizeAttemptState,
   normalizeJobState,

@@ -2,9 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
-  assertWorkerAttemptMatchesJob,
-  assertWorkerOwnsJob,
-  buildAttemptPayload,
+  buildCanonicalProgressTransition,
   buildRunningJobNotFoundPayload,
   clampProgress,
   findHermesJob,
@@ -14,11 +12,9 @@ import {
   getCreatedAtFromBody,
   getWorkerIdFromBody,
   getWorkerSupabase,
-  isTerminalWorkerStatus,
-  normalizeWorkerStatus,
   parseJsonBody,
   responseFromMaybe,
-  updateHermesJob,
+  updateCanonicalHermesJob,
 } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
@@ -59,8 +55,7 @@ export async function POST(req: NextRequest) {
 
   const now = new Date().toISOString();
   const progressPercent = clampProgress(body.progress_percent, 0);
-  const workerStatus = normalizeWorkerStatus(body.status);
-  const currentStep = body.current_step ?? (workerStatus === "queued" ? "waiting_worker_claim" : "running");
+  const currentStep = body.current_step ?? "running";
   const workerId = getWorkerIdFromBody(body);
   const attemptId = getAttemptIdFromBody(body);
   const { data: existingJob, error: findError } = await findHermesJob(supabase, jobId);
@@ -81,56 +76,57 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
-  if (ownershipError) return ownershipError;
-
-  const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
-  if (attemptError) return attemptError;
-
-  if (isTerminalWorkerStatus(existingJob.status)) {
+  const transition = buildCanonicalProgressTransition(existingJob, {
+    worker_id: workerId,
+    attempt_id: attemptId,
+    now,
+    progress_percent: progressPercent,
+    current_step: currentStep,
+    status_message: body.status_message,
+  });
+  if (transition.terminal) {
     return NextResponse.json({
       ok: true,
       job: existingJob,
       idempotent: true,
-      skipped: "terminal_job_progress_ignored",
+      terminal_progress_is_noop: true,
     });
   }
-
-  const { data, error, skippedColumns } = await updateHermesJob(supabase, jobId, {
-    status: body.status ?? "running",
-    claimed_by: workerId,
-    progress_percent: workerStatus === "queued" ? 0 : progressPercent,
-    current_step: currentStep,
-    status_message: body.status_message ?? null,
-    ...(attemptId
-      ? {
-          attempt_id: attemptId,
-          active_attempt_id: attemptId,
-          payload: buildAttemptPayload(existingJob, {
-            attempt_id: attemptId,
-            job_id: jobId,
-            worker_id: workerId,
-            status: workerStatus,
-            updated_at: now,
-          }),
-        }
-      : {}),
-    updated_at: now,
-  });
+  if (!transition.ok || !transition.patch) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "canonical_progress_rejected",
+        failure_code: transition.failure_code,
+        failure_stage: transition.failure_stage,
+        violated_invariants: transition.violations ?? [],
+      },
+      { status: 409 }
+    );
+  }
+  const { data, error } = await updateCanonicalHermesJob(
+    supabase,
+    jobId,
+    transition.patch,
+    typeof existingJob.updated_at === "string" ? existingJob.updated_at : null
+  );
 
   if (error) {
     return NextResponse.json({ ok: false, error: error.message ?? "update failed" }, { status: 500 });
   }
-  if (skippedColumns.length > 0) {
-    console.log(`[worker/progress] skipped missing hermes_jobs columns: ${skippedColumns.join(", ")}`);
+  if (!data) {
+    return NextResponse.json(
+      { ok: false, error: "canonical_progress_race_lost" },
+      { status: 409 }
+    );
   }
 
   const recordId = getBitableRecordId(body, data, existingJob);
   await syncWorkerStatusToFeishu({
     recordId,
-    status: workerStatus === "queued" ? "queued" : "running",
+    status: "running",
     stage: "execution",
-    progressPercent: workerStatus === "queued" ? 0 : progressPercent,
+    progressPercent,
     currentStep,
     statusMessage: body.status_message ?? null,
     updatedAt: now,
