@@ -107,6 +107,11 @@ test("worker contract carries verification-only no-change success flags", () => 
   assert.match(reportRoute, /codex_required:\s*body\.codex_required \?\? null/);
 });
 
+test("approval context readback mismatch codes are diagnostics-safe", () => {
+  assert.match(workerJobs, /"APPROVAL_CONTEXT_BATCH_MISMATCH"/);
+  assert.match(workerJobs, /"APPROVAL_CONTEXT_POLICY_MISMATCH"/);
+});
+
 test("diagnostics preserves context without original request text", () => {
   assert.match(workerJobs, /project_domain:/);
   assert.match(workerJobs, /requested_mode:/);

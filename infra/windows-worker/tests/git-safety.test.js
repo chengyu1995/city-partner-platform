@@ -434,8 +434,9 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
   });
 
   await t.test("system repair intake injects repair scope before generic planning and exact scope validation", () => {
-    const directWorkerIndex = routeSource.indexOf("if (isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text))");
-    const repairIntakeIndex = routeSource.indexOf("const systemRepairIntakeContext = resolveSystemRepairIntakeContext(text)");
+    const repairPrecheckIndex = routeSource.indexOf("const directWorkerSystemRepairIntakeContext = resolveSystemRepairIntakeContext(text)");
+    const directWorkerIndex = routeSource.indexOf("isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text)");
+    const repairIntakeIndex = routeSource.indexOf("const systemRepairIntakeContext =");
     const planChangeIndex = routeSource.indexOf("if (isPlanChangeReply(text))");
     const planningChoiceIndex = routeSource.indexOf("const planningChoice = parseProjectDirectorPlanningChoice(text)");
     const genericDemandIndex = routeSource.indexOf("const demandKind = classifyProjectDirectorDemand(text)");
@@ -444,7 +445,10 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
       routeSource.indexOf("function buildSystemRepairIntakeRecord")
     );
 
+    assert.notEqual(repairPrecheckIndex, -1);
+    assert.notEqual(directWorkerIndex, -1);
     assert.notEqual(repairIntakeIndex, -1);
+    assert.ok(repairPrecheckIndex < directWorkerIndex);
     assert.ok(directWorkerIndex < repairIntakeIndex);
     assert.ok(repairIntakeIndex < planChangeIndex);
     assert.ok(repairIntakeIndex < planningChoiceIndex);
@@ -489,19 +493,24 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
 
   await t.test("system repair execution continues after approval context save and readback", () => {
     const repairBranch = routeSource.slice(
-      routeSource.indexOf("const systemRepairIntakeContext = resolveSystemRepairIntakeContext(text)"),
+      routeSource.indexOf("const systemRepairIntakeContext ="),
       routeSource.indexOf("if (isPlanChangeReply(text))")
     );
 
     assert.match(routeSource, /function hasSystemRepairExecutionIntent/);
     assert.match(routeSource, /function isSystemRepairContextSaveOnlyRequest/);
     assert.match(routeSource, /function saveSystemRepairApprovalContextRecord/);
+    assert.match(routeSource, /function assertSystemRepairApprovalContextReadback/);
     assert.match(routeSource, /function findActiveSystemRepairWorkerJobByBatch/);
     assert.match(routeSource, /function insertSystemRepairWorkerTask/);
     assert.match(repairBranch, /hasSystemRepairExecutionIntent\(text, systemRepairIntakeContext\)/);
     assert.ok(
       repairBranch.indexOf("saveSystemRepairApprovalContextRecord") <
         repairBranch.indexOf("findActiveSystemRepairWorkerJobByBatch")
+    );
+    assert.ok(
+      repairBranch.indexOf("approvalContextReadback") <
+        repairBranch.indexOf("insertSystemRepairWorkerTask")
     );
     assert.ok(
       repairBranch.indexOf("findActiveSystemRepairWorkerJobByBatch") <
@@ -520,6 +529,16 @@ test("Project Director Worker task creation uses hermes_jobs contract", async (t
     assert.match(routeSource, /existing_worker: true/);
     assert.match(routeSource, /APPROVAL_CONTEXT_PERSISTENCE_FAILED/);
     assert.match(routeSource, /APPROVAL_CONTEXT_READBACK_FAILED/);
+    assert.match(routeSource, /APPROVAL_CONTEXT_BATCH_MISMATCH/);
+    assert.match(routeSource, /APPROVAL_CONTEXT_POLICY_MISMATCH/);
+    assert.match(routeSource, /order\("created_at", \{ ascending: false \}\)/);
+    assert.doesNotMatch(
+      routeSource.slice(
+        routeSource.indexOf("async function saveSystemRepairApprovalContextRecord"),
+        routeSource.indexOf("function normalizeApprovalReadbackValue")
+      ),
+      /\.eq\("content", systemRecord\)/
+    );
     assert.match(routeSource, /assertNoScopeContractConflict\(SYSTEM_REPAIR_SCOPE, text\)/);
     assert.match(routeSource, /assertNoScopeContractConflict\(input\.context\.exactAllowedScope, forbiddenScope\)/);
     assert.match(routeSource, /normal_write_allowed_exact_scope_validation/);
@@ -4638,12 +4657,12 @@ test("Codex spawn preflight guard", async (t) => {
       path.join(workerRoot, "..", "..", "src", "app", "api", "feishu", "event", "route.ts"),
       "utf8"
     );
-    const directBranchIndex = routeSource.indexOf("if (isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text))");
+    const directBranchIndex = routeSource.indexOf("isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text)");
     const planningChoiceIndex = routeSource.indexOf("const planningChoice = parseProjectDirectorPlanningChoice(text)");
     const genericDemandIndex = routeSource.indexOf('const demandKind = classifyProjectDirectorDemand(text)');
     const directBranch = routeSource.slice(
       directBranchIndex,
-      routeSource.indexOf("const systemRepairIntakeContext = resolveSystemRepairIntakeContext(text)", directBranchIndex)
+      routeSource.indexOf("const systemRepairIntakeContext =", directBranchIndex)
     );
 
     assert.notEqual(directBranchIndex, -1);
@@ -4666,6 +4685,8 @@ test("Codex spawn preflight guard", async (t) => {
     assert.match(routeSource, /PROJECT_DIRECTOR_DIRECT_WORKER_TASK_DUPLICATE/);
     assert.ok(directBranch.indexOf("findRecentDuplicateFeishuJob") < directBranch.indexOf("insertDirectWorkerTask"));
     assert.doesNotMatch(directBranch, /buildProjectDirectorReply|buildTaskTreeDraftSummary|approval_context_saved=false/);
+    assert.match(routeSource, /shouldUseSystemRepairWorkerFlow/);
+    assert.match(routeSource, /!shouldUseSystemRepairWorkerFlow/);
     assert.match(routeSource, /taskMode: modeContract\.taskMode/);
     assert.match(routeSource, /readOnlyMode: modeContract\.readOnlyMode/);
     assert.match(routeSource, /approvedBatch: modeContract\.batchCode/);

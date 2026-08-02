@@ -1244,6 +1244,7 @@ function projectDomainForTaskMode(taskMode: string | null): string | null {
 
 const SYSTEM_REPAIR_BATCH_PREFIX = "BATCH-ARCH-COMPLETE";
 const SYSTEM_REPAIR_TASK_TYPE = "system_repair";
+const SYSTEM_REPAIR_APPROVAL_CONTEXT_NAME = "project_director_repair_mode_approval_context";
 const SYSTEM_REPAIR_SCOPE = [
   "src/app/api/feishu/event/route.ts",
   "src/lib/project-director-console.ts",
@@ -1317,7 +1318,7 @@ function resolveSystemRepairIntakeContext(text: string) {
         parsedProjectDomain,
         parsedTaskType,
         parsedBatchCode,
-        parsedRequestedMode: parsedRequestedMode ?? "not_provided",
+        parsedRequestedMode: parsedRequestedMode ?? "write_allowed",
         parsedFinalMode: parsedFinalMode ?? "write_allowed",
         parsedTaskMode: parsedTaskMode ?? "automation_system_write_allowed",
         repairModeCandidate,
@@ -1335,7 +1336,7 @@ function resolveSystemRepairIntakeContext(text: string) {
       parsedProjectDomain,
       parsedTaskType,
       parsedBatchCode,
-      parsedRequestedMode: parsedRequestedMode ?? "not_provided",
+      parsedRequestedMode: parsedRequestedMode ?? "write_allowed",
       parsedFinalMode: parsedFinalMode ?? "write_allowed",
       parsedTaskMode: parsedTaskMode ?? "automation_system_write_allowed",
       repairModeCandidate,
@@ -1421,6 +1422,7 @@ function buildSystemRepairIntakeRecord(
     `exact_allowed_scope=${context.exactAllowedScope.join(", ")}`,
     `exact_allowed_scope_count=${context.exactAllowedScope.length}`,
     `approval_context_saved=${context.ok ? "true" : "false"}`,
+    "approval_context_readback_required=true",
     `validation_path=${context.validationPath}`,
     `failure_code=${context.failureCode ?? "null"}`,
     `failure_stage=${context.failureStage ?? "null"}`,
@@ -1432,11 +1434,30 @@ function buildSystemRepairIntakeRecord(
     `final_mode=${context.parsedFinalMode}`,
     `task_mode=${context.parsedTaskMode}`,
     "read_only_mode=false",
+    "repair_mode=true",
+    "verification_only=false",
+    "worker_only=false",
+    "allow_no_change_success=false",
+    "execution_intent=apply_code_changes",
+    "code_changes_required=true",
+    "codex_required=true",
+    "git_commit_required=true",
+    "git_push_required=true",
     "approval_required=true",
+    `forbidden_scope=${readDirectWorkerContextField(inputText, "forbidden_scope") ?? "src/app product pages for non-product modes, database, env, secrets, deploy"}`,
+    `task_goal=${readDirectWorkerContextField(inputText, "task_goal") ?? `Execute approved automation system repair batch ${context.parsedBatchCode}.`}`,
+    `required_output_fields=${readDirectWorkerContextField(inputText, "required_output_fields") ?? "null"}`,
+    `acceptance_conditions=${readDirectWorkerContextField(inputText, "acceptance_conditions") ?? "null"}`,
     "context_source=project_director_gm_intake_repair_mode",
     `context_id=${context.parsedBatchCode}:${feishuMessageId}`,
+    "execution_policy_source=current_approval_context",
+    `execution_policy_batch_code=${context.parsedBatchCode}`,
+    `execution_policy_context_id=${context.parsedBatchCode}:${feishuMessageId}`,
+    "execution_policy_inherited=false",
+    "execution_policy_inheritance_rejected_reason=null",
     "consumed=false",
     `original_request_text_base64=${originalRequestTextBase64}`,
+    "original_request_text_preserved=true",
     `original_request_text=${inputText}`,
     "worker_created=false",
     "next_stage_allowed=false",
@@ -1492,8 +1513,9 @@ function buildSystemRepairWorkerCreatedReply(
 async function saveSystemRepairApprovalContextRecord(
   supabase: SupabaseClient,
   convId: string,
-  systemRecord: string
-): Promise<void> {
+  systemRecord: string,
+  context: NonNullable<ReturnType<typeof resolveSystemRepairIntakeContext>>
+): Promise<{ id: string | null; content: string }> {
   const { error } = await supabase.from("hermes_messages").insert([
     {
       conversation_id: convId,
@@ -1501,7 +1523,7 @@ async function saveSystemRepairApprovalContextRecord(
       content: systemRecord,
       feishu_message_id: null,
       tool_call_id: null,
-      name: "project_director_repair_mode_approval_context",
+      name: SYSTEM_REPAIR_APPROVAL_CONTEXT_NAME,
     },
   ]);
   if (error) {
@@ -1513,21 +1535,94 @@ async function saveSystemRepairApprovalContextRecord(
 
   const { data, error: readbackError } = await supabase
     .from("hermes_messages")
-    .select("id, content, name")
+    .select("id, content, name, created_at")
     .eq("conversation_id", convId)
-    .eq("name", "project_director_repair_mode_approval_context")
-    .eq("content", systemRecord)
-    .order("id", { ascending: false })
+    .eq("name", SYSTEM_REPAIR_APPROVAL_CONTEXT_NAME)
+    .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
-  if (readbackError || !data || (data as { content?: string | null }).content !== systemRecord) {
+  const readbackContent = (data as { content?: string | null } | null)?.content ?? null;
+  if (readbackError || !readbackContent) {
     const saveError = new Error(
       `approval context readback failed: ${readbackError?.message ?? "record not found"}`
     );
     (saveError as Error & { code?: string; stage?: string }).code = "APPROVAL_CONTEXT_READBACK_FAILED";
     (saveError as Error & { code?: string; stage?: string }).stage = "approval_context_readback";
     throw saveError;
+  }
+
+  assertSystemRepairApprovalContextReadback(readbackContent, context);
+  return { id: (data as { id?: string | null }).id ?? null, content: readbackContent };
+}
+
+function normalizeApprovalReadbackValue(value: string | null): string | null {
+  const normalized = value?.trim().toLowerCase() ?? null;
+  return normalized || null;
+}
+
+function readApprovalContextField(content: string, fieldName: string): string | null {
+  return readDirectWorkerContextField(content, fieldName);
+}
+
+function throwApprovalContextMismatch(
+  code: string,
+  stage: string,
+  message: string
+): never {
+  const error = new Error(message);
+  (error as Error & { code?: string; stage?: string }).code = code;
+  (error as Error & { code?: string; stage?: string }).stage = stage;
+  throw error;
+}
+
+function assertSystemRepairApprovalContextReadback(
+  readbackContent: string,
+  context: NonNullable<ReturnType<typeof resolveSystemRepairIntakeContext>>
+): void {
+  const expectedBatch = context.parsedBatchCode.toUpperCase();
+  const approvedBatch = readApprovalContextField(readbackContent, "approved_batch")?.toUpperCase() ?? null;
+  const batchCode = readApprovalContextField(readbackContent, "batch_code")?.toUpperCase() ?? null;
+
+  if (approvedBatch !== expectedBatch || batchCode !== expectedBatch) {
+    throwApprovalContextMismatch(
+      "APPROVAL_CONTEXT_BATCH_MISMATCH",
+      "approval_context_readback",
+      `approval context batch mismatch: expected ${expectedBatch}, read approved_batch=${approvedBatch ?? "missing"}, batch_code=${batchCode ?? "missing"}`
+    );
+  }
+
+  const expectedFields: Array<[string, string]> = [
+    ["project_domain", "automation_system"],
+    ["task_type", SYSTEM_REPAIR_TASK_TYPE],
+    ["requested_mode", "write_allowed"],
+    ["final_mode", "write_allowed"],
+    ["task_mode", "automation_system_write_allowed"],
+    ["read_only_mode", "false"],
+    ["repair_mode", "true"],
+    ["verification_only", "false"],
+    ["worker_only", "false"],
+    ["allow_no_change_success", "false"],
+    ["execution_intent", "apply_code_changes"],
+    ["code_changes_required", "true"],
+    ["codex_required", "true"],
+    ["git_commit_required", "true"],
+    ["git_push_required", "true"],
+    ["approval_required", "true"],
+  ];
+
+  const mismatchedField = expectedFields.find(([fieldName, expectedValue]) => {
+    const actualValue = normalizeApprovalReadbackValue(readApprovalContextField(readbackContent, fieldName));
+    return actualValue !== expectedValue;
+  });
+
+  if (mismatchedField) {
+    const [fieldName, expectedValue] = mismatchedField;
+    throwApprovalContextMismatch(
+      "APPROVAL_CONTEXT_POLICY_MISMATCH",
+      "approval_context_readback",
+      `approval context field mismatch: ${fieldName} expected ${expectedValue}, read ${readApprovalContextField(readbackContent, fieldName) ?? "missing"}`
+    );
   }
 }
 
@@ -1581,19 +1676,31 @@ async function insertSystemRepairWorkerTask(
     requestText: string;
     rawText: string;
     context: NonNullable<ReturnType<typeof resolveSystemRepairIntakeContext>>;
+    approvalContextReadback: string;
     feishuMessageId: string;
     feishuEventId: string;
     feishuChatId: string;
     feishuUserId: string;
   }
 ): Promise<{ jobId: string | null }> {
+  assertSystemRepairApprovalContextReadback(input.approvalContextReadback, input.context);
   const taskGoal =
+    readDirectWorkerContextField(input.approvalContextReadback, "task_goal") ??
     readDirectWorkerContextField(input.rawText, "task_goal") ??
     `Execute approved automation system repair batch ${input.context.parsedBatchCode}.`;
-  const requiredOutputFields = readDirectWorkerContextField(input.rawText, "required_output_fields");
-  const acceptanceConditions = readDirectWorkerContextField(input.rawText, "acceptance_conditions");
-  const forbiddenOperations = readDirectWorkerContextField(input.rawText, "forbidden_operations");
-  const forbiddenScope = readDirectWorkerContextField(input.rawText, "forbidden_scope") ?? input.rawText;
+  const requiredOutputFields =
+    readDirectWorkerContextField(input.approvalContextReadback, "required_output_fields") ??
+    readDirectWorkerContextField(input.rawText, "required_output_fields");
+  const acceptanceConditions =
+    readDirectWorkerContextField(input.approvalContextReadback, "acceptance_conditions") ??
+    readDirectWorkerContextField(input.rawText, "acceptance_conditions");
+  const forbiddenOperations =
+    readDirectWorkerContextField(input.approvalContextReadback, "forbidden_operations") ??
+    readDirectWorkerContextField(input.rawText, "forbidden_operations");
+  const forbiddenScope =
+    readDirectWorkerContextField(input.approvalContextReadback, "forbidden_scope") ??
+    readDirectWorkerContextField(input.rawText, "forbidden_scope") ??
+    input.rawText;
   assertNoScopeContractConflict(input.context.exactAllowedScope, forbiddenScope);
 
   const contractPayload = buildWorkerJobPayloadContract({
@@ -1601,10 +1708,21 @@ async function insertSystemRepairWorkerTask(
     originalRequestText: input.rawText,
     projectDomain: "automation_system",
     taskType: SYSTEM_REPAIR_TASK_TYPE,
+    requestedMode: "write_allowed",
+    finalMode: "write_allowed",
     taskMode: "automation_system_write_allowed",
     readOnlyMode: false,
     repairMode: true,
     repairScope: input.context.repairScope,
+    verificationOnly: false,
+    workerOnly: false,
+    allowNoChangeSuccess: false,
+    executionIntent: "apply_code_changes",
+    codeChangesRequired: true,
+    codexRequired: true,
+    gitCommitRequired: true,
+    gitPushRequired: true,
+    approvalRequired: true,
     allowedScope: input.context.exactAllowedScope,
     exactAllowedScope: input.context.exactAllowedScope,
     exactAllowedScopeCount: input.context.exactAllowedScope.length,
@@ -1629,8 +1747,17 @@ async function insertSystemRepairWorkerTask(
     final_mode: "write_allowed",
     task_mode: "automation_system_write_allowed",
     read_only_mode: false,
-    approval_required: false,
+    verification_only: false,
+    worker_only: false,
+    allow_no_change_success: false,
+    execution_intent: "apply_code_changes",
+    code_changes_required: true,
+    codex_required: true,
+    git_commit_required: true,
+    git_push_required: true,
+    approval_required: true,
     approval_satisfied: true,
+    approval_context_readback_verified: true,
     repair_mode: true,
     repair_scope: input.context.repairScope,
     allowed_scope: input.context.exactAllowedScope,
@@ -1646,6 +1773,11 @@ async function insertSystemRepairWorkerTask(
     created_at: new Date().toISOString(),
     consumed: false,
     context_id: `${input.context.parsedBatchCode}:${input.feishuMessageId}`,
+    execution_policy_source: "current_approval_context",
+    execution_policy_batch_code: input.context.parsedBatchCode,
+    execution_policy_context_id: `${input.context.parsedBatchCode}:${input.feishuMessageId}`,
+    execution_policy_inherited: false,
+    execution_policy_inheritance_rejected_reason: null,
     skip_planning_choice: true,
   };
   const contextualRequestText = withHermesWorkerContext(input.requestText, repairWorkerPayload);
@@ -2075,7 +2207,15 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      if (isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text)) {
+      const directWorkerSystemRepairIntakeContext = resolveSystemRepairIntakeContext(text);
+      const shouldUseSystemRepairWorkerFlow =
+        directWorkerSystemRepairIntakeContext?.ok === true &&
+        hasSystemRepairExecutionIntent(text, directWorkerSystemRepairIntakeContext);
+
+      if (
+        (isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text)) &&
+        !shouldUseSystemRepairWorkerFlow
+      ) {
         const requestText = buildDirectWorkerTaskText(text) || normalizeFeishuTaskText(text);
         const modeContract = resolveDirectWorkerReadOnlyContract(text);
         const token = await getFeishuToken();
@@ -2227,7 +2367,8 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      const systemRepairIntakeContext = resolveSystemRepairIntakeContext(text);
+      const systemRepairIntakeContext =
+        directWorkerSystemRepairIntakeContext ?? resolveSystemRepairIntakeContext(text);
       if (systemRepairIntakeContext) {
         if (
           systemRepairIntakeContext.ok &&
@@ -2241,8 +2382,14 @@ export async function POST(req: NextRequest) {
             ev.message.message_id
           );
 
+          let approvalContextReadback: { id: string | null; content: string };
           try {
-            await saveSystemRepairApprovalContextRecord(supabase, convId, systemRecord);
+            approvalContextReadback = await saveSystemRepairApprovalContextRecord(
+              supabase,
+              convId,
+              systemRecord,
+              systemRepairIntakeContext
+            );
           } catch (error) {
             const typedError = error as Error & { code?: string; stage?: string };
             const reply = [
@@ -2369,6 +2516,7 @@ export async function POST(req: NextRequest) {
               requestText,
               rawText: text,
               context: systemRepairIntakeContext,
+              approvalContextReadback: approvalContextReadback.content,
               feishuMessageId: ev.message.message_id,
               feishuEventId: eventId,
               feishuChatId: ev.message.chat_id,
