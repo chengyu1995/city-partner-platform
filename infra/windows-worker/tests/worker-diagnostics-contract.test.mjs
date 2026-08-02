@@ -224,8 +224,8 @@ test("missing diagnostics storage fails closed before notification side effects"
 });
 
 test("duplicate terminal report is idempotent and skips non-diagnostic side effects", () => {
-  const duplicateStart = reportRoute.indexOf("if (existingTerminalStatus)");
-  const duplicateEnd = reportRoute.indexOf("const { data, error, skippedColumns }", duplicateStart);
+  const duplicateStart = reportRoute.indexOf("if (existingTerminalStatus || terminalFinalization?.idempotent)");
+  const duplicateEnd = reportRoute.indexOf("const updateResult", duplicateStart);
   assert.ok(duplicateStart >= 0 && duplicateEnd > duplicateStart, "duplicate branch should be detectable");
   const duplicateBranch = reportRoute.slice(duplicateStart, duplicateEnd);
   assert.doesNotMatch(duplicateBranch, /syncWorkerStatusToFeishu/);

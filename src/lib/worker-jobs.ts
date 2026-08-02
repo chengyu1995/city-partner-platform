@@ -4344,6 +4344,300 @@ export async function findHermesJob(
   return { data: (data as JobRecord | null) ?? null, error };
 }
 
+export interface CanonicalTerminalReportResult {
+  ok: boolean;
+  terminal_applied: boolean;
+  idempotent: boolean;
+  conflict: boolean;
+  terminal_immutable: boolean;
+  failure_code: string | null;
+  failure_stage: "terminal_report_finalization";
+  job: JobRecord | null;
+}
+
+interface CanonicalTerminalReportInput {
+  job_id: string;
+  worker_id: string;
+  attempt_id: string;
+  report_identity: string;
+  worker_execution_status: string | null;
+  task_goal_status: string | null;
+  effective_final_status: string | null;
+  report_fields: JobRecord;
+  now?: string;
+}
+
+function terminalReportFailure(
+  failureCode: string,
+  job: JobRecord | null = null,
+  conflict = false
+): CanonicalTerminalReportResult {
+  return {
+    ok: false,
+    terminal_applied: false,
+    idempotent: false,
+    conflict,
+    terminal_immutable: true,
+    failure_code: failureCode,
+    failure_stage: "terminal_report_finalization",
+    job,
+  };
+}
+
+function getStoredTerminalWorkerId(job: JobRecord): string | null {
+  const result = readRecord(job.result);
+  const canonical = readRecord(result?.canonical_worker_report);
+  const terminalResult = readRecord(readRecord(result?.job_state_machine)?.terminal_result);
+  return (
+    readString(terminalResult?.worker_id) ??
+    readString(canonical?.worker_id) ??
+    readString(result?.worker_id)
+  );
+}
+
+function buildAuthoritativeTerminalReportPatch(
+  transitionPatch: JobRecord,
+  reportFields: JobRecord,
+  input: CanonicalTerminalReportInput
+): JobRecord {
+  const lifecycleResult = readRecord(transitionPatch.result) ?? {};
+  const reportResult = readRecord(reportFields.result) ?? {};
+  const lifecycleMachine = readRecord(lifecycleResult.job_state_machine);
+  const terminalResult = readRecord(lifecycleMachine?.terminal_result);
+  return {
+    ...reportFields,
+    ...transitionPatch,
+    status: transitionPatch.status,
+    claimed_by: null,
+    claimed_at: null,
+    attempt_id: null,
+    active_attempt_id: null,
+    lease_id: null,
+    active_lease_id: null,
+    expires_at: null,
+    heartbeat_at: null,
+    last_progress_at: null,
+    running_job_id: null,
+    retryable: false,
+    retry_requested: false,
+    retry_pending: false,
+    should_retry: false,
+    result: {
+      ...lifecycleResult,
+      ...reportResult,
+      attempt_id: input.attempt_id,
+      terminal_report_identity: input.report_identity,
+      terminal_report_worker_id: input.worker_id,
+      ...(lifecycleMachine
+        ? {
+            job_state_machine: {
+              ...lifecycleMachine,
+              terminal_result: {
+                ...terminalResult,
+                worker_id: input.worker_id,
+                report_identity: input.report_identity,
+              },
+            },
+          }
+        : {}),
+      terminal_state: lifecycleResult.terminal_state,
+    },
+    updated_at: transitionPatch.updated_at,
+  };
+}
+
+function classifyTerminalReportRace(
+  job: JobRecord,
+  input: CanonicalTerminalReportInput
+): CanonicalTerminalReportResult {
+  const inspection = inspectCanonicalJobState(job);
+  if (inspection.terminal) {
+    if (!terminalAttemptMatches(job, input.attempt_id)) {
+      return terminalReportFailure("STALE_ATTEMPT_TERMINAL_REPORT", job);
+    }
+    const storedWorkerId = getStoredTerminalWorkerId(job);
+    if (storedWorkerId && storedWorkerId !== input.worker_id) {
+      return terminalReportFailure("FOREIGN_WORKER_TERMINAL_REPORT", job);
+    }
+    const replay = buildCanonicalFinalization(job, {
+      attempt_id: input.attempt_id,
+      worker_execution_status: input.worker_execution_status,
+      task_goal_status: input.task_goal_status,
+      effective_final_status: input.effective_final_status,
+      now: input.now,
+    }) as CanonicalTransitionResult;
+    if (!replay.ok) {
+      return terminalReportFailure(replay.failure_code ?? "TERMINAL_REPORT_CONFLICT", job, true);
+    }
+    return {
+      ok: true,
+      terminal_applied: false,
+      idempotent: true,
+      conflict: false,
+      terminal_immutable: true,
+      failure_code: null,
+      failure_stage: "terminal_report_finalization",
+      job,
+    };
+  }
+
+  const invariant = validateCanonicalJobStateInvariant(job) as CanonicalInvariantResult;
+  if (!invariant.ok) {
+    return terminalReportFailure(invariant.failure_code ?? "JOB_STATE_INVARIANT_VIOLATION", job);
+  }
+  const snapshot = inspectCanonicalJobState(job);
+  const activeAttempt = getCanonicalActiveAttempt(job);
+  const activeLease = snapshot.active_lease as Record<string, unknown> | null;
+  if (snapshot.claimed_by !== input.worker_id || readString(activeAttempt?.worker_id) !== input.worker_id) {
+    return terminalReportFailure("TERMINAL_REPORT_OWNERSHIP_CHANGED", job);
+  }
+  if (
+    readString(activeAttempt?.id) !== input.attempt_id ||
+    readString(activeLease?.attempt_id) !== input.attempt_id ||
+    readString(activeLease?.worker_id) !== input.worker_id
+  ) {
+    return terminalReportFailure("TERMINAL_REPORT_ATTEMPT_CHANGED", job);
+  }
+  return terminalReportFailure("TERMINAL_REPORT_COMPARE_AND_SET_FAILED", job);
+}
+
+export async function finalizeCanonicalJobReportSafely(
+  supabase: SupabaseClient,
+  input: CanonicalTerminalReportInput
+): Promise<CanonicalTerminalReportResult> {
+  if (!input.job_id || !input.worker_id || !input.attempt_id || !input.report_identity) {
+    return terminalReportFailure("TERMINAL_REPORT_IDENTITY_REQUIRED");
+  }
+  const currentRead = await findHermesJob(supabase, input.job_id);
+  if (currentRead.error) return terminalReportFailure("TERMINAL_REPORT_STATE_READ_FAILED");
+  if (!currentRead.data) return terminalReportFailure("TERMINAL_REPORT_JOB_NOT_FOUND");
+
+  const currentJob = currentRead.data;
+  const currentInspection = inspectCanonicalJobState(currentJob);
+  const storedWorkerId = currentInspection.terminal ? getStoredTerminalWorkerId(currentJob) : null;
+  if (currentInspection.terminal) {
+    if (!terminalAttemptMatches(currentJob, input.attempt_id)) {
+      return terminalReportFailure("STALE_ATTEMPT_TERMINAL_REPORT", currentJob);
+    }
+    if (storedWorkerId && storedWorkerId !== input.worker_id) {
+      return terminalReportFailure("FOREIGN_WORKER_TERMINAL_REPORT", currentJob);
+    }
+  } else {
+    const preInvariant = validateCanonicalJobStateInvariant(currentJob) as CanonicalInvariantResult;
+    if (!preInvariant.ok) {
+      return terminalReportFailure(preInvariant.failure_code ?? "JOB_STATE_INVARIANT_VIOLATION", currentJob);
+    }
+    const snapshot = preInvariant.snapshot;
+    const activeAttempt = getCanonicalActiveAttempt(currentJob);
+    const activeLease = snapshot.active_lease as Record<string, unknown> | null;
+    if (!["claimed", "running"].includes(String(snapshot.state ?? ""))) {
+      return terminalReportFailure("TERMINAL_REPORT_JOB_NOT_ACTIVE", currentJob);
+    }
+    if (snapshot.claimed_by !== input.worker_id || readString(activeAttempt?.worker_id) !== input.worker_id) {
+      return terminalReportFailure("FOREIGN_WORKER_TERMINAL_REPORT", currentJob);
+    }
+    if (
+      readString(activeAttempt?.id) !== input.attempt_id ||
+      readString(activeLease?.attempt_id) !== input.attempt_id ||
+      readString(activeLease?.worker_id) !== input.worker_id
+    ) {
+      return terminalReportFailure("STALE_ATTEMPT_TERMINAL_REPORT", currentJob);
+    }
+  }
+
+  const transition = buildCanonicalFinalization(currentJob, {
+    attempt_id: input.attempt_id,
+    worker_execution_status: input.worker_execution_status,
+    task_goal_status: input.task_goal_status,
+    effective_final_status: input.effective_final_status,
+    now: input.now ?? new Date().toISOString(),
+  }) as CanonicalTransitionResult;
+  if (!transition.ok || !transition.patch) {
+    return terminalReportFailure(
+      transition.failure_code ?? "TERMINAL_REPORT_TRANSITION_REJECTED",
+      currentJob,
+      transition.conflict === true
+    );
+  }
+
+  if (currentInspection.terminal && !terminalJobHasRuntimeState(currentJob)) {
+    return {
+      ok: true,
+      terminal_applied: false,
+      idempotent: true,
+      conflict: false,
+      terminal_immutable: true,
+      failure_code: null,
+      failure_stage: "terminal_report_finalization",
+      job: currentJob,
+    };
+  }
+
+  const patch = currentInspection.terminal
+    ? transition.patch
+    : buildAuthoritativeTerminalReportPatch(transition.patch, input.report_fields, input);
+  const proposedJob = { ...currentJob, ...patch };
+  const proposedInvariant = validateCanonicalJobStateInvariant(proposedJob) as CanonicalInvariantResult;
+  if (!proposedInvariant.ok || !proposedInvariant.snapshot.terminal) {
+    return terminalReportFailure(
+      proposedInvariant.failure_code ?? "TERMINAL_REPORT_POST_TRANSITION_INVALID",
+      currentJob
+    );
+  }
+
+  const expectedStatus = readString(currentJob.status);
+  const expectedUpdatedAt = readString(currentJob.updated_at);
+  if (!expectedStatus || !expectedUpdatedAt) {
+    return terminalReportFailure("TERMINAL_REPORT_REVISION_REQUIRED", currentJob);
+  }
+
+  let query = supabase
+    .from("hermes_jobs")
+    .update(patch)
+    .eq("id", input.job_id)
+    .eq("status", expectedStatus)
+    .eq("updated_at", expectedUpdatedAt);
+  if (!currentInspection.terminal) {
+    if (
+      readString(currentJob.attempt_id) !== input.attempt_id ||
+      readString(currentJob.active_attempt_id) !== input.attempt_id
+    ) {
+      return terminalReportFailure("TERMINAL_REPORT_ATTEMPT_COLUMNS_REQUIRED", currentJob);
+    }
+    query = query
+      .eq("claimed_by", input.worker_id)
+      .eq("attempt_id", input.attempt_id)
+      .eq("active_attempt_id", input.attempt_id);
+  }
+  const { data, error } = await query.select("*").maybeSingle();
+  if (error) return terminalReportFailure("TERMINAL_REPORT_COMPARE_AND_SET_FAILED", currentJob);
+  if (!data) {
+    const raceRead = await findHermesJob(supabase, input.job_id);
+    if (raceRead.error) return terminalReportFailure("TERMINAL_REPORT_RACE_READ_FAILED");
+    if (!raceRead.data) return terminalReportFailure("TERMINAL_REPORT_JOB_NOT_FOUND");
+    return classifyTerminalReportRace(raceRead.data, input);
+  }
+
+  const persistedJob = data as JobRecord;
+  const postInvariant = validateCanonicalJobStateInvariant(persistedJob) as CanonicalInvariantResult;
+  if (!postInvariant.ok || !postInvariant.snapshot.terminal) {
+    return terminalReportFailure(
+      postInvariant.failure_code ?? "TERMINAL_REPORT_PERSISTED_STATE_INVALID",
+      persistedJob
+    );
+  }
+  return {
+    ok: true,
+    terminal_applied: !currentInspection.terminal,
+    idempotent: currentInspection.terminal,
+    conflict: false,
+    terminal_immutable: true,
+    failure_code: null,
+    failure_stage: "terminal_report_finalization",
+    job: persistedJob,
+  };
+}
+
 export interface FailedClaimRollbackResult {
   ok: boolean;
   rollback_applied: boolean;
@@ -4498,9 +4792,12 @@ export function getBitableRecordId(...sources: unknown[]): string | null {
   return null;
 }
 
-export function normalizeWorkerStatus(value: unknown): "queued" | "running" | "succeeded" | "failed" {
+export function normalizeWorkerStatus(
+  value: unknown
+): "queued" | "running" | "succeeded" | "failed" | "cancelled" {
   if (value === "failed" || value === "error") return "failed";
   if (value === "succeeded" || value === "success" || value === "completed") return "succeeded";
+  if (value === "cancelled" || value === "canceled") return "cancelled";
   if (value === "queued" || value === "pending") return "queued";
   return "running";
 }

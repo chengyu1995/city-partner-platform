@@ -186,14 +186,14 @@ test("terminal cleanup clears attempts, lease, running index, and retry flags", 
   assert.match(cleanup, /should_retry:\s*false/);
   assert.match(cleanup, /active_attempt:\s*null/);
   assert.match(cleanup, /active_lease:\s*null/);
-  assert.match(reportRoute, /buildCanonicalFinalizeTransition\(existingJob/);
-  assert.match(reportRoute, /terminalJobHasRuntimeState\(existingJob\)/);
-  assert.match(reportRoute, /terminal_runtime_cleanup_applied:\s*terminalRuntimeCleanupApplied/);
+  assert.match(reportRoute, /finalizeCanonicalJobReportSafely\(supabase/);
+  assert.match(workerJobs, /buildCanonicalFinalization\(currentJob/);
+  assert.match(workerJobs, /terminalJobHasRuntimeState\(currentJob\)/);
 });
 
 test("duplicate terminal report stays terminal and idempotent after runtime cleanup", () => {
-  const duplicateStart = reportRoute.indexOf("if (existingTerminalStatus)");
-  const duplicateEnd = reportRoute.indexOf("const { data, error, skippedColumns }", duplicateStart);
+  const duplicateStart = reportRoute.indexOf("if (existingTerminalStatus || terminalFinalization?.idempotent)");
+  const duplicateEnd = reportRoute.indexOf("const updateResult", duplicateStart);
   const duplicateBranch = reportRoute.slice(duplicateStart, duplicateEnd);
 
   assert.match(duplicateBranch, /duplicate_report_idempotent:\s*true/);

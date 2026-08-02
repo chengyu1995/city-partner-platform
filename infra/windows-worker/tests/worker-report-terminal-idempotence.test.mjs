@@ -10,8 +10,8 @@ const reportRoute = fs.readFileSync(path.join(root, "src", "app", "api", "worker
 const workerJobs = fs.readFileSync(path.join(root, "src", "lib", "worker-jobs.ts"), "utf8");
 
 function duplicateBranch() {
-  const start = reportRoute.indexOf("if (existingTerminalStatus)");
-  const end = reportRoute.indexOf("const { data, error, skippedColumns }", start);
+  const start = reportRoute.indexOf("if (existingTerminalStatus || terminalFinalization?.idempotent)");
+  const end = reportRoute.indexOf("const updateResult", start);
   assert.ok(start >= 0 && end > start, "duplicate terminal branch should exist");
   return reportRoute.slice(start, end);
 }
@@ -63,7 +63,7 @@ test("active attempt identity is not polluted by old result diagnostics", () => 
 
 test("terminal duplicate requires same stored attempt", () => {
   const branch = duplicateBranch();
-  assert.match(branch, /terminalAttemptMatches\(existingJob, attemptId\)/);
+  assert.match(branch, /terminalAttemptMatches\(terminalJob, attemptId\)/);
   assert.match(branch, /stale_attempt_terminal_report/);
   assert.match(branch, /duplicate_report_detected:\s*false/);
 });

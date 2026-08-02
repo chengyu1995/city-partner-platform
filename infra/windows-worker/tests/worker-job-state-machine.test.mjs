@@ -196,7 +196,7 @@ test("report finalization clears claimed owner", () => {
     now: NOW,
   });
   assert.equal(finalization.patch.claimed_by, null);
-  assert.match(reportRoute, /buildCanonicalFinalizeTransition/);
+  assert.match(reportRoute, /finalizeCanonicalJobReportSafely/);
 });
 
 test("report finalization releases the active lease", () => {

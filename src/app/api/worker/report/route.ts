@@ -2,8 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { syncWorkerStatusToFeishu } from "@/lib/feishu-worker-sync";
 import {
   assertWorkerAuthorized,
-  buildCanonicalFinalizeTransition,
-  buildTerminalJobCleanupFields,
   assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
   buildRunningJobNotFoundPayload,
@@ -14,6 +12,7 @@ import {
   DIAGNOSTICS_STORAGE_FIELD,
   DIAGNOSTICS_STORAGE_UNAVAILABLE,
   findHermesJob,
+  finalizeCanonicalJobReportSafely,
   getAttemptIdFromBody,
   getBatchCodeFromBody,
   getBitableRecordId,
@@ -25,7 +24,6 @@ import {
   normalizeWorkerStatus,
   parseJsonBody,
   responseFromMaybe,
-  terminalJobHasRuntimeState,
   terminalAttemptMatches,
   updateHermesJob,
   validateCanonicalWorkerReportSchema,
@@ -454,7 +452,7 @@ export async function POST(req: NextRequest) {
   if (responseFromMaybe(supabase)) return supabase;
 
   const workerStatus = normalizeWorkerStatus(body.status);
-  const terminal = workerStatus === "succeeded" || workerStatus === "failed";
+  const terminal = isTerminalWorkerStatus(workerStatus);
   const now = new Date().toISOString();
   const progressPercent = terminal ? 100 : clampProgress(body.progress_percent, 0);
   const errorText = body.error_text ?? body.error ?? null;
@@ -517,19 +515,65 @@ export async function POST(req: NextRequest) {
     workerId,
     attemptId,
   });
-  const canonicalFinalization = terminal
-    ? buildCanonicalFinalizeTransition(existingJob, {
-        attempt_id: attemptId,
+  const reportFields = {
+    status: terminal ? storedStatus : workerStatus,
+    claimed_by: terminal ? null : workerId,
+    attempt_id: terminal ? null : attemptId,
+    active_attempt_id: terminal ? null : attemptId,
+    progress_percent: progressPercent,
+    current_step:
+      body.current_step ??
+      (storedStatus === "succeeded" ? "completed" : storedStatus === "failed" ? "failed" : null),
+    status_message: terminal ? projectDirectorReport.text : body.status_message ?? null,
+    git_commit_sha: body.git_commit_sha ?? null,
+    error_text: storedStatus === "failed" ? falsePositiveGuard?.errorText ?? errorText : null,
+    result: {
+      ...buildResult({ ...body, attempt_id: attemptId ?? body.attempt_id }),
+      canonical_worker_report: canonicalReport,
+      report_schema_version: CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
+      project_director_report: projectDirectorReport.data,
+      project_director_report_text: projectDirectorReport.text,
+      diagnostics: projectDirectorReport.data.diagnostics ?? null,
+    },
+    completed_at: terminal ? now : null,
+    updated_at: now,
+  };
+  const terminalFinalization = terminal
+    ? await finalizeCanonicalJobReportSafely(supabase, {
+        job_id: jobId,
+        worker_id: workerId,
+        attempt_id: attemptId ?? "",
+        report_identity: `${jobId}:${attemptId ?? "missing"}:${body.report_schema_version ?? CANONICAL_WORKER_REPORT_SCHEMA_VERSION}:${effectiveFinalStatus}`,
         worker_execution_status: readString(projectDirectorReport.data.worker_execution_status),
         task_goal_status: readString(projectDirectorReport.data.task_goal_status),
         effective_final_status: readString(projectDirectorReport.data.effective_final_status),
+        report_fields: reportFields,
         now,
       })
     : null;
 
+  if (terminalFinalization && !terminalFinalization.ok) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: terminalFinalization.conflict
+          ? "terminal_report_conflict"
+          : "job_finalization_rejected",
+        failure_code: terminalFinalization.failure_code,
+        failure_stage: terminalFinalization.failure_stage,
+        terminal_immutable: terminalFinalization.terminal_immutable,
+        status_unchanged: true,
+        duplicate_report_detected: terminalFinalization.conflict,
+      },
+      { status: 409 }
+    );
+  }
+
   const existingTerminalStatus = getCanonicalTerminalWorkerJobStatus(existingJob);
-  if (existingTerminalStatus) {
-    if (!terminalAttemptMatches(existingJob, attemptId)) {
+  if (existingTerminalStatus || terminalFinalization?.idempotent) {
+    const terminalJob = terminalFinalization?.job ?? existingJob;
+    const terminalStatus = getCanonicalTerminalWorkerJobStatus(terminalJob) ?? existingTerminalStatus;
+    if (!terminalAttemptMatches(terminalJob, attemptId)) {
       return NextResponse.json(
         {
           ok: false,
@@ -544,59 +588,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (canonicalFinalization && !canonicalFinalization.ok) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "terminal_report_conflict",
-          failure_code: canonicalFinalization.failure_code,
-          failure_stage: "job_state_machine",
-          terminal_immutable: true,
-          status_unchanged: true,
-          duplicate_report_detected: true,
-        },
-        { status: 409 }
-      );
-    }
-
     const storedProjectDirectorReport =
-      getStoredProjectDirectorReport(existingJob) ?? projectDirectorReport;
-    const storedResult = readRecord(existingJob.result);
-    const storedTerminalStatus =
-      normalizeWorkerStatus(existingJob.status) === "failed" ? "failed" : "succeeded";
-    let terminalRuntimeCleanupApplied = false;
-    if (terminalJobHasRuntimeState(existingJob)) {
-      const cleanupResult = await updateHermesJob(
-        supabase,
-        jobId,
-        (canonicalFinalization?.patch as Record<string, unknown> | null) ??
-          buildTerminalJobCleanupFields(existingJob, existingTerminalStatus, now)
-      );
-      if (cleanupResult.error) {
-        return NextResponse.json(
-          {
-            ok: false,
-            error: cleanupResult.error.message ?? "terminal runtime cleanup failed",
-            failure_code: "TERMINAL_JOB_CLEANUP_FAILED",
-            failure_stage: "duplicate_terminal_report_cleanup",
-            status_unchanged: true,
-            duplicate_report_detected: true,
-          },
-          { status: 500 }
-        );
-      }
-      terminalRuntimeCleanupApplied = Boolean(cleanupResult.data);
-    }
+      getStoredProjectDirectorReport(terminalJob) ?? projectDirectorReport;
+    const storedResult = readRecord(terminalJob.result);
+    const storedTerminalStatus = terminalStatus ?? normalizeWorkerStatus(terminalJob.status);
     const diagnosticsEnrichment = await enrichTerminalDiagnosticsIfMissing({
       supabase,
       jobId,
-      existingJob,
+      existingJob: terminalJob,
       diagnostics: projectDirectorReport.data.diagnostics,
     });
 
     return NextResponse.json({
       ok: true,
-      job: existingJob,
+      job: terminalJob,
       attempt_id: attemptId,
       project_director_report: storedProjectDirectorReport,
       idempotent: true,
@@ -606,7 +611,7 @@ export async function POST(req: NextRequest) {
       diagnostics_enrichment_only: diagnosticsEnrichment.enriched,
       diagnostics_enrichment_reason: diagnosticsEnrichment.reason,
       non_diagnostic_side_effects: 0,
-      terminal_runtime_cleanup_applied: terminalRuntimeCleanupApplied,
+      terminal_runtime_cleanup_applied: false,
       skipped: "terminal_job_report_ignored",
       feishu_sync: "skipped_duplicate_terminal",
       git_commit_sha:
@@ -639,53 +644,14 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  if (terminal && canonicalFinalization && !canonicalFinalization.ok) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "job_finalization_rejected",
-        failure_code: canonicalFinalization.failure_code,
-        failure_stage: "job_state_machine",
-        violated_invariants: canonicalFinalization.violations ?? [],
-      },
-      { status: 409 }
-    );
-  }
-
-  const lifecyclePatch =
-    terminal && canonicalFinalization?.ok && canonicalFinalization.patch
-      ? (canonicalFinalization.patch as Record<string, unknown>)
-      : {};
-  const lifecycleResult = readRecord(lifecyclePatch.result);
-
-  const { data, error, skippedColumns } = await updateHermesJob(supabase, jobId, {
-    ...lifecyclePatch,
-    status: terminal ? lifecyclePatch.status ?? storedStatus : storedStatus,
-    claimed_by: terminal ? null : workerId,
-    attempt_id: terminal ? null : attemptId,
-    active_attempt_id: terminal ? null : attemptId,
-    progress_percent: progressPercent,
-    current_step:
-      body.current_step ??
-      (storedStatus === "succeeded" ? "completed" : storedStatus === "failed" ? "failed" : null),
-    status_message: terminal ? projectDirectorReport.text : body.status_message ?? null,
-    git_commit_sha: body.git_commit_sha ?? null,
-    error_text: storedStatus === "failed" ? falsePositiveGuard?.errorText ?? errorText : null,
-    result: {
-      ...(lifecycleResult ?? {}),
-      ...buildResult({ ...body, attempt_id: attemptId ?? body.attempt_id }),
-      canonical_worker_report: canonicalReport,
-      report_schema_version: CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
-      project_director_report: projectDirectorReport.data,
-      project_director_report_text: projectDirectorReport.text,
-      diagnostics: projectDirectorReport.data.diagnostics ?? null,
-      ...(lifecycleResult?.job_state_machine
-        ? { job_state_machine: lifecycleResult.job_state_machine }
-        : {}),
-    },
-    completed_at: terminal ? now : null,
-    updated_at: now,
-  });
+  const updateResult = terminal
+    ? {
+        data: terminalFinalization?.job ?? null,
+        error: null,
+        skippedColumns: [] as string[],
+      }
+    : await updateHermesJob(supabase, jobId, reportFields);
+  const { data, error, skippedColumns } = updateResult;
 
   if (error) {
     return NextResponse.json({ ok: false, error: error.message ?? "update failed" }, { status: 500 });
@@ -713,7 +679,7 @@ export async function POST(req: NextRequest) {
   const recordId = getBitableRecordId(body, data, existingJob);
   await syncWorkerStatusToFeishu({
     recordId,
-    status: storedStatus,
+    status: storedStatus === "cancelled" ? "failed" : storedStatus,
     stage: storedStatus === "failed" ? "failed" : terminal ? "completed" : "execution",
     progressPercent,
     currentStep:
