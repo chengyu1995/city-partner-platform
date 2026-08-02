@@ -11,8 +11,8 @@ import {
   getWorkerIdFromRequest,
   getWorkerSupabase,
   parseJsonBody,
+  persistCanonicalRuntimeSignalSafely,
   responseFromMaybe,
-  updateCanonicalHermesJob,
 } from "@/lib/worker-jobs";
 
 export const dynamic = "force-dynamic";
@@ -94,19 +94,37 @@ export async function POST(req: NextRequest) {
       { status: 409 }
     );
   }
-  const { data, error } = await updateCanonicalHermesJob(
-    supabase,
-    jobId,
-    transition.patch,
-    typeof existingJob.updated_at === "string" ? existingJob.updated_at : null
-  );
+  const persistence = await persistCanonicalRuntimeSignalSafely(supabase, {
+    job_id: jobId,
+    worker_id: workerId,
+    attempt_id: attemptId ?? "",
+    signal: "heartbeat",
+    expected_job: existingJob,
+    patch: transition.patch,
+  });
+  const { data, error } = persistence;
 
   if (error) {
     return NextResponse.json({ ok: false, error: error.message ?? "heartbeat update failed" }, { status: 500 });
   }
-  if (!data) {
+  if (persistence.terminal && data) {
+    return NextResponse.json({
+      ok: true,
+      job: data,
+      attempt_id: attemptId,
+      idempotent: true,
+      terminal_heartbeat_is_noop: true,
+      runtime_cas_race_lost: persistence.race_lost,
+    });
+  }
+  if (!persistence.ok || !data) {
     return NextResponse.json(
-      { ok: false, error: "canonical_heartbeat_race_lost" },
+      {
+        ok: false,
+        error: "canonical_heartbeat_race_lost",
+        failure_code: persistence.failure_code,
+        failure_stage: persistence.failure_stage,
+      },
       { status: 409 }
     );
   }

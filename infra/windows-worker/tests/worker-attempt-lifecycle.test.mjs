@@ -247,10 +247,28 @@ test("heartbeat and progress reject wrong attempts with explicit failure code", 
 test("heartbeat and progress update the active attempt payload for the correct attempt", () => {
   assert.match(stateMachineSource, /function applyHeartbeat\(job, input = \{\}\)/);
   assert.match(stateMachineSource, /function applyProgress\(job, input = \{\}\)/);
-  assert.match(heartbeatRoute, /updateCanonicalHermesJob\(/);
-  assert.match(progressRoute, /updateCanonicalHermesJob\(/);
+  assert.match(heartbeatRoute, /persistCanonicalRuntimeSignalSafely\(/);
+  assert.match(progressRoute, /persistCanonicalRuntimeSignalSafely\(/);
   assert.match(heartbeatRoute, /transition\.patch/);
   assert.match(progressRoute, /transition\.patch/);
+});
+
+test("runtime signal persistence guards state ownership attempt and revision", () => {
+  const nextRuntimePersistence = functionBlock(workerJobs, "persistCanonicalRuntimeSignalSafely");
+  const productionRuntimePersistence = functionBlock(productionWorkerApi, "runtimePersistCanonicalTransition");
+  for (const block of [nextRuntimePersistence, productionRuntimePersistence]) {
+    assert.match(block, /validateCanonicalJobStateInvariant|canonicalValidateJobStateInvariant/);
+    assert.match(block, /\.eq\("status", expectedStatus\)/);
+    assert.match(block, /\.eq\("claimed_by",/);
+    assert.match(block, /\.eq\("attempt_id",/);
+    assert.match(block, /\.eq\("active_attempt_id",/);
+    assert.match(block, /\.eq\("updated_at", expectedUpdatedAt\)/);
+    assert.match(block, /RUNTIME_SIGNAL_RACE_READ_FAILED/);
+    assert.match(block, /snapshot\.terminal/);
+  }
+  assert.match(productionWorkerApi, /runtimePersistCanonicalTransition\(existingJob, transition\.patch/);
+  assert.match(productionWorkerApi, /terminal_heartbeat_is_noop:\s*true/);
+  assert.match(productionWorkerApi, /terminal_progress_is_noop:\s*true/);
 });
 
 test("terminal report blocks false positive success after lifecycle failure", () => {

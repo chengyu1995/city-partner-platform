@@ -4277,16 +4277,194 @@ export async function updateHermesJob(
   };
 }
 
-export async function updateCanonicalHermesJob(
+export interface CanonicalRuntimeSignalPersistenceResult {
+  ok: boolean;
+  applied: boolean;
+  terminal: boolean;
+  idempotent: boolean;
+  race_lost: boolean;
+  failure_code: string | null;
+  failure_stage: "runtime_signal_persistence";
+  data: JobRecord | null;
+  error: SupabaseWriteError | null;
+}
+
+interface CanonicalRuntimeSignalPersistenceInput {
+  job_id: string;
+  worker_id: string;
+  attempt_id: string;
+  signal: "heartbeat" | "progress";
+  expected_job: JobRecord;
+  patch: JobRecord;
+}
+
+function runtimeSignalPersistenceFailure(
+  failureCode: string,
+  data: JobRecord | null = null,
+  error: SupabaseWriteError | null = null,
+  raceLost = false
+): CanonicalRuntimeSignalPersistenceResult {
+  return {
+    ok: false,
+    applied: false,
+    terminal: false,
+    idempotent: false,
+    race_lost: raceLost,
+    failure_code: failureCode,
+    failure_stage: "runtime_signal_persistence",
+    data,
+    error,
+  };
+}
+
+function terminalRuntimeSignalNoop(job: JobRecord): CanonicalRuntimeSignalPersistenceResult {
+  return {
+    ok: true,
+    applied: false,
+    terminal: true,
+    idempotent: true,
+    race_lost: true,
+    failure_code: null,
+    failure_stage: "runtime_signal_persistence",
+    data: job,
+    error: null,
+  };
+}
+
+export async function persistCanonicalRuntimeSignalSafely(
   supabase: SupabaseClient,
-  jobId: string,
-  fields: JobRecord,
-  expectedUpdatedAt?: string | null
-): Promise<{ data: JobRecord | null; error: SupabaseWriteError | null }> {
-  let query = supabase.from("hermes_jobs").update(fields).eq("id", jobId);
-  if (expectedUpdatedAt) query = query.eq("updated_at", expectedUpdatedAt);
-  const { data, error } = await query.select("*").maybeSingle();
-  return { data: (data as JobRecord | null) ?? null, error };
+  input: CanonicalRuntimeSignalPersistenceInput
+): Promise<CanonicalRuntimeSignalPersistenceResult> {
+  if (!input.job_id || !input.worker_id || !input.attempt_id) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_IDENTITY_REQUIRED");
+  }
+
+  const expectedJob = input.expected_job;
+  const expectedInvariant = validateCanonicalJobStateInvariant(expectedJob) as CanonicalInvariantResult;
+  if (expectedInvariant.snapshot.terminal) return terminalRuntimeSignalNoop(expectedJob);
+  if (!expectedInvariant.ok) {
+    return runtimeSignalPersistenceFailure(
+      expectedInvariant.failure_code ?? "JOB_STATE_INVARIANT_VIOLATION",
+      expectedJob
+    );
+  }
+
+  const expectedSnapshot = expectedInvariant.snapshot;
+  const expectedAttempt = getCanonicalActiveAttempt(expectedJob);
+  const expectedLease = expectedSnapshot.active_lease as Record<string, unknown> | null;
+  if (!["claimed", "running"].includes(String(expectedSnapshot.state ?? ""))) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_JOB_NOT_ACTIVE", expectedJob);
+  }
+  if (
+    expectedSnapshot.claimed_by !== input.worker_id ||
+    readString(expectedAttempt?.worker_id) !== input.worker_id ||
+    readString(expectedLease?.worker_id) !== input.worker_id
+  ) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_WORKER_OWNERSHIP_MISMATCH", expectedJob);
+  }
+  if (
+    readString(expectedAttempt?.id) !== input.attempt_id ||
+    readString(expectedLease?.attempt_id) !== input.attempt_id
+  ) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_ATTEMPT_MISMATCH", expectedJob);
+  }
+
+  const proposedJob = { ...expectedJob, ...input.patch };
+  const proposedInvariant = validateCanonicalJobStateInvariant(proposedJob) as CanonicalInvariantResult;
+  if (
+    !proposedInvariant.ok ||
+    proposedInvariant.snapshot.terminal ||
+    !["claimed", "running"].includes(String(proposedInvariant.snapshot.state ?? ""))
+  ) {
+    return runtimeSignalPersistenceFailure(
+      proposedInvariant.failure_code ?? "RUNTIME_SIGNAL_POST_TRANSITION_INVALID",
+      expectedJob
+    );
+  }
+
+  const expectedStatus = readString(expectedJob.status);
+  const expectedUpdatedAt = readString(expectedJob.updated_at);
+  if (!expectedStatus || !expectedUpdatedAt || isTerminalWorkerStatus(expectedStatus)) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_STATE_REVISION_REQUIRED", expectedJob);
+  }
+  if (
+    readString(expectedJob.claimed_by) !== input.worker_id ||
+    readString(expectedJob.attempt_id) !== input.attempt_id ||
+    readString(expectedJob.active_attempt_id) !== input.attempt_id
+  ) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_CAS_IDENTITY_REQUIRED", expectedJob);
+  }
+
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .update(input.patch)
+    .eq("id", input.job_id)
+    .eq("status", expectedStatus)
+    .eq("claimed_by", input.worker_id)
+    .eq("attempt_id", input.attempt_id)
+    .eq("active_attempt_id", input.attempt_id)
+    .eq("updated_at", expectedUpdatedAt)
+    .select("*")
+    .maybeSingle();
+  if (error) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_COMPARE_AND_SET_FAILED", expectedJob, error);
+  }
+  if (data) {
+    const persistedJob = data as JobRecord;
+    const persistedInvariant = validateCanonicalJobStateInvariant(persistedJob) as CanonicalInvariantResult;
+    if (!persistedInvariant.ok || persistedInvariant.snapshot.terminal) {
+      return runtimeSignalPersistenceFailure(
+        persistedInvariant.failure_code ?? "RUNTIME_SIGNAL_PERSISTED_STATE_INVALID",
+        persistedJob
+      );
+    }
+    return {
+      ok: true,
+      applied: true,
+      terminal: false,
+      idempotent: false,
+      race_lost: false,
+      failure_code: null,
+      failure_stage: "runtime_signal_persistence",
+      data: persistedJob,
+      error: null,
+    };
+  }
+
+  const raceRead = await findHermesJob(supabase, input.job_id);
+  if (raceRead.error) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_RACE_READ_FAILED", null, raceRead.error, true);
+  }
+  if (!raceRead.data) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_JOB_NOT_FOUND", null, null, true);
+  }
+  const racedJob = raceRead.data;
+  const racedInvariant = validateCanonicalJobStateInvariant(racedJob) as CanonicalInvariantResult;
+  if (racedInvariant.snapshot.terminal) return terminalRuntimeSignalNoop(racedJob);
+  if (!racedInvariant.ok) {
+    return runtimeSignalPersistenceFailure(
+      racedInvariant.failure_code ?? "JOB_STATE_INVARIANT_VIOLATION",
+      racedJob,
+      null,
+      true
+    );
+  }
+  const racedAttempt = getCanonicalActiveAttempt(racedJob);
+  const racedLease = racedInvariant.snapshot.active_lease as Record<string, unknown> | null;
+  if (
+    racedInvariant.snapshot.claimed_by !== input.worker_id ||
+    readString(racedAttempt?.worker_id) !== input.worker_id ||
+    readString(racedLease?.worker_id) !== input.worker_id
+  ) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_WORKER_OWNERSHIP_CHANGED", racedJob, null, true);
+  }
+  if (
+    readString(racedAttempt?.id) !== input.attempt_id ||
+    readString(racedLease?.attempt_id) !== input.attempt_id
+  ) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_ATTEMPT_CHANGED", racedJob, null, true);
+  }
+  return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_COMPARE_AND_SET_RACE_LOST", racedJob, null, true);
 }
 
 export async function claimHermesJob(

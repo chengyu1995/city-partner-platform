@@ -11,7 +11,7 @@ const ts = require("typescript");
 const machine = require(path.join(root, "infra", "tencent-worker", "worker_job_state_machine.js"));
 const NOW = "2026-08-02T12:00:00.000Z";
 const CLAIMED_AT = "2026-08-02T11:00:00.000Z";
-const EXPIRES_AT = "2026-08-02T13:00:00.000Z";
+const EXPIRES_AT = "2099-08-02T13:00:00.000Z";
 
 function loadTypeScriptModule(file, mocks) {
   const source = fs.readFileSync(file, "utf8");

@@ -2587,10 +2587,149 @@ async function runtimeUpdateHermesJobWithSchemaFallback(jobId, updateData, build
   return { data: null, error: new Error("worker_lifecycle_schema_fallback_exhausted"), skipped };
 }
 
-async function runtimePersistCanonicalTransition(job, patch) {
-  let query = supabase.from("hermes_jobs").update(patch).eq("id", job.id);
-  if (job.updated_at) query = query.eq("updated_at", job.updated_at);
-  return query.select("*").maybeSingle();
+function runtimeSignalPersistenceFailure(failureCode, job = null, error = null, raceLost = false) {
+  return {
+    ok: false,
+    data: job,
+    error,
+    terminal: false,
+    idempotent: false,
+    race_lost: raceLost,
+    failure_code: failureCode,
+    failure_stage: "runtime_signal_persistence",
+  };
+}
+
+function runtimeTerminalSignalNoop(job) {
+  return {
+    ok: true,
+    data: job,
+    error: null,
+    terminal: true,
+    idempotent: true,
+    race_lost: true,
+    failure_code: null,
+    failure_stage: "runtime_signal_persistence",
+  };
+}
+
+async function runtimePersistCanonicalTransition(job, patch, input) {
+  const workerName = readFinalReportString(input && input.worker_id);
+  const attemptId = readFinalReportString(input && input.attempt_id);
+  if (!job || !workerName || !attemptId) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_IDENTITY_REQUIRED", job || null);
+  }
+
+  const validation = canonicalValidateJobStateInvariant(job);
+  if (validation.snapshot.terminal) return runtimeTerminalSignalNoop(job);
+  if (!validation.ok) {
+    return runtimeSignalPersistenceFailure(validation.failure_code || "JOB_STATE_INVARIANT_VIOLATION", job);
+  }
+  const snapshot = validation.snapshot;
+  const activeAttempt = canonicalGetActiveAttempt(job);
+  const activeLease = snapshot.active_lease;
+  if (!["claimed", "running"].includes(snapshot.state)) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_JOB_NOT_ACTIVE", job);
+  }
+  if (
+    snapshot.claimed_by !== workerName ||
+    !activeAttempt || activeAttempt.worker_id !== workerName ||
+    !activeLease || activeLease.worker_id !== workerName
+  ) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_WORKER_OWNERSHIP_MISMATCH", job);
+  }
+  if (activeAttempt.id !== attemptId || activeLease.attempt_id !== attemptId) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_ATTEMPT_MISMATCH", job);
+  }
+
+  const proposed = { ...job, ...patch };
+  const proposedValidation = canonicalValidateJobStateInvariant(proposed);
+  if (
+    !proposedValidation.ok ||
+    proposedValidation.snapshot.terminal ||
+    !["claimed", "running"].includes(proposedValidation.snapshot.state)
+  ) {
+    return runtimeSignalPersistenceFailure(
+      proposedValidation.failure_code || "RUNTIME_SIGNAL_POST_TRANSITION_INVALID",
+      job
+    );
+  }
+
+  const expectedStatus = readFinalReportString(job.status);
+  const expectedUpdatedAt = readFinalReportString(job.updated_at);
+  if (
+    !expectedStatus || !expectedUpdatedAt ||
+    !["pending", "queued", "running"].includes(expectedStatus) ||
+    job.claimed_by !== workerName || job.attempt_id !== attemptId || job.active_attempt_id !== attemptId
+  ) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_CAS_IDENTITY_REQUIRED", job);
+  }
+
+  const write = await supabase
+    .from("hermes_jobs")
+    .update(patch)
+    .eq("id", job.id)
+    .eq("status", expectedStatus)
+    .eq("claimed_by", workerName)
+    .eq("attempt_id", attemptId)
+    .eq("active_attempt_id", attemptId)
+    .eq("updated_at", expectedUpdatedAt)
+    .select("*")
+    .maybeSingle();
+  if (write.error) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_COMPARE_AND_SET_FAILED", job, write.error);
+  }
+  if (write.data) {
+    const persistedValidation = canonicalValidateJobStateInvariant(write.data);
+    if (!persistedValidation.ok || persistedValidation.snapshot.terminal) {
+      return runtimeSignalPersistenceFailure(
+        persistedValidation.failure_code || "RUNTIME_SIGNAL_PERSISTED_STATE_INVALID",
+        write.data
+      );
+    }
+    return {
+      ok: true,
+      data: write.data,
+      error: null,
+      terminal: false,
+      idempotent: false,
+      race_lost: false,
+      failure_code: null,
+      failure_stage: "runtime_signal_persistence",
+    };
+  }
+
+  const raceRead = await runtimeFindHermesJob(job.id);
+  if (raceRead.error) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_RACE_READ_FAILED", null, raceRead.error, true);
+  }
+  if (!raceRead.data) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_JOB_NOT_FOUND", null, null, true);
+  }
+  const racedJob = raceRead.data;
+  const racedValidation = canonicalValidateJobStateInvariant(racedJob);
+  if (racedValidation.snapshot.terminal) return runtimeTerminalSignalNoop(racedJob);
+  if (!racedValidation.ok) {
+    return runtimeSignalPersistenceFailure(
+      racedValidation.failure_code || "JOB_STATE_INVARIANT_VIOLATION",
+      racedJob,
+      null,
+      true
+    );
+  }
+  const racedAttempt = canonicalGetActiveAttempt(racedJob);
+  const racedLease = racedValidation.snapshot.active_lease;
+  if (
+    racedValidation.snapshot.claimed_by !== workerName ||
+    !racedAttempt || racedAttempt.worker_id !== workerName ||
+    !racedLease || racedLease.worker_id !== workerName
+  ) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_WORKER_OWNERSHIP_CHANGED", racedJob, null, true);
+  }
+  if (racedAttempt.id !== attemptId || racedLease.attempt_id !== attemptId) {
+    return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_ATTEMPT_CHANGED", racedJob, null, true);
+  }
+  return runtimeSignalPersistenceFailure("RUNTIME_SIGNAL_COMPARE_AND_SET_RACE_LOST", racedJob, null, true);
 }
 
 async function runtimeRollbackFailedClaim(jobId, workerName, attemptId) {
@@ -3088,7 +3227,12 @@ app.post("/api/worker/heartbeat", authenticateWorker, async (req, res) => {
       violated_invariants: transition.violations || [],
     });
   }
-  const { data, error } = await runtimePersistCanonicalTransition(existingJob, transition.patch);
+  const persistence = await runtimePersistCanonicalTransition(existingJob, transition.patch, {
+    worker_id: workerName,
+    attempt_id: attemptId,
+    signal: "heartbeat",
+  });
+  const { data, error } = persistence;
 
   if (error) {
     console.error("Heartbeat failed:", error);
@@ -3100,12 +3244,23 @@ app.post("/api/worker/heartbeat", authenticateWorker, async (req, res) => {
     });
   }
 
-  if (!data) {
+  if (persistence.terminal && data) {
+    return res.json({
+      ok: true,
+      job: data,
+      attempt_id: attemptId,
+      idempotent: true,
+      terminal_heartbeat_is_noop: true,
+      runtime_cas_race_lost: persistence.race_lost,
+    });
+  }
+
+  if (!persistence.ok || !data) {
     return res.status(404).json({
       ok: false,
       error: "running_job_not_found",
-      failure_code: "CANONICAL_HEARTBEAT_RACE_LOST",
-      failure_stage: "worker_heartbeat",
+      failure_code: persistence.failure_code || "CANONICAL_HEARTBEAT_RACE_LOST",
+      failure_stage: persistence.failure_stage || "worker_heartbeat",
     });
   }
 
@@ -3204,7 +3359,12 @@ app.post("/api/worker/progress", authenticateWorker, async (req, res) => {
       violated_invariants: transition.violations || [],
     });
   }
-  const { data, error } = await runtimePersistCanonicalTransition(existingJob, transition.patch);
+  const persistence = await runtimePersistCanonicalTransition(existingJob, transition.patch, {
+    worker_id: workerName,
+    attempt_id: attemptId,
+    signal: "progress",
+  });
+  const { data, error } = persistence;
 
   if (error) {
     console.error("Progress update failed:", error);
@@ -3216,10 +3376,23 @@ app.post("/api/worker/progress", authenticateWorker, async (req, res) => {
     });
   }
 
-  if (!data) {
+  if (persistence.terminal && data) {
+    return res.json({
+      ok: true,
+      job: data,
+      attempt_id: attemptId,
+      idempotent: true,
+      terminal_progress_is_noop: true,
+      runtime_cas_race_lost: persistence.race_lost,
+    });
+  }
+
+  if (!persistence.ok || !data) {
     return res.status(404).json({
       ok: false,
       error: "running_job_not_found_or_not_owned",
+      failure_code: persistence.failure_code || "CANONICAL_PROGRESS_RACE_LOST",
+      failure_stage: persistence.failure_stage || "worker_progress",
     });
   }
 

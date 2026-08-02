@@ -9,9 +9,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
 const machine = require(path.join(root, "infra", "tencent-worker", "worker_job_state_machine.js"));
-const CLAIMED_AT = "2026-08-02T10:00:00.000Z";
+const SAME_TIMESTAMP = "2026-08-02T10:00:00.000Z";
+const CLAIMED_AT = SAME_TIMESTAMP;
 const EXPIRES_AT = "2999-08-02T11:00:00.000Z";
-const TERMINAL_AT = "2026-08-02T10:30:00.000Z";
+const TERMINAL_AT = SAME_TIMESTAMP;
 
 function loadTypeScriptModule(file, mocks) {
   const source = fs.readFileSync(file, "utf8");
@@ -196,6 +197,18 @@ function terminalInput(status, overrides = {}) {
   };
 }
 
+function runtimeSignalInput(expectedJob, patch, signal, overrides = {}) {
+  return {
+    job_id: expectedJob.id,
+    worker_id: "Worker-A",
+    attempt_id: "attempt-a",
+    signal,
+    expected_job: expectedJob,
+    patch,
+    ...overrides,
+  };
+}
+
 test("two simultaneous success reports produce one canonical terminal truth", async () => {
   const store = createSupabaseStore(claimedJob());
   const route = loadReportRoute(store);
@@ -274,7 +287,7 @@ test("terminal report wins over failed-claim rollback", async () => {
   assert.equal(machine.normalizeJobState(store.job), "terminal_success");
 });
 
-test("terminal report wins over a stale heartbeat CAS", async () => {
+test("same timestamp terminal success wins over a stale heartbeat CAS", async () => {
   const claimed = claimedJob();
   const heartbeat = workerJobs.buildCanonicalHeartbeatTransition(claimed, {
     worker_id: "Worker-A",
@@ -284,12 +297,16 @@ test("terminal report wins over a stale heartbeat CAS", async () => {
   });
   const store = createSupabaseStore(claimed);
   await workerJobs.finalizeCanonicalJobReportSafely(store, terminalInput("succeeded"));
-  const stale = await workerJobs.updateCanonicalHermesJob(store, claimed.id, heartbeat.patch, claimed.updated_at);
-  assert.equal(stale.data, null);
+  const stale = await workerJobs.persistCanonicalRuntimeSignalSafely(
+    store,
+    runtimeSignalInput(claimed, heartbeat.patch, "heartbeat")
+  );
+  assert.equal(stale.terminal, true);
+  assert.equal(stale.idempotent, true);
   assert.equal(machine.normalizeJobState(store.job), "terminal_success");
 });
 
-test("terminal report wins over a stale progress CAS", async () => {
+test("same timestamp terminal failure wins over a stale progress CAS", async () => {
   const claimed = claimedJob();
   const progress = workerJobs.buildCanonicalProgressTransition(claimed, {
     worker_id: "Worker-A",
@@ -300,12 +317,171 @@ test("terminal report wins over a stale progress CAS", async () => {
   });
   const store = createSupabaseStore(claimed);
   await workerJobs.finalizeCanonicalJobReportSafely(store, terminalInput("failed"));
-  const stale = await workerJobs.updateCanonicalHermesJob(store, claimed.id, progress.patch, claimed.updated_at);
-  assert.equal(stale.data, null);
+  const stale = await workerJobs.persistCanonicalRuntimeSignalSafely(
+    store,
+    runtimeSignalInput(claimed, progress.patch, "progress")
+  );
+  assert.equal(stale.terminal, true);
+  assert.equal(store.job.result.failure_code, "FIRST_FAILURE");
+  assert.equal(store.job.result.failure_stage, "first_failure_stage");
   assert.equal(machine.normalizeJobState(store.job), "terminal_failed");
 });
 
-test("terminal report wins over stale recovery persistence", async () => {
+test("same timestamp runtime signal first still ends in terminal truth", async () => {
+  const claimed = claimedJob();
+  const heartbeat = workerJobs.buildCanonicalHeartbeatTransition(claimed, {
+    worker_id: "Worker-A",
+    attempt_id: "attempt-a",
+    now: SAME_TIMESTAMP,
+    expires_at: EXPIRES_AT,
+  });
+  const store = createSupabaseStore(claimed);
+  const runtime = await workerJobs.persistCanonicalRuntimeSignalSafely(
+    store,
+    runtimeSignalInput(claimed, heartbeat.patch, "heartbeat")
+  );
+  assert.equal(runtime.applied, true);
+  const terminal = await workerJobs.finalizeCanonicalJobReportSafely(store, terminalInput("succeeded"));
+  assert.equal(terminal.terminal_applied, true);
+  assert.equal(machine.normalizeJobState(store.job), "terminal_success");
+});
+
+test("same timestamp terminal and runtime requests converge on terminal", async () => {
+  const claimed = claimedJob();
+  const progress = workerJobs.buildCanonicalProgressTransition(claimed, {
+    worker_id: "Worker-A",
+    attempt_id: "attempt-a",
+    now: SAME_TIMESTAMP,
+    progress_percent: 95,
+    current_step: "same timestamp race",
+  });
+  const store = createSupabaseStore(claimed);
+  await Promise.all([
+    workerJobs.finalizeCanonicalJobReportSafely(store, terminalInput("succeeded")),
+    workerJobs.persistCanonicalRuntimeSignalSafely(
+      store,
+      runtimeSignalInput(claimed, progress.patch, "progress")
+    ),
+  ]);
+  assert.equal(machine.normalizeJobState(store.job), "terminal_success");
+});
+
+test("same timestamp cancelled terminal makes stale heartbeat a no-op", async () => {
+  const claimed = claimedJob();
+  const heartbeat = workerJobs.buildCanonicalHeartbeatTransition(claimed, {
+    worker_id: "Worker-A",
+    attempt_id: "attempt-a",
+    now: SAME_TIMESTAMP,
+    expires_at: EXPIRES_AT,
+  });
+  const store = createSupabaseStore(claimed);
+  await workerJobs.finalizeCanonicalJobReportSafely(store, terminalInput("cancelled"));
+  const stale = await workerJobs.persistCanonicalRuntimeSignalSafely(
+    store,
+    runtimeSignalInput(claimed, heartbeat.patch, "heartbeat")
+  );
+  assert.equal(stale.terminal, true);
+  assert.equal(machine.normalizeJobState(store.job), "terminal_cancelled");
+});
+
+test("same timestamp failed heartbeat and cancelled progress preserve terminal truth", async () => {
+  for (const scenario of [
+    { terminal: "failed", signal: "heartbeat" },
+    { terminal: "cancelled", signal: "progress" },
+  ]) {
+    const claimed = claimedJob();
+    const transition = scenario.signal === "heartbeat"
+      ? workerJobs.buildCanonicalHeartbeatTransition(claimed, {
+          worker_id: "Worker-A",
+          attempt_id: "attempt-a",
+          now: SAME_TIMESTAMP,
+          expires_at: EXPIRES_AT,
+        })
+      : workerJobs.buildCanonicalProgressTransition(claimed, {
+          worker_id: "Worker-A",
+          attempt_id: "attempt-a",
+          now: SAME_TIMESTAMP,
+          progress_percent: 99,
+          current_step: "late progress",
+        });
+    const store = createSupabaseStore(claimed);
+    await workerJobs.finalizeCanonicalJobReportSafely(store, terminalInput(scenario.terminal));
+    const stale = await workerJobs.persistCanonicalRuntimeSignalSafely(
+      store,
+      runtimeSignalInput(claimed, transition.patch, scenario.signal)
+    );
+    assert.equal(stale.terminal, true);
+    assert.equal(machine.normalizeJobState(store.job), `terminal_${scenario.terminal}`);
+    if (scenario.terminal === "failed") {
+      assert.equal(store.job.result.failure_code, "FIRST_FAILURE");
+      assert.equal(store.job.result.failure_stage, "first_failure_stage");
+    }
+  }
+});
+
+test("stale attempt runtime signal fails closed", async () => {
+  const current = claimedJob("Worker-A", "attempt-b");
+  const staleSnapshot = claimedJob("Worker-A", "attempt-a");
+  const heartbeat = workerJobs.buildCanonicalHeartbeatTransition(staleSnapshot, {
+    worker_id: "Worker-A",
+    attempt_id: "attempt-a",
+    now: SAME_TIMESTAMP,
+    expires_at: EXPIRES_AT,
+  });
+  const store = createSupabaseStore(current);
+  const stale = await workerJobs.persistCanonicalRuntimeSignalSafely(
+    store,
+    runtimeSignalInput(staleSnapshot, heartbeat.patch, "heartbeat")
+  );
+  assert.equal(stale.ok, false);
+  assert.equal(stale.failure_code, "RUNTIME_SIGNAL_ATTEMPT_CHANGED");
+  assert.equal(machine.getActiveAttempt(store.job).id, "attempt-b");
+});
+
+test("foreign worker runtime signal fails closed", async () => {
+  const claimed = claimedJob();
+  const heartbeat = workerJobs.buildCanonicalHeartbeatTransition(claimed, {
+    worker_id: "Worker-A",
+    attempt_id: "attempt-a",
+    now: SAME_TIMESTAMP,
+    expires_at: EXPIRES_AT,
+  });
+  const store = createSupabaseStore(claimed);
+  const foreign = await workerJobs.persistCanonicalRuntimeSignalSafely(
+    store,
+    runtimeSignalInput(claimed, heartbeat.patch, "heartbeat", { worker_id: "Worker-B" })
+  );
+  assert.equal(foreign.ok, false);
+  assert.equal(foreign.failure_code, "RUNTIME_SIGNAL_WORKER_OWNERSHIP_MISMATCH");
+  assert.equal(machine.normalizeJobState(store.job), "claimed");
+});
+
+test("runtime CAS zero-row rereads ownership and never retries", async () => {
+  const claimed = claimedJob();
+  const heartbeat = workerJobs.buildCanonicalHeartbeatTransition(claimed, {
+    worker_id: "Worker-A",
+    attempt_id: "attempt-a",
+    now: SAME_TIMESTAMP,
+    expires_at: EXPIRES_AT,
+  });
+  let updateCalls = 0;
+  const store = createSupabaseStore(claimed, {
+    onUpdate({ api }) {
+      updateCalls += 1;
+      api.job = claimedJob("Worker-B", "attempt-b");
+      return { data: null, error: null };
+    },
+  });
+  const raced = await workerJobs.persistCanonicalRuntimeSignalSafely(
+    store,
+    runtimeSignalInput(claimed, heartbeat.patch, "heartbeat")
+  );
+  assert.equal(raced.ok, false);
+  assert.equal(raced.failure_code, "RUNTIME_SIGNAL_WORKER_OWNERSHIP_CHANGED");
+  assert.equal(updateCalls, 1);
+});
+
+test("terminal failure wins over stale recovery persistence", async () => {
   const claimed = claimedJob();
   const recovery = machine.recoverStaleAttempt(claimed, {
     now: "3000-08-02T12:00:00.000Z",
@@ -315,10 +491,18 @@ test("terminal report wins over stale recovery persistence", async () => {
   });
   assert.equal(recovery.ok, true);
   const store = createSupabaseStore(claimed);
-  await workerJobs.finalizeCanonicalJobReportSafely(store, terminalInput("succeeded"));
-  const stale = await workerJobs.updateCanonicalHermesJob(store, claimed.id, recovery.patch, claimed.updated_at);
+  await workerJobs.finalizeCanonicalJobReportSafely(store, terminalInput("failed"));
+  const stale = await store
+    .from("hermes_jobs")
+    .update(recovery.patch)
+    .eq("id", claimed.id)
+    .eq("status", claimed.status)
+    .eq("updated_at", claimed.updated_at)
+    .select("*")
+    .maybeSingle();
   assert.equal(stale.data, null);
-  assert.equal(machine.normalizeJobState(store.job), "terminal_success");
+  assert.equal(store.job.result.failure_code, "FIRST_FAILURE");
+  assert.equal(machine.normalizeJobState(store.job), "terminal_failed");
 });
 
 test("zero-row terminal CAS recheck fails closed after ownership changes", async () => {
