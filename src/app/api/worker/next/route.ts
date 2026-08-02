@@ -8,11 +8,10 @@ import {
   createWorkerAttemptId,
   findHermesJob,
   getBitableRecordId,
-  getDisabledTerminalJobStatus,
+  getCanonicalTerminalWorkerJobStatus,
   getProjectDirectorJobCorrelation,
   getWorkerIdFromRequest,
   getWorkerSupabase,
-  isTerminalWorkerStatus,
   responseFromMaybe,
   updateHermesJob,
 } from "@/lib/worker-jobs";
@@ -40,32 +39,51 @@ async function handleNext(req: NextRequest) {
   const supabase = await getWorkerSupabase();
   if (responseFromMaybe(supabase)) return supabase;
 
-  const { data: job, error } = await supabase
+  const { data: queuedJobs, error } = await supabase
     .from("hermes_jobs")
     .select("*")
     .in("status", ["queued", "pending"])
     .is("claimed_by", null)
     .order("created_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
+    .limit(50);
 
   if (error) {
     return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
   }
+  let job: (Record<string, unknown> & { id: string }) | null = null;
+  for (const queuedJob of (queuedJobs ?? []) as Record<string, unknown>[]) {
+    const terminalStatus = getCanonicalTerminalWorkerJobStatus(queuedJob);
+    if (!terminalStatus) {
+      job = queuedJob as Record<string, unknown> & { id: string };
+      break;
+    }
+    const cleanupResult = await releaseTerminalJob(supabase, queuedJob, terminalStatus);
+    if (cleanupResult.error) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: cleanupResult.error.message ?? "terminal job cleanup failed",
+          failure_code: "TERMINAL_JOB_CLEANUP_FAILED",
+          failure_stage: "eligibility_terminal_cleanup",
+          worker_next_returned: false,
+        },
+        { status: 500 }
+      );
+    }
+  }
   if (!job) {
     return NextResponse.json({ ok: true, job: null });
   }
+  const jobId = String(job.id);
 
-  const { data: preClaimJob, error: preClaimError } = await findHermesJob(supabase, job.id);
+  const { data: preClaimJob, error: preClaimError } = await findHermesJob(supabase, jobId);
   if (preClaimError) {
     return NextResponse.json(
       { ok: false, error: preClaimError.message ?? "pre-claim terminal check failed" },
       { status: 500 }
     );
   }
-  const preClaimTerminalStatus =
-    getDisabledTerminalJobStatus(preClaimJob ?? job) ??
-    (isTerminalWorkerStatus(preClaimJob?.status) ? String(preClaimJob?.status) : null);
+  const preClaimTerminalStatus = getCanonicalTerminalWorkerJobStatus(preClaimJob ?? job);
   if (preClaimTerminalStatus) {
     const cleanupResult = await releaseTerminalJob(
       supabase,
@@ -100,10 +118,10 @@ async function handleNext(req: NextRequest) {
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
   const workerId = getWorkerIdFromRequest(req);
-  const attemptId = createWorkerAttemptId(job.id, workerId);
+  const attemptId = createWorkerAttemptId(jobId, workerId);
   const { data: claimedJob, error: updateError, skippedColumns } = await claimHermesJob(
     supabase,
-    job.id,
+    jobId,
     workerId,
     {
       status: "running",
@@ -117,7 +135,7 @@ async function handleNext(req: NextRequest) {
       status_message: "Worker claimed job",
       payload: buildAttemptPayload(job, {
         attempt_id: attemptId,
-        job_id: job.id,
+        job_id: jobId,
         worker_id: workerId,
         status: "running",
         started_at: now,
@@ -155,7 +173,7 @@ async function handleNext(req: NextRequest) {
 
   const { data: persistedClaimedJob, error: postClaimError } = await findHermesJob(
     supabase,
-    job.id
+    jobId
   );
   if (postClaimError) {
     return NextResponse.json(
@@ -163,11 +181,9 @@ async function handleNext(req: NextRequest) {
       { status: 500 }
     );
   }
-  const postClaimTerminalStatus =
-    getDisabledTerminalJobStatus(persistedClaimedJob ?? claimedJob) ??
-    (isTerminalWorkerStatus(persistedClaimedJob?.status)
-      ? String(persistedClaimedJob?.status)
-      : null);
+  const postClaimTerminalStatus = getCanonicalTerminalWorkerJobStatus(
+    persistedClaimedJob ?? claimedJob
+  );
   if (postClaimTerminalStatus) {
     const cleanupResult = await releaseTerminalJob(
       supabase,
@@ -241,7 +257,7 @@ async function handleNext(req: NextRequest) {
         failure_code: "WORKER_ATTEMPT_PERSISTENCE_FAILED",
         failure_stage: "worker_claim",
         worker_created: false,
-        job_id: job.id,
+        job_id: jobId,
         attempt_id: attemptId,
       },
       { status: 500 }

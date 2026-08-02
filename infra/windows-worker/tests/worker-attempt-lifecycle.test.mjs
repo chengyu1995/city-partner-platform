@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -15,6 +16,16 @@ const localWorker = fs.readFileSync(path.join(root, "infra", "windows-worker", "
 const workerJobs = fs.readFileSync(path.join(root, "src", "lib", "worker-jobs.ts"), "utf8");
 const feishuRoute = fs.readFileSync(path.join(root, "src", "app", "api", "feishu", "event", "route.ts"), "utf8");
 const jobBuilder = fs.readFileSync(path.join(root, "src", "lib", "project-director-job-builder.ts"), "utf8");
+const productionWorkerApi = fs.readFileSync(
+  path.join(root, "infra", "tencent-worker", "worker_api.js"),
+  "utf8"
+);
+const terminalPolicySource = fs.readFileSync(
+  path.join(root, "infra", "tencent-worker", "worker_terminal_policy.js"),
+  "utf8"
+);
+const require = createRequire(import.meta.url);
+const terminalPolicy = require(path.join(root, "infra", "tencent-worker", "worker_terminal_policy.js"));
 
 function functionBlock(source, name) {
   const start = source.indexOf(`function ${name}`);
@@ -52,8 +63,8 @@ test("terminal jobs are excluded before and after claim using persisted state", 
 
   assert.ok(preClaimRead >= 0 && preClaimRead < claim);
   assert.ok(postClaimRead > claim && postClaimRead < returnJob);
-  assert.match(nextRoute, /isTerminalWorkerStatus\(preClaimJob\?\.status\)/);
-  assert.match(nextRoute, /isTerminalWorkerStatus\(persistedClaimedJob\?\.status\)/);
+  assert.match(nextRoute, /getCanonicalTerminalWorkerJobStatus\(preClaimJob \?\? job\)/);
+  assert.match(nextRoute, /getCanonicalTerminalWorkerJobStatus\(\s*persistedClaimedJob \?\? claimedJob/);
   assert.match(nextRoute, /terminal_job_excluded_before_claim/);
   assert.match(nextRoute, /terminal_job_detected_after_claim/);
   assert.match(nextRoute, /execution_aborted:\s*true/);
@@ -62,12 +73,80 @@ test("terminal jobs are excluded before and after claim using persisted state", 
 });
 
 test("cancelled SMOKE-44 and superseded MASTER-FAST-FORWARD-46 stay disabled", () => {
-  assert.match(workerJobs, /ef2453ed-2385-49f2-a618-34fcc037fb70["'],\s*["']cancelled/);
-  assert.match(workerJobs, /3ca92636-1b5a-4711-9c5d-5148c195e21b["'],\s*["']superseded/);
-  assert.match(workerJobs, /"completed"/);
-  assert.match(workerJobs, /"superseded"/);
-  assert.match(nextRoute, /getDisabledTerminalJobStatus\(preClaimJob \?\? job\)/);
+  assert.match(terminalPolicySource, /eaaee4df-8ac7-4e5b-8267-080eb68f6b31/);
+  assert.match(terminalPolicySource, /ef2453ed-2385-49f2-a618-34fcc037fb70/);
+  assert.match(terminalPolicySource, /3ca92636-1b5a-4711-9c5d-5148c195e21b/);
+  assert.match(terminalPolicySource, /terminalState:\s*"superseded"/);
+  assert.match(terminalPolicySource, /terminalState:\s*"completed"/);
   assert.match(nextRoute, /worker_next_returned:\s*false/);
+});
+
+test("canonical terminal predicate recognizes legacy semantic terminal records", () => {
+  assert.equal(
+    terminalPolicy.isTerminalWorkerJob({ status: "failed", result: { terminal_state: "superseded" } }),
+    true
+  );
+  assert.equal(
+    terminalPolicy.isTerminalWorkerJob({ status: "failed", result: { terminal_state: "cancelled" } }),
+    true
+  );
+  assert.equal(
+    terminalPolicy.isTerminalWorkerJob({
+      status: "queued",
+      retryable: true,
+      result: { terminal_state: "superseded" },
+    }),
+    true
+  );
+  assert.equal(terminalPolicy.isTerminalWorkerJob({ status: "queued", result: {} }), false);
+  assert.equal(
+    terminalPolicy.getTerminalWorkerJobDescriptor({ status: "succeeded" }).storageStatus,
+    "succeeded"
+  );
+});
+
+test("production next filters terminal semantics before selecting and claiming", () => {
+  const eligibility = productionWorkerApi.indexOf("for (const queuedJob of Array.isArray(data) ? data : [])");
+  const candidate = productionWorkerApi.indexOf("job = queuedJob", eligibility);
+  const claim = productionWorkerApi.indexOf("runtimeClaimHermesJob(job, workerName)", eligibility);
+  assert.ok(eligibility >= 0 && eligibility < candidate && candidate < claim);
+  assert.match(productionWorkerApi, /runtimeGetTerminalJobDescriptor\(queuedJob\)/);
+  assert.match(productionWorkerApi, /runtimeFindHermesJob\(job\.id\)/);
+  assert.match(productionWorkerApi, /post_claim_terminal_check_failed/);
+});
+
+test("production stale recovery cannot reactivate terminal jobs", () => {
+  const recovery = functionBlock(productionWorkerApi, "recoverStaleJobs");
+  assert.match(recovery, /runtimeExcludeTerminalJobsFromActiveQueue\("before_stale_recovery"\)/);
+  assert.match(recovery, /recover_stale_hermes_jobs/);
+  assert.match(recovery, /runtimeExcludeTerminalJobsFromActiveQueue\("after_stale_recovery"\)/);
+  assert.match(productionWorkerApi, /terminal_jobs_excluded_from_active_queue/);
+});
+
+test("terminal cleanup is schema-aware and keeps terminal semantics persisted", () => {
+  const productionCleanup = functionBlock(productionWorkerApi, "runtimeBuildTerminalCleanupFields");
+  assert.match(productionCleanup, /claimed_by:\s*null/);
+  assert.match(productionCleanup, /claimed_at:\s*null/);
+  assert.match(productionCleanup, /heartbeat_at:\s*null/);
+  assert.match(productionCleanup, /last_progress_at:\s*null/);
+  assert.match(productionCleanup, /terminal_state:\s*descriptor\.terminalState/);
+  assert.match(productionCleanup, /field in job/);
+  assert.doesNotMatch(productionCleanup, /status:\s*["'](?:queued|pending|running)["']/);
+});
+
+test("terminal approval identity replay is suppressed before insert", () => {
+  const createJobs = functionBlock(workerJobs, "createHermesJobs");
+  assert.match(createJobs, /replayedTerminalIdentities/);
+  assert.match(createJobs, /isCanonicalTerminalWorkerJob\(existingJob\)/);
+  assert.match(createJobs, /terminal_identity_replay_suppressed/);
+  assert.match(createJobs, /insertedCount:\s*0/);
+});
+
+test("repository and production runtime share one terminal status registry", () => {
+  assert.match(workerJobs, /infra\/tencent-worker\/worker_terminal_policy/);
+  assert.match(productionWorkerApi, /require\("\.\/worker_terminal_policy"\)/);
+  assert.doesNotMatch(workerJobs, /const TERMINAL_WORKER_STATUSES/);
+  assert.doesNotMatch(productionWorkerApi, /const RUNTIME_TERMINAL_JOB_STATUSES/);
 });
 
 test("terminal cleanup clears attempts, lease, running index, and retry flags", () => {

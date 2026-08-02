@@ -2,6 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { getSupabaseService } from "@/lib/env";
 import { createHash } from "node:crypto";
+import {
+  getTerminalWorkerJobDescriptor,
+  isTerminalWorkerJob,
+  normalizeTerminalWorkerStatus,
+} from "../../infra/tencent-worker/worker_terminal_policy";
 
 type JobRecord = Record<string, unknown>;
 
@@ -41,18 +46,6 @@ const RECORD_ID_KEYS = [
   "recordId",
 ];
 
-const TERMINAL_WORKER_STATUSES = new Set([
-  "succeeded",
-  "failed",
-  "cancelled",
-  "canceled",
-  "completed",
-  "superseded",
-]);
-const DISABLED_TERMINAL_JOBS = new Map([
-  ["ef2453ed-2385-49f2-a618-34fcc037fb70", "cancelled"],
-  ["3ca92636-1b5a-4711-9c5d-5148c195e21b", "superseded"],
-]);
 const TASK_MUTATION_PATTERN =
   /修复|新增|更新|补齐|建立|修改|改动|创建|写入|补充|fix|repair|add|create|update|modify|patch|implement/i;
 const READ_ONLY_TASK_PATTERN =
@@ -3721,15 +3714,23 @@ export function buildAttemptPayload(
 }
 
 export function isTerminalWorkerStatus(value: unknown): boolean {
-  return TERMINAL_WORKER_STATUSES.has(String(value || "").trim().toLowerCase());
+  return normalizeTerminalWorkerStatus(value) !== null;
 }
 
 export function getDisabledTerminalJobStatus(
   job: JobRecord | null | undefined
 ): string | null {
-  if (!job) return null;
-  const jobId = readString(job.id) ?? readString(job.job_id);
-  return jobId ? DISABLED_TERMINAL_JOBS.get(jobId) ?? null : null;
+  return getTerminalWorkerJobDescriptor(job)?.terminalState ?? null;
+}
+
+export function getCanonicalTerminalWorkerJobStatus(
+  job: JobRecord | null | undefined
+): string | null {
+  return getTerminalWorkerJobDescriptor(job)?.terminalState ?? null;
+}
+
+export function isCanonicalTerminalWorkerJob(job: JobRecord | null | undefined): boolean {
+  return isTerminalWorkerJob(job);
 }
 
 export function buildTerminalJobCleanupFields(
@@ -3738,10 +3739,13 @@ export function buildTerminalJobCleanupFields(
   now = new Date().toISOString()
 ): JobRecord {
   const payload = readRecord(job?.payload) ?? {};
-  const normalizedStatus = String(status || job?.status || "failed").trim().toLowerCase();
+  const result = readRecord(job?.result) ?? {};
+  const descriptor = getTerminalWorkerJobDescriptor({ ...(job ?? {}), status });
+  const terminalState = descriptor?.terminalState ?? String(status || "failed").trim().toLowerCase();
+  const storageStatus = descriptor?.storageStatus ?? "failed";
 
-  return {
-    status: normalizedStatus,
+  const cleanupFields: JobRecord = {
+    status: storageStatus,
     claimed_by: null,
     claimed_at: null,
     attempt_id: null,
@@ -3759,12 +3763,26 @@ export function buildTerminalJobCleanupFields(
       retry_requested: false,
       retry_pending: false,
       should_retry: false,
-      terminal_state: normalizedStatus,
+      terminal_state: terminalState,
+    },
+    result: {
+      ...result,
+      terminal_state: terminalState,
+      retry_requested: false,
+      retry_pending: false,
+      should_retry: false,
     },
     request_text: stripAttemptContextFromRequestText(job?.request_text),
     completed_at: readString(job?.completed_at) ?? now,
+    finished_at: readString(job?.finished_at) ?? now,
     updated_at: now,
   };
+  if (!job) return cleanupFields;
+  return Object.fromEntries(
+    Object.entries(cleanupFields).filter(
+      ([field]) => field === "status" || field === "result" || field in job
+    )
+  );
 }
 
 export function terminalJobHasRuntimeState(job: JobRecord | null | undefined): boolean {
@@ -4044,6 +4062,29 @@ export async function createHermesJobs(
   let rows = rowsInput.map((row) => ({ ...row }));
   const skippedColumns: string[] = [];
   const adjustedFields: string[] = [];
+  const replayedTerminalIdentities = new Set<string>();
+  for (const row of rows) {
+    const stableId = readString(row.id);
+    const requestText = stripAttemptContextFromRequestText(row.request_text);
+    if (!stableId && !requestText) continue;
+    let query = supabase.from("hermes_jobs").select("*");
+    query = stableId ? query.eq("id", stableId) : query.eq("request_text", requestText);
+    const { data, error } = await query.order("created_at", { ascending: false }).limit(20);
+    if (error) throw new Error(`${failureLabel}: terminal identity check failed: ${error.message}`);
+    if ((data as JobRecord[] | null)?.some((existingJob) => isCanonicalTerminalWorkerJob(existingJob))) {
+      replayedTerminalIdentities.add(stableId ?? requestText);
+    }
+  }
+  if (replayedTerminalIdentities.size > 0) {
+    rows = rows.filter((row) => {
+      const identity = readString(row.id) ?? stripAttemptContextFromRequestText(row.request_text);
+      return !replayedTerminalIdentities.has(identity);
+    });
+    adjustedFields.push("terminal_identity_replay_suppressed");
+  }
+  if (rows.length === 0) {
+    return { insertedCount: 0, skippedColumns, adjustedFields, jobIds: [] };
+  }
   let retriedPendingStatus = false;
   let retriedTextPriority = false;
 

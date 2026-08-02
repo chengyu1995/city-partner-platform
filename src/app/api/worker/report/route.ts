@@ -16,6 +16,7 @@ import {
   getAttemptIdFromBody,
   getBatchCodeFromBody,
   getBitableRecordId,
+  getCanonicalTerminalWorkerJobStatus,
   getCreatedAtFromBody,
   getWorkerIdFromBody,
   getWorkerSupabase,
@@ -516,7 +517,11 @@ export async function POST(req: NextRequest) {
     attemptId,
   });
 
+  let existingTerminalStatus = getCanonicalTerminalWorkerJobStatus(existingJob);
   if (isTerminalWorkerStatus(existingJob.status)) {
+    existingTerminalStatus ??= normalizeWorkerStatus(existingJob.status);
+  }
+  if (existingTerminalStatus) {
     if (!terminalAttemptMatches(existingJob, attemptId)) {
       return NextResponse.json(
         {
@@ -542,7 +547,7 @@ export async function POST(req: NextRequest) {
       const cleanupResult = await updateHermesJob(
         supabase,
         jobId,
-        buildTerminalJobCleanupFields(existingJob, String(existingJob.status), now)
+        buildTerminalJobCleanupFields(existingJob, existingTerminalStatus, now)
       );
       if (cleanupResult.error) {
         return NextResponse.json(
