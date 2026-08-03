@@ -10,6 +10,7 @@ import {
   finalizeJob as buildCanonicalFinalization,
   getActiveAttempt as getCanonicalActiveAttempt,
   inspectJobState as inspectCanonicalJobState,
+  initializeQueuedJob as initializeCanonicalQueuedJob,
   isCanonicalClaimPersisted as canonicalClaimIsPersisted,
   isJobSelectable as isCanonicalJobSelectable,
   normalizeJobState as normalizeCanonicalJobState,
@@ -4242,6 +4243,47 @@ export async function createHermesJob(
   failureLabel = "create hermes job failed"
 ): Promise<HermesJobInsertResult> {
   return createHermesJobs(supabase, [row], failureLabel);
+}
+
+const CANONICAL_JOB_CREATION_FORBIDDEN_FIELDS = [
+  "claimed_by",
+  "attempt_id",
+  "active_attempt_id",
+  "lease_id",
+  "active_lease_id",
+  "running_job_id",
+  "terminal_state",
+] as const;
+
+export async function canonicalCreateJob(
+  supabase: SupabaseClient,
+  row: JobRecord,
+  failureLabel = "canonical create job failed"
+): Promise<HermesJobInsertResult> {
+  const forbidden = CANONICAL_JOB_CREATION_FORBIDDEN_FIELDS.filter((field) => {
+    const value = row[field];
+    return value !== undefined && value !== null && value !== false;
+  });
+  if (forbidden.length) {
+    throw new Error(`CANONICAL_JOB_INITIAL_STATE_FORBIDDEN:${forbidden.join(",")}`);
+  }
+  const transition = initializeCanonicalQueuedJob(row, { now: new Date().toISOString() }) as {
+    ok: boolean;
+    patch: JobRecord | null;
+    failure_code: string | null;
+  };
+  if (!transition.ok || !transition.patch) {
+    throw new Error(transition.failure_code ?? "CANONICAL_JOB_INITIALIZATION_FAILED");
+  }
+  return createHermesJob(
+    supabase,
+    {
+      ...row,
+      ...transition.patch,
+      source: readString(row.source) ?? "canonical_orchestration",
+    },
+    failureLabel
+  );
 }
 
 export async function updateHermesJob(

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+DEPRECATED legacy Hermes queue runner. It is preserved for compatibility only.
+New canonical orchestration must not call hermes_queue or task_results.
+
 Hermes 拆任务 runner - GitHub Action 调用
 - 拉 Supabase hermes_queue pending
 - 用 minimax LLM 拆任务

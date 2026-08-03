@@ -133,11 +133,11 @@ addCheck(
 addCheck(
   "terminal report idempotency prevents status overwrite",
   includesAll(workerReport, [
-    "isTerminalWorkerStatus(existingJob.status)",
-    "terminal_job_report_ignored",
-    "idempotent",
+    "finalizeCanonicalJobReportSafely",
+    "terminal_immutable",
+    "duplicate_report_idempotent",
   ]),
-  "succeeded/failed terminal jobs ignore later reports"
+  "shared canonical finalizer preserves first terminal truth"
 );
 
 addCheck(

@@ -64,7 +64,8 @@ for (const text of [
 for (const text of [
   "createWorkerAttemptId",
   "assertWorkerAttemptMatchesJob",
-  "TERMINAL_WORKER_STATUSES",
+  "validateCanonicalJobStateInvariant",
+  "worker_job_state_machine",
 ]) {
   assertIncludes("src/lib/worker-jobs.ts", text);
 }

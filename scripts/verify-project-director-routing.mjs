@@ -84,7 +84,9 @@ assertNoProductPlanningTemplate(
 );
 
 const routeSource = readFileSync(routePath, "utf8");
-const directWorkerIndex = routeSource.indexOf("if (isDirectWorkerTaskRequest(text))");
+const directWorkerIndex = routeSource.indexOf(
+  "(isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text))"
+);
 const planningChoiceIndex = routeSource.indexOf("const planningChoice = parseProjectDirectorPlanningChoice(text)");
 assert(directWorkerIndex >= 0, "route should contain direct Worker branch");
 assert(planningChoiceIndex >= 0, "route should contain planning choice branch");

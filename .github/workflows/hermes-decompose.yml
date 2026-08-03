@@ -1,3 +1,4 @@
+# DEPRECATED: legacy hermes_queue workflow; not used by canonical orchestration.
 name: Hermes 拆任务
 
 on:

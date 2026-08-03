@@ -500,6 +500,48 @@ function transitionFailure(code, violations = [], detail = null) {
   };
 }
 
+function initializeQueuedJob(job = {}, input = {}) {
+  const current = inspectJobState(job, { now: input.now });
+  if (!["created", "queued"].includes(current.state) || current.terminal) {
+    return transitionFailure("JOB_INITIALIZATION_STATE_FORBIDDEN");
+  }
+  if (current.claimed_by || current.active_attempt || current.active_lease) {
+    return transitionFailure("JOB_INITIALIZATION_RUNTIME_STATE_FORBIDDEN");
+  }
+  const now = input.now || new Date().toISOString();
+  const result = buildMachineResult(job, {
+    job_state: "queued",
+    selectable: true,
+    active_attempt: null,
+    active_lease: null,
+    attempt_history: [],
+    lease_history: [],
+    last_transition: { name: "initialize_queued", at: now, attempt_id: null },
+  });
+  const patch = {
+    status: compatibilityStatus("queued"),
+    claimed_by: null,
+    attempt_id: null,
+    active_attempt_id: null,
+    lease_id: null,
+    active_lease_id: null,
+    expires_at: null,
+    selectable: true,
+    retryable: true,
+    retry_requested: false,
+    retry_pending: false,
+    should_retry: false,
+    running_job_id: null,
+    result,
+    updated_at: now,
+  };
+  const validation = validateJobStateInvariant({ ...job, ...patch }, { now });
+  if (!validation.ok || !isJobSelectable({ ...job, ...patch }, { now })) {
+    return transitionFailure(validation.failure_code || "JOB_INITIALIZATION_INVALID", validation.violations);
+  }
+  return { ok: true, patch, failure_code: null, failure_stage: "job_state_machine" };
+}
+
 function claimJob(job, input) {
   const validation = validateJobStateInvariant(job, { now: input.now });
   if (!validation.ok) return transitionFailure(validation.failure_code, validation.violations);
@@ -962,6 +1004,7 @@ module.exports = {
   getLease,
   getStateMachine,
   inspectJobState,
+  initializeQueuedJob,
   isCanonicalClaimPersisted,
   isJobSelectable,
   isRetryAllowed,
