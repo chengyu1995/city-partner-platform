@@ -4275,11 +4275,18 @@ export async function canonicalCreateJob(
   if (!transition.ok || !transition.patch) {
     throw new Error(transition.failure_code ?? "CANONICAL_JOB_INITIALIZATION_FAILED");
   }
+  const payload = readRecord(row.payload) ?? {};
   return createHermesJob(
     supabase,
     {
       ...row,
       ...transition.patch,
+      canonical_job_state: "queued",
+      canonical_revision: 0,
+      requested_mode: readString(row.requested_mode) ?? readString(payload.requested_mode),
+      plan_id: readString(row.plan_id) ?? readString(payload.plan_id),
+      subtask_id: readString(row.subtask_id) ?? readString(payload.subtask_id),
+      terminal_at: null,
       source: readString(row.source) ?? "canonical_orchestration",
     },
     failureLabel
