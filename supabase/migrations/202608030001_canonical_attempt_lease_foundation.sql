@@ -48,11 +48,11 @@ create table if not exists public.hermes_job_leases (
 
 create table if not exists public.hermes_job_terminals (
   terminal_id uuid primary key default gen_random_uuid(),
-  job_id uuid not null unique references public.hermes_jobs(id) on delete restrict,
+  job_id uuid not null references public.hermes_jobs(id) on delete restrict,
   attempt_id text not null,
   worker_id text not null,
   report_identity text not null,
-  worker_status text not null,
+  worker_execution_status text not null,
   task_goal_status text not null,
   effective_final_status text not null,
   failure_code text null,
@@ -60,7 +60,7 @@ create table if not exists public.hermes_job_terminals (
   terminal_at timestamptz not null,
   canonical_report jsonb not null,
   created_at timestamptz not null default now(),
-  unique (job_id, report_identity),
+  constraint hermes_job_terminals_first_truth_per_job unique (job_id),
   foreign key (job_id, attempt_id)
     references public.hermes_job_attempts(job_id, attempt_id) on delete restrict
 );
@@ -77,11 +77,11 @@ create unique index if not exists hermes_job_leases_one_active_per_attempt
   on public.hermes_job_leases(attempt_id)
   where lease_state = 'active';
 
-create index if not exists hermes_job_attempts_history
-  on public.hermes_job_attempts(job_id, attempt_number);
-
 create index if not exists hermes_job_leases_history
   on public.hermes_job_leases(job_id, acquired_at);
+
+create index if not exists hermes_job_leases_attempt_history
+  on public.hermes_job_leases(attempt_id, created_at);
 
 create index if not exists hermes_jobs_canonical_selectable
   on public.hermes_jobs(canonical_job_state, canonical_revision, created_at)
@@ -102,7 +102,7 @@ create or replace function public.canonical_acquire_attempt_lease(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_job public.hermes_jobs%rowtype;
@@ -213,7 +213,7 @@ create or replace function public.canonical_record_runtime_signal(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_job public.hermes_jobs%rowtype;
@@ -323,7 +323,7 @@ create or replace function public.canonical_finalize_terminal(
   p_report_identity text,
   p_terminal_job_state text,
   p_final_attempt_state text,
-  p_worker_status text,
+  p_worker_execution_status text,
   p_task_goal_status text,
   p_effective_final_status text,
   p_failure_code text,
@@ -333,7 +333,7 @@ create or replace function public.canonical_finalize_terminal(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_job public.hermes_jobs%rowtype;
@@ -407,11 +407,11 @@ begin
 
   insert into public.hermes_job_terminals (
     job_id, attempt_id, worker_id, report_identity,
-    worker_status, task_goal_status, effective_final_status,
+    worker_execution_status, task_goal_status, effective_final_status,
     failure_code, failure_stage, terminal_at, canonical_report
   ) values (
     p_job_id, p_attempt_id, p_worker_id, p_report_identity,
-    p_worker_status, p_task_goal_status, p_effective_final_status,
+    p_worker_execution_status, p_task_goal_status, p_effective_final_status,
     p_failure_code, p_failure_stage, p_now, p_canonical_report
   ) returning * into v_terminal;
 
@@ -472,7 +472,7 @@ create or replace function public.canonical_recover_stale_attempt(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_job public.hermes_jobs%rowtype;

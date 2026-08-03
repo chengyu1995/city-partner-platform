@@ -27,6 +27,44 @@ export interface CanonicalJobRecord {
   terminal_at: string | null;
 }
 
+export const CANONICAL_JOB_DATABASE_COLUMN_MAP = {
+  job_id: "id",
+  job_state: "canonical_job_state",
+  revision: "canonical_revision",
+  requested_mode: "requested_mode",
+  plan_id: "plan_id",
+  subtask_id: "subtask_id",
+  created_at: "created_at",
+  updated_at: "updated_at",
+  terminal_at: "terminal_at",
+} as const satisfies Record<keyof CanonicalJobRecord, string>;
+
+export interface CanonicalJobDatabaseRow {
+  id: string;
+  canonical_job_state: string;
+  canonical_revision: number;
+  requested_mode: string;
+  plan_id: string | null;
+  subtask_id: string | null;
+  created_at: string;
+  updated_at: string;
+  terminal_at: string | null;
+}
+
+export function mapCanonicalJobDatabaseRow(row: CanonicalJobDatabaseRow): CanonicalJobRecord {
+  return {
+    job_id: row.id,
+    job_state: row.canonical_job_state,
+    revision: row.canonical_revision,
+    requested_mode: row.requested_mode,
+    plan_id: row.plan_id,
+    subtask_id: row.subtask_id,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    terminal_at: row.terminal_at,
+  };
+}
+
 export interface CanonicalAttemptRecord {
   attempt_id: string;
   job_id: string;
@@ -60,7 +98,7 @@ export interface CanonicalTerminalRecord {
   attempt_id: string;
   worker_id: string;
   report_identity: string;
-  worker_status: string;
+  worker_execution_status: string;
   task_goal_status: string;
   effective_final_status: string;
   failure_code: string | null;
@@ -111,7 +149,7 @@ export interface CanonicalTerminalInput extends CanonicalOwnershipGuard {
   report_identity: string;
   terminal_job_state: "terminal_success" | "terminal_failed" | "terminal_cancelled";
   final_attempt_state: "finished" | "failed" | "abandoned";
-  worker_status: string;
+  worker_execution_status: string;
   task_goal_status: string;
   effective_final_status: string;
   failure_code: string | null;
@@ -322,7 +360,7 @@ export function canonicalFinalizeTerminal(
     p_report_identity: input.report_identity,
     p_terminal_job_state: input.terminal_job_state,
     p_final_attempt_state: input.final_attempt_state,
-    p_worker_status: input.worker_status,
+    p_worker_execution_status: input.worker_execution_status,
     p_task_goal_status: input.task_goal_status,
     p_effective_final_status: input.effective_final_status,
     p_failure_code: input.failure_code,

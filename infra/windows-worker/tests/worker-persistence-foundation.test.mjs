@@ -21,6 +21,10 @@ const hermesSource = [
 ].map((file) => readFileSync(join(root, file), "utf8")).join("\n");
 const openClawSource = readFileSync(join(root, "src/lib/openclaw/capability-gateway.ts"), "utf8");
 const packageJson = readFileSync(join(root, "package.json"), "utf8");
+const auditRequirements = readFileSync(
+  join(root, "docs/database/canonical-migration-audit-requirements.md"),
+  "utf8"
+);
 const contract = await import(pathToFileURL(contractPath).href);
 
 const NOW = "2026-08-03T10:00:00.000Z";
@@ -86,7 +90,7 @@ function terminalRecord() {
     attempt_id: "attempt-1",
     worker_id: "worker-1",
     report_identity: "report-1",
-    worker_status: "succeeded",
+    worker_execution_status: "succeeded",
     task_goal_status: "succeeded",
     effective_final_status: "succeeded",
     failure_code: null,
@@ -108,6 +112,66 @@ test("canonical job contract includes state, revision, plan, mode, and terminal 
   for (const field of ["job_state", "revision", "requested_mode", "plan_id", "subtask_id", "terminal_at"]) {
     assert.match(contractSource, new RegExp(`\\b${field}:`));
   }
+});
+
+test("canonical job database column mapping is explicit and complete", () => {
+  assert.deepEqual(contract.CANONICAL_JOB_DATABASE_COLUMN_MAP, {
+    job_id: "id",
+    job_state: "canonical_job_state",
+    revision: "canonical_revision",
+    requested_mode: "requested_mode",
+    plan_id: "plan_id",
+    subtask_id: "subtask_id",
+    created_at: "created_at",
+    updated_at: "updated_at",
+    terminal_at: "terminal_at",
+  });
+  const mapped = contract.mapCanonicalJobDatabaseRow({
+    id: "11111111-1111-4111-8111-111111111111",
+    canonical_job_state: "queued",
+    canonical_revision: 0,
+    requested_mode: "worker_read_only",
+    plan_id: "plan-1",
+    subtask_id: "subtask-1",
+    created_at: NOW,
+    updated_at: NOW,
+    terminal_at: null,
+  });
+  assert.equal(mapped.job_id, "11111111-1111-4111-8111-111111111111");
+  assert.equal(mapped.job_state, "queued");
+  assert.equal(mapped.revision, 0);
+});
+
+test("terminal persistence uses worker execution status consistently", () => {
+  assert.match(contractSource, /worker_execution_status: string/);
+  assert.doesNotMatch(contractSource, /\bworker_status\b/);
+  assert.match(migration, /worker_execution_status text not null/i);
+  assert.match(migration, /p_worker_execution_status text/i);
+  assert.doesNotMatch(migration, /\bworker_status\b/i);
+});
+
+test("migration indexes preserve history without redundant attempt indexes", () => {
+  assert.doesNotMatch(migration, /create index if not exists hermes_job_attempts_history/i);
+  assert.doesNotMatch(migration, /unique \(job_id, report_identity\)/i);
+  assert.match(
+    migration,
+    /create index if not exists hermes_job_leases_attempt_history\s+on public\.hermes_job_leases\(attempt_id, created_at\)/i
+  );
+});
+
+test("all security definer functions use the fixed safe search path", () => {
+  assert.equal((migration.match(/security definer/gi) ?? []).length, 4);
+  assert.equal((migration.match(/set search_path = public, pg_temp/gi) ?? []).length, 4);
+  assert.doesNotMatch(migration, /set search_path = public\s*\n/i);
+});
+
+test("first terminal truth has one named constraint and idempotent duplicate handling", () => {
+  assert.match(migration, /constraint hermes_job_terminals_first_truth_per_job unique \(job_id\)/i);
+  assert.equal((migration.match(/hermes_job_terminals_first_truth_per_job/gi) ?? []).length, 1);
+  assert.doesNotMatch(migration, /unique \(job_id, report_identity\)/i);
+  assert.match(migration, /where job_id = p_job_id;[\s\S]*if found then[\s\S]*'idempotent', true/i);
+  assert.match(auditRequirements, /pg_catalog\.pg_constraint/);
+  assert.match(auditRequirements, /function and schema ACL metadata/i);
 });
 
 test("attempt ids are unique database identities", () => {
@@ -308,7 +372,7 @@ test("progress persistence shares the canonical runtime CAS", () => {
 });
 
 test("terminal persistence is one immutable row per job", () => {
-  assert.match(migration, /job_id uuid not null unique references public\.hermes_jobs/i);
+  assert.match(migration, /constraint hermes_job_terminals_first_truth_per_job unique \(job_id\)/i);
   assert.match(migration, /insert into public\.hermes_job_terminals/i);
 });
 
@@ -318,7 +382,7 @@ test("Worker success cannot override task failure", () => {
     report_identity: "report-2",
     terminal_job_state: "terminal_success",
     final_attempt_state: "finished",
-    worker_status: "succeeded",
+    worker_execution_status: "succeeded",
     task_goal_status: "failed",
     effective_final_status: "succeeded",
     failure_code: null,
