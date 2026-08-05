@@ -19,9 +19,12 @@ import { createCanonicalHermesPlanningProvider, runAgent, AgentMessage } from "@
 import {
   canonicalHermesAllowsDirectWorkerBypass,
   runApprovedRequestThroughCanonicalHermes,
+  runApprovedRequestThroughHermesShadow,
 } from "@/lib/project-director-hermes-delegation";
 import { isHermesCanonicalOrchestrationEnabled } from "@/lib/hermes/orchestration-adapter";
+import { buildLegacyShadowPlan } from "@/lib/hermes/shadow-runtime";
 import { RegistryCapabilityGateway } from "@/lib/openclaw/capability-gateway";
+import { attachHermesShadowComparison } from "@/lib/project-director-final-report";
 import {
   buildProjectDirectorConsoleAction,
   isProjectDirectorDispatchPaused,
@@ -3012,6 +3015,38 @@ export async function POST(req: NextRequest) {
           batch_code: approvedBatchCode,
         });
       }
+      const shadowRequestedMode = approvedHermesMode(`${recentDraft.originalDemand}\n${text}`)
+        ?? "manager_read_only";
+      const shadowObservation = await runApprovedRequestThroughHermesShadow(
+        {
+          request_id: ev.message.message_id,
+          original_request_text: recentDraft.originalDemand,
+          project_domain: classifyFeishuWorkerTaskDomain(recentDraft.originalDemand),
+          requested_mode: shadowRequestedMode,
+          approval_context: {
+            approved_by: userId,
+            approved_at: new Date().toISOString(),
+            approval_id: ev.message.message_id,
+            feishu_chat_id: ev.message.chat_id,
+            feishu_event_id: eventId,
+          },
+          objective: recentDraft.originalDemand,
+        },
+        buildLegacyShadowPlan(
+          ev.message.message_id,
+          buildResult.tasks.map((task) => ({
+            task_type: task.task_type,
+            selected_agent: task.agent_role,
+            execution_mode: task.execution_mode,
+            allowed_paths: task.allowed_files,
+            forbidden_paths: task.forbidden_files,
+            acceptance_criteria: task.acceptance_criteria,
+            risk_level: task.risk_level,
+          }))
+        ),
+        createCanonicalHermesPlanningProvider(),
+        new RegistryCapabilityGateway()
+      );
       const dispatchedTaskKeys = new Set(buildResult.tasks.map((task) => task.task_key));
       const dispatchedBatches = dispatchPlan.dispatch_plan.batches
         .map((batch) => ({
@@ -3060,6 +3095,14 @@ export async function POST(req: NextRequest) {
         chatId: ev.message.chat_id,
         userId,
       });
+      const gmShadowReport = attachHermesShadowComparison(
+        {
+          state: "approved_execution_dispatched",
+          inserted_jobs: insertResult.insertedCount,
+          effective_final_status: "legacy_runtime_pending",
+        },
+        shadowObservation
+      );
       const reply = [
         `[Project Director Dispatch] boss_request_id=${approvedTree.boss_request_id}`,
         `[Project Director Dispatch] plan_id=${approvedTree.plan_id}`,
@@ -3097,6 +3140,7 @@ export async function POST(req: NextRequest) {
           "attempt_id_contract: assigned_on_worker_claim_and_required_on_report",
           `inserted_jobs: ${insertResult.insertedCount}`,
           `skipped_hermes_jobs_columns: ${insertResult.skippedColumns.join(", ") || "none"}`,
+          `hermes_shadow_report: ${JSON.stringify(gmShadowReport)}`,
         ].join("\n"),
         "project_director_approved_execution",
         ev.message.message_id
@@ -3116,6 +3160,7 @@ export async function POST(req: NextRequest) {
         worker_created: insertResult.insertedCount > 0,
         next_stage_allowed: insertResult.insertedCount > 0,
         inserted_jobs: insertResult.insertedCount,
+        hermes_shadow: gmShadowReport,
       });
     }
 

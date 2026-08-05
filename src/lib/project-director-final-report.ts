@@ -1,4 +1,5 @@
 import type { HermesPlanAggregate } from "./hermes/result-aggregator.ts";
+import type { HermesShadowObservation } from "./hermes/shadow-runtime.ts";
 
 export interface ProjectDirectorFinalReport {
   report_schema_version: "1.0";
@@ -39,5 +40,24 @@ export function buildProjectDirectorFinalReport(
       projection_only: true,
       canonical_effective_final_status: aggregate.effective_final_status,
     },
+  };
+}
+
+export interface ProjectDirectorShadowReport<T> {
+  gm_report_primary_source: "legacy_runtime";
+  gm_report_shadow_source: "hermes_shadow_comparison";
+  primary_result: T;
+  shadow_observation: HermesShadowObservation;
+}
+
+export function attachHermesShadowComparison<T>(
+  primaryResult: T,
+  shadowObservation: HermesShadowObservation
+): ProjectDirectorShadowReport<T> {
+  return {
+    gm_report_primary_source: "legacy_runtime",
+    gm_report_shadow_source: "hermes_shadow_comparison",
+    primary_result: primaryResult,
+    shadow_observation: shadowObservation,
   };
 }

@@ -8,6 +8,11 @@ import {
 } from "./hermes/orchestration-adapter.ts";
 import type { AgentCapabilityGateway } from "./openclaw/capability-gateway.ts";
 import type { HermesExecutionPlan } from "./hermes/execution-plan.ts";
+import {
+  observeApprovedRequestInHermesShadow,
+  type HermesShadowObservation,
+  type LegacyShadowPlan,
+} from "./hermes/shadow-runtime.ts";
 
 export type GMHermesDelegationResult =
   | { delegated: false; reason: "feature_disabled"; plan: null }
@@ -54,6 +59,22 @@ export async function runApprovedRequestThroughCanonicalHermes(
   const plan = await planApprovedRequest(request, planner, capabilityGateway);
   const jobs = await createCanonicalJobsForPlan(plan, canonicalCreateJob);
   return { delegated: true, reason: "canonical_jobs_created", plan, jobs };
+}
+
+export async function runApprovedRequestThroughHermesShadow(
+  request: GMApprovedRequest,
+  legacyPlan: LegacyShadowPlan,
+  planner: HermesPlanningProvider,
+  capabilityGateway: AgentCapabilityGateway,
+  env: Record<string, string | undefined> = process.env
+): Promise<HermesShadowObservation> {
+  return observeApprovedRequestInHermesShadow({
+    request,
+    legacy_plan: legacyPlan,
+    planner,
+    capability_gateway: capabilityGateway,
+    env,
+  });
 }
 
 export function canonicalHermesAllowsDirectWorkerBypass(input: {
