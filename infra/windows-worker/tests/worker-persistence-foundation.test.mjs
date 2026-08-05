@@ -76,6 +76,7 @@ function ownership(overrides = {}) {
   return {
     job_id: "11111111-1111-4111-8111-111111111111",
     attempt_id: "attempt-1",
+    lease_id: "lease-1",
     worker_id: "worker-1",
     expected_revision: 7,
     now: NOW,
@@ -351,7 +352,7 @@ test("canonicalCreateJob remains the unique recommended job creation path", () =
 });
 
 test("atomic claim validates then persists attempt, lease, and job under one row lock", () => {
-  const claim = migration.match(/create or replace function public\.canonical_acquire_attempt_lease[\s\S]*?end;\n\$\$;/i)?.[0] ?? "";
+  const claim = migration.match(/create or replace function public\.canonical_acquire_attempt_lease[\s\S]*?end;\r?\n\$\$;/i)?.[0] ?? "";
   assert.match(claim, /for update/i);
   assert.match(claim, /insert into public\.hermes_job_attempts/i);
   assert.match(claim, /insert into public\.hermes_job_leases/i);
@@ -360,7 +361,7 @@ test("atomic claim validates then persists attempt, lease, and job under one row
 });
 
 test("heartbeat persistence binds job, attempt, worker, lease, and revision", () => {
-  const runtime = migration.match(/create or replace function public\.canonical_record_runtime_signal[\s\S]*?end;\n\$\$;/i)?.[0] ?? "";
+  const runtime = migration.match(/create or replace function public\.canonical_record_runtime_signal[\s\S]*?end;\r?\n\$\$;/i)?.[0] ?? "";
   for (const evidence of ["p_job_id", "p_attempt_id", "p_worker_id", "p_expected_revision", "lease_state = 'active'", "LEASE_EXPIRED"]) {
     assert.match(runtime, new RegExp(evidence.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
   }
@@ -400,7 +401,7 @@ test("all persistence RPCs use a monotonic expected revision", () => {
     "canonical_finalize_terminal",
     "canonical_recover_stale_attempt",
   ]) {
-    const block = migration.match(new RegExp(`create or replace function public\\.${name}[\\s\\S]*?end;\\n\\$\\$;`, "i"))?.[0] ?? "";
+    const block = migration.match(new RegExp(`create or replace function public\\.${name}[\\s\\S]*?end;\\r?\\n\\$\\$;`, "i"))?.[0] ?? "";
     assert.match(block, /p_expected_revision bigint/i);
     assert.match(block, /canonical_revision = p_expected_revision/i);
     assert.match(block, /canonical_revision = p_expected_revision \+ 1/i);

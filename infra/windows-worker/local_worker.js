@@ -79,6 +79,10 @@ function assertRequiredEnv() {
 let stopping = false;
 let working = false;
 let currentAttemptId = null;
+let currentLeaseId = null;
+let currentCanonicalRevision = null;
+let currentLeaseExpiresAt = null;
+let canonicalMutationTail = Promise.resolve();
 let currentReadOnlyMode = false;
 let codexStartupDiagnostics = null;
 let codexResolvedExecutableState = null;
@@ -86,6 +90,30 @@ const terminalReportState = createTerminalReportState();
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function runCanonicalMutation(task) {
+  const result = canonicalMutationTail.then(task, task);
+  canonicalMutationTail = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+function canonicalProtocolFields(attemptId = null) {
+  if (!currentLeaseId && currentCanonicalRevision === null) return {};
+  return {
+    attempt_id: attemptId || currentAttemptId,
+    lease_id: currentLeaseId,
+    lease_expires_at: currentLeaseExpiresAt,
+    expected_revision: currentCanonicalRevision,
+    canonical_revision: currentCanonicalRevision,
+  };
+}
+
+function consumeCanonicalProtocolResponse(value) {
+  const revision = Number(value?.canonical_revision ?? value?.revision);
+  if (Number.isSafeInteger(revision) && revision >= 0) currentCanonicalRevision = revision;
+  if (readString(value?.lease_id)) currentLeaseId = readString(value.lease_id);
+  if (readString(value?.lease_expires_at)) currentLeaseExpiresAt = readString(value.lease_expires_at);
 }
 
 function readPlainRecord(value) {
@@ -1160,33 +1188,37 @@ async function sendHeartbeat(jobId, attemptId = null) {
     return { ok: true, skipped: "terminal_report_locked" };
   }
 
-  const response = await request("/api/worker/heartbeat", {
-    method: "POST",
-    body: JSON.stringify({
-      job_id: jobId,
-      attempt_id: attemptId,
-      worker_id: WORKER_NAME,
-      worker_name: WORKER_NAME,
-    }),
-  });
+  return runCanonicalMutation(async () => {
+    const response = await request("/api/worker/heartbeat", {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: jobId,
+        attempt_id: attemptId,
+        worker_id: WORKER_NAME,
+        worker_name: WORKER_NAME,
+        ...canonicalProtocolFields(attemptId),
+      }),
+    });
 
-  if (!response.ok) {
     const text = await response.text();
-    if (
-      recordPostCompletionTransportWarning(
-        { status: response.status, text },
-        "worker_heartbeat",
-        jobId
-      )
-    ) {
-      return { ok: true, warning: "post_completion_transport_warning" };
+    if (!response.ok) {
+      if (
+        recordPostCompletionTransportWarning(
+          { status: response.status, text },
+          "worker_heartbeat",
+          jobId
+        )
+      ) {
+        return { ok: true, warning: "post_completion_transport_warning" };
+      }
+      throw new Error(
+        `心跳上报失败 HTTP ${response.status}: ${text}`
+      );
     }
-    throw new Error(
-      `心跳上报失败 HTTP ${response.status}: ${text}`
-    );
-  }
 
-  return { ok: true };
+    try { consumeCanonicalProtocolResponse(text ? JSON.parse(text) : null); } catch { /* legacy response */ }
+    return { ok: true };
+  });
 }
 
 function startHeartbeat(jobId, attemptId = null) {
@@ -7481,20 +7513,27 @@ async function updateProgress(
   }
 
   try {
-    const response = await request("/api/worker/progress", {
-      method: "POST",
-      body: JSON.stringify({
-        job_id: jobId,
-        attempt_id: attemptId || currentAttemptId,
-        worker_id: WORKER_NAME,
-        worker_name: WORKER_NAME,
-        progress_percent: progressPercent,
-        current_step: currentStep,
-        status_message: statusMessage,
-      }),
+    const transport = await runCanonicalMutation(async () => {
+      const response = await request("/api/worker/progress", {
+        method: "POST",
+        body: JSON.stringify({
+          job_id: jobId,
+          attempt_id: attemptId || currentAttemptId,
+          worker_id: WORKER_NAME,
+          worker_name: WORKER_NAME,
+          progress_percent: progressPercent,
+          current_step: currentStep,
+          status_message: statusMessage,
+          ...canonicalProtocolFields(attemptId),
+        }),
+      });
+      const text = await response.text();
+      if (response.ok) {
+        try { consumeCanonicalProtocolResponse(text ? JSON.parse(text) : null); } catch { /* legacy response */ }
+      }
+      return { response, text };
     });
-
-    const text = await response.text();
+    const { response, text } = transport;
 
     if (!response.ok) {
       if (
@@ -7567,6 +7606,7 @@ async function report(jobId, status, payload, extra = {}) {
     normalizedExtra.post_completion_state_applied === undefined ? true : normalizedExtra.post_completion_state_applied;
   normalizedExtra.final_report_source =
     normalizedExtra.final_report_source || "worker_runtime_report";
+  Object.assign(normalizedExtra, canonicalProtocolFields(attemptId));
   const body =
     status === "succeeded"
       ? {
@@ -7588,22 +7628,21 @@ async function report(jobId, status, payload, extra = {}) {
           ...normalizedExtra,
         };
 
-  const response = await request("/api/worker/report", {
-    method: "POST",
-    body: JSON.stringify(body),
+  const transport = await runCanonicalMutation(async () => {
+    const response = await request("/api/worker/report", {
+        method: "POST",
+        body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    let responseBody = null;
+    try { responseBody = text ? JSON.parse(text) : null; } catch { /* non-JSON error response */ }
+    if (response.ok) consumeCanonicalProtocolResponse(responseBody);
+    return { response, text, responseBody };
   });
-
-  const text = await response.text();
+  const { response, text, responseBody } = transport;
 
   if (!response.ok) {
     throw new Error(`上报失败 HTTP ${response.status}: ${text}`);
-  }
-
-  let responseBody = null;
-  try {
-    responseBody = text ? JSON.parse(text) : null;
-  } catch (_) {
-    responseBody = null;
   }
 
   if (["succeeded", "failed", "cancelled"].includes(terminalStatus)) {
@@ -7845,13 +7884,26 @@ async function pollOnce() {
   const payload = JSON.parse(text);
   const job = payload.job;
   const attemptId = payload.attempt_id || job?.attempt_id || job?.active_attempt_id || job?.payload?.attempt_id || null;
+  const leaseId = payload.lease_id || job?.lease_id || null;
+  const canonicalRevision = payload.canonical_revision ?? job?.canonical_revision ?? null;
 
   if (!job || !job.id) {
     return;
   }
+  if (
+    job.canonical_job_state &&
+    (!attemptId || !leaseId || !Number.isSafeInteger(Number(canonicalRevision)))
+  ) {
+    throw new Error("CANONICAL_PROTOCOL_IDENTITY_REQUIRED");
+  }
 
   working = true;
   currentAttemptId = attemptId;
+  currentLeaseId = leaseId;
+  currentCanonicalRevision = Number.isSafeInteger(Number(canonicalRevision))
+    ? Number(canonicalRevision)
+    : null;
+  currentLeaseExpiresAt = payload.lease_expires_at || null;
   resetTerminalReportState();
 
   console.log(`领取任务： ${job.id}`);
@@ -8743,6 +8795,10 @@ async function pollOnce() {
   } finally {
     stopHeartbeat();
     currentAttemptId = null;
+    currentLeaseId = null;
+    currentCanonicalRevision = null;
+    currentLeaseExpiresAt = null;
+    canonicalMutationTail = Promise.resolve();
     currentReadOnlyMode = false;
     working = false;
   }

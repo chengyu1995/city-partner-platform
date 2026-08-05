@@ -4,6 +4,7 @@ import {
   assertWorkerAuthorized,
   buildCanonicalProgressTransition,
   buildRunningJobNotFoundPayload,
+  canonicalPersistenceRuntimeEnabled,
   clampProgress,
   findHermesJob,
   getAttemptIdFromBody,
@@ -12,8 +13,10 @@ import {
   getCreatedAtFromBody,
   getWorkerIdFromBody,
   getWorkerSupabase,
+  isCanonicalPersistenceJob,
   parseJsonBody,
   persistCanonicalRuntimeSignalSafely,
+  persistCanonicalWorkerRuntimeSignal,
   responseFromMaybe,
 } from "@/lib/worker-jobs";
 
@@ -24,6 +27,9 @@ interface WorkerProgressBody {
   id?: string;
   job_id?: string;
   attempt_id?: string;
+  lease_id?: string;
+  canonical_revision?: number;
+  expected_revision?: number;
   status?: string;
   progress_percent?: number;
   current_step?: string;
@@ -74,6 +80,62 @@ export async function POST(req: NextRequest) {
       }),
       { status: 404 }
     );
+  }
+
+  if (isCanonicalPersistenceJob(existingJob)) {
+    if (!canonicalPersistenceRuntimeEnabled()) {
+      return NextResponse.json(
+        { ok: false, failure_code: "CANONICAL_PERSISTENCE_RUNTIME_DISABLED" },
+        { status: 409 }
+      );
+    }
+    const expectedRevision = body.expected_revision ?? body.canonical_revision;
+    if (!attemptId || !body.lease_id || !Number.isSafeInteger(expectedRevision)) {
+      return NextResponse.json(
+        { ok: false, failure_code: "CANONICAL_PROTOCOL_IDENTITY_REQUIRED" },
+        { status: 400 }
+      );
+    }
+    try {
+      const result = await persistCanonicalWorkerRuntimeSignal(supabase, {
+        job_id: jobId,
+        worker_id: workerId,
+        attempt_id: attemptId,
+        lease_id: body.lease_id,
+        expected_revision: expectedRevision as number,
+        signal: "progress",
+      });
+      const recordId = getBitableRecordId(body, result.job, existingJob);
+      await syncWorkerStatusToFeishu({
+        recordId,
+        status: "running",
+        stage: "execution",
+        progressPercent,
+        currentStep,
+        statusMessage: body.status_message ?? null,
+        updatedAt: now,
+      });
+      return NextResponse.json({
+        ok: true,
+        job: result.job,
+        attempt_id: attemptId,
+        lease_id: body.lease_id,
+        canonical_revision: result.revision,
+        terminal_progress_is_noop: result.terminal_noop === true,
+        idempotent: result.idempotent === true,
+        feishu_sync: recordId ? "attempted" : "skipped_no_record_id",
+      });
+    } catch (errorValue) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: errorValue instanceof Error ? errorValue.message : String(errorValue),
+          failure_code: "CANONICAL_PROGRESS_REJECTED",
+          failure_stage: "canonical_progress",
+        },
+        { status: 409 }
+      );
+    }
   }
 
   const transition = buildCanonicalProgressTransition(existingJob, {

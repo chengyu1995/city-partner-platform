@@ -3,6 +3,7 @@ import {
   assertWorkerAuthorized,
   buildCanonicalHeartbeatTransition,
   buildRunningJobNotFoundPayload,
+  canonicalPersistenceRuntimeEnabled,
   findHermesJob,
   getAttemptIdFromBody,
   getBatchCodeFromBody,
@@ -10,8 +11,10 @@ import {
   getWorkerIdFromBody,
   getWorkerIdFromRequest,
   getWorkerSupabase,
+  isCanonicalPersistenceJob,
   parseJsonBody,
   persistCanonicalRuntimeSignalSafely,
+  persistCanonicalWorkerRuntimeSignal,
   responseFromMaybe,
 } from "@/lib/worker-jobs";
 
@@ -24,6 +27,9 @@ interface WorkerHeartbeatBody {
   worker_id?: string;
   worker_name?: string;
   attempt_id?: string;
+  lease_id?: string;
+  canonical_revision?: number;
+  expected_revision?: number;
   batch_code?: string;
   job_created_at?: string;
   created_at?: string;
@@ -63,6 +69,52 @@ export async function POST(req: NextRequest) {
       }),
       { status: 404 }
     );
+  }
+
+  if (isCanonicalPersistenceJob(existingJob)) {
+    if (!canonicalPersistenceRuntimeEnabled()) {
+      return NextResponse.json(
+        { ok: false, failure_code: "CANONICAL_PERSISTENCE_RUNTIME_DISABLED" },
+        { status: 409 }
+      );
+    }
+    const expectedRevision = body.expected_revision ?? body.canonical_revision;
+    if (!attemptId || !body.lease_id || !Number.isSafeInteger(expectedRevision)) {
+      return NextResponse.json(
+        { ok: false, failure_code: "CANONICAL_PROTOCOL_IDENTITY_REQUIRED" },
+        { status: 400 }
+      );
+    }
+    try {
+      const result = await persistCanonicalWorkerRuntimeSignal(supabase, {
+        job_id: jobId,
+        worker_id: workerId,
+        attempt_id: attemptId,
+        lease_id: body.lease_id,
+        expected_revision: expectedRevision as number,
+        signal: "heartbeat",
+        lease_expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      });
+      return NextResponse.json({
+        ok: true,
+        job: result.job,
+        attempt_id: attemptId,
+        lease_id: body.lease_id,
+        canonical_revision: result.revision,
+        terminal_heartbeat_is_noop: result.terminal_noop === true,
+        idempotent: result.idempotent === true,
+      });
+    } catch (errorValue) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: errorValue instanceof Error ? errorValue.message : String(errorValue),
+          failure_code: "CANONICAL_HEARTBEAT_REJECTED",
+          failure_stage: "canonical_heartbeat",
+        },
+        { status: 409 }
+      );
+    }
   }
 
   const now = new Date().toISOString();

@@ -21,6 +21,25 @@ import {
 import {
   finalizeCanonicalJobReportSafely as finalizeSharedCanonicalJobReportSafely,
 } from "../../infra/tencent-worker/worker_terminal_finalizer";
+import {
+  canonicalAcquireAttemptLease,
+  canonicalFinalizeTerminal,
+  canonicalPersistRuntimeSignal,
+  canonicalRecoverStaleAttempt as persistCanonicalStaleAttempt,
+  isCanonicalDatabasePersistenceEnabled,
+  type CanonicalPersistenceRpcClient,
+} from "./worker-job-persistence-contract";
+import {
+  aggregatePlanResults,
+  type CanonicalSubtaskResult,
+} from "./hermes/result-aggregator";
+import {
+  normalizeExecutionPlan,
+  type HermesExecutionPlan,
+  type HermesExecutionSubtask,
+  type HermesRequestedMode,
+} from "./hermes/execution-plan";
+import { buildProjectDirectorFinalReport } from "./project-director-final-report";
 
 type JobRecord = Record<string, unknown>;
 
@@ -4293,6 +4312,421 @@ export async function canonicalCreateJob(
   );
 }
 
+export interface CanonicalWorkerProtocolResult {
+  job: JobRecord;
+  job_id: string;
+  worker_task_id: string;
+  attempt_id: string;
+  lease_id: string;
+  canonical_revision: number;
+  lease_expires_at: string;
+  requested_mode: string;
+  scope: unknown;
+  acceptance: unknown;
+  execution_intent: unknown;
+}
+
+interface CanonicalProtocolMutationIdentity {
+  job_id: string;
+  attempt_id: string;
+  lease_id: string;
+  worker_id: string;
+  expected_revision: number;
+}
+
+function canonicalRpcClient(supabase: SupabaseClient): CanonicalPersistenceRpcClient {
+  return supabase as unknown as CanonicalPersistenceRpcClient;
+}
+
+function canonicalRevision(value: unknown): number {
+  const revision = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(revision) || revision < 0) throw new Error("CANONICAL_REVISION_INVALID");
+  return revision;
+}
+
+function canonicalPayload(job: JobRecord): JobRecord {
+  return readRecord(job.payload) ?? {};
+}
+
+export function isCanonicalPersistenceJob(job: JobRecord | null | undefined): boolean {
+  return Boolean(
+    job &&
+      readString(job.canonical_job_state) &&
+      Number.isSafeInteger(Number(job.canonical_revision))
+  );
+}
+
+export function canonicalPersistenceRuntimeEnabled(
+  env: Record<string, string | undefined> = process.env
+): boolean {
+  return isCanonicalDatabasePersistenceEnabled(env);
+}
+
+async function loadCanonicalOwnership(supabase: SupabaseClient, jobId: string) {
+  const { data: job, error: jobError } = await supabase
+    .from("hermes_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .maybeSingle();
+  if (jobError) throw new Error(`CANONICAL_JOB_READ_FAILED:${jobError.message}`);
+  if (!job) throw new Error("CANONICAL_JOB_NOT_FOUND");
+
+  const { data: attempts, error: attemptError } = await supabase
+    .from("hermes_job_attempts")
+    .select("*")
+    .eq("job_id", jobId)
+    .in("attempt_state", ["claimed", "running"])
+    .limit(2);
+  if (attemptError) throw new Error(`CANONICAL_ATTEMPT_READ_FAILED:${attemptError.message}`);
+
+  const { data: leases, error: leaseError } = await supabase
+    .from("hermes_job_leases")
+    .select("*")
+    .eq("job_id", jobId)
+    .eq("lease_state", "active")
+    .limit(2);
+  if (leaseError) throw new Error(`CANONICAL_LEASE_READ_FAILED:${leaseError.message}`);
+
+  const { data: terminal, error: terminalError } = await supabase
+    .from("hermes_job_terminals")
+    .select("*")
+    .eq("job_id", jobId)
+    .maybeSingle();
+  if (terminalError) throw new Error(`CANONICAL_TERMINAL_READ_FAILED:${terminalError.message}`);
+
+  return {
+    job: job as JobRecord,
+    attempt: ((attempts as JobRecord[] | null) ?? [])[0] ?? null,
+    lease: ((leases as JobRecord[] | null) ?? [])[0] ?? null,
+    terminal: (terminal as JobRecord | null) ?? null,
+    active_attempt_count: ((attempts as JobRecord[] | null) ?? []).length,
+    active_lease_count: ((leases as JobRecord[] | null) ?? []).length,
+  };
+}
+
+function assertCanonicalMutationIdentity(
+  ownership: Awaited<ReturnType<typeof loadCanonicalOwnership>>,
+  input: CanonicalProtocolMutationIdentity
+) {
+  if (canonicalRevision(ownership.job.canonical_revision) !== input.expected_revision) {
+    throw new Error("STALE_REVISION");
+  }
+  if (ownership.active_attempt_count !== 1 || !ownership.attempt) throw new Error("ACTIVE_ATTEMPT_REQUIRED");
+  if (ownership.active_lease_count !== 1 || !ownership.lease) throw new Error("ACTIVE_LEASE_REQUIRED");
+  if (readString(ownership.attempt.attempt_id) !== input.attempt_id) throw new Error("ATTEMPT_IDENTITY_MISMATCH");
+  if (readString(ownership.lease.lease_id) !== input.lease_id) throw new Error("LEASE_IDENTITY_MISMATCH");
+  if (readString(ownership.lease.attempt_id) !== input.attempt_id) throw new Error("LEASE_ATTEMPT_MISMATCH");
+  if (
+    readString(ownership.attempt.worker_id) !== input.worker_id ||
+    readString(ownership.lease.worker_id) !== input.worker_id
+  ) {
+    throw new Error("WORKER_OWNERSHIP_MISMATCH");
+  }
+}
+
+async function canonicalDependenciesReady(supabase: SupabaseClient, job: JobRecord): Promise<boolean> {
+  const payload = canonicalPayload(job);
+  const dependencies = Array.isArray(payload.dependencies)
+    ? payload.dependencies.filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+    : [];
+  const planId = readString(job.plan_id) ?? readString(payload.plan_id);
+  if (!dependencies.length) return true;
+  if (!planId) throw new Error("CANONICAL_PLAN_ID_REQUIRED");
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .select("subtask_id,canonical_job_state")
+    .eq("plan_id", planId)
+    .in("subtask_id", dependencies);
+  if (error) throw new Error(`CANONICAL_DEPENDENCY_READ_FAILED:${error.message}`);
+  const states = new Map(
+    ((data as JobRecord[] | null) ?? []).map((row) => [readString(row.subtask_id), readString(row.canonical_job_state)])
+  );
+  return dependencies.every((dependency) => states.get(dependency) === "terminal_success");
+}
+
+export async function claimNextCanonicalHermesJob(
+  supabase: SupabaseClient,
+  workerId: string,
+  now = new Date()
+): Promise<CanonicalWorkerProtocolResult | null> {
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .select("*")
+    .eq("canonical_job_state", "queued")
+    .is("terminal_at", null)
+    .order("created_at", { ascending: true })
+    .limit(50);
+  if (error) throw new Error(`CANONICAL_JOB_SELECTION_FAILED:${error.message}`);
+
+  for (const candidate of (data as JobRecord[] | null) ?? []) {
+    if (!(await canonicalDependenciesReady(supabase, candidate))) continue;
+    const jobId = readString(candidate.id);
+    if (!jobId) continue;
+    const attemptId = createWorkerAttemptId(jobId, workerId);
+    const leaseId = `lease:${attemptId}`;
+    const leaseExpiresAt = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
+    const expectedRevision = canonicalRevision(candidate.canonical_revision);
+    try {
+      const result = await canonicalAcquireAttemptLease(canonicalRpcClient(supabase), {
+        job_id: jobId,
+        worker_id: workerId,
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        expected_revision: expectedRevision,
+        now: now.toISOString(),
+        expires_at: leaseExpiresAt,
+      });
+      const revision = canonicalRevision(result.revision);
+      const payload = canonicalPayload(candidate);
+      return {
+        job: {
+          ...candidate,
+          canonical_job_state: "claimed",
+          canonical_revision: revision,
+          status: "running",
+          claimed_by: workerId,
+          projection_only: true,
+        },
+        job_id: jobId,
+        worker_task_id: readString(candidate.job_id) ?? jobId,
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        canonical_revision: revision,
+        lease_expires_at: leaseExpiresAt,
+        requested_mode: readString(candidate.requested_mode) ?? readString(payload.requested_mode) ?? "",
+        scope: payload.allowed_paths ?? payload.allowed_scope ?? [],
+        acceptance: payload.acceptance_criteria ?? candidate.acceptance ?? [],
+        execution_intent: payload.execution_intent ?? null,
+      };
+    } catch (errorValue) {
+      const message = errorValue instanceof Error ? errorValue.message : String(errorValue);
+      if (/STALE_REVISION|JOB_NOT_QUEUED|ACTIVE_ATTEMPT_EXISTS|ACTIVE_LEASE_EXISTS/.test(message)) continue;
+      throw errorValue;
+    }
+  }
+  return null;
+}
+
+export async function persistCanonicalWorkerRuntimeSignal(
+  supabase: SupabaseClient,
+  input: CanonicalProtocolMutationIdentity & {
+    signal: "heartbeat" | "progress";
+    now?: string;
+    lease_expires_at?: string | null;
+  }
+) {
+  const ownership = await loadCanonicalOwnership(supabase, input.job_id);
+  if (ownership.terminal) {
+    return {
+      ok: true,
+      terminal_noop: true,
+      idempotent: true,
+      revision: canonicalRevision(ownership.job.canonical_revision),
+      job: ownership.job,
+    };
+  }
+  assertCanonicalMutationIdentity(ownership, input);
+  const now = input.now ?? new Date().toISOString();
+  const result = await canonicalPersistRuntimeSignal(canonicalRpcClient(supabase), {
+    ...input,
+    now,
+    new_expires_at: input.signal === "heartbeat" ? input.lease_expires_at ?? null : null,
+  });
+  const revision = canonicalRevision(result.revision);
+  return {
+    ...result,
+    revision,
+    job: {
+      ...ownership.job,
+      canonical_job_state: "running",
+      canonical_revision: revision,
+      status: "running",
+      projection_only: true,
+    },
+  };
+}
+
+export async function finalizeCanonicalPersistenceJobSafely(
+  supabase: SupabaseClient,
+  input: CanonicalTerminalReportInput & {
+    lease_id: string;
+    expected_revision: number;
+  }
+): Promise<CanonicalTerminalReportResult & { revision?: number }> {
+  const ownership = await loadCanonicalOwnership(supabase, input.job_id);
+  if (!ownership.terminal) assertCanonicalMutationIdentity(ownership, input);
+  const effectiveStatus = readString(input.effective_final_status) ?? "failed";
+  const taskGoalStatus = readString(input.task_goal_status) ?? "failed";
+  const workerStatus = readString(input.worker_execution_status) ?? "failed";
+  if (taskGoalStatus === "failed" && effectiveStatus === "succeeded") {
+    throw new Error("TASK_FAILURE_CANNOT_SUCCEED");
+  }
+  const terminalState =
+    effectiveStatus === "succeeded"
+      ? "terminal_success"
+      : effectiveStatus === "cancelled"
+        ? "terminal_cancelled"
+        : "terminal_failed";
+  const result = await canonicalFinalizeTerminal(canonicalRpcClient(supabase), {
+    job_id: input.job_id,
+    attempt_id: input.attempt_id,
+    lease_id: input.lease_id,
+    worker_id: input.worker_id,
+    expected_revision: input.expected_revision,
+    now: input.now ?? new Date().toISOString(),
+    report_identity: input.report_identity,
+    terminal_job_state: terminalState,
+    final_attempt_state: terminalState === "terminal_success" ? "finished" : terminalState === "terminal_cancelled" ? "abandoned" : "failed",
+    worker_execution_status: workerStatus,
+    task_goal_status: taskGoalStatus,
+    effective_final_status: effectiveStatus,
+    failure_code: readString(input.failure_code),
+    failure_stage: readString(input.failure_stage),
+    canonical_report: input.report_fields,
+  });
+  const revision = canonicalRevision(result.revision);
+  const terminalStatus = terminalState === "terminal_success" ? "succeeded" : terminalState === "terminal_cancelled" ? "cancelled" : "failed";
+  return {
+    ok: true,
+    terminal_applied: result.idempotent !== true,
+    idempotent: result.idempotent === true,
+    conflict: false,
+    terminal_immutable: true,
+    failure_code: null,
+    failure_stage: "terminal_report_finalization",
+    revision,
+    job: {
+      ...ownership.job,
+      canonical_job_state: terminalState,
+      canonical_revision: revision,
+      terminal_at: input.now ?? new Date().toISOString(),
+      status: terminalStatus,
+      claimed_by: null,
+      result: input.report_fields.result ?? input.report_fields,
+      projection_only: true,
+    },
+  };
+}
+
+export async function recoverCanonicalExpiredLeases(
+  supabase: SupabaseClient,
+  now = new Date().toISOString(),
+  limit = 100
+) {
+  const { data, error } = await supabase
+    .from("hermes_job_leases")
+    .select("*")
+    .eq("lease_state", "active")
+    .lte("expires_at", now)
+    .order("expires_at", { ascending: true })
+    .limit(limit);
+  if (error) throw new Error(`CANONICAL_STALE_LEASE_READ_FAILED:${error.message}`);
+  const recovered: Array<Record<string, unknown>> = [];
+  for (const lease of (data as JobRecord[] | null) ?? []) {
+    const jobId = readString(lease.job_id);
+    const attemptId = readString(lease.attempt_id);
+    const leaseId = readString(lease.lease_id);
+    const workerId = readString(lease.worker_id);
+    if (!jobId || !attemptId || !leaseId || !workerId) continue;
+    const ownership = await loadCanonicalOwnership(supabase, jobId);
+    if (ownership.terminal) continue;
+    const result = await persistCanonicalStaleAttempt(canonicalRpcClient(supabase), {
+      job_id: jobId,
+      attempt_id: attemptId,
+      lease_id: leaseId,
+      worker_id: workerId,
+      expected_revision: canonicalRevision(ownership.job.canonical_revision),
+      now,
+    });
+    recovered.push(result);
+  }
+  return recovered;
+}
+
+function subtaskFromCanonicalJob(job: JobRecord): HermesExecutionSubtask {
+  const payload = canonicalPayload(job);
+  return {
+    subtask_id: readString(job.subtask_id) ?? readString(payload.subtask_id) ?? "",
+    title: readString(payload.subtask_title) ?? readString(job.title) ?? "Canonical subtask",
+    objective: readString(payload.objective) ?? readString(job.request_text) ?? "Canonical subtask",
+    dependencies: Array.isArray(payload.dependencies) ? payload.dependencies.filter((value): value is string => typeof value === "string") : [],
+    recommended_agent: readString(payload.recommended_agent) ?? "codex_agent",
+    required_capabilities: Array.isArray(payload.required_capabilities) ? payload.required_capabilities.filter((value): value is string => typeof value === "string") : [],
+    execution_intent: readString(payload.execution_intent) ?? "verification",
+    allowed_paths: Array.isArray(payload.allowed_paths) ? payload.allowed_paths.filter((value): value is string => typeof value === "string") : [],
+    forbidden_paths: Array.isArray(payload.forbidden_paths) ? payload.forbidden_paths.filter((value): value is string => typeof value === "string") : [],
+    acceptance_criteria: Array.isArray(payload.acceptance_criteria) ? payload.acceptance_criteria.filter((value): value is string => typeof value === "string") : [],
+    validation_requirements: Array.isArray(payload.validation_requirements) ? payload.validation_requirements.filter((value): value is string => typeof value === "string") : [],
+    git_commit_required: payload.git_commit_required === true,
+    git_push_required: payload.git_push_required === true,
+    deployment_required: payload.deployment_required === true,
+  };
+}
+
+export async function buildCanonicalPlanFinalReportProjection(
+  supabase: SupabaseClient,
+  planId: string
+) {
+  const { data: jobs, error: jobsError } = await supabase
+    .from("hermes_jobs")
+    .select("*")
+    .eq("plan_id", planId)
+    .order("created_at", { ascending: true });
+  if (jobsError) throw new Error(`CANONICAL_PLAN_JOBS_READ_FAILED:${jobsError.message}`);
+  const jobRows = (jobs as JobRecord[] | null) ?? [];
+  if (!jobRows.length) return null;
+  const jobIds = jobRows.map((job) => readString(job.id)).filter((value): value is string => Boolean(value));
+  const { data: terminals, error: terminalsError } = await supabase
+    .from("hermes_job_terminals")
+    .select("*")
+    .in("job_id", jobIds);
+  if (terminalsError) throw new Error(`CANONICAL_PLAN_TERMINALS_READ_FAILED:${terminalsError.message}`);
+  const terminalRows = (terminals as JobRecord[] | null) ?? [];
+  const terminalByJob = new Map(terminalRows.map((terminal) => [readString(terminal.job_id), terminal]));
+  const jobBySubtask = new Map(jobRows.map((job) => [readString(job.subtask_id), job]));
+  for (const job of jobRows) {
+    if (terminalByJob.has(readString(job.id))) continue;
+    const blocked = subtaskFromCanonicalJob(job).dependencies.some((dependency) => {
+      const dependencyJob = jobBySubtask.get(dependency);
+      const terminal = dependencyJob ? terminalByJob.get(readString(dependencyJob.id)) : null;
+      return terminal && readString(terminal.effective_final_status) !== "succeeded";
+    });
+    if (!blocked) return null;
+  }
+
+  const first = jobRows[0];
+  const payload = canonicalPayload(first);
+  const requestedMode = (readString(first.requested_mode) ?? readString(payload.requested_mode)) as HermesRequestedMode;
+  const plan = normalizeExecutionPlan(
+    {
+      schema_version: readString(payload.plan_schema_version) ?? "1.0",
+      plan_id: planId,
+      plan_revision: Number(payload.plan_revision) || 1,
+      original_request_text: readString(payload.original_request_text) ?? readString(first.request_text) ?? "Canonical plan",
+      project_domain: readString(first.project_domain) ?? readString(payload.project_domain) ?? "unknown",
+      requested_mode: requestedMode,
+      approval_context: readRecord(payload.approval_context) ?? {},
+      objective: readString(payload.plan_objective) ?? readString(payload.objective) ?? "Canonical plan",
+      aggregation_policy: payload.aggregation_policy === "best_effort" ? "best_effort" : "all_required",
+      subtasks: jobRows.map(subtaskFromCanonicalJob),
+    },
+    requestedMode
+  ) as HermesExecutionPlan;
+  const results: CanonicalSubtaskResult[] = terminalRows.map((terminal) => {
+    const job = jobRows.find((candidate) => readString(candidate.id) === readString(terminal.job_id));
+    return {
+      subtask_id: readString(job?.subtask_id) ?? "",
+      report_identity: readString(terminal.report_identity) ?? "",
+      worker_status: readString(terminal.worker_execution_status) ?? "failed",
+      task_goal_status: readString(terminal.task_goal_status) ?? "failed",
+      effective_final_status: readString(terminal.effective_final_status) ?? "failed",
+      failure_code: readString(terminal.failure_code),
+      failure_stage: readString(terminal.failure_stage),
+    };
+  });
+  return buildProjectDirectorFinalReport(aggregatePlanResults({ plan, job_results: results }));
+}
+
 export async function updateHermesJob(
   supabase: SupabaseClient,
   jobId: string,
@@ -4593,6 +5027,8 @@ interface CanonicalTerminalReportInput {
   worker_execution_status: string | null;
   task_goal_status: string | null;
   effective_final_status: string | null;
+  failure_code?: string | null;
+  failure_stage?: string | null;
   report_fields: JobRecord;
   now?: string;
 }

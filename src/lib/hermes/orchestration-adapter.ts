@@ -52,11 +52,18 @@ export interface CanonicalJobCommand {
   project_domain: string;
   requested_mode: HermesRequestedMode;
   payload: {
+    canonical_runtime: true;
     plan_schema_version: string;
     plan_id: string;
     plan_revision: number;
     plan_hash: string;
+    original_request_text: string;
+    project_domain: string;
+    requested_mode: HermesRequestedMode;
+    plan_objective: string;
+    aggregation_policy: "all_required" | "best_effort";
     subtask_id: string;
+    subtask_title: string;
     objective: string;
     dependencies: string[];
     recommended_agent: string;
@@ -143,11 +150,18 @@ export function buildCanonicalJobCommands(plan: HermesExecutionPlan): CanonicalJ
     project_domain: plan.project_domain,
     requested_mode: plan.requested_mode,
     payload: {
+      canonical_runtime: true,
       plan_schema_version: plan.schema_version,
       plan_id: plan.plan_id,
       plan_revision: plan.plan_revision,
       plan_hash: plan.plan_hash,
+      original_request_text: plan.original_request_text,
+      project_domain: plan.project_domain,
+      requested_mode: plan.requested_mode,
+      plan_objective: plan.objective,
+      aggregation_policy: plan.aggregation_policy,
       subtask_id: subtask.subtask_id,
+      subtask_title: subtask.title,
       objective: subtask.objective,
       dependencies: [...subtask.dependencies],
       recommended_agent: subtask.recommended_agent,

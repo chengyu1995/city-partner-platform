@@ -118,9 +118,19 @@ export interface CanonicalPersistenceSnapshot {
 export interface CanonicalOwnershipGuard {
   job_id: string;
   attempt_id: string;
+  lease_id: string;
   worker_id: string;
   expected_revision: number;
   now: string;
+}
+
+export interface CanonicalWorkerProtocolIdentity {
+  job_id: string;
+  worker_task_id: string;
+  attempt_id: string;
+  lease_id: string;
+  canonical_revision: number;
+  lease_expires_at: string;
 }
 
 export interface CanonicalPersistenceGuardResult {
@@ -203,6 +213,7 @@ function validateOwnership(
   if (snapshot.active_attempt.worker_id !== input.worker_id) return guardFailure("WORKER_OWNERSHIP_MISMATCH");
   if (requireActiveLease && !snapshot.active_lease) return guardFailure("ACTIVE_LEASE_REQUIRED");
   if (snapshot.active_lease) {
+    if (snapshot.active_lease.lease_id !== input.lease_id) return guardFailure("LEASE_IDENTITY_MISMATCH");
     if (snapshot.active_lease.attempt_id !== input.attempt_id) return guardFailure("LEASE_ATTEMPT_MISMATCH");
     if (snapshot.active_lease.worker_id !== input.worker_id) return guardFailure("LEASE_WORKER_MISMATCH");
     if (snapshot.active_lease.job_id !== input.job_id) return guardFailure("LEASE_JOB_MISMATCH");
@@ -382,4 +393,40 @@ export function canonicalRecoverStaleAttempt(
     p_expected_revision: input.expected_revision,
     p_now: input.now,
   });
+}
+
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`CANONICAL_PROTOCOL_FIELD_REQUIRED:${field}`);
+  return value.trim();
+}
+
+function requiredRevision(value: unknown): number {
+  const revision = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(revision) || revision < 0) {
+    throw new Error("CANONICAL_PROTOCOL_REVISION_INVALID");
+  }
+  return revision;
+}
+
+export function buildCanonicalWorkerProtocolIdentity(input: {
+  job_id: unknown;
+  worker_task_id?: unknown;
+  attempt_id: unknown;
+  lease_id: unknown;
+  revision: unknown;
+  lease_expires_at: unknown;
+}): CanonicalWorkerProtocolIdentity {
+  const jobId = requiredString(input.job_id, "job_id");
+  return {
+    job_id: jobId,
+    worker_task_id: requiredString(input.worker_task_id ?? jobId, "worker_task_id"),
+    attempt_id: requiredString(input.attempt_id, "attempt_id"),
+    lease_id: requiredString(input.lease_id, "lease_id"),
+    canonical_revision: requiredRevision(input.revision),
+    lease_expires_at: requiredString(input.lease_expires_at, "lease_expires_at"),
+  };
+}
+
+export function readCanonicalRpcRevision(result: Record<string, unknown>): number {
+  return requiredRevision(result.revision);
 }

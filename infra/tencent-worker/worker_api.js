@@ -20,6 +20,7 @@ const {
 const {
   finalizeCanonicalJobReportSafely,
 } = require("./worker_terminal_finalizer");
+const canonicalPersistence = require("./worker_canonical_persistence");
 
 if (typeof globalThis.WebSocket === "undefined") {
   globalThis.WebSocket = class DisabledRealtimeWebSocket {
@@ -3032,10 +3033,26 @@ app.get("/api/worker/next", authenticateWorker, async (req, res) => {
       .trim()
       .slice(0, 100);
 
+  if (canonicalPersistence.enabled()) {
+    try {
+      const claimed = await canonicalPersistence.claimNext(supabase, workerName);
+      if (!claimed) return res.status(204).send();
+      return res.json({ ok: true, ...claimed });
+    } catch (errorValue) {
+      return res.status(409).json({
+        ok: false,
+        error: errorValue instanceof Error ? errorValue.message : String(errorValue),
+        failure_code: "CANONICAL_CLAIM_FAILED",
+        failure_stage: "canonical_worker_claim",
+      });
+    }
+  }
+
   const { data, error } = await supabase
     .from("hermes_jobs")
     .select("*")
     .in("status", ["pending", "queued"])
+    .is("canonical_job_state", null)
     .is("claimed_by", null)
     .order("created_at", { ascending: true })
     .limit(50);
@@ -3204,6 +3221,31 @@ app.post("/api/worker/heartbeat", authenticateWorker, async (req, res) => {
       attempt_id: attemptId,
     });
   }
+  if (canonicalPersistence.isCanonicalJob(existingJob)) {
+    if (!canonicalPersistence.enabled()) {
+      return res.status(409).json({ ok: false, failure_code: "CANONICAL_PERSISTENCE_RUNTIME_DISABLED" });
+    }
+    const leaseId = String(req.body?.lease_id || "").trim();
+    const expectedRevision = Number(req.body?.expected_revision ?? req.body?.canonical_revision);
+    if (!attemptId || !leaseId || !Number.isSafeInteger(expectedRevision)) {
+      return res.status(400).json({ ok: false, failure_code: "CANONICAL_PROTOCOL_IDENTITY_REQUIRED" });
+    }
+    try {
+      const result = await canonicalPersistence.recordSignal(supabase, {
+        job_id: jobId,
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        worker_id: workerName,
+        expected_revision: expectedRevision,
+        signal: "heartbeat",
+        now,
+        new_expires_at: expiresAt,
+      });
+      return res.json({ ok: true, ...result, attempt_id: attemptId, lease_id: leaseId });
+    } catch (errorValue) {
+      return res.status(409).json({ ok: false, failure_code: "CANONICAL_HEARTBEAT_REJECTED", message: String(errorValue.message || errorValue) });
+    }
+  }
   const transition = canonicalApplyHeartbeat(existingJob, {
     worker_id: workerName,
     attempt_id: attemptId,
@@ -3332,6 +3374,30 @@ app.post("/api/worker/progress", authenticateWorker, async (req, res) => {
       failure_stage: "worker_progress",
       attempt_id: attemptId,
     });
+  }
+  if (canonicalPersistence.isCanonicalJob(existingJob)) {
+    if (!canonicalPersistence.enabled()) {
+      return res.status(409).json({ ok: false, failure_code: "CANONICAL_PERSISTENCE_RUNTIME_DISABLED" });
+    }
+    const leaseId = String(req.body?.lease_id || "").trim();
+    const expectedRevision = Number(req.body?.expected_revision ?? req.body?.canonical_revision);
+    if (!attemptId || !leaseId || !Number.isSafeInteger(expectedRevision)) {
+      return res.status(400).json({ ok: false, failure_code: "CANONICAL_PROTOCOL_IDENTITY_REQUIRED" });
+    }
+    try {
+      const result = await canonicalPersistence.recordSignal(supabase, {
+        job_id: jobId,
+        attempt_id: attemptId,
+        lease_id: leaseId,
+        worker_id: workerName,
+        expected_revision: expectedRevision,
+        signal: "progress",
+        now,
+      });
+      return res.json({ ok: true, ...result, attempt_id: attemptId, lease_id: leaseId });
+    } catch (errorValue) {
+      return res.status(409).json({ ok: false, failure_code: "CANONICAL_PROGRESS_REJECTED", message: String(errorValue.message || errorValue) });
+    }
   }
   const transition = canonicalApplyProgress(existingJob, {
     worker_id: workerName,
@@ -4632,11 +4698,11 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
     });
   }
 
-  if (!["succeeded", "failed"].includes(finalStatus)) {
+  if (!["succeeded", "failed", "cancelled"].includes(finalStatus)) {
     return res.status(400).json({
       ok: false,
       error: "invalid_status",
-      allowed: ["succeeded", "failed"],
+      allowed: ["succeeded", "failed", "cancelled"],
     });
   }
 
@@ -4776,7 +4842,35 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
           : JSON.stringify(error ?? "Worker execution failed"));
   }
 
-  const terminalFinalization = await finalizeCanonicalJobReportSafely(supabase, {
+  const canonicalPersistenceTerminal = canonicalPersistence.isCanonicalJob(existingJob);
+  if (canonicalPersistenceTerminal && !canonicalPersistence.enabled()) {
+    return res.status(409).json({ ok: false, failure_code: "CANONICAL_PERSISTENCE_RUNTIME_DISABLED" });
+  }
+  const terminalFinalization = canonicalPersistenceTerminal
+    ? await canonicalPersistence.finalize(supabase, {
+        job_id: jobId,
+        worker_id: reportWorkerName,
+        attempt_id: incomingAttemptId || "",
+        lease_id: String(req.body?.lease_id || "").trim(),
+        expected_revision: Number(req.body?.expected_revision ?? req.body?.canonical_revision),
+        report_identity: `${jobId}:${incomingAttemptId || "missing"}:${RUNTIME_CANONICAL_WORKER_REPORT_SCHEMA_VERSION}:${effectiveFinalStatus}`,
+        worker_execution_status: updateData.worker_execution_status,
+        task_goal_status: updateData.task_goal_status,
+        effective_final_status: updateData.effective_final_status,
+        failure_code: updateData.failure_code,
+        failure_stage: updateData.failure_stage,
+        canonical_report: updateData,
+        now: terminalNow,
+      }).then((result) => ({
+        ok: true,
+        idempotent: result.idempotent === true,
+        conflict: false,
+        terminal_immutable: true,
+        failure_code: null,
+        failure_stage: "terminal_report_finalization",
+        job: { ...existingJob, canonical_job_state: effectiveFinalStatus === "succeeded" ? "terminal_success" : "terminal_failed", canonical_revision: result.canonical_revision, status: effectiveFinalStatus, projection_only: true },
+      }))
+    : await finalizeCanonicalJobReportSafely(supabase, {
     job_id: jobId,
     worker_id: reportWorkerName,
     attempt_id: incomingAttemptId || "",
@@ -4786,7 +4880,7 @@ app.post("/api/worker/report", authenticateWorker, async (req, res) => {
     effective_final_status: updateData.effective_final_status,
     report_fields: updateData,
     now: terminalNow,
-  });
+      });
   if (!terminalFinalization.ok) {
     return res.status(409).json({
       ok: false,
@@ -5034,6 +5128,10 @@ app.use((err, req, res, next) => {
 
 async function recoverStaleJobs() {
   try {
+    if (canonicalPersistence.enabled()) {
+      const recovered = await canonicalPersistence.recoverExpired(supabase);
+      if (recovered.length > 0) console.log(`canonical persistence stale recovery: recovered=${recovered.length}`);
+    }
     await runtimeExcludeTerminalJobsFromActiveQueue("before_stale_recovery");
     const now = new Date().toISOString();
     const staleBefore = new Date(Date.now() - 40 * 60 * 1000).toISOString();
@@ -5041,6 +5139,7 @@ async function recoverStaleJobs() {
       .from("hermes_jobs")
       .select("*")
       .eq("status", "running")
+      .is("canonical_job_state", null)
       .lt("updated_at", staleBefore)
       .limit(100);
     if (error) throw error;

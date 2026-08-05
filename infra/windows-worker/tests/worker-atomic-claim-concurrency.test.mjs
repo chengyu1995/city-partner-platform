@@ -35,6 +35,10 @@ const workerJobs = loadTypeScriptModule(path.join(root, "src", "lib", "worker-jo
   "@/lib/env": { getSupabaseService: async () => null },
   "../../infra/tencent-worker/worker_job_state_machine": machine,
   "../../infra/tencent-worker/worker_terminal_finalizer": terminalFinalizer,
+  "./worker-job-persistence-contract": { isCanonicalDatabasePersistenceEnabled: () => false },
+  "./hermes/result-aggregator": {},
+  "./hermes/execution-plan": {},
+  "./project-director-final-report": {},
 });
 
 function createQueuedJob(round) {

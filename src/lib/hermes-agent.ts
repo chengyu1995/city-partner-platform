@@ -14,6 +14,11 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import * as fs from "fs";
 import * as path from "path";
+import type {
+  HermesPlanDraft,
+  HermesPlanningProvider,
+  HermesPlanningRequest,
+} from "./hermes/orchestration-adapter.ts";
 
 /**
  * Hermes 总管系统提示词 (从 docs/HERMES_SYSTEM_PROMPT.md 读)
@@ -110,6 +115,56 @@ async function callLLM(
     content: msg?.content ?? "",
     tool_calls: msg?.tool_calls ?? [],
     finish_reason: (data.choices?.[0]?.finish_reason as AgentResponse["finish_reason"]) ?? "stop",
+  };
+}
+
+function parseCanonicalPlanningDraft(content: string): HermesPlanDraft {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1] ?? trimmed;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fenced);
+  } catch {
+    throw new Error("HERMES_PLANNER_INVALID_JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("HERMES_PLANNER_INVALID_RESPONSE");
+  }
+  const draft = parsed as HermesPlanDraft;
+  if (!Array.isArray(draft.subtasks) || draft.subtasks.length === 0) {
+    throw new Error("HERMES_PLANNER_SUBTASKS_REQUIRED");
+  }
+  return draft;
+}
+
+export function createCanonicalHermesPlanningProvider(): HermesPlanningProvider {
+  return {
+    async plan(request: HermesPlanningRequest): Promise<HermesPlanDraft> {
+      const response = await callLLM(
+        [
+          {
+            role: "system",
+            content: [
+              "You are the Hermes planning provider.",
+              "Return one JSON object only. Do not call tools or write databases.",
+              "Produce objective, aggregation_policy, and subtasks.",
+              "Each subtask requires: subtask_id, title, objective, dependencies,",
+              "required_capabilities, execution_intent, allowed_paths, forbidden_paths,",
+              "acceptance_criteria, validation_requirements, git_commit_required,",
+              "git_push_required, deployment_required.",
+              "Never include job, attempt, lease, claim, retry, or terminal state fields.",
+              `The immutable permission ceiling is ${request.permission_ceiling}.`,
+            ].join("\n"),
+          },
+          { role: "user", content: JSON.stringify(request) },
+        ],
+        []
+      );
+      if (response.finish_reason === "error") {
+        throw new Error(`HERMES_PLANNER_FAILED:${response.content}`);
+      }
+      return parseCanonicalPlanningDraft(response.content);
+    },
   };
 }
 

@@ -15,7 +15,13 @@
 import { NextResponse, NextRequest } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { decryptFeishuEvent } from "@/lib/feishu-crypto";
-import { runAgent, AgentMessage } from "@/lib/hermes-agent";
+import { createCanonicalHermesPlanningProvider, runAgent, AgentMessage } from "@/lib/hermes-agent";
+import {
+  canonicalHermesAllowsDirectWorkerBypass,
+  runApprovedRequestThroughCanonicalHermes,
+} from "@/lib/project-director-hermes-delegation";
+import { isHermesCanonicalOrchestrationEnabled } from "@/lib/hermes/orchestration-adapter";
+import { RegistryCapabilityGateway } from "@/lib/openclaw/capability-gateway";
 import {
   buildProjectDirectorConsoleAction,
   isProjectDirectorDispatchPaused,
@@ -85,6 +91,8 @@ import {
 import {
   createHermesJob,
   createHermesJobs,
+  canonicalCreateJob,
+  canonicalPersistenceRuntimeEnabled,
   buildWorkerJobPayloadContract,
   findRecentDuplicateFeishuJob,
   normalizeFeishuTaskText,
@@ -194,6 +202,22 @@ function isExplicitDirectWorkerCreateCommand(text: string): boolean {
   return /direct\s+create\s+Worker\s+task|create\s+Worker\s+task|direct\s+dispatch\s+to\s+Worker/i.test(normalized) ||
     /(?:\u8bf7\s*)?\u76f4\u63a5\s*\u521b\u5efa\s*Worker\s*\u4efb\u52a1|(?:\u8bf7\s*)?\u521b\u5efa\s*Worker\s*\u4efb\u52a1|\u7acb\u5373\s*\u521b\u5efa\s*Worker\s*\u4efb\u52a1|(?:\u8bf7\s*)?\u7acb\u5373\s*\u6392\u961f\s*Worker\s*\u4efb\u52a1|\u76f4\u63a5\s*\u5206\u53d1\s*\u7ed9\s*Worker/i.test(normalized) ||
     /(?:\u65e0\u9700\s*\u518d\u6b21\s*\u89c4\u5212|\u65e0\u9700\s*\u518d\u6b21\s*\u5ba1\u6279|\u65e0\u9700\s*\u518d\u6b21\s*\u6279\u51c6)[\s\S]*(?:Worker|\bBATCH-)/i.test(normalized);
+}
+
+function isExplicitCanonicalMaintenanceDirectWorker(text: string): boolean {
+  return /canonical_direct_worker_maintenance\s*[:=]\s*true/i.test(text) &&
+    /maintenance|diagnostic|debug|repair/i.test(text);
+}
+
+function approvedHermesMode(text: string): "manager_read_only" | "worker_read_only" | "write_allowed" | null {
+  const value = parseDirectRequestedMode(text, extractPrimaryRouteBatchCode(text));
+  if (!value) return null;
+  if (value === "manager_read_only") return "manager_read_only";
+  if (value === "write_allowed" || value === "automation_system_write_allowed") return "write_allowed";
+  if (value === "worker_read_only" || value === "read_only" || value === "automation_system_worker_read_only") {
+    return "worker_read_only";
+  }
+  return null;
 }
 
 function parseDirectRequestedMode(text: string, batchCode: string | null): string | null {
@@ -2214,7 +2238,11 @@ export async function POST(req: NextRequest) {
 
       if (
         (isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text)) &&
-        !shouldUseSystemRepairWorkerFlow
+        !shouldUseSystemRepairWorkerFlow &&
+        canonicalHermesAllowsDirectWorkerBypass({
+          featureEnabled: isHermesCanonicalOrchestrationEnabled(),
+          explicitMaintenanceOperation: isExplicitCanonicalMaintenanceDirectWorker(text),
+        })
       ) {
         const requestText = buildDirectWorkerTaskText(text) || normalizeFeishuTaskText(text);
         const modeContract = resolveDirectWorkerReadOnlyContract(text);
@@ -2877,6 +2905,72 @@ export async function POST(req: NextRequest) {
         });
       }
 
+      if (isHermesCanonicalOrchestrationEnabled()) {
+        const requestedMode = approvedHermesMode(`${recentDraft.originalDemand}\n${text}`);
+        if (!requestedMode) throw new Error("HERMES_APPROVED_REQUEST_MODE_REQUIRED");
+        const result = await runApprovedRequestThroughCanonicalHermes(
+          {
+            request_id: ev.message.message_id,
+            original_request_text: recentDraft.originalDemand,
+            project_domain: classifyFeishuWorkerTaskDomain(recentDraft.originalDemand),
+            requested_mode: requestedMode,
+            approval_context: {
+              approved_by: userId,
+              approved_at: new Date().toISOString(),
+              approval_id: ev.message.message_id,
+              feishu_chat_id: ev.message.chat_id,
+              feishu_event_id: eventId,
+            },
+            objective: recentDraft.originalDemand,
+          },
+          createCanonicalHermesPlanningProvider(),
+          new RegistryCapabilityGateway(),
+          async (command) => canonicalCreateJob(supabase, {
+            source: command.source,
+            request_text: command.request_text,
+            project_domain: command.project_domain,
+            requested_mode: command.requested_mode,
+            plan_id: command.payload.plan_id,
+            subtask_id: command.payload.subtask_id,
+            payload: command.payload,
+            status: "queued",
+          }),
+          { canonicalPersistenceReady: canonicalPersistenceRuntimeEnabled() }
+        );
+        if (!result.delegated || result.reason !== "canonical_jobs_created") {
+          throw new Error("HERMES_CANONICAL_DELEGATION_NOT_APPLIED");
+        }
+        const reply = [
+          "PROJECT_DIRECTOR_HERMES_CANONICAL_DISPATCHED",
+          `plan_id: ${result.plan.plan_id}`,
+          `canonical_jobs_created: ${result.jobs.length}`,
+          `requested_mode: ${result.plan.requested_mode}`,
+        ].join("\n");
+        await saveSystemRecordedReply(
+          supabase,
+          convId,
+          text,
+          reply,
+          reply,
+          "project_director_hermes_canonical_dispatch",
+          ev.message.message_id
+        );
+        await sendFeishuMessage(
+          token,
+          ev.message.chat_id,
+          ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+          reply
+        );
+        await markReceiptCompleted(supabase, eventId);
+        return NextResponse.json({
+          code: 0,
+          project_director_intake: true,
+          state: "hermes_canonical_dispatched",
+          plan_id: result.plan.plan_id,
+          inserted_jobs: result.jobs.length,
+        });
+      }
+
       const approvedTree = buildProjectDirectorTaskTreeDraft(
         recentDraft.originalDemand,
         text,
@@ -3385,6 +3479,28 @@ export async function POST(req: NextRequest) {
     }
 
     const history = await loadHistory(supabase, convId);
+
+    if (isHermesCanonicalOrchestrationEnabled()) {
+      const reply = "PROJECT_DIRECTOR_HERMES_APPROVAL_REQUIRED: canonical orchestration does not use the legacy Hermes tool queue.";
+      await saveSystemRecordedReply(
+        supabase,
+        convId,
+        text,
+        reply,
+        reply,
+        "project_director_hermes_canonical_approval_required",
+        ev.message.message_id
+      );
+      const token = await getFeishuToken();
+      await sendFeishuMessage(
+        token,
+        ev.message.chat_id,
+        ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+        reply
+      );
+      await markReceiptCompleted(supabase, eventId);
+      return NextResponse.json({ code: 0, state: "hermes_canonical_approval_required" });
+    }
 
     // 8. 调 Agent
     const { reply, newMessages } = await runAgent(text, history);

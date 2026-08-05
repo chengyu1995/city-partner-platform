@@ -5,14 +5,17 @@ import {
   assertWorkerAttemptMatchesJob,
   assertWorkerOwnsJob,
   buildRunningJobNotFoundPayload,
+  buildCanonicalPlanFinalReportProjection,
   buildCanonicalWorkerReportSchema,
   buildProjectDirectorWorkerReport,
   clampProgress,
+  canonicalPersistenceRuntimeEnabled,
   CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
   DIAGNOSTICS_STORAGE_FIELD,
   DIAGNOSTICS_STORAGE_UNAVAILABLE,
   findHermesJob,
   finalizeCanonicalJobReportSafely,
+  finalizeCanonicalPersistenceJobSafely,
   getAttemptIdFromBody,
   getBatchCodeFromBody,
   getBitableRecordId,
@@ -21,6 +24,7 @@ import {
   getWorkerIdFromBody,
   getWorkerSupabase,
   isTerminalWorkerStatus,
+  isCanonicalPersistenceJob,
   normalizeWorkerStatus,
   parseJsonBody,
   responseFromMaybe,
@@ -36,6 +40,9 @@ interface WorkerReportBody {
   id?: string;
   job_id?: string;
   attempt_id?: string;
+  lease_id?: string;
+  canonical_revision?: number;
+  expected_revision?: number;
   status?: string;
   progress_percent?: number;
   current_step?: string;
@@ -476,11 +483,14 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
-  if (ownershipError) return ownershipError;
+  const canonicalPersistenceJob = isCanonicalPersistenceJob(existingJob);
+  if (!canonicalPersistenceJob) {
+    const ownershipError = assertWorkerOwnsJob(existingJob, workerId);
+    if (ownershipError) return ownershipError;
 
-  const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
-  if (attemptError) return attemptError;
+    const attemptError = assertWorkerAttemptMatchesJob(existingJob, attemptId);
+    if (attemptError) return attemptError;
+  }
 
   const falsePositiveGuard = buildFalsePositiveSuccessGuard(existingJob, body, workerStatus);
   const projectDirectorReport = buildProjectDirectorWorkerReport({
@@ -538,6 +548,88 @@ export async function POST(req: NextRequest) {
     completed_at: terminal ? now : null,
     updated_at: now,
   };
+  if (canonicalPersistenceJob) {
+    if (!canonicalPersistenceRuntimeEnabled()) {
+      return NextResponse.json(
+        { ok: false, failure_code: "CANONICAL_PERSISTENCE_RUNTIME_DISABLED" },
+        { status: 409 }
+      );
+    }
+    const expectedRevision = body.expected_revision ?? body.canonical_revision;
+    if (!terminal) {
+      return NextResponse.json(
+        { ok: false, failure_code: "CANONICAL_NONTERMINAL_REPORT_UNSUPPORTED" },
+        { status: 400 }
+      );
+    }
+    if (!attemptId || !body.lease_id || !Number.isSafeInteger(expectedRevision)) {
+      return NextResponse.json(
+        { ok: false, failure_code: "CANONICAL_PROTOCOL_IDENTITY_REQUIRED" },
+        { status: 400 }
+      );
+    }
+    try {
+      const finalization = await finalizeCanonicalPersistenceJobSafely(supabase, {
+        job_id: jobId,
+        worker_id: workerId,
+        attempt_id: attemptId,
+        lease_id: body.lease_id,
+        expected_revision: expectedRevision as number,
+        report_identity: `${jobId}:${attemptId}:${body.report_schema_version ?? CANONICAL_WORKER_REPORT_SCHEMA_VERSION}:${effectiveFinalStatus}`,
+        worker_execution_status: readString(projectDirectorReport.data.worker_execution_status),
+        task_goal_status: readString(projectDirectorReport.data.task_goal_status),
+        effective_final_status: readString(projectDirectorReport.data.effective_final_status),
+        failure_code: readString(projectDirectorReport.data.failure_code),
+        failure_stage: readString(projectDirectorReport.data.failure_stage),
+        report_fields: reportFields,
+        now,
+      });
+      const planId = readString(existingJob.plan_id) ?? readString(readRecord(existingJob.payload)?.plan_id);
+      const canonicalPlanReport = planId
+        ? await buildCanonicalPlanFinalReportProjection(supabase, planId)
+        : null;
+      const visibleReport = canonicalPlanReport
+        ? { text: canonicalPlanReport.summary, data: canonicalPlanReport }
+        : projectDirectorReport;
+      const recordId = getBitableRecordId(body, existingJob);
+      await syncWorkerStatusToFeishu({
+        recordId,
+        status: storedStatus === "cancelled" ? "failed" : storedStatus,
+        stage: storedStatus === "failed" ? "failed" : "completed",
+        progressPercent: 100,
+        currentStep: storedStatus === "succeeded" ? "completed" : "failed",
+        statusMessage: visibleReport.text,
+        gitCommitSha: body.git_commit_sha ?? null,
+        errorText: storedStatus === "failed" ? visibleReport.text : "",
+        completedAt: now,
+        updatedAt: now,
+      });
+      return NextResponse.json({
+        ok: true,
+        job: finalization.job,
+        attempt_id: attemptId,
+        lease_id: body.lease_id,
+        canonical_revision: finalization.revision,
+        project_director_report: visibleReport,
+        hermes_plan_aggregated: Boolean(canonicalPlanReport),
+        idempotent: finalization.idempotent,
+        duplicate_report_idempotent: finalization.idempotent,
+        terminal_status_persisted: true,
+        canonical_report_schema_version: CANONICAL_WORKER_REPORT_SCHEMA_VERSION,
+        feishu_sync: recordId ? "attempted" : "skipped_no_record_id",
+      });
+    } catch (errorValue) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: errorValue instanceof Error ? errorValue.message : String(errorValue),
+          failure_code: "CANONICAL_TERMINAL_REPORT_REJECTED",
+          failure_stage: "canonical_terminal_report",
+        },
+        { status: 409 }
+      );
+    }
+  }
   const terminalFinalization = terminal
     ? await finalizeCanonicalJobReportSafely(supabase, {
         job_id: jobId,

@@ -5,6 +5,8 @@ import {
   buildAttemptPayload,
   buildCanonicalClaimTransition,
   buildTerminalJobCleanupFields,
+  canonicalPersistenceRuntimeEnabled,
+  claimNextCanonicalHermesJob,
   claimHermesJob,
   createWorkerAttemptId,
   findHermesJob,
@@ -45,10 +47,40 @@ async function handleNext(req: NextRequest) {
   const supabase = await getWorkerSupabase();
   if (responseFromMaybe(supabase)) return supabase;
 
+  const workerId = getWorkerIdFromRequest(req);
+  if (canonicalPersistenceRuntimeEnabled()) {
+    try {
+      const claimed = await claimNextCanonicalHermesJob(supabase, workerId);
+      if (!claimed) return NextResponse.json({ ok: true, job: null });
+      return NextResponse.json({
+        ok: true,
+        ...claimed,
+        project_director: {
+          attempt_id: claimed.attempt_id,
+          lease_id: claimed.lease_id,
+          canonical_revision: claimed.canonical_revision,
+          attempt_contract:
+            "echo attempt_id, lease_id, and canonical_revision in heartbeat, progress, and report",
+        },
+      });
+    } catch (errorValue) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: errorValue instanceof Error ? errorValue.message : String(errorValue),
+          failure_code: "CANONICAL_CLAIM_FAILED",
+          failure_stage: "canonical_worker_claim",
+        },
+        { status: 409 }
+      );
+    }
+  }
+
   const { data: queuedJobs, error } = await supabase
     .from("hermes_jobs")
     .select("*")
     .in("status", ["queued", "pending"])
+    .is("canonical_job_state", null)
     .is("claimed_by", null)
     .order("created_at", { ascending: true })
     .limit(50);
@@ -148,7 +180,6 @@ async function handleNext(req: NextRequest) {
 
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-  const workerId = getWorkerIdFromRequest(req);
   const attemptId = createWorkerAttemptId(jobId, workerId);
   const canonicalClaim = buildCanonicalClaimTransition(preClaimJob ?? job, {
     worker_id: workerId,
