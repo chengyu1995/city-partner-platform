@@ -8,6 +8,7 @@ const canonical = await import("../../tencent-worker/worker_canonical_persistenc
 const adapter = await import("../../../src/lib/hermes/orchestration-adapter.ts");
 const delegation = await import("../../../src/lib/project-director-hermes-delegation.ts");
 const executionPlan = await import("../../../src/lib/hermes/execution-plan.ts");
+const persistenceContract = await import("../../../src/lib/worker-job-persistence-contract.ts");
 
 const source = (file) => readFileSync(join(root, file), "utf8");
 const workerSource = source("infra/windows-worker/local_worker.js");
@@ -19,6 +20,29 @@ const progressSource = source("src/app/api/worker/progress/route.ts");
 const reportSource = source("src/app/api/worker/report/route.ts");
 const feishuSource = source("src/app/api/feishu/event/route.ts");
 const hermesAgentSource = source("src/lib/hermes-agent.ts");
+const workerJobsSource = source("src/lib/worker-jobs.ts");
+
+function exportedFunctionBlock(sourceText, name) {
+  const start = sourceText.indexOf(`export async function ${name}(`);
+  assert.notEqual(start, -1, `${name} must exist`);
+  const end = sourceText.indexOf("\nexport ", start + 1);
+  return sourceText.slice(start, end === -1 ? sourceText.length : end);
+}
+
+function terminalIdentity(overrides = {}) {
+  return {
+    job_id: "job-03c1",
+    attempt_id: "attempt-03c1",
+    worker_id: "worker-03c1",
+    report_identity: "report-03c1",
+    worker_execution_status: "succeeded",
+    task_goal_status: "succeeded",
+    effective_final_status: "succeeded",
+    failure_code: null,
+    failure_stage: null,
+    ...overrides,
+  };
+}
 
 class Query {
   constructor(rows) {
@@ -92,7 +116,17 @@ function fixture(options = {}) {
         job.canonical_job_state = args.p_terminal_job_state;
         job.terminal_at = args.p_now;
         job.canonical_revision += 1;
-        tables.hermes_job_terminals.push({ job_id: job.id, report_identity: args.p_report_identity });
+        tables.hermes_job_terminals.push({
+          job_id: job.id,
+          attempt_id: args.p_attempt_id,
+          worker_id: args.p_worker_id,
+          report_identity: args.p_report_identity,
+          worker_execution_status: args.p_worker_execution_status,
+          task_goal_status: args.p_task_goal_status,
+          effective_final_status: args.p_effective_final_status,
+          failure_code: args.p_failure_code,
+          failure_stage: args.p_failure_stage,
+        });
         return { data: { ok: true, idempotent: false, revision: job.canonical_revision }, error: null };
       }
       if (name === "canonical_recover_stale_attempt") {
@@ -284,11 +318,61 @@ test("conflicting terminal report cannot overwrite first truth", async () => {
     effective_final_status: "succeeded", canonical_report: {},
   };
   await canonical.finalize(state.client, common);
-  const conflict = await canonical.finalize(state.client, {
+  await assert.rejects(() => canonical.finalize(state.client, {
     ...common, expected_revision: 2, report_identity: "report-conflict",
     worker_execution_status: "failed", task_goal_status: "failed", effective_final_status: "failed",
-  });
-  assert.equal(conflict.idempotent, true);
+  }), /CANONICAL_TERMINAL_CONFLICT/);
+  assert.equal(state.job.canonical_job_state, "terminal_success");
+});
+
+test("canonicalCreateJob never calls the legacy createHermesJob helper", () => {
+  const block = exportedFunctionBlock(workerJobsSource, "canonicalCreateJob");
+  assert.doesNotMatch(block, /\bcreateHermesJob\s*\(/);
+});
+
+test("canonicalCreateJob uses one strict canonical persistence insert", () => {
+  const block = exportedFunctionBlock(workerJobsSource, "canonicalCreateJob");
+  assert.match(block, /\.from\("hermes_jobs"\)[\s\S]*\.insert\(\[canonicalRow\]\)/);
+  assert.doesNotMatch(block, /isMissingColumnError|shouldRetryPendingStatus|shouldRetryTextPriority/);
+});
+
+test("terminal semantic identity accepts an exact duplicate", () => {
+  const terminal = terminalIdentity();
+  assert.equal(persistenceContract.canonicalTerminalSemanticsMatch(terminal, { ...terminal }), true);
+});
+
+test("terminal semantic identity rejects a changed terminal result", () => {
+  const terminal = terminalIdentity();
+  assert.equal(persistenceContract.canonicalTerminalSemanticsMatch(terminal, {
+    ...terminal,
+    report_identity: "report-conflict",
+    worker_execution_status: "failed",
+    task_goal_status: "failed",
+    effective_final_status: "failed",
+  }), false);
+});
+
+test("concurrent conflicting terminal finalizers preserve one winner", async () => {
+  const state = await claimedFixture();
+  const common = {
+    job_id: state.job.id, attempt_id: state.claim.attempt_id, lease_id: state.claim.lease_id,
+    worker_id: "worker-03c1", expected_revision: 1, report_identity: "report-success",
+    worker_execution_status: "succeeded", task_goal_status: "succeeded",
+    effective_final_status: "succeeded", canonical_report: {},
+  };
+  const results = await Promise.allSettled([
+    canonical.finalize(state.client, common),
+    canonical.finalize(state.client, {
+      ...common,
+      report_identity: "report-failed",
+      worker_execution_status: "failed",
+      task_goal_status: "failed",
+      effective_final_status: "failed",
+    }),
+  ]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  assert.equal(state.tables.hermes_job_terminals.length, 1);
   assert.equal(state.job.canonical_job_state, "terminal_success");
 });
 

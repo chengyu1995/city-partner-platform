@@ -167,6 +167,46 @@ export interface CanonicalTerminalInput extends CanonicalOwnershipGuard {
   canonical_report: Record<string, unknown>;
 }
 
+export type CanonicalTerminalSemanticIdentity = Pick<
+  CanonicalTerminalRecord,
+  | "job_id"
+  | "attempt_id"
+  | "worker_id"
+  | "report_identity"
+  | "worker_execution_status"
+  | "task_goal_status"
+  | "effective_final_status"
+  | "failure_code"
+  | "failure_stage"
+>;
+
+const CANONICAL_TERMINAL_SEMANTIC_FIELDS = [
+  "job_id",
+  "attempt_id",
+  "worker_id",
+  "report_identity",
+  "worker_execution_status",
+  "task_goal_status",
+  "effective_final_status",
+  "failure_code",
+  "failure_stage",
+] as const satisfies readonly (keyof CanonicalTerminalSemanticIdentity)[];
+
+function normalizedTerminalSemanticValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+export function canonicalTerminalSemanticsMatch(
+  existing: CanonicalTerminalSemanticIdentity,
+  requested: CanonicalTerminalSemanticIdentity
+): boolean {
+  return CANONICAL_TERMINAL_SEMANTIC_FIELDS.every(
+    (field) =>
+      normalizedTerminalSemanticValue(existing[field]) ===
+      normalizedTerminalSemanticValue(requested[field])
+  );
+}
+
 export interface CanonicalStaleRecoveryInput extends CanonicalOwnershipGuard {
   lease_id: string;
 }

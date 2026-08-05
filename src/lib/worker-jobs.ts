@@ -26,7 +26,9 @@ import {
   canonicalFinalizeTerminal,
   canonicalPersistRuntimeSignal,
   canonicalRecoverStaleAttempt as persistCanonicalStaleAttempt,
+  canonicalTerminalSemanticsMatch,
   isCanonicalDatabasePersistenceEnabled,
+  type CanonicalTerminalSemanticIdentity,
   type CanonicalPersistenceRpcClient,
 } from "./worker-job-persistence-contract";
 import {
@@ -4295,21 +4297,30 @@ export async function canonicalCreateJob(
     throw new Error(transition.failure_code ?? "CANONICAL_JOB_INITIALIZATION_FAILED");
   }
   const payload = readRecord(row.payload) ?? {};
-  return createHermesJob(
-    supabase,
-    {
-      ...row,
-      ...transition.patch,
-      canonical_job_state: "queued",
-      canonical_revision: 0,
-      requested_mode: readString(row.requested_mode) ?? readString(payload.requested_mode),
-      plan_id: readString(row.plan_id) ?? readString(payload.plan_id),
-      subtask_id: readString(row.subtask_id) ?? readString(payload.subtask_id),
-      terminal_at: null,
-      source: readString(row.source) ?? "canonical_orchestration",
-    },
-    failureLabel
-  );
+  const canonicalRow: JobRecord = {
+    ...row,
+    ...transition.patch,
+    canonical_job_state: "queued",
+    canonical_revision: 0,
+    requested_mode: readString(row.requested_mode) ?? readString(payload.requested_mode),
+    plan_id: readString(row.plan_id) ?? readString(payload.plan_id),
+    subtask_id: readString(row.subtask_id) ?? readString(payload.subtask_id),
+    terminal_at: null,
+    source: readString(row.source) ?? "canonical_orchestration",
+  };
+  const { data, error } = await supabase
+    .from("hermes_jobs")
+    .insert([canonicalRow])
+    .select("id, job_id");
+  if (error) {
+    throw new Error(formatHermesJobInsertError(failureLabel, error, [canonicalRow], [], []));
+  }
+  const jobIds = Array.isArray(data)
+    ? data
+        .map((inserted) => inserted?.job_id ?? inserted?.id)
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+    : [];
+  return { insertedCount: 1, skippedColumns: [], adjustedFields: [], jobIds };
 }
 
 export interface CanonicalWorkerProtocolResult {
@@ -4402,6 +4413,36 @@ async function loadCanonicalOwnership(supabase: SupabaseClient, jobId: string) {
     active_attempt_count: ((attempts as JobRecord[] | null) ?? []).length,
     active_lease_count: ((leases as JobRecord[] | null) ?? []).length,
   };
+}
+
+function requestedCanonicalTerminalIdentity(
+  input: CanonicalTerminalReportInput
+): CanonicalTerminalSemanticIdentity {
+  return {
+    job_id: input.job_id,
+    attempt_id: input.attempt_id,
+    worker_id: input.worker_id,
+    report_identity: input.report_identity,
+    worker_execution_status: readString(input.worker_execution_status) ?? "failed",
+    task_goal_status: readString(input.task_goal_status) ?? "failed",
+    effective_final_status: readString(input.effective_final_status) ?? "failed",
+    failure_code: readString(input.failure_code),
+    failure_stage: readString(input.failure_stage),
+  };
+}
+
+function assertCanonicalTerminalReplay(
+  terminal: JobRecord,
+  input: CanonicalTerminalReportInput
+): void {
+  if (
+    !canonicalTerminalSemanticsMatch(
+      terminal as unknown as CanonicalTerminalSemanticIdentity,
+      requestedCanonicalTerminalIdentity(input)
+    )
+  ) {
+    throw new Error("CANONICAL_TERMINAL_CONFLICT");
+  }
 }
 
 function assertCanonicalMutationIdentity(
@@ -4554,7 +4595,11 @@ export async function finalizeCanonicalPersistenceJobSafely(
   }
 ): Promise<CanonicalTerminalReportResult & { revision?: number }> {
   const ownership = await loadCanonicalOwnership(supabase, input.job_id);
-  if (!ownership.terminal) assertCanonicalMutationIdentity(ownership, input);
+  if (ownership.terminal) {
+    assertCanonicalTerminalReplay(ownership.terminal, input);
+  } else {
+    assertCanonicalMutationIdentity(ownership, input);
+  }
   const effectiveStatus = readString(input.effective_final_status) ?? "failed";
   const taskGoalStatus = readString(input.task_goal_status) ?? "failed";
   const workerStatus = readString(input.worker_execution_status) ?? "failed";
@@ -4584,6 +4629,11 @@ export async function finalizeCanonicalPersistenceJobSafely(
     failure_stage: readString(input.failure_stage),
     canonical_report: input.report_fields,
   });
+  if (result.idempotent === true && !ownership.terminal) {
+    const replayOwnership = await loadCanonicalOwnership(supabase, input.job_id);
+    if (!replayOwnership.terminal) throw new Error("CANONICAL_TERMINAL_RECORD_MISSING");
+    assertCanonicalTerminalReplay(replayOwnership.terminal, input);
+  }
   const revision = canonicalRevision(result.revision);
   const terminalStatus = terminalState === "terminal_success" ? "succeeded" : terminalState === "terminal_cancelled" ? "cancelled" : "failed";
   return {

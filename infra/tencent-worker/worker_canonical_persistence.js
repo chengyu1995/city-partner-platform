@@ -21,6 +21,32 @@ function isCanonicalJob(job) {
   return Boolean(job && text(job.canonical_job_state) && Number.isSafeInteger(Number(job.canonical_revision)));
 }
 
+const TERMINAL_SEMANTIC_FIELDS = [
+  "job_id",
+  "attempt_id",
+  "worker_id",
+  "report_identity",
+  "worker_execution_status",
+  "task_goal_status",
+  "effective_final_status",
+  "failure_code",
+  "failure_stage",
+];
+
+function terminalValue(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function terminalSemanticsMatch(existing, requested) {
+  return TERMINAL_SEMANTIC_FIELDS.every(
+    (field) => terminalValue(existing[field]) === terminalValue(requested[field])
+  );
+}
+
+function assertTerminalReplay(existing, input) {
+  if (!terminalSemanticsMatch(existing, input)) throw new Error("CANONICAL_TERMINAL_CONFLICT");
+}
+
 async function rpc(client, name, args) {
   const { data, error } = await client.rpc(name, args);
   if (error) throw new Error(`${name}:${error.code || "RPC_FAILED"}:${error.message || "unknown"}`);
@@ -139,7 +165,8 @@ async function recordSignal(client, input) {
 
 async function finalize(client, input) {
   const ownership = await loadOwnership(client, input.job_id);
-  if (!ownership.terminal) assertIdentity(ownership, input);
+  if (ownership.terminal) assertTerminalReplay(ownership.terminal, input);
+  else assertIdentity(ownership, input);
   if (input.task_goal_status === "failed" && input.effective_final_status === "succeeded") {
     throw new Error("TASK_FAILURE_CANNOT_SUCCEED");
   }
@@ -162,6 +189,11 @@ async function finalize(client, input) {
     p_canonical_report: input.canonical_report || {},
     p_now: input.now || new Date().toISOString(),
   });
+  if (result.idempotent === true && !ownership.terminal) {
+    const replayOwnership = await loadOwnership(client, input.job_id);
+    if (!replayOwnership.terminal) throw new Error("CANONICAL_TERMINAL_RECORD_MISSING");
+    assertTerminalReplay(replayOwnership.terminal, input);
+  }
   return { ...result, canonical_revision: revision(result.revision), lease_id: input.lease_id };
 }
 
