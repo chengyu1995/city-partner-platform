@@ -12,9 +12,13 @@ import {
   RegistryCapabilityGateway,
   type AgentCapabilityGateway,
 } from "../openclaw/capability-gateway.ts";
+import {
+  HERMES_CANONICAL_ORCHESTRATION_ENV,
+  resolveHermesCanonicalCutoverConfig,
+} from "./cutover-control.ts";
 
 export const HERMES_CANONICAL_ORCHESTRATION_ENABLED_DEFAULT = false;
-export const HERMES_CANONICAL_ORCHESTRATION_ENV = "HERMES_CANONICAL_ORCHESTRATION_ENABLED";
+export { HERMES_CANONICAL_ORCHESTRATION_ENV };
 
 export interface GMApprovedRequest {
   request_id: string;
@@ -89,7 +93,7 @@ export type CanonicalJobCreator = (command: CanonicalJobCommand) => Promise<unkn
 export function isHermesCanonicalOrchestrationEnabled(
   env: Record<string, string | undefined> = process.env
 ): boolean {
-  return env[HERMES_CANONICAL_ORCHESTRATION_ENV]?.trim().toLowerCase() === "true";
+  return resolveHermesCanonicalCutoverConfig(env).canonical_enabled;
 }
 
 export function toHermesPlanningRequest(request: GMApprovedRequest): HermesPlanningRequest {

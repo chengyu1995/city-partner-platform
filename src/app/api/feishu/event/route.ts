@@ -22,10 +22,11 @@ import {
   scheduleApprovedRequestThroughHermesShadow,
 } from "@/lib/project-director-hermes-delegation";
 import { isHermesCanonicalOrchestrationEnabled } from "@/lib/hermes/orchestration-adapter";
+import { attemptHermesCanonicalCutover } from "@/lib/hermes/cutover-control";
 import { buildLegacyShadowPlan } from "@/lib/hermes/shadow-runtime";
 import {
+  createProductionCapabilityGateway,
   OpenClawShadowCapabilityGateway,
-  RegistryCapabilityGateway,
 } from "@/lib/openclaw/capability-gateway";
 import {
   buildProjectDirectorConsoleAction,
@@ -2910,41 +2911,51 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      if (isHermesCanonicalOrchestrationEnabled()) {
-        const requestedMode = approvedHermesMode(`${recentDraft.originalDemand}\n${text}`);
-        if (!requestedMode) throw new Error("HERMES_APPROVED_REQUEST_MODE_REQUIRED");
-        const result = await runApprovedRequestThroughCanonicalHermes(
-          {
-            request_id: ev.message.message_id,
-            original_request_text: recentDraft.originalDemand,
-            project_domain: classifyFeishuWorkerTaskDomain(recentDraft.originalDemand),
-            requested_mode: requestedMode,
-            approval_context: {
-              approved_by: userId,
-              approved_at: new Date().toISOString(),
-              approval_id: ev.message.message_id,
-              feishu_chat_id: ev.message.chat_id,
-              feishu_event_id: eventId,
+      const canonicalCutover = await attemptHermesCanonicalCutover({
+        executeCanonical: async (writeGuard) => {
+          const requestedMode = approvedHermesMode(`${recentDraft.originalDemand}\n${text}`);
+          if (!requestedMode) throw new Error("HERMES_APPROVED_REQUEST_MODE_REQUIRED");
+          const result = await runApprovedRequestThroughCanonicalHermes(
+            {
+              request_id: ev.message.message_id,
+              original_request_text: recentDraft.originalDemand,
+              project_domain: classifyFeishuWorkerTaskDomain(recentDraft.originalDemand),
+              requested_mode: requestedMode,
+              approval_context: {
+                approved_by: userId,
+                approved_at: new Date().toISOString(),
+                approval_id: ev.message.message_id,
+                feishu_chat_id: ev.message.chat_id,
+                feishu_event_id: eventId,
+              },
+              objective: recentDraft.originalDemand,
             },
-            objective: recentDraft.originalDemand,
-          },
-          createCanonicalHermesPlanningProvider(),
-          new RegistryCapabilityGateway(),
-          async (command) => canonicalCreateJob(supabase, {
-            source: command.source,
-            request_text: command.request_text,
-            project_domain: command.project_domain,
-            requested_mode: command.requested_mode,
-            plan_id: command.payload.plan_id,
-            subtask_id: command.payload.subtask_id,
-            payload: command.payload,
-            status: "queued",
-          }),
-          { canonicalPersistenceReady: canonicalPersistenceRuntimeEnabled() }
-        );
-        if (!result.delegated || result.reason !== "canonical_jobs_created") {
-          throw new Error("HERMES_CANONICAL_DELEGATION_NOT_APPLIED");
-        }
+            createCanonicalHermesPlanningProvider(),
+            createProductionCapabilityGateway(),
+            async (command) => {
+              const created = await canonicalCreateJob(supabase, {
+                source: command.source,
+                request_text: command.request_text,
+                project_domain: command.project_domain,
+                requested_mode: command.requested_mode,
+                plan_id: command.payload.plan_id,
+                subtask_id: command.payload.subtask_id,
+                payload: command.payload,
+                status: "queued",
+              });
+              writeGuard.recordAuthoritativeWrite(created.insertedCount);
+              return created;
+            },
+            { canonicalPersistenceReady: canonicalPersistenceRuntimeEnabled() }
+          );
+          if (!result.delegated || result.reason !== "canonical_jobs_created") {
+            throw new Error("HERMES_CANONICAL_DELEGATION_NOT_APPLIED");
+          }
+          return result;
+        },
+      });
+      if (canonicalCutover.path === "canonical_primary") {
+        const result = canonicalCutover.canonical_result;
         const reply = [
           "PROJECT_DIRECTOR_HERMES_CANONICAL_DISPATCHED",
           `plan_id: ${result.plan.plan_id}`,
@@ -3135,6 +3146,7 @@ export async function POST(req: NextRequest) {
           "attempt_id_contract: assigned_on_worker_claim_and_required_on_report",
           `inserted_jobs: ${insertResult.insertedCount}`,
           `skipped_hermes_jobs_columns: ${insertResult.skippedColumns.join(", ") || "none"}`,
+          `hermes_canonical_cutover: ${JSON.stringify(canonicalCutover)}`,
           `hermes_shadow_correlation: ${JSON.stringify(shadowLaunch)}`,
         ].join("\n"),
         "project_director_approved_execution",
@@ -3155,6 +3167,7 @@ export async function POST(req: NextRequest) {
         worker_created: insertResult.insertedCount > 0,
         next_stage_allowed: insertResult.insertedCount > 0,
         inserted_jobs: insertResult.insertedCount,
+        hermes_canonical_cutover: canonicalCutover,
         hermes_shadow: shadowLaunch,
       });
     }

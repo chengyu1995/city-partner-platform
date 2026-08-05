@@ -304,7 +304,7 @@ export async function observeApprovedRequestInHermesShadow(input: {
 }): Promise<HermesShadowObservation> {
   const config = resolveHermesShadowRuntimeConfig(input.env ?? process.env);
   if (!config.shadow_enabled) {
-    const reason = config.canonical_orchestration_enabled
+    const reason = config.canonical_orchestration_enabled || config.configuration_conflict
       ? "canonical_authoritative_enabled"
       : "shadow_disabled";
     return { observed: false, reason, plan: null, report: null, safety: SHADOW_SAFETY_BOUNDARY };
@@ -362,7 +362,7 @@ export function scheduleApprovedRequestInHermesShadow(input: {
       scheduled: false,
       correlation_id: correlationId,
       source_request_id: input.request.request_id,
-      reason: config.canonical_orchestration_enabled
+      reason: config.canonical_orchestration_enabled || config.configuration_conflict
         ? "canonical_authoritative_enabled"
         : "shadow_disabled",
       authoritative_execution: false,

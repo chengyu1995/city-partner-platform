@@ -1,8 +1,14 @@
+import {
+  HERMES_CANONICAL_ORCHESTRATION_ENV,
+  HERMES_CANONICAL_SHADOW_ENV,
+  resolveHermesCanonicalCutoverConfig,
+} from "./cutover-control.ts";
+
 export const HERMES_CANONICAL_SHADOW_ENABLED_DEFAULT = false;
-export const HERMES_CANONICAL_SHADOW_ENV = "HERMES_CANONICAL_SHADOW_ENABLED";
+export { HERMES_CANONICAL_SHADOW_ENV };
 export const HERMES_CANONICAL_SHADOW_TIMEOUT_ENV = "HERMES_CANONICAL_SHADOW_TIMEOUT_MS";
 export const HERMES_CANONICAL_SHADOW_TIMEOUT_DEFAULT_MS = 10_000;
-export const HERMES_CANONICAL_ORCHESTRATION_ENV = "HERMES_CANONICAL_ORCHESTRATION_ENABLED";
+export { HERMES_CANONICAL_ORCHESTRATION_ENV };
 
 export interface HermesShadowRuntimeConfig {
   runtime_environment: "test" | "development" | "production";
@@ -40,13 +46,13 @@ export function resolveHermesShadowRuntimeConfig(
 ): HermesShadowRuntimeConfig {
   const runtime = runtimeEnvironment(env.NODE_ENV, env.NODE_TEST_CONTEXT);
   const explicitShadow = explicitBoolean(env[HERMES_CANONICAL_SHADOW_ENV]);
-  const canonicalEnabled = explicitBoolean(env[HERMES_CANONICAL_ORCHESTRATION_ENV]) === true;
+  const cutover = resolveHermesCanonicalCutoverConfig(env);
   const requestedShadow = explicitShadow ?? runtime === "test";
   return {
     runtime_environment: runtime,
-    shadow_enabled: requestedShadow && !canonicalEnabled,
-    canonical_orchestration_enabled: canonicalEnabled,
+    shadow_enabled: requestedShadow && !cutover.canonical_requested && !cutover.rollback_to_legacy,
+    canonical_orchestration_enabled: cutover.canonical_enabled,
     shadow_timeout_ms: shadowTimeout(env[HERMES_CANONICAL_SHADOW_TIMEOUT_ENV]),
-    configuration_conflict: requestedShadow && canonicalEnabled,
+    configuration_conflict: requestedShadow && cutover.canonical_requested,
   };
 }

@@ -119,6 +119,33 @@ export class OpenClawShadowCapabilityGateway implements AgentCapabilityGateway {
   }
 }
 
+export class OpenClawProductionCapabilityGateway implements AgentCapabilityGateway {
+  readonly gateway_role = "openclaw_production_capability_gateway";
+  readonly direct_worker_access = false;
+  readonly direct_database_access = false;
+  readonly state_machine_present = false;
+  readonly env: Record<string, string | undefined>;
+
+  constructor(env: Record<string, string | undefined> = process.env) {
+    this.env = env;
+  }
+
+  async resolveAgentCapabilities(request: CapabilityResolutionRequest): Promise<CapabilityResolution> {
+    if (!isOpenClawCapabilityGatewayEnabled(this.env)) {
+      throw new Error("OPENCLAW_CAPABILITY_GATEWAY_DISABLED");
+    }
+    return resolveAgentCapabilities(request);
+  }
+}
+
+export function createProductionCapabilityGateway(
+  env: Record<string, string | undefined> = process.env
+): AgentCapabilityGateway {
+  return isOpenClawCapabilityGatewayEnabled(env)
+    ? new OpenClawProductionCapabilityGateway(env)
+    : new RegistryCapabilityGateway();
+}
+
 export class DisabledOpenClawCliGateway implements AgentCapabilityGateway {
   async resolveAgentCapabilities(): Promise<CapabilityResolution> {
     throw new Error("OPENCLAW_CAPABILITY_GATEWAY_DISABLED");
