@@ -1,14 +1,17 @@
 import type { HermesExecutionPlan } from "./execution-plan.ts";
 import {
-  isHermesCanonicalOrchestrationEnabled,
   planApprovedRequest,
   type GMApprovedRequest,
   type HermesPlanningProvider,
 } from "./orchestration-adapter.ts";
+import {
+  HERMES_CANONICAL_SHADOW_ENABLED_DEFAULT,
+  HERMES_CANONICAL_SHADOW_ENV,
+  resolveHermesShadowRuntimeConfig,
+} from "./shadow-config.ts";
 import type { AgentCapabilityGateway } from "../openclaw/capability-gateway.ts";
 
-export const HERMES_CANONICAL_SHADOW_ENABLED_DEFAULT = false;
-export const HERMES_CANONICAL_SHADOW_ENV = "HERMES_CANONICAL_SHADOW_ENABLED";
+export { HERMES_CANONICAL_SHADOW_ENABLED_DEFAULT, HERMES_CANONICAL_SHADOW_ENV };
 
 export type HermesShadowDifferenceSeverity = "NONE" | "LOW" | "MEDIUM" | "HIGH";
 
@@ -44,8 +47,21 @@ export interface CanonicalShadowPlan {
   risk_levels: string[];
 }
 
+export interface HermesShadowArchitectureSignals {
+  shadow_database_write: boolean;
+  shadow_direct_worker_access: boolean;
+  dual_authoritative_write: boolean;
+  canonical_boundary_bypass: boolean;
+}
+
 export interface HermesShadowDifference {
-  dimension: "task_classification" | "agent_selection" | "execution_scope" | "acceptance" | "risk";
+  dimension:
+    | "task_classification"
+    | "agent_selection"
+    | "execution_scope"
+    | "acceptance"
+    | "risk"
+    | "architecture_conflict";
   severity: Exclude<HermesShadowDifferenceSeverity, "NONE">;
   legacy: string[];
   canonical: string[];
@@ -88,8 +104,9 @@ export type HermesShadowObservation =
     }
   | {
       observed: false;
-      reason: "shadow_planning_failed";
-      error_code: "HERMES_SHADOW_PLANNING_FAILED";
+      reason: "shadow_planning_failed" | "shadow_timeout";
+      error_code: "HERMES_SHADOW_PLANNING_FAILED" | "HERMES_SHADOW_TIMEOUT";
+      shadow_error: "planning_failed" | "timeout";
       plan: null;
       report: null;
       safety: HermesShadowSafetyBoundary;
@@ -101,6 +118,16 @@ export type HermesShadowObservation =
       report: HermesShadowComparisonReport;
       safety: HermesShadowSafetyBoundary;
     };
+
+export interface HermesShadowLaunchResult {
+  scheduled: boolean;
+  correlation_id: string;
+  source_request_id: string;
+  reason: "shadow_scheduled" | "shadow_disabled" | "canonical_authoritative_enabled" | "shadow_schedule_failed";
+  authoritative_execution: false;
+}
+
+export type HermesShadowTaskScheduler = (task: () => Promise<void>) => void;
 
 const SHADOW_SAFETY_BOUNDARY: HermesShadowSafetyBoundary = Object.freeze({
   projection_only: true,
@@ -114,12 +141,22 @@ const SHADOW_SAFETY_BOUNDARY: HermesShadowSafetyBoundary = Object.freeze({
   state_machine_created: false,
 });
 
+const SAFE_ARCHITECTURE_SIGNALS: HermesShadowArchitectureSignals = Object.freeze({
+  shadow_database_write: false,
+  shadow_direct_worker_access: false,
+  dual_authoritative_write: false,
+  canonical_boundary_bypass: false,
+});
+
 const SEVERITY_RANK: Record<HermesShadowDifferenceSeverity, number> = {
   NONE: 0,
   LOW: 1,
   MEDIUM: 2,
   HIGH: 3,
 };
+
+const MAX_COMPLETED_OBSERVATIONS = 1_000;
+const completedObservations = new Map<string, HermesShadowObservation>();
 
 function normalizeValues(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();
@@ -163,10 +200,26 @@ function addDifference(
   });
 }
 
+function rememberCompletedObservation(requestId: string, observation: HermesShadowObservation): void {
+  completedObservations.set(requestId, observation);
+  while (completedObservations.size > MAX_COMPLETED_OBSERVATIONS) {
+    const oldest = completedObservations.keys().next().value;
+    if (typeof oldest !== "string") break;
+    completedObservations.delete(oldest);
+  }
+}
+
+function architectureConflicts(signals: HermesShadowArchitectureSignals): string[] {
+  return Object.entries(signals)
+    .filter(([, active]) => active)
+    .map(([name]) => name)
+    .sort();
+}
+
 export function isHermesCanonicalShadowEnabled(
   env: Record<string, string | undefined> = process.env
 ): boolean {
-  return env[HERMES_CANONICAL_SHADOW_ENV]?.trim().toLowerCase() === "true";
+  return resolveHermesShadowRuntimeConfig(env).shadow_enabled;
 }
 
 export function buildLegacyShadowPlan(requestId: string, tasks: LegacyShadowTask[]): LegacyShadowPlan {
@@ -197,7 +250,8 @@ export function buildCanonicalShadowPlan(plan: HermesExecutionPlan): CanonicalSh
 
 export function compareLegacyAndCanonicalPlans(
   legacyPlan: LegacyShadowPlan,
-  plan: HermesExecutionPlan
+  plan: HermesExecutionPlan,
+  architectureSignals: HermesShadowArchitectureSignals = SAFE_ARCHITECTURE_SIGNALS
 ): HermesShadowComparisonReport {
   const canonicalPlan = buildCanonicalShadowPlan(plan);
   const differences: HermesShadowDifference[] = [];
@@ -206,12 +260,21 @@ export function compareLegacyAndCanonicalPlans(
   addDifference(
     differences,
     "execution_scope",
-    "HIGH",
+    "MEDIUM",
     [...legacyPlan.execution_modes, ...legacyPlan.allowed_paths, ...legacyPlan.forbidden_paths],
     [...canonicalPlan.execution_intents, ...canonicalPlan.allowed_paths, ...canonicalPlan.forbidden_paths]
   );
   addDifference(differences, "acceptance", "LOW", legacyPlan.acceptance_criteria, canonicalPlan.acceptance_criteria);
-  addDifference(differences, "risk", "HIGH", legacyPlan.risk_levels, canonicalPlan.risk_levels);
+  addDifference(differences, "risk", "MEDIUM", legacyPlan.risk_levels, canonicalPlan.risk_levels);
+  const conflicts = architectureConflicts(architectureSignals);
+  if (conflicts.length) {
+    differences.push({
+      dimension: "architecture_conflict",
+      severity: "HIGH",
+      legacy: ["authoritative_boundary_safe"],
+      canonical: conflicts,
+    });
+  }
 
   const severity = highestSeverity(differences);
   return {
@@ -239,22 +302,28 @@ export async function observeApprovedRequestInHermesShadow(input: {
   capability_gateway: AgentCapabilityGateway;
   env?: Record<string, string | undefined>;
 }): Promise<HermesShadowObservation> {
-  const env = input.env ?? process.env;
-  if (!isHermesCanonicalShadowEnabled(env)) {
-    return { observed: false, reason: "shadow_disabled", plan: null, report: null, safety: SHADOW_SAFETY_BOUNDARY };
-  }
-  if (isHermesCanonicalOrchestrationEnabled(env)) {
-    return {
-      observed: false,
-      reason: "canonical_authoritative_enabled",
-      plan: null,
-      report: null,
-      safety: SHADOW_SAFETY_BOUNDARY,
-    };
+  const config = resolveHermesShadowRuntimeConfig(input.env ?? process.env);
+  if (!config.shadow_enabled) {
+    const reason = config.canonical_orchestration_enabled
+      ? "canonical_authoritative_enabled"
+      : "shadow_disabled";
+    return { observed: false, reason, plan: null, report: null, safety: SHADOW_SAFETY_BOUNDARY };
   }
 
+  const controller = new AbortController();
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      reject(new Error("HERMES_SHADOW_TIMEOUT"));
+    }, config.shadow_timeout_ms);
+  });
+
   try {
-    const plan = await planApprovedRequest(input.request, input.planner, input.capability_gateway);
+    const plan = await Promise.race([
+      planApprovedRequest(input.request, input.planner, input.capability_gateway, { signal: controller.signal }),
+      timeout,
+    ]);
     return {
       observed: true,
       reason: "shadow_comparison_created",
@@ -262,14 +331,71 @@ export async function observeApprovedRequestInHermesShadow(input: {
       report: compareLegacyAndCanonicalPlans(input.legacy_plan, plan),
       safety: SHADOW_SAFETY_BOUNDARY,
     };
-  } catch {
+  } catch (error) {
+    const timedOut = error instanceof Error && error.message === "HERMES_SHADOW_TIMEOUT";
     return {
       observed: false,
-      reason: "shadow_planning_failed",
-      error_code: "HERMES_SHADOW_PLANNING_FAILED",
+      reason: timedOut ? "shadow_timeout" : "shadow_planning_failed",
+      error_code: timedOut ? "HERMES_SHADOW_TIMEOUT" : "HERMES_SHADOW_PLANNING_FAILED",
+      shadow_error: timedOut ? "timeout" : "planning_failed",
       plan: null,
       report: null,
       safety: SHADOW_SAFETY_BOUNDARY,
     };
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
   }
+}
+
+export function scheduleApprovedRequestInHermesShadow(input: {
+  request: GMApprovedRequest;
+  legacy_plan: LegacyShadowPlan;
+  planner: HermesPlanningProvider;
+  capability_gateway: AgentCapabilityGateway;
+  scheduler: HermesShadowTaskScheduler;
+  env?: Record<string, string | undefined>;
+}): HermesShadowLaunchResult {
+  const config = resolveHermesShadowRuntimeConfig(input.env ?? process.env);
+  const correlationId = `hermes-shadow:${input.request.request_id}`;
+  if (!config.shadow_enabled) {
+    return {
+      scheduled: false,
+      correlation_id: correlationId,
+      source_request_id: input.request.request_id,
+      reason: config.canonical_orchestration_enabled
+        ? "canonical_authoritative_enabled"
+        : "shadow_disabled",
+      authoritative_execution: false,
+    };
+  }
+
+  try {
+    input.scheduler(async () => {
+      const observation = await observeApprovedRequestInHermesShadow(input);
+      rememberCompletedObservation(input.request.request_id, observation);
+    });
+    return {
+      scheduled: true,
+      correlation_id: correlationId,
+      source_request_id: input.request.request_id,
+      reason: "shadow_scheduled",
+      authoritative_execution: false,
+    };
+  } catch {
+    return {
+      scheduled: false,
+      correlation_id: correlationId,
+      source_request_id: input.request.request_id,
+      reason: "shadow_schedule_failed",
+      authoritative_execution: false,
+    };
+  }
+}
+
+export function getCompletedHermesShadowObservation(requestId: string): HermesShadowObservation | null {
+  return completedObservations.get(requestId) ?? null;
+}
+
+export function clearHermesShadowObservationCacheForTests(): void {
+  completedObservations.clear();
 }

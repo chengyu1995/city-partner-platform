@@ -16,6 +16,7 @@ import * as fs from "fs";
 import * as path from "path";
 import type {
   HermesPlanDraft,
+  HermesPlanningContext,
   HermesPlanningProvider,
   HermesPlanningRequest,
 } from "./hermes/orchestration-adapter.ts";
@@ -79,7 +80,8 @@ export interface AgentResponse {
 // ============== LLM 调用 (MiniMax) ==============
 async function callLLM(
   messages: AgentMessage[],
-  tools: { type: "function"; function: { name: string; description: string; parameters: unknown } }[]
+  tools: { type: "function"; function: { name: string; description: string; parameters: unknown } }[],
+  signal?: AbortSignal
 ): Promise<AgentResponse> {
   const apiKey = process.env.MINIMAX_CN_API_KEY || process.env.HERMES_API_KEY;
   if (!apiKey) {
@@ -102,6 +104,7 @@ async function callLLM(
       "Content-Type": "application/json; charset=utf-8",
     },
     body: bytes,
+    signal,
   });
   const raw = await res.text();
   let data: { choices?: { message: { content?: string; tool_calls?: AgentToolCall[] }; finish_reason?: string }[]; error?: { message: string } };
@@ -139,7 +142,7 @@ function parseCanonicalPlanningDraft(content: string): HermesPlanDraft {
 
 export function createCanonicalHermesPlanningProvider(): HermesPlanningProvider {
   return {
-    async plan(request: HermesPlanningRequest): Promise<HermesPlanDraft> {
+    async plan(request: HermesPlanningRequest, context?: HermesPlanningContext): Promise<HermesPlanDraft> {
       const response = await callLLM(
         [
           {
@@ -158,7 +161,8 @@ export function createCanonicalHermesPlanningProvider(): HermesPlanningProvider 
           },
           { role: "user", content: JSON.stringify(request) },
         ],
-        []
+        [],
+        context?.signal
       );
       if (response.finish_reason === "error") {
         throw new Error(`HERMES_PLANNER_FAILED:${response.content}`);

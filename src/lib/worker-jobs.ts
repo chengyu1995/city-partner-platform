@@ -41,7 +41,11 @@ import {
   type HermesExecutionSubtask,
   type HermesRequestedMode,
 } from "./hermes/execution-plan";
-import { buildProjectDirectorFinalReport } from "./project-director-final-report";
+import {
+  attachHermesShadowToFinalReport,
+  buildProjectDirectorFinalReport,
+} from "./project-director-final-report";
+import { getCompletedHermesShadowObservation } from "./hermes/shadow-runtime";
 
 type JobRecord = Record<string, unknown>;
 
@@ -3700,9 +3704,32 @@ export function buildProjectDirectorWorkerReport(input: {
     data.next_step,
   ];
 
-  const text = requiredHeader.join("\n");
+  const sourceRequestId =
+    readString(input.job?.source_message_id) ??
+    readString(input.job?.feishu_message_id) ??
+    readString(jobPayload?.message_id);
+  const shadowObservation = sourceRequestId
+    ? getCompletedHermesShadowObservation(sourceRequestId)
+    : null;
+  if (!shadowObservation) {
+    return { text: requiredHeader.join("\n"), data };
+  }
 
-  return { text, data };
+  const finalData = attachHermesShadowToFinalReport(data, shadowObservation);
+  const shadowLines = shadowObservation.observed
+    ? [
+        "",
+        "Hermes Shadow Comparison:",
+        `comparison_id: ${shadowObservation.report.comparison_id}`,
+        `difference_count: ${shadowObservation.report.difference_count}`,
+        `severity: ${shadowObservation.report.severity}`,
+      ]
+    : [
+        "",
+        "Hermes Shadow Comparison:",
+        `shadow_error: ${"shadow_error" in shadowObservation ? shadowObservation.shadow_error : shadowObservation.reason}`,
+      ];
+  return { text: [...requiredHeader, ...shadowLines].join("\n"), data: finalData };
 }
 
 export function buildAttemptPayload(

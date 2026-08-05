@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const shadow = require(join(root, "src", "lib", "hermes", "shadow-runtime.ts"));
+const shadowConfig = require(join(root, "src", "lib", "hermes", "shadow-config.ts"));
 const delegation = require(join(root, "src", "lib", "project-director-hermes-delegation.ts"));
 const finalReport = require(join(root, "src", "lib", "project-director-final-report.ts"));
 const capabilities = require(join(root, "src", "lib", "openclaw", "capability-gateway.ts"));
@@ -76,13 +77,26 @@ function shadowEnv(overrides = {}) {
 }
 
 async function observe(overrides = {}) {
-  return delegation.runApprovedRequestThroughHermesShadow(
+  return shadow.observeApprovedRequestInHermesShadow({
+    request: overrides.request ?? approvedRequest(),
+    legacy_plan: overrides.legacyPlan ?? legacyPlan(),
+    planner: overrides.planner ?? planner(),
+    capability_gateway: overrides.gateway ?? new capabilities.OpenClawShadowCapabilityGateway(),
+    env: overrides.env ?? shadowEnv(),
+  });
+}
+
+function schedule(overrides = {}) {
+  const tasks = [];
+  const launch = delegation.scheduleApprovedRequestThroughHermesShadow(
     overrides.request ?? approvedRequest(),
     overrides.legacyPlan ?? legacyPlan(),
     overrides.planner ?? planner(),
-    overrides.gateway ?? new capabilities.RegistryCapabilityGateway(),
+    overrides.gateway ?? new capabilities.OpenClawShadowCapabilityGateway(),
+    overrides.scheduler ?? ((task) => tasks.push(task)),
     overrides.env ?? shadowEnv()
   );
+  return { launch, tasks };
 }
 
 test("Hermes canonical shadow flag defaults off", () => {
@@ -92,6 +106,29 @@ test("Hermes canonical shadow flag defaults off", () => {
 
 test("Hermes canonical shadow flag enables independently", () => {
   assert.equal(shadow.isHermesCanonicalShadowEnabled(shadowEnv()), true);
+});
+
+test("test runtime enables Shadow while canonical production remains off", () => {
+  const config = shadowConfig.resolveHermesShadowRuntimeConfig({ NODE_TEST_CONTEXT: "child-v8" });
+  assert.equal(config.shadow_enabled, true);
+  assert.equal(config.canonical_orchestration_enabled, false);
+});
+
+test("production runtime keeps Shadow off unless explicitly configured", () => {
+  assert.equal(shadowConfig.resolveHermesShadowRuntimeConfig({ NODE_ENV: "production" }).shadow_enabled, false);
+  assert.equal(shadowConfig.resolveHermesShadowRuntimeConfig({
+    NODE_ENV: "production",
+    HERMES_CANONICAL_SHADOW_ENABLED: "true",
+  }).shadow_enabled, true);
+});
+
+test("canonical production flag disables conflicting Shadow configuration", () => {
+  const config = shadowConfig.resolveHermesShadowRuntimeConfig({
+    NODE_ENV: "test",
+    HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true",
+  });
+  assert.equal(config.shadow_enabled, false);
+  assert.equal(config.configuration_conflict, true);
 });
 
 test("disabled shadow does not call the Hermes planner", async () => {
@@ -154,10 +191,22 @@ test("equal legacy and canonical projections produce severity NONE", async () =>
   assert.equal(result.report.severity, "NONE");
 });
 
-test("comparison report calculates HIGH severity for scope differences", async () => {
+test("comparison report calculates MEDIUM severity for scope differences", async () => {
   const result = await observe({ legacyPlan: legacyPlan({ allowed_paths: ["docs/**"] }) });
   assert.equal(result.report.differences.some((item) => item.dimension === "execution_scope"), true);
-  assert.equal(result.report.severity, "HIGH");
+  assert.equal(result.report.severity, "MEDIUM");
+});
+
+test("architecture conflicts calculate HIGH severity", async () => {
+  const result = await observe();
+  const report = shadow.compareLegacyAndCanonicalPlans(result.report.legacy_plan, result.plan, {
+    shadow_database_write: false,
+    shadow_direct_worker_access: true,
+    dual_authoritative_write: false,
+    canonical_boundary_bypass: false,
+  });
+  assert.equal(report.severity, "HIGH");
+  assert.equal(report.differences.some((item) => item.dimension === "architecture_conflict"), true);
 });
 
 test("comparison report records both runtime paths and correlation ids", async () => {
@@ -198,6 +247,95 @@ test("Legacy failure remains failed when shadow succeeds", async () => {
   assert.equal(report.primary_result.failure_code, "LEGACY_FAILED");
 });
 
+test("Shadow scheduling returns before planner execution completes", () => {
+  let plannerCalled = false;
+  const { launch, tasks } = schedule({
+    planner: { plan: async () => { plannerCalled = true; return new Promise(() => {}); } },
+  });
+  assert.equal(launch.scheduled, true);
+  assert.equal(plannerCalled, false);
+  assert.equal(tasks.length, 1);
+});
+
+test("Shadow timeout aborts a hanging planner without throwing to Legacy", async () => {
+  let receivedSignal = null;
+  const observation = await observe({
+    env: shadowEnv({ HERMES_CANONICAL_SHADOW_TIMEOUT_MS: "25" }),
+    planner: {
+      plan: async (_request, context) => {
+        receivedSignal = context.signal;
+        return new Promise(() => {});
+      },
+    },
+  });
+  assert.equal(observation.reason, "shadow_timeout");
+  assert.equal(observation.shadow_error, "timeout");
+  assert.equal(receivedSignal.aborted, true);
+});
+
+test("scheduled Shadow failure is isolated and retained as an observation", async () => {
+  shadow.clearHermesShadowObservationCacheForTests();
+  const request = approvedRequest({ request_id: "shadow-failure-1" });
+  const { launch, tasks } = schedule({
+    request,
+    legacyPlan: legacyPlan({ request_id: "shadow-failure-1" }),
+    planner: { plan: async () => { throw new Error("gateway failed"); } },
+  });
+  assert.equal(launch.scheduled, true);
+  await tasks[0]();
+  const completed = shadow.getCompletedHermesShadowObservation("shadow-failure-1");
+  assert.equal(completed.reason, "shadow_planning_failed");
+  assert.equal(completed.shadow_error, "planning_failed");
+});
+
+test("scheduler failure cannot throw into Legacy", () => {
+  const { launch } = schedule({ scheduler: () => { throw new Error("scheduler unavailable"); } });
+  assert.equal(launch.scheduled, false);
+  assert.equal(launch.reason, "shadow_schedule_failed");
+});
+
+test("completed Shadow comparison is available to the final GM report contract", async () => {
+  shadow.clearHermesShadowObservationCacheForTests();
+  const request = approvedRequest({ request_id: "final-report-shadow-1" });
+  const { tasks } = schedule({
+    request,
+    legacyPlan: legacyPlan({ request_id: "final-report-shadow-1" }),
+  });
+  await tasks[0]();
+  const observation = shadow.getCompletedHermesShadowObservation("final-report-shadow-1");
+  const report = finalReport.attachHermesShadowToFinalReport(
+    { effective_final_status: "failed", failure_code: "LEGACY_FAILED" },
+    observation
+  );
+  assert.equal(report.gm_report_primary_source, "legacy_runtime");
+  assert.equal(report.gm_report_shadow_source, "hermes_shadow_comparison");
+  assert.equal(report.effective_final_status, "failed");
+  assert.equal(report.hermes_shadow_comparison.severity, "NONE");
+});
+
+test("final Shadow attachment cannot override primary result fields", async () => {
+  const observation = await observe();
+  const report = finalReport.attachHermesShadowToFinalReport(
+    { effective_final_status: "failed", failure_code: "PRIMARY_FAILED" },
+    observation
+  );
+  assert.equal(report.effective_final_status, "failed");
+  assert.equal(report.failure_code, "PRIMARY_FAILED");
+  assert.equal(report.hermes_shadow_comparison.severity, "NONE");
+});
+
+test("OpenClaw Shadow gateway is the configured capability boundary", async () => {
+  const gateway = new capabilities.OpenClawShadowCapabilityGateway();
+  const resolution = await gateway.resolveAgentCapabilities({
+    required_capabilities: ["code_read", "code_review"],
+    execution_intent: "review",
+    requested_mode: "worker_read_only",
+  });
+  assert.equal(gateway.gateway_role, "openclaw_shadow_capability_gateway");
+  assert.equal(gateway.projection_only, true);
+  assert.equal(resolution.selected_agent, "code_review_agent");
+});
+
 test("shadow runtime source has no authoritative persistence or Worker dependency", () => {
   const source = readFileSync(join(root, "src", "lib", "hermes", "shadow-runtime.ts"), "utf8");
   assert.doesNotMatch(source, /canonicalCreateJob|canonicalAcquire|canonical_acquire|SupabaseClient|\/api\/worker|\.from\(|\.insert\(|\.update\(/);
@@ -205,17 +343,28 @@ test("shadow runtime source has no authoritative persistence or Worker dependenc
 
 test("shadow delegation accepts no canonical job creator", () => {
   const source = readFileSync(join(root, "src", "lib", "project-director-hermes-delegation.ts"), "utf8");
-  const shadowFunction = source.slice(source.indexOf("export async function runApprovedRequestThroughHermesShadow"));
+  const shadowFunction = source.slice(source.indexOf("export function scheduleApprovedRequestThroughHermesShadow"));
   assert.doesNotMatch(shadowFunction, /CanonicalJobCreator|createCanonicalJobsForPlan|canonicalCreateJob/);
+  assert.doesNotMatch(source, /runApprovedRequestThroughHermesShadow/);
 });
 
 test("Feishu approved execution keeps Legacy dispatch and adds shadow observation", () => {
   const source = readFileSync(join(root, "src", "app", "api", "feishu", "event", "route.ts"), "utf8");
-  const shadowIndex = source.indexOf("runApprovedRequestThroughHermesShadow(");
+  const shadowIndex = source.indexOf("scheduleApprovedRequestThroughHermesShadow(");
   const legacyWriteIndex = source.indexOf("insertApprovedAgentDispatchJobsWithContract(supabase", shadowIndex);
   assert.notEqual(shadowIndex, -1);
   assert.equal(legacyWriteIndex > shadowIndex, true);
-  assert.match(source, /hermes_shadow_report:/);
+  assert.doesNotMatch(source.slice(shadowIndex, legacyWriteIndex), /await\s+scheduleApprovedRequestThroughHermesShadow/);
+  assert.match(source, /hermes_shadow_correlation:/);
+  assert.match(source, /new OpenClawShadowCapabilityGateway\(\)/);
+});
+
+test("Shadow result attachment is absent from dispatch and present in final report builder", () => {
+  const routeSource = readFileSync(join(root, "src", "app", "api", "feishu", "event", "route.ts"), "utf8");
+  const workerSource = readFileSync(join(root, "src", "lib", "worker-jobs.ts"), "utf8");
+  assert.doesNotMatch(routeSource, /attachHermesShadowComparison/);
+  assert.match(workerSource, /getCompletedHermesShadowObservation/);
+  assert.match(workerSource, /attachHermesShadowToFinalReport/);
 });
 
 test("Shadow and Legacy produce no silent dual authoritative write", async () => {

@@ -9,8 +9,9 @@ import {
 import type { AgentCapabilityGateway } from "./openclaw/capability-gateway.ts";
 import type { HermesExecutionPlan } from "./hermes/execution-plan.ts";
 import {
-  observeApprovedRequestInHermesShadow,
-  type HermesShadowObservation,
+  scheduleApprovedRequestInHermesShadow,
+  type HermesShadowLaunchResult,
+  type HermesShadowTaskScheduler,
   type LegacyShadowPlan,
 } from "./hermes/shadow-runtime.ts";
 
@@ -61,18 +62,20 @@ export async function runApprovedRequestThroughCanonicalHermes(
   return { delegated: true, reason: "canonical_jobs_created", plan, jobs };
 }
 
-export async function runApprovedRequestThroughHermesShadow(
+export function scheduleApprovedRequestThroughHermesShadow(
   request: GMApprovedRequest,
   legacyPlan: LegacyShadowPlan,
   planner: HermesPlanningProvider,
   capabilityGateway: AgentCapabilityGateway,
+  scheduler: HermesShadowTaskScheduler,
   env: Record<string, string | undefined> = process.env
-): Promise<HermesShadowObservation> {
-  return observeApprovedRequestInHermesShadow({
+): HermesShadowLaunchResult {
+  return scheduleApprovedRequestInHermesShadow({
     request,
     legacy_plan: legacyPlan,
     planner,
     capability_gateway: capabilityGateway,
+    scheduler,
     env,
   });
 }

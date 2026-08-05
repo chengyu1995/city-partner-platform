@@ -61,3 +61,23 @@ export function attachHermesShadowComparison<T>(
     shadow_observation: shadowObservation,
   };
 }
+
+export type ProjectDirectorFinalReportWithShadow<T extends Record<string, unknown>> = T & {
+  gm_report_primary_source: "legacy_runtime";
+  gm_report_shadow_source: "hermes_shadow_comparison";
+  hermes_shadow_observation: HermesShadowObservation;
+  hermes_shadow_comparison: HermesShadowObservation["report"];
+};
+
+export function attachHermesShadowToFinalReport<T extends Record<string, unknown>>(
+  primaryResult: T,
+  shadowObservation: HermesShadowObservation
+): ProjectDirectorFinalReportWithShadow<T> {
+  return {
+    ...primaryResult,
+    gm_report_primary_source: "legacy_runtime",
+    gm_report_shadow_source: "hermes_shadow_comparison",
+    hermes_shadow_observation: shadowObservation,
+    hermes_shadow_comparison: shadowObservation.report,
+  };
+}

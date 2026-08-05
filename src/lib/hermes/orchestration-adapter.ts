@@ -43,7 +43,11 @@ export interface HermesPlanDraft {
 }
 
 export interface HermesPlanningProvider {
-  plan(request: HermesPlanningRequest): Promise<HermesPlanDraft>;
+  plan(request: HermesPlanningRequest, context?: HermesPlanningContext): Promise<HermesPlanDraft>;
+}
+
+export interface HermesPlanningContext {
+  signal?: AbortSignal;
 }
 
 export interface CanonicalJobCommand {
@@ -100,10 +104,11 @@ export function toHermesPlanningRequest(request: GMApprovedRequest): HermesPlann
 export async function planApprovedRequest(
   approvedRequest: GMApprovedRequest,
   planner: HermesPlanningProvider,
-  capabilityGateway: AgentCapabilityGateway = new RegistryCapabilityGateway()
+  capabilityGateway: AgentCapabilityGateway = new RegistryCapabilityGateway(),
+  context?: HermesPlanningContext
 ): Promise<HermesExecutionPlan> {
   const planningRequest = toHermesPlanningRequest(approvedRequest);
-  const draft = await planner.plan(planningRequest);
+  const draft = await planner.plan(planningRequest, context);
   const planningBoundary = validatePlanningStateBoundary(draft);
   if (!planningBoundary.ok) throw new Error(planningBoundary.errors.join(";"));
   if (draft.requested_mode && draft.requested_mode !== approvedRequest.requested_mode) {

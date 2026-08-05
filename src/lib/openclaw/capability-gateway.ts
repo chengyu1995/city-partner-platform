@@ -110,6 +110,15 @@ export class RegistryCapabilityGateway implements AgentCapabilityGateway {
   }
 }
 
+export class OpenClawShadowCapabilityGateway implements AgentCapabilityGateway {
+  readonly gateway_role = "openclaw_shadow_capability_gateway";
+  readonly projection_only = true;
+
+  async resolveAgentCapabilities(request: CapabilityResolutionRequest): Promise<CapabilityResolution> {
+    return resolveAgentCapabilities(request);
+  }
+}
+
 export class DisabledOpenClawCliGateway implements AgentCapabilityGateway {
   async resolveAgentCapabilities(): Promise<CapabilityResolution> {
     throw new Error("OPENCLAW_CAPABILITY_GATEWAY_DISABLED");

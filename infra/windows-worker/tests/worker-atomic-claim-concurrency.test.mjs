@@ -38,6 +38,7 @@ const workerJobs = loadTypeScriptModule(path.join(root, "src", "lib", "worker-jo
   "./worker-job-persistence-contract": { isCanonicalDatabasePersistenceEnabled: () => false },
   "./hermes/result-aggregator": {},
   "./hermes/execution-plan": {},
+  "./hermes/shadow-runtime": { getCompletedHermesShadowObservation: () => null },
   "./project-director-final-report": {},
 });
 
