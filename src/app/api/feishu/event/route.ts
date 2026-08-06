@@ -15,6 +15,10 @@
 import { after, NextResponse, NextRequest } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { decryptFeishuEvent } from "@/lib/feishu-crypto";
+import {
+  buildCanonicalApprovalContext,
+  buildCanonicalWorkerContextPayload,
+} from "@/lib/feishu-canonical-context";
 import { createCanonicalHermesPlanningProvider, runAgent, AgentMessage } from "@/lib/hermes-agent";
 import {
   canonicalHermesAllowsDirectWorkerBypass,
@@ -692,6 +696,42 @@ async function findRecentTaskTreeDraft(
       };
     } catch (parseError) {
       console.error("[feishu-event] task tree draft parse failed:", sanitizeLogText(errorToText(parseError)));
+    }
+  }
+
+  return null;
+}
+
+async function findRecentCanonicalApprovalContext(
+  supabase: SupabaseClient,
+  convId: string,
+  approvalText: string
+): Promise<string | null> {
+  const batchCode = extractApprovedBatchCode(approvalText) ?? extractPrimaryRouteBatchCode(approvalText);
+  if (!batchCode) return null;
+
+  const { data, error } = await supabase
+    .from("hermes_messages")
+    .select("role, content, name, created_at")
+    .eq("conversation_id", convId)
+    .order("created_at", { ascending: false })
+    .limit(60);
+
+  if (error) throw new Error(`load canonical approval context failed: ${error.message}`);
+  if (!data) return null;
+
+  for (const message of data) {
+    const content = typeof message.content === "string" ? message.content : "";
+    if (!content.includes(batchCode)) continue;
+    if (
+      content.includes("approval_context_saved=true") ||
+      content.includes("approval_context_saved: true") ||
+      content.includes("original_request_text=") ||
+      content.includes("original_request_text:") ||
+      content.includes("original_request_text_base64=") ||
+      content.includes("original_request_text_base64:")
+    ) {
+      return content;
     }
   }
 
@@ -2883,6 +2923,182 @@ export async function POST(req: NextRequest) {
       }
       const recentDraft = await findRecentTaskTreeDraft(supabase, convId);
       if (!recentDraft) {
+        if (isHermesCanonicalOrchestrationEnabled()) {
+          const savedContext = await findRecentCanonicalApprovalContext(supabase, convId, text);
+          const canonicalContext = buildCanonicalApprovalContext({
+            approval_text: text,
+            saved_context_text: savedContext,
+            request_id: ev.message.message_id,
+            approved_by: userId,
+            approved_at: new Date().toISOString(),
+            feishu_chat_id: ev.message.chat_id,
+            feishu_event_id: eventId,
+          });
+
+          if (!canonicalContext.ok) {
+            const reply = [
+              "PROJECT_DIRECTOR_HERMES_CANONICAL_CONTEXT_BLOCKED",
+              "canonical_context_builder_used=true",
+              "legacy_context_builder_used=false",
+              "worker_created=false",
+              "next_stage_allowed=false",
+              `batch_code: ${canonicalContext.batch_code ?? "missing"}`,
+              `requested_mode: ${canonicalContext.requested_mode ?? "missing"}`,
+              `failure_code=${canonicalContext.failure_code}`,
+              `failure_stage=${canonicalContext.failure_stage}`,
+            ].join("\n");
+            await saveSystemRecordedReply(
+              supabase,
+              convId,
+              text,
+              reply,
+              reply,
+              "project_director_hermes_canonical_context_blocked",
+              ev.message.message_id
+            );
+            await sendFeishuMessage(
+              token,
+              ev.message.chat_id,
+              ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+              reply
+            );
+            await markReceiptCompleted(supabase, eventId);
+            return NextResponse.json({
+              code: 0,
+              project_director_intake: true,
+              state: "hermes_canonical_context_blocked",
+              canonical_context_builder_used: true,
+              legacy_context_builder_used: false,
+              worker_created: false,
+              next_stage_allowed: false,
+              failure_code: canonicalContext.failure_code,
+              failure_stage: canonicalContext.failure_stage,
+            });
+          }
+
+          const canonicalCutover = await attemptHermesCanonicalCutover({
+            executeCanonical: async (writeGuard) => {
+              const result = await runApprovedRequestThroughCanonicalHermes(
+                {
+                  request_id: ev.message.message_id,
+                  original_request_text: canonicalContext.original_request_text ?? text,
+                  project_domain: canonicalContext.project_domain ?? "automation_system",
+                  requested_mode: canonicalContext.requested_mode ?? "worker_read_only",
+                  approval_context: canonicalContext.approval_context,
+                  objective: canonicalContext.original_request_text ?? text,
+                },
+                createCanonicalHermesPlanningProvider(),
+                createProductionCapabilityGateway(),
+                async (command) => {
+                  const workerContext = buildCanonicalWorkerContextPayload({
+                    plan_id: command.payload.plan_id,
+                    subtask_id: command.payload.subtask_id,
+                    requested_mode: canonicalContext.requested_mode ?? "worker_read_only",
+                    batch_code: canonicalContext.batch_code ?? "unknown",
+                  });
+                  const created = await canonicalCreateJob(supabase, {
+                    source: command.source,
+                    request_text: command.request_text,
+                    project_domain: command.project_domain,
+                    requested_mode: command.requested_mode,
+                    plan_id: command.payload.plan_id,
+                    subtask_id: command.payload.subtask_id,
+                    payload: {
+                      ...command.payload,
+                      ...workerContext,
+                      canonical_context_builder_used: true,
+                      legacy_context_builder_used: false,
+                    },
+                    status: "queued",
+                  });
+                  writeGuard.recordAuthoritativeWrite(created.insertedCount);
+                  return created;
+                },
+                { canonicalPersistenceReady: canonicalPersistenceRuntimeEnabled() }
+              );
+              if (!result.delegated || result.reason !== "canonical_jobs_created") {
+                throw new Error("HERMES_CANONICAL_DELEGATION_NOT_APPLIED");
+              }
+              return result;
+            },
+          });
+
+          if (canonicalCutover.path === "canonical_primary") {
+            const result = canonicalCutover.canonical_result;
+            const reply = [
+              "PROJECT_DIRECTOR_HERMES_CANONICAL_DISPATCHED",
+              "canonical_context_builder_used=true",
+              "legacy_context_builder_used=false",
+              "worker_context_complete=true",
+              `plan_id: ${result.plan.plan_id}`,
+              `canonical_jobs_created: ${result.jobs.length}`,
+              `requested_mode: ${result.plan.requested_mode}`,
+            ].join("\n");
+            await saveSystemRecordedReply(
+              supabase,
+              convId,
+              text,
+              reply,
+              reply,
+              "project_director_hermes_canonical_dispatch",
+              ev.message.message_id
+            );
+            await sendFeishuMessage(
+              token,
+              ev.message.chat_id,
+              ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+              reply
+            );
+            await markReceiptCompleted(supabase, eventId);
+            return NextResponse.json({
+              code: 0,
+              project_director_intake: true,
+              state: "hermes_canonical_dispatched",
+              canonical_context_builder_used: true,
+              legacy_context_builder_used: false,
+              worker_context_complete: true,
+              plan_id: result.plan.plan_id,
+              inserted_jobs: result.jobs.length,
+            });
+          }
+
+          const reply = [
+            "PROJECT_DIRECTOR_HERMES_CANONICAL_CONTEXT_BLOCKED",
+            "canonical_context_builder_used=true",
+            "legacy_context_builder_used=false",
+            "worker_created=false",
+            "next_stage_allowed=false",
+            `failure_code=${canonicalCutover.reason === "canonical_prewrite_failure" ? "CANONICAL_PREWRITE_FAILURE" : canonicalCutover.reason}`,
+            "failure_stage=canonical_runtime_dispatch",
+          ].join("\n");
+          await saveSystemRecordedReply(
+            supabase,
+            convId,
+            text,
+            reply,
+            reply,
+            "project_director_hermes_canonical_context_blocked",
+            ev.message.message_id
+          );
+          await sendFeishuMessage(
+            token,
+            ev.message.chat_id,
+            ev.message.chat_type === "p2p" ? "open_id" : "chat_id",
+            reply
+          );
+          await markReceiptCompleted(supabase, eventId);
+          return NextResponse.json({
+            code: 0,
+            project_director_intake: true,
+            state: "hermes_canonical_context_blocked",
+            canonical_context_builder_used: true,
+            legacy_context_builder_used: false,
+            worker_created: false,
+            next_stage_allowed: false,
+            failure_code: canonicalCutover.reason === "canonical_prewrite_failure" ? "CANONICAL_PREWRITE_FAILURE" : canonicalCutover.reason,
+            failure_stage: "canonical_runtime_dispatch",
+          });
+        }
         const reply = "未找到可执行的任务树计划，请先发送新需求并完成项目总管规划。";
         await saveSystemRecordedReply(
           supabase,
