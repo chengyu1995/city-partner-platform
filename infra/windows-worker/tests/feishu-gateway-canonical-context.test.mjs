@@ -58,21 +58,32 @@ test("canonical approval context fails closed when original request is missing",
   assert.equal(result.failure_stage, "canonical_approval_context_validation");
 });
 
-test("canonical worker context contains execution identity placeholders", () => {
+test("canonical worker context carries planning context without invented execution identities", () => {
   const payload = context.buildCanonicalWorkerContextPayload({
     plan_id: "plan-1",
     subtask_id: "subtask-1",
     requested_mode: "worker_read_only",
     batch_code: "BATCH-ARCH-COMPLETE-03C-3B-LIVE-VALIDATION-01",
+    project_domain: "automation_system",
+    execution_intent: "verification_only",
+    scope: ["infra/tencent-worker/**"],
+    acceptance: ["tests pass"],
+    original_request_text: "audit request",
+    approval_context: { approved_by: "boss" },
   });
 
-  assert.equal(payload.job_id, "assigned_by_canonical_create_job");
   assert.equal(payload.plan_id, "plan-1");
   assert.equal(payload.subtask_id, "subtask-1");
   assert.equal(payload.requested_mode, "worker_read_only");
   assert.equal(payload.canonical_revision, 0);
-  assert.equal(payload.worker_identity, "assigned_by_canonical_claim");
-  assert.equal(payload.lease_identity, "assigned_by_canonical_claim");
+  assert.equal(payload.execution_intent, "verification_only");
+  assert.deepEqual(payload.scope, ["infra/tencent-worker/**"]);
+  assert.deepEqual(payload.acceptance, ["tests pass"]);
+  assert.equal("job_id" in payload, false);
+  assert.equal("attempt_id" in payload, false);
+  assert.equal("lease_id" in payload, false);
+  assert.equal("worker_identity" in payload, false);
+  assert.equal("lease_identity" in payload, false);
 });
 
 test("Feishu gateway routes missing legacy draft approvals through canonical context when enabled", () => {

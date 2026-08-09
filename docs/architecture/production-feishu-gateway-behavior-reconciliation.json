@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "reference": {
+    "production_path": "/home/ubuntu/city-partner-agent/feishu_gateway_canonical.js",
+    "sha256": "9656fade1c0feb769aa9d3af5a70ccb9c1ada52c3e31db6b49f9abeb73f35f35",
+    "size": 309480,
+    "captured_read_only": true,
+    "transport_observed": "http_callback",
+    "nginx_route": "/feishu/event -> http://127.0.0.1:3002/feishu/event"
+  },
+  "origin_classification": "historical_manual_production_file",
+  "git_history_found": false,
+  "build_pipeline_found": false,
+  "authoritative_routing": {
+    "flag_off": "legacy_runtime",
+    "flag_on_approval": "shared_nextjs_canonical_handler",
+    "flag_on_non_approval": "legacy_compatibility_routes",
+    "parallel_authoritative_writes": false
+  },
+  "behaviors": [
+    { "name": "express_http_listener", "classification": "PRESERVE", "evidence": "app.listen on 127.0.0.1 and configured port" },
+    { "name": "nginx_http_callback_transport", "classification": "PRESERVE", "evidence": "production nginx exact /feishu/event proxy" },
+    { "name": "url_verification_ack", "classification": "PRESERVE", "evidence": "url_verification challenge response" },
+    { "name": "event_deduplication", "classification": "PRESERVE", "evidence": "message/event dedupe before routing" },
+    { "name": "feishu_reply_transport", "classification": "PRESERVE", "evidence": "reply API with tenant token" },
+    { "name": "health_endpoint", "classification": "PRESERVE", "evidence": "GET /health" },
+    { "name": "gateway_control_commands", "classification": "PRESERVE", "evidence": "pause resume and status routes remain under legacy compatibility" },
+    { "name": "approval_context_file_store", "classification": "PRESERVE", "evidence": "flag-off legacy context persistence remains unchanged" },
+    { "name": "planning_choice_routes", "classification": "PRESERVE", "evidence": "non-canonical planning choices remain legacy compatible" },
+    { "name": "direct_worker_legacy_route", "classification": "PRESERVE", "evidence": "available only when canonical approval router does not handle the event" },
+    { "name": "worker_api_status_integration", "classification": "PRESERVE", "evidence": "gateway status fields continue to query worker API" },
+    { "name": "supabase_legacy_job_inserts", "classification": "PRESERVE", "evidence": "retained for flag-off and non-approval compatibility only" },
+    { "name": "failure_memory", "classification": "PRESERVE", "evidence": "runtime failure memory files remain unchanged" },
+    { "name": "bitable_result_visibility", "classification": "PRESERVE", "evidence": "downstream worker-api and Feishu reply integrations remain unchanged" },
+    { "name": "canonical_approval_context", "classification": "REPLACE", "evidence": "shared feishu-canonical-context-core implementation" },
+    { "name": "canonical_approval_routing", "classification": "REPLACE", "evidence": "signed dispatch to /api/feishu/event before legacy approval gates" },
+    { "name": "legacy_readonly_gate_for_canonical_approval", "classification": "DEPRECATE", "evidence": "canonical approval returns before legacy gate when flag is on" },
+    { "name": "gateway_direct_canonical_persistence", "classification": "DEPRECATE", "evidence": "canonical router has no DB or Worker mutation API" }
+  ],
+  "unknown_runtime_behaviors": []
+}
