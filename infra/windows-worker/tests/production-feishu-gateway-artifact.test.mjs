@@ -7,49 +7,20 @@ import { join } from "node:path";
 
 const root = process.cwd();
 const require = createRequire(import.meta.url);
-const manifestPath = join(root, "infra/tencent-worker/production-artifacts/feishu-gateway.json");
-const reconciliationPath = join(root, "docs/architecture/production-feishu-gateway-behavior-reconciliation.json");
+const manifest = JSON.parse(readFileSync(join(root, "infra/tencent-worker/production-artifacts/feishu-gateway.json"), "utf8"));
+const reconciliation = JSON.parse(readFileSync(join(root, "docs/architecture/production-feishu-gateway-behavior-reconciliation.json"), "utf8"));
 const gatewayPath = join(root, "infra/tencent-worker/feishu_gateway_canonical.js");
 const routerPath = join(root, "infra/tencent-worker/feishu_gateway_canonical_router.js");
 const contextPath = join(root, "infra/tencent-worker/feishu-canonical-context-core.js");
-const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-const reconciliation = JSON.parse(readFileSync(reconciliationPath, "utf8"));
+const routePath = join(root, "src/app/api/feishu/event/route.ts");
+const featurePath = join(root, "src/lib/feishu-application-boundary.ts");
 const gatewaySource = readFileSync(gatewayPath, "utf8");
 const routerSource = readFileSync(routerPath, "utf8");
 const contextSource = readFileSync(contextPath, "utf8");
+const routeSource = readFileSync(routePath, "utf8");
+const featureSource = readFileSync(featurePath, "utf8");
+const gatewayModule = require(gatewayPath);
 const routerModule = require(routerPath);
-const contextModule = require(contextPath);
-
-function approvalInput(overrides = {}) {
-  const original = [
-    "BATCH-ARCH-COMPLETE-03C-3B-LIVE-VALIDATION-01",
-    "requested_mode=worker_read_only",
-    "execution_intent=verification_only",
-  ].join("\n");
-  return {
-    is_approval: true,
-    approval_text: "approve BATCH-ARCH-COMPLETE-03C-3B-LIVE-VALIDATION-01 requested_mode=worker_read_only",
-    batch_code: "BATCH-ARCH-COMPLETE-03C-3B-LIVE-VALIDATION-01",
-    body: { type: "event_callback", event: { message: { message_id: "m-1" } } },
-    request_id: "m-1",
-    approved_by: "boss",
-    approved_at: "2026-08-09T00:00:00.000Z",
-    feishu_chat_id: "chat-1",
-    feishu_event_id: "event-1",
-    load_saved_context: async () => ({
-      batch_code: "BATCH-ARCH-COMPLETE-03C-3B-LIVE-VALIDATION-01",
-      requested_mode: "worker_read_only",
-      project_domain: "automation_system",
-      execution_intent: "verification_only",
-      original_request_text: original,
-      exact_allowed_scope: [],
-      acceptance_conditions: ["no writes"],
-      plan_id: "plan-1",
-      subtask_id: "subtask-1",
-    }),
-    ...overrides,
-  };
-}
 
 test("production Gateway source and dependencies are tracked by Git", () => {
   for (const file of manifest.files) {
@@ -62,180 +33,137 @@ test("artifact mapping is direct and deterministic", () => {
   assert.equal(manifest.artifact_type, "direct");
   assert.equal(manifest.build_required, false);
   assert.equal(manifest.build_command, null);
-  assert.equal(manifest.files.length, 3);
+  assert.equal(manifest.files.length, 2);
 });
 
 test("production PM2 target mapping is explicit", () => {
   assert.equal(manifest.pm2_process, "feishu-gateway");
-  assert.equal(manifest.runtime_cwd, "/home/ubuntu/city-partner-agent");
   assert.equal(manifest.files[0].target_path, "/home/ubuntu/city-partner-agent/feishu_gateway_canonical.js");
 });
 
-test("restart and rollback mapping are scoped to feishu-gateway", () => {
-  assert.equal(manifest.restart_required, true);
+test("restart and rollback mapping remain scoped to feishu-gateway", () => {
   assert.equal(manifest.restart_command, "pm2 restart feishu-gateway");
   assert.match(manifest.rollback_source, /same target paths/);
-  assert.doesNotMatch(JSON.stringify(manifest), /restart all|worker-api|nginx/i);
+  assert.doesNotMatch(manifest.restart_command, /worker-api|nginx|restart all/i);
 });
 
-test("Gateway imports the canonical transport router before legacy runtime", () => {
-  assert.match(gatewaySource.slice(0, 500), /feishu_gateway_canonical_router\.js/);
-  const routeStart = gatewaySource.indexOf('app.post("/feishu/event"');
-  const routeSource = gatewaySource.slice(routeStart);
-  assert.ok(routeSource.indexOf("canonicalGatewayResult.handled") < routeSource.indexOf("PROJECT_DIRECTOR_APPROVAL_BATCH_ROUTER_GATE"));
+test("Gateway delegates every business event to the shared application boundary", () => {
+  assert.match(gatewaySource, /createFeishuApplicationBoundaryClient/);
+  assert.match(gatewaySource, /client\.dispatch\(\{ body, rawBody \}\)/);
 });
 
-test("canonical transport router imports the shared context builder", () => {
-  assert.match(routerSource, /require\("\.\/feishu-canonical-context-core\.js"\)/);
-  assert.match(routerSource, /buildCanonicalApprovalContext\(\{/);
+test("Gateway contains no direct hermes_jobs persistence", () => {
+  assert.doesNotMatch(gatewaySource, /hermes_jobs|supabase|\/rest\/v1|\/rpc\//i);
 });
 
-test("there is one canonical approval context implementation", () => {
-  const definitions = contextSource.match(/function buildCanonicalApprovalContext\s*\(/g) || [];
-  assert.equal(definitions.length, 1);
-  assert.doesNotMatch(gatewaySource, /function buildCanonicalApprovalContext\s*\(/);
-  assert.doesNotMatch(routerSource, /function buildCanonicalApprovalContext\s*\(/);
+test("Gateway contains no Worker job creator", () => {
+  assert.doesNotMatch(gatewaySource, /(?:create|insert|enqueue)[A-Za-z0-9_]*Job|canonicalCreateJob/i);
 });
 
-test("flag OFF leaves the complete legacy path untouched", async () => {
-  let loaded = false;
-  const router = routerModule.createCanonicalGatewayRouter({ env: {}, fetchImpl: async () => { throw new Error("unexpected fetch"); } });
-  const result = await router.route(approvalInput({ load_saved_context: async () => { loaded = true; return {}; } }));
-  assert.deepEqual(result, { handled: false, reason: "canonical_flag_off" });
-  assert.equal(loaded, false);
+test("Gateway contains no independent GM routing", () => {
+  assert.doesNotMatch(gatewaySource, /project[_ -]?(?:director|general_manager)|GM_ROUTING|agent[_ -]?mapping/i);
 });
 
-test("flag ON approval dispatches to the shared canonical application handler", async () => {
-  let request;
-  const env = {
-    HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true",
-    HERMES_CANONICAL_SHADOW_ENABLED: "false",
-    HERMES_CANONICAL_EVENT_URL: "https://example.test/api/feishu/event",
-    FEISHU_APP_SECRET: "test-secret",
-  };
-  const router = routerModule.createCanonicalGatewayRouter({
-    env,
-    fetchImpl: async (url, options) => {
-      request = { url, options };
-      return new Response(JSON.stringify({ code: 0, state: "hermes_canonical_dispatched" }), { status: 200 });
-    },
-  });
-  const result = await router.route(approvalInput());
-  assert.equal(result.handled, true);
-  assert.equal(result.ok, true);
-  assert.equal(request.url, env.HERMES_CANONICAL_EVENT_URL);
-  const body = JSON.parse(request.options.body);
-  assert.equal(body._canonical_gateway_context.canonical_context_builder_used, true);
-  assert.equal(body._canonical_gateway_context.legacy_context_builder_used, false);
-  assert.equal(routerModule.verifyCanonicalGatewayContextSignature(body._canonical_gateway_context, request.options.headers[routerModule.SIGNATURE_HEADER], env.FEISHU_APP_SECRET), true);
+test("Gateway contains no execution-state authority", () => {
+  assert.doesNotMatch(gatewaySource, /attempt_id|lease_id|terminal_at|effective_final_status/i);
 });
 
-test("canonical approval never enters the legacy readonly gate", () => {
-  const routeStart = gatewaySource.indexOf('app.post("/feishu/event"');
-  const routeSource = gatewaySource.slice(routeStart);
-  const canonicalReturn = routeSource.indexOf("return res.status(canonicalGatewayResult.status");
-  const legacyApproval = routeSource.indexOf("PROJECT_DIRECTOR_APPROVAL_BATCH_ROUTER_GATE");
-  assert.ok(canonicalReturn > 0 && canonicalReturn < legacyApproval);
+test("transport dedupe keys only use event or message identity", () => {
+  assert.equal(gatewayModule.eventDedupeKey({ header: { event_id: "e-1" } }), "event:e-1");
+  assert.equal(gatewayModule.eventDedupeKey({ event: { message: { message_id: "m-1" } } }), "message:m-1");
 });
 
-test("true missing canonical context fails closed without downstream dispatch", async () => {
-  let fetched = false;
-  const router = routerModule.createCanonicalGatewayRouter({
-    env: {
-      HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true",
-      HERMES_CANONICAL_EVENT_URL: "https://example.test/api/feishu/event",
-      FEISHU_APP_SECRET: "test-secret",
-    },
-    fetchImpl: async () => { fetched = true; throw new Error("unexpected fetch"); },
-  });
-  const result = await router.route(approvalInput({ load_saved_context: async () => null }));
-  assert.equal(result.handled, true);
-  assert.equal(result.ok, false);
-  assert.equal(result.response.failure_code, "CANONICAL_APPROVAL_CONTEXT_INCOMPLETE");
-  assert.equal(fetched, false);
+test("transport dedupe shares one in-flight dispatch", async () => {
+  const dedupe = gatewayModule.createTransportDedupe();
+  let calls = 0;
+  const operation = async () => { calls += 1; return { ok: true }; };
+  const [first, second] = await Promise.all([dedupe.run("event:e", operation), dedupe.run("event:e", operation)]);
+  assert.equal(calls, 1);
+  assert.equal(first.result.ok, true);
+  assert.equal(second.duplicate, true);
 });
 
-test("complete worker_read_only context is accepted without writable scope", () => {
-  const context = contextModule.buildCanonicalApprovalContext({
-    approval_text: "approve BATCH-ARCH-COMPLETE-03C-3B-LIVE-VALIDATION-01 requested_mode=worker_read_only",
-    saved_context_record: {
-      batch_code: "BATCH-ARCH-COMPLETE-03C-3B-LIVE-VALIDATION-01",
-      requested_mode: "worker_read_only",
-      original_request_text: "read only audit",
-      exact_allowed_scope: [],
-    },
-    request_id: "m-1",
-    approved_by: "boss",
-    approved_at: "2026-08-09T00:00:00.000Z",
-    feishu_chat_id: "chat-1",
-    feishu_event_id: "event-1",
-  });
-  assert.equal(context.ok, true);
-  assert.equal(context.failure_code, null);
+test("failed transport dispatch is retryable", async () => {
+  const dedupe = gatewayModule.createTransportDedupe();
+  await assert.rejects(dedupe.run("event:e", async () => { throw new Error("offline"); }));
+  const retried = await dedupe.run("event:e", async () => ({ ok: true }));
+  assert.equal(retried.duplicate, false);
 });
 
-test("canonical worker context never invents job attempt or lease identity", () => {
-  const payload = contextModule.buildCanonicalWorkerContextPayload({
-    plan_id: "plan-1",
-    subtask_id: "subtask-1",
-    requested_mode: "worker_read_only",
-    batch_code: "BATCH-1",
-  });
-  for (const key of ["job_id", "attempt_id", "lease_id", "worker_identity", "lease_identity"]) {
-    assert.equal(key in payload, false);
-  }
+test("application client signs and forwards the original body", async () => {
+  let captured;
+  const env = { FEISHU_APPLICATION_EVENT_URL: "https://example.test/api/feishu/event", FEISHU_APP_SECRET: "secret" };
+  const client = routerModule.createFeishuApplicationBoundaryClient({ env, fetchImpl: async (url, options) => {
+    captured = { url, options };
+    return new Response('{"code":0}', { status: 200 });
+  } });
+  const rawBody = '{"type":"event_callback"}';
+  const result = await client.dispatch({ rawBody, body: JSON.parse(rawBody) });
+  assert.equal(captured.url, env.FEISHU_APPLICATION_EVENT_URL);
+  assert.equal(captured.options.body, rawBody);
+  assert.equal(result.body.code, 0);
 });
 
-test("canonical router has no database authoritative write surface", () => {
-  assert.doesNotMatch(routerSource, /supabase|hermes_jobs|canonicalCreateJob|canonical_acquire_attempt_lease/i);
-  assert.doesNotMatch(routerSource, /\/rest\/v1|\/rpc\//i);
+test("application boundary signature rejects tampering", () => {
+  const signature = routerModule.signApplicationPayload("one", "secret");
+  assert.equal(routerModule.verifyApplicationPayloadSignature("one", signature, "secret"), true);
+  assert.equal(routerModule.verifyApplicationPayloadSignature("two", signature, "secret"), false);
 });
 
-test("canonical router has no Worker or Codex execution surface", () => {
-  assert.doesNotMatch(routerSource, /local_worker|worker-api|codex|attempt_id|lease_id/i);
+test("application endpoint cannot point at the PM2 callback route", () => {
+  assert.equal(routerModule.resolveApplicationEndpoint({ FEISHU_APPLICATION_EVENT_URL: "https://example.test/feishu/event" }), null);
+  assert.equal(routerModule.resolveApplicationEndpoint({ FEISHU_APPLICATION_EVENT_URL: "https://example.test/api/feishu/event" }), "https://example.test/api/feishu/event");
 });
 
-test("signed context rejects tampering", () => {
-  const context = { ok: true, batch_code: "BATCH-1" };
-  const signature = routerModule.signCanonicalGatewayContext(context, "secret");
-  assert.equal(routerModule.verifyCanonicalGatewayContextSignature(context, signature, "secret"), true);
-  assert.equal(routerModule.verifyCanonicalGatewayContextSignature({ ...context, batch_code: "BATCH-2" }, signature, "secret"), false);
+test("Next.js route verifies the PM2 transport envelope", () => {
+  assert.match(routeSource, /verifyFeishuApplicationBoundaryRequest\(\{/);
+  assert.match(routeSource, /FEISHU_APPLICATION_BOUNDARY_SOURCE_HEADER/);
 });
 
-test("canonical endpoint cannot loop back into the production Gateway route", async () => {
-  const router = routerModule.createCanonicalGatewayRouter({
-    env: {
-      HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true",
-      HERMES_CANONICAL_EVENT_URL: "https://example.test/feishu/event",
-      FEISHU_APP_SECRET: "secret",
-    },
-  });
-  const result = await router.route(approvalInput());
-  assert.equal(result.response.failure_code, "CANONICAL_GATEWAY_ENDPOINT_INVALID");
+test("Next.js route owns the shared feature decision", () => {
+  assert.match(routeSource, /resolveFeishuApplicationFeatureRoute\(process\.env\)/);
+  assert.match(featureSource, /resolveHermesCanonicalCutoverConfig/);
+  assert.doesNotMatch(gatewaySource + routerSource, /HERMES_CANONICAL_(?:ORCHESTRATION|SHADOW)_ENABLED/);
 });
 
-test("production behavior reconciliation has no UNKNOWN entries", () => {
+test("canonical approval context has one implementation", () => {
+  assert.equal((contextSource.match(/function buildCanonicalApprovalContext\s*\(/g) || []).length, 1);
+  assert.doesNotMatch(gatewaySource + routerSource, /function buildCanonicalApprovalContext\s*\(/);
+});
+
+test("production behavior reconciliation has no unknowns or parallel authority", () => {
   assert.deepEqual(reconciliation.unknown_runtime_behaviors, []);
-  assert.equal(reconciliation.authoritative_routing.parallel_authoritative_writes, false);
-  assert.equal(reconciliation.behaviors.some((item) => item.classification === "UNKNOWN"), false);
+  assert.deepEqual(reconciliation.gateway_authoritative_code_hits, []);
+  assert.equal(reconciliation.target_architecture.parallel_business_implementations, 0);
+  assert.equal(reconciliation.target_architecture.parallel_authoritative_job_creators, 0);
 });
 
-test("historical production transport and safety behavior is preserved", () => {
-  for (const marker of ['app.get("/health"', 'app.post("/feishu/event"', "url_verification", "shouldSkipDuplicateFeishuEvent", "replyFeishu", "runtimePatchHandleGatewayControlCommand"]) {
-    assert.match(gatewaySource, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  }
+test("manifest declares thin entrypoint authority", () => {
+  assert.ok(manifest.entrypoint_responsibilities.includes("shared_application_boundary_dispatch"));
+  assert.ok(manifest.entrypoint_forbidden_authorities.includes("database_persistence"));
+  assert.equal(manifest.shared_application_boundary.source_path, "src/app/api/feishu/event/route.ts");
 });
 
-test("canonical event envelope is verified before Next.js uses it", () => {
-  const route = readFileSync(join(root, "src/app/api/feishu/event/route.ts"), "utf8");
-  assert.match(route, /readVerifiedCanonicalGatewayContext\(\{/);
-  assert.match(route, /gatewayContextProvided && !verifiedGatewayContext/);
-  assert.match(route, /saved_context_record: savedContextRecord/);
+test("shared application boundary covers every reconciled production business capability", () => {
+  const requiredMarkers = [
+    "FEISHU_VERIFICATION_TOKEN",
+    "decryptFeishuEvent",
+    "feishu_event_receipts",
+    "sendFeishuMessage",
+    "parseProjectDirectorConsoleCommand",
+    "isBossApprovalReply",
+    "runApprovedRequestThroughCanonicalHermes",
+    "canonicalCreateJob",
+    "createHermesJob",
+    "markReceiptFailed",
+  ];
+  for (const marker of requiredMarkers) assert.match(routeSource, new RegExp(marker));
 });
 
-test("artifact verifier covers tracked files syntax and mapping", () => {
+test("artifact verifier scans the real PM2 entrypoint authority", () => {
   const verifier = readFileSync(join(root, "scripts/verify-production-feishu-gateway-artifact.mjs"), "utf8");
-  assert.match(verifier, /git["'], \["ls-files", "--error-unmatch"/);
-  assert.match(verifier, /new Script\(sourceText/);
-  assert.match(verifier, /unknown_runtime_behaviors/);
+  assert.match(verifier, /forbiddenAuthorityPatterns/);
+  assert.match(verifier, /productionGatewayArtifact/);
+  assert.match(verifier, /PM2 Gateway artifact authority detected/);
+  assert.match(verifier, /entrypoint_direct_authority_scan_passed/);
 });

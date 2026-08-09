@@ -8,6 +8,28 @@
   "pm2_process": "feishu-gateway",
   "runtime_user": "ubuntu",
   "runtime_cwd": "/home/ubuntu/city-partner-agent",
+  "entrypoint_responsibilities": [
+    "http_callback_transport",
+    "url_verification_challenge",
+    "transport_event_deduplication",
+    "shared_application_boundary_dispatch",
+    "http_ack_and_error_transport"
+  ],
+  "entrypoint_forbidden_authorities": [
+    "gm_orchestration",
+    "job_creation",
+    "database_persistence",
+    "worker_execution",
+    "attempt_lease_terminal_state"
+  ],
+  "shared_application_boundary": {
+    "boundary_id": "nextjs_feishu_event_application_v1",
+    "source_path": "src/app/api/feishu/event/route.ts",
+    "feature_contract_path": "src/lib/feishu-application-boundary.ts",
+    "endpoint_env": "FEISHU_APPLICATION_EVENT_URL",
+    "compatibility_endpoint_env": "HERMES_CANONICAL_EVENT_URL",
+    "endpoint_contract": "https://<verified-host>/api/feishu/event"
+  },
   "build_required": false,
   "build_command": null,
   "restart_required": true,
@@ -23,16 +45,9 @@
     {
       "source_path": "infra/tencent-worker/feishu_gateway_canonical_router.js",
       "target_path": "/home/ubuntu/city-partner-agent/feishu_gateway_canonical_router.js",
-      "role": "canonical_transport_router"
-    },
-    {
-      "source_path": "infra/tencent-worker/feishu-canonical-context-core.js",
-      "target_path": "/home/ubuntu/city-partner-agent/feishu-canonical-context-core.js",
-      "role": "shared_canonical_context_builder"
+      "role": "shared_application_boundary_client"
     }
   ],
-  "canonical_application_endpoint_env": "HERMES_CANONICAL_EVENT_URL",
-  "canonical_application_endpoint_contract": "https://<verified-host>/api/feishu/event",
-  "canonical_feature_flag": "HERMES_CANONICAL_ORCHESTRATION_ENABLED",
-  "shadow_feature_flag": "HERMES_CANONICAL_SHADOW_ENABLED"
+  "feature_routing_owner": "src/lib/feishu-application-boundary.ts",
+  "canonical_context_owner": "infra/tencent-worker/feishu-canonical-context-core.js"
 }

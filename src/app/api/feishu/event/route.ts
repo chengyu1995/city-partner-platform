@@ -20,16 +20,17 @@ import {
   buildCanonicalWorkerContextPayload,
 } from "@/lib/feishu-canonical-context";
 import {
-  CANONICAL_GATEWAY_SIGNATURE_HEADER,
-  readVerifiedCanonicalGatewayContext,
+  FEISHU_APPLICATION_BOUNDARY_SIGNATURE_HEADER,
+  FEISHU_APPLICATION_BOUNDARY_SOURCE_HEADER,
+  verifyFeishuApplicationBoundaryRequest,
 } from "@/lib/feishu-canonical-gateway-envelope";
+import { resolveFeishuApplicationFeatureRoute } from "@/lib/feishu-application-boundary";
 import { createCanonicalHermesPlanningProvider, runAgent, AgentMessage } from "@/lib/hermes-agent";
 import {
   canonicalHermesAllowsDirectWorkerBypass,
   runApprovedRequestThroughCanonicalHermes,
   scheduleApprovedRequestThroughHermesShadow,
 } from "@/lib/project-director-hermes-delegation";
-import { isHermesCanonicalOrchestrationEnabled } from "@/lib/hermes/orchestration-adapter";
 import { attemptHermesCanonicalCutover } from "@/lib/hermes/cutover-control";
 import { buildLegacyShadowPlan } from "@/lib/hermes/shadow-runtime";
 import {
@@ -2068,18 +2069,20 @@ export async function POST(req: NextRequest) {
     try { body = JSON.parse(bodyText); }
     catch { return NextResponse.json({ code: 400, msg: "invalid json" }, { status: 400 }); }
 
-    const gatewayContextProvided = Boolean(body?._canonical_gateway_context);
-    const verifiedGatewayContext = readVerifiedCanonicalGatewayContext({
-      body,
-      signature: req.headers.get(CANONICAL_GATEWAY_SIGNATURE_HEADER),
+    const gatewaySource = req.headers.get(FEISHU_APPLICATION_BOUNDARY_SOURCE_HEADER);
+    const gatewaySignature = req.headers.get(FEISHU_APPLICATION_BOUNDARY_SIGNATURE_HEADER);
+    if ((gatewaySource || gatewaySignature) && !verifyFeishuApplicationBoundaryRequest({
+      rawBody: bodyText,
+      signature: gatewaySignature,
+      source: gatewaySource,
       secret: process.env.FEISHU_APP_SECRET || "",
-    });
-    if (gatewayContextProvided && !verifiedGatewayContext) {
+    })) {
       return NextResponse.json(
-        { code: 401, msg: "invalid canonical gateway context signature" },
+        { code: 401, msg: "invalid Feishu application boundary signature" },
         { status: 401 }
       );
     }
+    const feishuFeatureRoute = resolveFeishuApplicationFeatureRoute(process.env);
 
     if (body?.type === "url_verification" && typeof body.challenge === "string") {
       return NextResponse.json({ challenge: body.challenge });
@@ -2303,7 +2306,7 @@ export async function POST(req: NextRequest) {
         (isDirectWorkerTaskRequest(text) || isExplicitDirectWorkerCreateCommand(text)) &&
         !shouldUseSystemRepairWorkerFlow &&
         canonicalHermesAllowsDirectWorkerBypass({
-          featureEnabled: isHermesCanonicalOrchestrationEnabled(),
+          featureEnabled: feishuFeatureRoute.canonical_enabled,
           explicitMaintenanceOperation: isExplicitCanonicalMaintenanceDirectWorker(text),
         })
       ) {
@@ -2940,28 +2943,11 @@ export async function POST(req: NextRequest) {
       }
       const recentDraft = await findRecentTaskTreeDraft(supabase, convId);
       if (!recentDraft) {
-        if (isHermesCanonicalOrchestrationEnabled()) {
-          const savedContext = verifiedGatewayContext
-            ? null
-            : await findRecentCanonicalApprovalContext(supabase, convId, text);
-          const savedContextRecord = verifiedGatewayContext
-            ? {
-                ...verifiedGatewayContext.approval_context,
-                original_request_text: verifiedGatewayContext.original_request_text,
-                requested_mode: verifiedGatewayContext.requested_mode,
-                project_domain: verifiedGatewayContext.project_domain,
-                execution_intent: verifiedGatewayContext.execution_intent,
-                exact_allowed_scope: verifiedGatewayContext.scope,
-                acceptance_conditions: verifiedGatewayContext.acceptance,
-                plan_id: verifiedGatewayContext.plan_id,
-                subtask_id: verifiedGatewayContext.subtask_id,
-              }
-            : null;
+        if (feishuFeatureRoute.canonical_enabled) {
+          const savedContext = await findRecentCanonicalApprovalContext(supabase, convId, text);
           const canonicalContext = buildCanonicalApprovalContext({
             approval_text: text,
             saved_context_text: savedContext,
-            saved_context_record: savedContextRecord,
-            original_request_text: verifiedGatewayContext?.original_request_text,
             request_id: ev.message.message_id,
             approved_by: userId,
             approved_at: new Date().toISOString(),
@@ -3789,7 +3775,7 @@ export async function POST(req: NextRequest) {
 
     const history = await loadHistory(supabase, convId);
 
-    if (isHermesCanonicalOrchestrationEnabled()) {
+    if (feishuFeatureRoute.canonical_enabled) {
       const reply = "PROJECT_DIRECTOR_HERMES_APPROVAL_REQUIRED: canonical orchestration does not use the legacy Hermes tool queue.";
       await saveSystemRecordedReply(
         supabase,

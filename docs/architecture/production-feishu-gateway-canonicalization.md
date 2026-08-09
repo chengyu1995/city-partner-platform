@@ -1,21 +1,21 @@
 # Production Feishu Gateway Canonicalization
 
-The production Feishu entry is an HTTP callback, not a WebSocket long connection. Nginx forwards the exact `/feishu/event` route to the PM2 process `feishu-gateway` on `127.0.0.1:3002`.
+The production Feishu entry is an Nginx HTTP callback. Nginx forwards `/feishu/event` to the PM2 process `feishu-gateway` on `127.0.0.1:3002`; no WebSocket long connection is involved.
 
-## Source Of Truth
+## Authority Boundary
 
-The only production Gateway source is `infra/tencent-worker/feishu_gateway_canonical.js`. It preserves the audited production behavior when canonical orchestration is disabled.
+`infra/tencent-worker/feishu_gateway_canonical.js` is the only production PM2 source. It is a thin transport adapter: URL verification, bounded in-memory event dedupe, HTTP acknowledgement, logging, and signed dispatch to `/api/feishu/event`.
 
-When canonical orchestration is enabled for an approval event, the Gateway returns before every legacy approval and Worker creation gate. It reconstructs context with `infra/tencent-worker/feishu-canonical-context-core.js`, signs the context envelope, and dispatches to the shared Next.js canonical application endpoint `/api/feishu/event` through `infra/tencent-worker/feishu_gateway_canonical_router.js`.
+The PM2 entrypoint has no GM routing, feature routing, job creation, Supabase persistence, Worker execution, or terminal authority. `src/app/api/feishu/event/route.ts` is the single Feishu application boundary. `src/lib/feishu-application-boundary.ts` owns the Legacy, Shadow, and Canonical feature routing contract.
 
-The Gateway does not create canonical jobs, attempts, leases, terminals, or Worker executions. Those operations remain owned by the canonical application and Worker state machine.
+The canonical context rules remain implemented once in `infra/tencent-worker/feishu-canonical-context-core.js`; `src/lib/feishu-canonical-context.ts` is its typed adapter.
 
 ## Direct Artifact Mapping
 
-No build is required. Deployment copies the three manifest files byte-for-byte to their declared target paths, checks SHA256 before and after transfer, runs `node --check` on all JavaScript files, atomically replaces the targets, and restarts only `feishu-gateway`.
+No build is required. Deployment copies the two manifest files byte-for-byte, verifies SHA256, runs `node --check`, atomically replaces the targets, and restarts only `feishu-gateway`. `FEISHU_APPLICATION_EVENT_URL` must resolve to the shared `/api/feishu/event` boundary; `HERMES_CANONICAL_EVENT_URL` remains an endpoint-name compatibility fallback and does not control feature routing.
 
-The machine-readable mapping is `infra/tencent-worker/production-artifacts/feishu-gateway.json`. Run `npm run verify:feishu-gateway-artifact` from a clean checkout before packaging.
+Run `npm run verify:feishu-gateway-artifact` from a clean checkout before packaging. The verifier fails on direct database persistence, job creation, GM routing, Worker execution, or terminal-state markers in the real PM2 entrypoint.
 
 ## Rollback
 
-Back up every declared target before replacement. Rollback restores those exact files, re-runs `node --check`, and restarts only `feishu-gateway`. Canonical and shadow flags remain off during artifact activation.
+Back up every manifest target before replacement. Rollback restores those files, re-runs `node --check`, and restarts only `feishu-gateway`. No schema or historical execution data is removed.

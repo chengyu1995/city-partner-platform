@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "reference": {
     "production_path": "/home/ubuntu/city-partner-agent/feishu_gateway_canonical.js",
     "sha256": "9656fade1c0feb769aa9d3af5a70ccb9c1ada52c3e31db6b49f9abeb73f35f35",
@@ -9,33 +9,39 @@
     "nginx_route": "/feishu/event -> http://127.0.0.1:3002/feishu/event"
   },
   "origin_classification": "historical_manual_production_file",
-  "git_history_found": false,
-  "build_pipeline_found": false,
-  "authoritative_routing": {
-    "flag_off": "legacy_runtime",
-    "flag_on_approval": "shared_nextjs_canonical_handler",
-    "flag_on_non_approval": "legacy_compatibility_routes",
-    "parallel_authoritative_writes": false
+  "target_architecture": {
+    "pm2_entrypoint_role": "thin_transport_adapter",
+    "business_source_of_truth": "src/app/api/feishu/event/route.ts",
+    "feature_routing_contract": "src/lib/feishu-application-boundary.ts",
+    "parallel_business_implementations": 0,
+    "parallel_authoritative_job_creators": 0,
+    "gateway_authoritative_database_write": false
   },
   "behaviors": [
-    { "name": "express_http_listener", "classification": "PRESERVE", "evidence": "app.listen on 127.0.0.1 and configured port" },
-    { "name": "nginx_http_callback_transport", "classification": "PRESERVE", "evidence": "production nginx exact /feishu/event proxy" },
-    { "name": "url_verification_ack", "classification": "PRESERVE", "evidence": "url_verification challenge response" },
-    { "name": "event_deduplication", "classification": "PRESERVE", "evidence": "message/event dedupe before routing" },
-    { "name": "feishu_reply_transport", "classification": "PRESERVE", "evidence": "reply API with tenant token" },
-    { "name": "health_endpoint", "classification": "PRESERVE", "evidence": "GET /health" },
-    { "name": "gateway_control_commands", "classification": "PRESERVE", "evidence": "pause resume and status routes remain under legacy compatibility" },
-    { "name": "approval_context_file_store", "classification": "PRESERVE", "evidence": "flag-off legacy context persistence remains unchanged" },
-    { "name": "planning_choice_routes", "classification": "PRESERVE", "evidence": "non-canonical planning choices remain legacy compatible" },
-    { "name": "direct_worker_legacy_route", "classification": "PRESERVE", "evidence": "available only when canonical approval router does not handle the event" },
-    { "name": "worker_api_status_integration", "classification": "PRESERVE", "evidence": "gateway status fields continue to query worker API" },
-    { "name": "supabase_legacy_job_inserts", "classification": "PRESERVE", "evidence": "retained for flag-off and non-approval compatibility only" },
-    { "name": "failure_memory", "classification": "PRESERVE", "evidence": "runtime failure memory files remain unchanged" },
-    { "name": "bitable_result_visibility", "classification": "PRESERVE", "evidence": "downstream worker-api and Feishu reply integrations remain unchanged" },
-    { "name": "canonical_approval_context", "classification": "REPLACE", "evidence": "shared feishu-canonical-context-core implementation" },
-    { "name": "canonical_approval_routing", "classification": "REPLACE", "evidence": "signed dispatch to /api/feishu/event before legacy approval gates" },
-    { "name": "legacy_readonly_gate_for_canonical_approval", "classification": "DEPRECATE", "evidence": "canonical approval returns before legacy gate when flag is on" },
-    { "name": "gateway_direct_canonical_persistence", "classification": "DEPRECATE", "evidence": "canonical router has no DB or Worker mutation API" }
+    { "name": "express_http_listener", "classification": "PRESERVE", "owner": "pm2_transport_adapter" },
+    { "name": "nginx_http_callback_transport", "classification": "PRESERVE", "owner": "pm2_transport_adapter" },
+    { "name": "url_verification_ack", "classification": "PRESERVE", "owner": "pm2_transport_adapter" },
+    { "name": "transport_event_deduplication", "classification": "PRESERVE", "owner": "pm2_transport_adapter" },
+    { "name": "http_status_and_ack_transport", "classification": "PRESERVE", "owner": "pm2_transport_adapter" },
+    { "name": "health_endpoint", "classification": "PRESERVE", "owner": "pm2_transport_adapter" },
+    { "name": "event_authentication_and_decryption", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "nextjs_feishu_event_application_v1" },
+    { "name": "durable_event_receipt_deduplication", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "nextjs_feishu_event_application_v1" },
+    { "name": "feishu_reply_transport", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "nextjs_feishu_event_application_v1" },
+    { "name": "gateway_control_commands", "classification": "REPLACE", "owner": "project_director_console_application" },
+    { "name": "approval_context_persistence", "classification": "REPLACE", "owner": "shared_feishu_application_persistence" },
+    { "name": "gm_requirement_classification", "classification": "REPLACE", "owner": "shared_feishu_application_boundary" },
+    { "name": "gm_approval_routing", "classification": "REPLACE", "owner": "shared_feishu_application_boundary" },
+    { "name": "legacy_feature_routing", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "feishu_application_feature_contract" },
+    { "name": "canonical_feature_routing", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "feishu_application_feature_contract" },
+    { "name": "shadow_feature_routing", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "feishu_application_feature_contract" },
+    { "name": "legacy_job_creation", "classification": "REPLACE", "owner": "shared_feishu_application_job_boundary" },
+    { "name": "canonical_job_creation", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "src/lib/worker-jobs.ts#canonicalCreateJob" },
+    { "name": "worker_dispatch", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "shared_feishu_application_job_boundary" },
+    { "name": "worker_status_visibility", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "canonical_worker_projection" },
+    { "name": "bitable_result_visibility", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "worker_api_and_feishu_reporting" },
+    { "name": "failure_reporting", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "shared_feishu_application_boundary" },
+    { "name": "attempt_lease_terminal_truth", "classification": "DEPRECATE", "owner": "canonical_worker_state_machine" }
   ],
+  "gateway_authoritative_code_hits": [],
   "unknown_runtime_behaviors": []
 }

@@ -89,7 +89,7 @@ test("canonical worker context carries planning context without invented executi
 test("Feishu gateway routes missing legacy draft approvals through canonical context when enabled", () => {
   assert.match(routeSource, /findRecentCanonicalApprovalContext\(supabase,\s*convId,\s*text\)/);
   assert.match(routeSource, /buildCanonicalApprovalContext\(\{/);
-  assert.match(routeSource, /isHermesCanonicalOrchestrationEnabled\(\)/);
+  assert.match(routeSource, /feishuFeatureRoute\.canonical_enabled/);
   assert.match(routeSource, /runApprovedRequestThroughCanonicalHermes\(/);
   assert.match(routeSource, /buildCanonicalWorkerContextPayload\(\{/);
   assert.match(routeSource, /canonical_context_builder_used:\s*true/);
@@ -110,7 +110,7 @@ test("legacy task tree missing path is preserved when canonical flag is off", ()
     routeSource.indexOf("if (!recentDraft)"),
     routeSource.indexOf("const canonicalCutover = await attemptHermesCanonicalCutover", routeSource.indexOf("if (!recentDraft)") + 1)
   );
-  assert.match(missingDraftBlock, /isHermesCanonicalOrchestrationEnabled\(\)/);
+  assert.match(missingDraftBlock, /feishuFeatureRoute\.canonical_enabled/);
   assert.match(routeSource, /state:\s*"waiting_task_tree_missing"/);
 });
 
