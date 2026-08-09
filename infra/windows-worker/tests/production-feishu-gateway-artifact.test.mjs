@@ -13,11 +13,13 @@ const gatewayPath = join(root, "infra/tencent-worker/feishu_gateway_canonical.js
 const routerPath = join(root, "infra/tencent-worker/feishu_gateway_canonical_router.js");
 const contextPath = join(root, "infra/tencent-worker/feishu-canonical-context-core.js");
 const routePath = join(root, "src/app/api/feishu/event/route.ts");
+const acceptancePath = join(root, "src/lib/feishu-callback-application.ts");
 const featurePath = join(root, "src/lib/feishu-application-boundary.ts");
 const gatewaySource = readFileSync(gatewayPath, "utf8");
 const routerSource = readFileSync(routerPath, "utf8");
 const contextSource = readFileSync(contextPath, "utf8");
 const routeSource = readFileSync(routePath, "utf8");
+const acceptanceSource = readFileSync(acceptancePath, "utf8");
 const featureSource = readFileSync(featurePath, "utf8");
 const gatewayModule = require(gatewayPath);
 const routerModule = require(routerPath);
@@ -49,7 +51,7 @@ test("restart and rollback mapping remain scoped to feishu-gateway", () => {
 
 test("Gateway delegates every business event to the shared application boundary", () => {
   assert.match(gatewaySource, /createFeishuApplicationBoundaryClient/);
-  assert.match(gatewaySource, /client\.dispatch\(\{ body, rawBody \}\)/);
+  assert.match(gatewaySource, /client\.dispatch\(\{[\s\S]*rawBody,[\s\S]*headers: req\.headers/);
 });
 
 test("Gateway contains no direct hermes_jobs persistence", () => {
@@ -97,10 +99,10 @@ test("application client signs and forwards the original body", async () => {
     captured = { url, options };
     return new Response('{"code":0}', { status: 200 });
   } });
-  const rawBody = '{"type":"event_callback"}';
-  const result = await client.dispatch({ rawBody, body: JSON.parse(rawBody) });
+  const rawBody = Buffer.from('{"type":"event_callback"}');
+  const result = await client.dispatch({ rawBody, headers: {} });
   assert.equal(captured.url, env.FEISHU_APPLICATION_EVENT_URL);
-  assert.equal(captured.options.body, rawBody);
+  assert.deepEqual(captured.options.body, rawBody);
   assert.equal(result.body.code, 0);
 });
 
@@ -116,8 +118,8 @@ test("application endpoint cannot point at the PM2 callback route", () => {
 });
 
 test("Next.js route verifies the PM2 transport envelope", () => {
-  assert.match(routeSource, /verifyFeishuApplicationBoundaryRequest\(\{/);
-  assert.match(routeSource, /FEISHU_APPLICATION_BOUNDARY_SOURCE_HEADER/);
+  assert.match(routeSource, /prepareFeishuCallbackAcceptance\(\{/);
+  assert.match(acceptanceSource, /verifyFeishuApplicationBoundaryRequest\(\{/);
 });
 
 test("Next.js route owns the shared feature decision", () => {
@@ -157,7 +159,7 @@ test("shared application boundary covers every reconciled production business ca
     "createHermesJob",
     "markReceiptFailed",
   ];
-  for (const marker of requiredMarkers) assert.match(routeSource, new RegExp(marker));
+  for (const marker of requiredMarkers) assert.match(routeSource + acceptanceSource, new RegExp(marker));
 });
 
 test("artifact verifier scans the real PM2 entrypoint authority", () => {

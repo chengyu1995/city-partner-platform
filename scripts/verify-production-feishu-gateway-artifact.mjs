@@ -18,6 +18,16 @@ if (manifest.source_of_truth !== "infra/tencent-worker/feishu_gateway_canonical.
 if (manifest.pm2_process !== "feishu-gateway") fail("PM2 process mismatch");
 if (manifest.files.length !== 2) fail("unexpected artifact file count");
 if (reconciliation.unknown_runtime_behaviors.length !== 0) fail("unknown runtime behavior remains");
+if (manifest.transport !== "NGINX_HTTP_CALLBACK") fail("transport contract mismatch");
+if (manifest.feishu_callback_external_deadline_ms !== 3000) fail("external callback deadline mismatch");
+if (manifest.application_accept_timeout_ms > 1500) fail("application acceptance timeout exceeds safety budget");
+if (manifest.gateway_internal_response_budget_ms > 2000) fail("Gateway response budget exceeds safety budget");
+if (manifest.raw_body_preservation !== true) fail("raw body preservation is required");
+if (manifest.challenge_handled_locally !== true) fail("challenge must be handled locally");
+const requiredForwardHeaders = ["x-lark-request-timestamp", "x-lark-request-nonce", "x-lark-signature", "content-type"];
+for (const header of requiredForwardHeaders) {
+  if (!manifest.required_forward_headers.includes(header)) fail(`required forward header missing: ${header}`);
+}
 
 for (const file of manifest.files) {
   const source = resolve(root, file.source_path);
@@ -44,16 +54,25 @@ const productionGatewayArtifact = `${gateway}\n${router}`;
 const authorityHits = forbiddenAuthorityPatterns.filter(([, pattern]) => pattern.test(productionGatewayArtifact)).map(([name]) => name);
 if (authorityHits.length > 0) fail(`PM2 Gateway artifact authority detected: ${authorityHits.join(",")}`);
 if (!gateway.includes("createFeishuApplicationBoundaryClient")) fail("shared application boundary delegation missing");
+if (!gateway.includes("runWithinResponseBudget")) fail("Gateway internal response budget enforcement missing");
 if (!gateway.includes('app.post("/feishu/event"')) fail("HTTP callback route missing");
 if (!gateway.includes("url_verification")) fail("URL verification challenge missing");
 if (!gateway.includes("createTransportDedupe")) fail("transport dedupe missing");
 if (!router.includes("/api/feishu/event")) fail("shared application endpoint contract missing");
+if (!router.includes("APPLICATION_ACCEPT_TIMEOUT_MS = 1_500")) fail("safe Application acceptance timeout missing");
+if (!router.includes("REQUIRED_FEISHU_FORWARD_HEADERS")) fail("signature forwarding whitelist missing");
+if (!router.includes("body: bodyBytes(input.rawBody)")) fail("raw body forwarding contract missing");
+if (/JSON\.stringify\([^)]*(?:rawBody|input\.body)/.test(router)) fail("Gateway router reserializes callback body");
+if (!applicationRoute.includes("new Uint8Array(await req.arrayBuffer())")) fail("Application route does not read the raw callback body");
+if (!applicationRoute.includes("after(async () =>")) fail("platform-supported background execution missing");
+if (!applicationRoute.includes("transport_acceptance: true")) fail("transport acceptance contract missing");
 if (!applicationRoute.includes("resolveFeishuApplicationFeatureRoute")) fail("Next.js route does not use shared feature contract");
 if (!featureContract.includes("resolveHermesCanonicalCutoverConfig")) fail("feature contract is not canonical cutover backed");
 
 process.stdout.write(JSON.stringify({
   artifact_manifest_verified: true,
   artifact_authority_boundary_verified: true,
+  artifact_callback_contract_verified: true,
   entrypoint_direct_authority_scan_passed: true,
   gateway_authoritative_code_hits: authorityHits,
   artifact_type: manifest.artifact_type,

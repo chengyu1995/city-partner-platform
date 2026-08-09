@@ -14,16 +14,11 @@
  */
 import { after, NextResponse, NextRequest } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { decryptFeishuEvent } from "@/lib/feishu-crypto";
+import { prepareFeishuCallbackAcceptance } from "@/lib/feishu-callback-application";
 import {
   buildCanonicalApprovalContext,
   buildCanonicalWorkerContextPayload,
 } from "@/lib/feishu-canonical-context";
-import {
-  FEISHU_APPLICATION_BOUNDARY_SIGNATURE_HEADER,
-  FEISHU_APPLICATION_BOUNDARY_SOURCE_HEADER,
-  verifyFeishuApplicationBoundaryRequest,
-} from "@/lib/feishu-canonical-gateway-envelope";
 import { resolveFeishuApplicationFeatureRoute } from "@/lib/feishu-application-boundary";
 import { createCanonicalHermesPlanningProvider, runAgent, AgentMessage } from "@/lib/hermes-agent";
 import {
@@ -2061,56 +2056,9 @@ async function insertApprovedAgentDispatchJobsWithContract(
   );
 }
 
-export async function POST(req: NextRequest) {
+async function processAcceptedFeishuEvent(payload: any) {
   try {
-    // 1. 飞书 URL 验证 (challenge) - 明文 challenge 必须最快返回。
-    const bodyText = await req.text();
-    let body: any;
-    try { body = JSON.parse(bodyText); }
-    catch { return NextResponse.json({ code: 400, msg: "invalid json" }, { status: 400 }); }
-
-    const gatewaySource = req.headers.get(FEISHU_APPLICATION_BOUNDARY_SOURCE_HEADER);
-    const gatewaySignature = req.headers.get(FEISHU_APPLICATION_BOUNDARY_SIGNATURE_HEADER);
-    if ((gatewaySource || gatewaySignature) && !verifyFeishuApplicationBoundaryRequest({
-      rawBody: bodyText,
-      signature: gatewaySignature,
-      source: gatewaySource,
-      secret: process.env.FEISHU_APP_SECRET || "",
-    })) {
-      return NextResponse.json(
-        { code: 401, msg: "invalid Feishu application boundary signature" },
-        { status: 401 }
-      );
-    }
     const feishuFeatureRoute = resolveFeishuApplicationFeatureRoute(process.env);
-
-    if (body?.type === "url_verification" && typeof body.challenge === "string") {
-      return NextResponse.json({ challenge: body.challenge });
-    }
-
-    // URL 验证 (encrypt key + verification token)
-    const FEISHU_ENCRYPT_KEY = process.env.FEISHU_ENCRYPT_KEY || "";
-    const FEISHU_VERIFICATION_TOKEN = process.env.FEISHU_VERIFICATION_TOKEN || "";
-
-    // 飞书 v2.0 事件加密方式: 整个 payload 是 { encrypt: "..." }, URL 验证也走加密
-    let payload: any;
-    if (body.encrypt && FEISHU_ENCRYPT_KEY) {
-      const decrypted = decryptFeishuEvent(body.encrypt, FEISHU_ENCRYPT_KEY);
-      try { payload = JSON.parse(decrypted); }
-      catch { return NextResponse.json({ code: 400, msg: "decrypt fail" }, { status: 400 }); }
-    } else {
-      payload = body;
-    }
-
-    // 验证 token (如果飞书后台配了)
-    if (FEISHU_VERIFICATION_TOKEN && payload.token && payload.token !== FEISHU_VERIFICATION_TOKEN) {
-      return NextResponse.json({ code: 401, msg: "invalid token" }, { status: 401 });
-    }
-
-    // 2. URL 验证请求
-    if (payload.type === "url_verification" || payload.challenge) {
-      return NextResponse.json({ challenge: payload.challenge });
-    }
 
     // 兼容飞书新版/旧版事件类型
     const eventType =
@@ -3850,14 +3798,61 @@ export async function POST(req: NextRequest) {
           );
         }
       }
-      return NextResponse.json({ code: 0, processing_error: true });
+      throw e;
     }
 
     return NextResponse.json({ code: 0 });
   } catch (e) {
     console.error("[feishu-event]", sanitizeLogText(errorToText(e)));
-    return NextResponse.json({ code: 0, callback_error: true });
+    throw e;
   }
+}
+
+export async function POST(req: NextRequest) {
+  const rawBody = new Uint8Array(await req.arrayBuffer());
+  const acceptance = prepareFeishuCallbackAcceptance({
+    rawBody,
+    headers: req.headers,
+    env: process.env,
+  });
+  if (!acceptance.ok) {
+    return NextResponse.json(
+      { code: acceptance.status, msg: "Feishu callback rejected", failure_code: acceptance.failure_code },
+      { status: acceptance.status }
+    );
+  }
+
+  const accepted = acceptance.accepted;
+  after(async () => {
+    console.log("[feishu-event] background_started", {
+      event_id: accepted.event_id,
+      transport_request_id: accepted.transport_request_id,
+      background_started: true,
+    });
+    try {
+      await processAcceptedFeishuEvent(accepted.payload);
+      console.log("[feishu-event] background_completed", {
+        event_id: accepted.event_id,
+        transport_request_id: accepted.transport_request_id,
+        background_completed: true,
+      });
+    } catch (error) {
+      console.error("[feishu-event] background_failed", {
+        event_id: accepted.event_id,
+        transport_request_id: accepted.transport_request_id,
+        background_failed: true,
+        failure_code: "FEISHU_BACKGROUND_EXECUTION_FAILED",
+        error: sanitizeLogText(errorToText(error)),
+      });
+    }
+  });
+
+  return NextResponse.json({
+    code: 0,
+    accepted: true,
+    transport_acceptance: true,
+    event_id: accepted.event_id,
+  });
 }
 
 export async function GET() {

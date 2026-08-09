@@ -1,9 +1,11 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 "use strict";
 
+const crypto = require("crypto");
 const express = require("express");
 const dotenv = require("dotenv");
 const {
+  GATEWAY_INTERNAL_RESPONSE_BUDGET_MS,
   createFeishuApplicationBoundaryClient,
   resolveApplicationEndpoint,
 } = require("./feishu_gateway_canonical_router.js");
@@ -28,6 +30,36 @@ function eventDedupeKey(body) {
   if (eventId) return `event:${eventId}`;
   const messageId = stringValue(message.message_id);
   return messageId ? `message:${messageId}` : "";
+}
+
+function parseRawJson(rawBody) {
+  return JSON.parse(rawBody.toString("utf8"));
+}
+
+async function runWithinResponseBudget(operation, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Math.min(options.timeoutMs, GATEWAY_INTERNAL_RESPONSE_BUDGET_MS)
+    : GATEWAY_INTERNAL_RESPONSE_BUDGET_MS;
+  const setTimeoutImpl = options.setTimeoutImpl || setTimeout;
+  const clearTimeoutImpl = options.clearTimeoutImpl || clearTimeout;
+  let timer;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise((_resolve, reject) => {
+        timer = setTimeoutImpl(() => reject(Object.assign(
+          new Error("FEISHU_GATEWAY_RESPONSE_BUDGET_EXCEEDED"),
+          {
+            code: "FEISHU_GATEWAY_RESPONSE_BUDGET_EXCEEDED",
+            status: 504,
+            forwardTimeout: true,
+          }
+        )), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeoutImpl(timer);
+  }
 }
 
 function createTransportDedupe(options = {}) {
@@ -77,13 +109,12 @@ function createGatewayApp(options = {}) {
   const logger = options.logger || console;
   const client = options.client || createFeishuApplicationBoundaryClient({ env: runtimeEnv });
   const dedupe = options.dedupe || createTransportDedupe();
+  const responseBudget = options.responseBudget || {};
   const app = express();
 
-  app.use(express.json({
+  app.use(express.raw({
+    type: () => true,
     limit: "2mb",
-    verify(req, _res, buffer) {
-      req.rawBody = buffer.toString("utf8");
-    },
   }));
 
   app.get("/health", (_req, res) => {
@@ -96,21 +127,50 @@ function createGatewayApp(options = {}) {
   });
 
   app.post("/feishu/event", async (req, res) => {
-    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const receivedAt = Date.now();
+    const transportRequestId = crypto.randomUUID();
+    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || "");
+    let body;
+    try {
+      body = parseRawJson(rawBody);
+    } catch {
+      return res.status(400).json({ code: 400, msg: "invalid callback payload" });
+    }
     if (body.type === "url_verification" && typeof body.challenge === "string") {
       return res.json({ challenge: body.challenge });
     }
 
-    const rawBody = stringValue(req.rawBody) || JSON.stringify(body);
     const dedupeKey = eventDedupeKey(body);
     try {
-      const dispatch = await dedupe.run(dedupeKey, () => client.dispatch({ body, rawBody }));
+      const elapsedMs = Date.now() - receivedAt;
+      const remainingBudgetMs = Math.max(1, GATEWAY_INTERNAL_RESPONSE_BUDGET_MS - elapsedMs);
+      const dispatch = await runWithinResponseBudget(
+        () => dedupe.run(dedupeKey, () => client.dispatch({
+          rawBody,
+          headers: req.headers,
+          transportRequestId,
+        })),
+        { ...responseBudget, timeoutMs: remainingBudgetMs }
+      );
       if (dispatch.duplicate) res.setHeader("x-city-partner-transport-deduplicated", "true");
+      logger.log?.("[feishu-gateway] application acceptance", {
+        event_id: dedupeKey || "unavailable",
+        transport_request_id: transportRequestId,
+        application_accept_latency_ms: Date.now() - receivedAt,
+        forward_timeout: false,
+      });
       return res.status(dispatch.result.status).json(dispatch.result.body);
     } catch (error) {
-      logger.error("[feishu-gateway] application boundary dispatch failed", error?.code || error?.message || String(error));
-      return res.status(502).json({
-        code: 502,
+      const failureStatus = Number.isInteger(error?.status) ? error.status : 502;
+      logger.error("[feishu-gateway] application boundary dispatch failed", {
+        event_id: dedupeKey || "unavailable",
+        transport_request_id: transportRequestId,
+        application_accept_latency_ms: Date.now() - receivedAt,
+        failure_code: error?.code || "FEISHU_APPLICATION_BOUNDARY_UNAVAILABLE",
+        forward_timeout: error?.forwardTimeout === true,
+      });
+      return res.status(failureStatus).json({
+        code: failureStatus,
         msg: "feishu application boundary unavailable",
         failure_code: error?.code || "FEISHU_APPLICATION_BOUNDARY_UNAVAILABLE",
       });
@@ -141,5 +201,7 @@ module.exports = {
   createGatewayApp,
   createTransportDedupe,
   eventDedupeKey,
+  parseRawJson,
+  runWithinResponseBudget,
   startGateway,
 };

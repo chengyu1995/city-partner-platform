@@ -1,10 +1,22 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "artifact_name": "feishu_gateway_canonical",
   "artifact_type": "direct",
   "source_of_truth": "infra/tencent-worker/feishu_gateway_canonical.js",
   "runtime_owner": "tencent_pm2_feishu_gateway",
-  "transport": "http_callback",
+  "transport": "NGINX_HTTP_CALLBACK",
+  "feishu_callback_external_deadline_ms": 3000,
+  "gateway_internal_response_budget_ms": 2000,
+  "application_accept_timeout_ms": 1500,
+  "application_event_url_env": "FEISHU_APPLICATION_EVENT_URL",
+  "required_forward_headers": [
+    "x-lark-request-timestamp",
+    "x-lark-request-nonce",
+    "x-lark-signature",
+    "content-type"
+  ],
+  "raw_body_preservation": true,
+  "challenge_handled_locally": true,
   "pm2_process": "feishu-gateway",
   "runtime_user": "ubuntu",
   "runtime_cwd": "/home/ubuntu/city-partner-agent",
@@ -28,7 +40,9 @@
     "feature_contract_path": "src/lib/feishu-application-boundary.ts",
     "endpoint_env": "FEISHU_APPLICATION_EVENT_URL",
     "compatibility_endpoint_env": "HERMES_CANONICAL_EVENT_URL",
-    "endpoint_contract": "https://<verified-host>/api/feishu/event"
+    "endpoint_contract": "https://<verified-host>/api/feishu/event",
+    "transport_acceptance_is_not_task_success": true,
+    "background_execution_primitive": "next/server.after"
   },
   "build_required": false,
   "build_command": null,

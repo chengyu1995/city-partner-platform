@@ -10,6 +10,14 @@ The PM2 entrypoint has no GM routing, feature routing, job creation, Supabase pe
 
 The canonical context rules remain implemented once in `infra/tencent-worker/feishu-canonical-context-core.js`; `src/lib/feishu-canonical-context.ts` is its typed adapter.
 
+## Callback Acceptance Contract
+
+Feishu's external callback deadline is 3000ms. The Gateway reserves transport margin by limiting the Application acceptance request to 1500ms and its own response budget to 2000ms. A timeout, network failure, authentication rejection, or Application 5xx is returned as a non-2xx response so Feishu can retry; it is never converted into a successful acknowledgement.
+
+The Gateway reads the callback body once as bytes and forwards those exact bytes with the original `X-Lark-Request-Timestamp`, `X-Lark-Request-Nonce`, `X-Lark-Signature`, and `Content-Type` values. It does not forward cookies, authorization headers, or runtime credentials. The Application verifies both the Gateway envelope and the Feishu signature against the raw body before parsing or performing any business action.
+
+`src/app/api/feishu/event/route.ts` returns only a transport acceptance after authentication and envelope validation. Long-running work is registered with the Next.js `after()` lifecycle primitive and continues through the existing shared Application Boundary. A transport 2xx does not represent Hermes, Worker, terminal, or task success.
+
 ## Direct Artifact Mapping
 
 No build is required. Deployment copies the two manifest files byte-for-byte, verifies SHA256, runs `node --check`, atomically replaces the targets, and restarts only `feishu-gateway`. `FEISHU_APPLICATION_EVENT_URL` must resolve to the shared `/api/feishu/event` boundary; `HERMES_CANONICAL_EVENT_URL` remains an endpoint-name compatibility fallback and does not control feature routing.
