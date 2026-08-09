@@ -22,6 +22,8 @@ const REQUIRED_FEISHU_FORWARD_HEADERS = Object.freeze([
 const FEISHU_CALLBACK_EXTERNAL_DEADLINE_MS = 3_000;
 const APPLICATION_ACCEPT_TIMEOUT_MS = 1_500;
 const GATEWAY_INTERNAL_RESPONSE_BUDGET_MS = 2_000;
+const APPLICATION_ACCEPTANCE_SUCCESS_STATUS = 200;
+const APPLICATION_ACCEPTANCE_CONTENT_TYPE = "application/json";
 
 function resolveApplicationEndpoint(env = process.env) {
   const value = env[APPLICATION_ENDPOINT_ENV] || env[LEGACY_ENDPOINT_ENV];
@@ -99,6 +101,75 @@ function verifyFeishuCallbackSignature(rawBody, headers, encryptKey) {
   return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
+function buildFeishuApplicationAcceptanceResponse(eventId) {
+  const normalizedEventId = String(eventId || "").trim();
+  if (!normalizedEventId) {
+    throw Object.assign(new Error("FEISHU_APPLICATION_ACCEPTANCE_EVENT_ID_MISSING"), {
+      code: "FEISHU_APPLICATION_ACCEPTANCE_EVENT_ID_MISSING",
+    });
+  }
+  return {
+    code: 0,
+    accepted: true,
+    transport_acceptance: true,
+    event_id: normalizedEventId,
+  };
+}
+
+function createApplicationResponseError(code, status, metadata = {}) {
+  return Object.assign(new Error(code), { code, status, ...metadata });
+}
+
+function isJsonContentType(value) {
+  return String(value || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase() === APPLICATION_ACCEPTANCE_CONTENT_TYPE;
+}
+
+function parseFeishuApplicationAcceptanceResponse(input) {
+  const status = Number(input.status);
+  const contentType = readHeader(input.headers, CONTENT_TYPE_HEADER);
+  const responseText = String(input.responseText ?? "");
+  const safeMetadata = {
+    applicationStatus: status,
+    responseContentType: contentType || "missing",
+    responseLength: Buffer.byteLength(responseText, "utf8"),
+  };
+
+  if (status < 200 || status >= 300) {
+    throw createApplicationResponseError("FEISHU_APPLICATION_HTTP_REJECTED", status, safeMetadata);
+  }
+  if (!isJsonContentType(contentType)) {
+    throw createApplicationResponseError("FEISHU_APPLICATION_INVALID_CONTENT_TYPE", 502, safeMetadata);
+  }
+
+  let responseBody;
+  try {
+    responseBody = JSON.parse(responseText);
+  } catch {
+    throw createApplicationResponseError("FEISHU_APPLICATION_INVALID_JSON", 502, safeMetadata);
+  }
+
+  if (responseBody && typeof responseBody === "object" && responseBody.accepted === false) {
+    throw createApplicationResponseError("FEISHU_APPLICATION_EXPLICIT_REJECTION", 502, safeMetadata);
+  }
+  if (
+    !responseBody ||
+    typeof responseBody !== "object" ||
+    Array.isArray(responseBody) ||
+    responseBody.code !== 0 ||
+    responseBody.accepted !== true ||
+    responseBody.transport_acceptance !== true ||
+    typeof responseBody.event_id !== "string" ||
+    !responseBody.event_id.trim()
+  ) {
+    throw createApplicationResponseError("FEISHU_APPLICATION_INVALID_ACCEPTANCE_SCHEMA", 502, safeMetadata);
+  }
+
+  return buildFeishuApplicationAcceptanceResponse(responseBody.event_id);
+}
+
 function createFeishuApplicationBoundaryClient(options = {}) {
   const runtimeEnv = options.env || process.env;
   const fetchImpl = options.fetchImpl || globalThis.fetch;
@@ -135,26 +206,24 @@ function createFeishuApplicationBoundaryClient(options = {}) {
           signal: controller.signal,
         });
         const responseText = await response.text();
-        let responseBody;
-        try { responseBody = JSON.parse(responseText); }
-        catch { responseBody = { code: response.status, msg: "feishu application boundary returned non-json" }; }
-        if (!response.ok) {
-          throw Object.assign(new Error("FEISHU_APPLICATION_ACCEPTANCE_REJECTED"), {
-            code: "FEISHU_APPLICATION_ACCEPTANCE_REJECTED",
-            status: response.status,
-            responseBody,
-          });
-        }
-        return { status: response.status, body: responseBody };
+        const responseBody = parseFeishuApplicationAcceptanceResponse({
+          status: response.status,
+          headers: response.headers,
+          responseText,
+        });
+        return { status: APPLICATION_ACCEPTANCE_SUCCESS_STATUS, body: responseBody };
       } catch (error) {
         if (error?.name === "AbortError") {
-          throw Object.assign(new Error("FEISHU_APPLICATION_BOUNDARY_TIMEOUT"), {
-            code: "FEISHU_APPLICATION_BOUNDARY_TIMEOUT",
+          throw Object.assign(new Error("FEISHU_APPLICATION_TIMEOUT"), {
+            code: "FEISHU_APPLICATION_TIMEOUT",
             status: 504,
             forwardTimeout: true,
           });
         }
-        throw error;
+        if (String(error?.code || "").startsWith("FEISHU_APPLICATION_")) throw error;
+        throw createApplicationResponseError("FEISHU_APPLICATION_NETWORK_FAILURE", 502, {
+          causeCode: String(error?.code || error?.name || "UNKNOWN"),
+        });
       } finally {
         clearTimeoutImpl(timer);
       }
@@ -177,8 +246,12 @@ module.exports = {
   FEISHU_CALLBACK_EXTERNAL_DEADLINE_MS,
   APPLICATION_ACCEPT_TIMEOUT_MS,
   GATEWAY_INTERNAL_RESPONSE_BUDGET_MS,
+  APPLICATION_ACCEPTANCE_SUCCESS_STATUS,
+  APPLICATION_ACCEPTANCE_CONTENT_TYPE,
+  buildFeishuApplicationAcceptanceResponse,
   calculateFeishuCallbackSignature,
   createFeishuApplicationBoundaryClient,
+  parseFeishuApplicationAcceptanceResponse,
   readHeader,
   resolveApplicationEndpoint,
   selectFeishuForwardHeaders,

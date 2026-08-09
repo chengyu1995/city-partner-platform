@@ -97,13 +97,17 @@ test("application client signs and forwards the original body", async () => {
   const env = { FEISHU_APPLICATION_EVENT_URL: "https://example.test/api/feishu/event", FEISHU_APP_SECRET: "secret" };
   const client = routerModule.createFeishuApplicationBoundaryClient({ env, fetchImpl: async (url, options) => {
     captured = { url, options };
-    return new Response('{"code":0}', { status: 200 });
+    return new Response(JSON.stringify(routerModule.buildFeishuApplicationAcceptanceResponse("event-artifact")), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   } });
   const rawBody = Buffer.from('{"type":"event_callback"}');
   const result = await client.dispatch({ rawBody, headers: {} });
   assert.equal(captured.url, env.FEISHU_APPLICATION_EVENT_URL);
   assert.deepEqual(captured.options.body, rawBody);
   assert.equal(result.body.code, 0);
+  assert.equal(result.body.accepted, true);
 });
 
 test("application boundary signature rejects tampering", () => {

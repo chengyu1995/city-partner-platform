@@ -1,5 +1,5 @@
 {
-  "schema_version": "2.1",
+  "schema_version": "2.2",
   "reference": {
     "production_path": "/home/ubuntu/city-partner-agent/feishu_gateway_canonical.js",
     "sha256": "9656fade1c0feb769aa9d3af5a70ccb9c1ada52c3e31db6b49f9abeb73f35f35",
@@ -30,6 +30,7 @@
     { "name": "callback_signature_validation", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "feishu_callback_acceptance_contract" },
     { "name": "three_second_callback_ack", "classification": "PRESERVE", "owner": "pm2_transport_adapter_and_application_acceptance" },
     { "name": "post_response_business_execution", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "next_server_after" },
+    { "name": "application_acceptance_response_validation", "classification": "PRESERVE", "owner": "feishu_application_acceptance_v1_fail_closed_parser" },
     { "name": "durable_event_receipt_deduplication", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "nextjs_feishu_event_application_v1" },
     { "name": "feishu_reply_transport", "classification": "DELEGATE_TO_SHARED_APPLICATION_BOUNDARY", "owner": "nextjs_feishu_event_application_v1" },
     { "name": "gateway_control_commands", "classification": "REPLACE", "owner": "project_director_console_application" },

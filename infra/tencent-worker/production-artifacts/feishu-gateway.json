@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.1",
+  "schema_version": "1.2",
   "artifact_name": "feishu_gateway_canonical",
   "artifact_type": "direct",
   "source_of_truth": "infra/tencent-worker/feishu_gateway_canonical.js",
@@ -17,6 +17,20 @@
   ],
   "raw_body_preservation": true,
   "challenge_handled_locally": true,
+  "application_response_contract": {
+    "schema": "feishu_application_acceptance_v1",
+    "allowed_http_status": "2xx",
+    "content_type": "application/json",
+    "required_fields": {
+      "code": 0,
+      "accepted": true,
+      "transport_acceptance": true,
+      "event_id": "non_empty_string"
+    },
+    "malformed_response_policy": "FAIL_CLOSED",
+    "default_response_policy": "REJECT",
+    "transport_acceptance_is_not_business_success": true
+  },
   "pm2_process": "feishu-gateway",
   "runtime_user": "ubuntu",
   "runtime_cwd": "/home/ubuntu/city-partner-agent",

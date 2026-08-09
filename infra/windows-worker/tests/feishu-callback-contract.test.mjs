@@ -45,6 +45,7 @@ const envelopeMock = {
   FEISHU_TIMESTAMP_HEADER: router.FEISHU_TIMESTAMP_HEADER,
   FEISHU_NONCE_HEADER: router.FEISHU_NONCE_HEADER,
   FEISHU_SIGNATURE_HEADER: router.FEISHU_SIGNATURE_HEADER,
+  buildFeishuApplicationAcceptanceResponse: router.buildFeishuApplicationAcceptanceResponse,
   verifyFeishuApplicationBoundaryRequest(input) {
     return input.source === router.SOURCE_ID && router.verifyApplicationPayloadSignature(input.rawBody, input.signature, input.secret);
   },
@@ -84,6 +85,23 @@ function accept(rawBody = CALLBACK_BODY, overrides = {}) {
       FEISHU_APP_SECRET: TEST_APPLICATION_SECRET,
       FEISHU_ENCRYPT_KEY: TEST_ENCRYPT_KEY,
     },
+  });
+}
+
+function validApplicationResponse(status = 200, eventId = "event-fixture") {
+  return new Response(JSON.stringify(router.buildFeishuApplicationAcceptanceResponse(eventId)), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+function applicationClient(fetchImpl) {
+  return router.createFeishuApplicationBoundaryClient({
+    env: {
+      FEISHU_APPLICATION_EVENT_URL: "https://example.test/api/feishu/event",
+      FEISHU_APP_SECRET: TEST_APPLICATION_SECRET,
+    },
+    fetchImpl,
   });
 }
 
@@ -189,7 +207,7 @@ test("Gateway forwards exact bytes and original signature values", async () => {
     env: { FEISHU_APPLICATION_EVENT_URL: "https://example.test/api/feishu/event", FEISHU_APP_SECRET: TEST_APPLICATION_SECRET },
     fetchImpl: async (_url, options) => {
       captured = options;
-      return new Response('{"code":0,"accepted":true}', { status: 200 });
+      return validApplicationResponse();
     },
   });
   const headers = callbackHeaders();
@@ -201,12 +219,161 @@ test("Gateway forwards exact bytes and original signature values", async () => {
   assert.equal(captured.headers[router.CONTENT_TYPE_HEADER], headers.get(router.CONTENT_TYPE_HEADER));
 });
 
+test("shared Application acceptance schema is explicit", () => {
+  assert.deepEqual(router.buildFeishuApplicationAcceptanceResponse(" event-1 "), {
+    code: 0,
+    accepted: true,
+    transport_acceptance: true,
+    event_id: "event-1",
+  });
+});
+
+test("real Router rejects HTTP 200 text/plain fallback success", async () => {
+  const client = applicationClient(async () => new Response("OK", {
+    status: 200,
+    headers: { "content-type": "text/plain" },
+  }));
+  await assert.rejects(
+    client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }),
+    (error) => error.code === "FEISHU_APPLICATION_INVALID_CONTENT_TYPE" && error.status === 502
+  );
+});
+
+test("real Router rejects JSON text served as text/html", async () => {
+  const client = applicationClient(async () => new Response('{"accepted":true}', {
+    status: 200,
+    headers: { "content-type": "text/html" },
+  }));
+  await assert.rejects(
+    client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }),
+    (error) => error.code === "FEISHU_APPLICATION_INVALID_CONTENT_TYPE"
+  );
+});
+
+test("real Router rejects an empty JSON response", async () => {
+  const client = applicationClient(async () => new Response("", {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  }));
+  await assert.rejects(
+    client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }),
+    (error) => error.code === "FEISHU_APPLICATION_INVALID_JSON"
+  );
+});
+
+test("real Router rejects invalid JSON", async () => {
+  const client = applicationClient(async () => new Response("{invalid-json", {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  }));
+  await assert.rejects(
+    client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }),
+    (error) => error.code === "FEISHU_APPLICATION_INVALID_JSON"
+  );
+});
+
+test("real Router rejects an empty acceptance schema", async () => {
+  const client = applicationClient(async () => new Response("{}", {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  }));
+  await assert.rejects(
+    client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }),
+    (error) => error.code === "FEISHU_APPLICATION_INVALID_ACCEPTANCE_SCHEMA"
+  );
+});
+
+test("real Router does not infer acceptance from code or ok fields", async () => {
+  const client = applicationClient(async () => new Response('{"code":0,"ok":true}', {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  }));
+  await assert.rejects(
+    client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }),
+    (error) => error.code === "FEISHU_APPLICATION_INVALID_ACCEPTANCE_SCHEMA"
+  );
+});
+
+test("real Router preserves explicit Application rejection", async () => {
+  const client = applicationClient(async () => new Response('{"code":0,"accepted":false}', {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  }));
+  await assert.rejects(
+    client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }),
+    (error) => error.code === "FEISHU_APPLICATION_EXPLICIT_REJECTION"
+  );
+});
+
+test("real Router accepts a valid 201 schema and normalizes the Feishu ACK to 200", async () => {
+  const result = await applicationClient(async () => validApplicationResponse(201)).dispatch({
+    rawBody: CALLBACK_BODY,
+    headers: callbackHeaders(),
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.accepted, true);
+});
+
+test("real Router rejects a 204 empty response", async () => {
+  const client = applicationClient(async () => new Response(null, { status: 204 }));
+  await assert.rejects(
+    client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }),
+    (error) => error.code === "FEISHU_APPLICATION_INVALID_CONTENT_TYPE"
+  );
+});
+
+test("default Application response policy rejects unknown JSON values", () => {
+  for (const responseText of ["null", "true", "[]", '"accepted"', '{"accepted":true}']) {
+    assert.throws(
+      () => router.parseFeishuApplicationAcceptanceResponse({
+        status: 200,
+        headers: { "content-type": "application/json" },
+        responseText,
+      }),
+      (error) => error.code === "FEISHU_APPLICATION_INVALID_ACCEPTANCE_SCHEMA"
+    );
+  }
+});
+
+test("malformed response errors expose metadata but never the response body", async () => {
+  const sensitiveBody = "secret-response-body-must-not-leak";
+  const client = applicationClient(async () => new Response(sensitiveBody, {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  }));
+  await assert.rejects(
+    client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }),
+    (error) => {
+      assert.equal(error.code, "FEISHU_APPLICATION_INVALID_JSON");
+      assert.equal(error.responseLength, Buffer.byteLength(sensitiveBody));
+      assert.doesNotMatch(JSON.stringify(error), /secret-response-body-must-not-leak/);
+      assert.doesNotMatch(error.message, /secret-response-body-must-not-leak/);
+      return true;
+    }
+  );
+});
+
+test("malformed response failure is immediate within the Gateway budget", async () => {
+  const startedAt = performance.now();
+  await assert.rejects(
+    applicationClient(async () => new Response("not-json", {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })).dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }),
+    (error) => error.code === "FEISHU_APPLICATION_INVALID_JSON"
+  );
+  assert.ok(performance.now() - startedAt < router.GATEWAY_INTERNAL_RESPONSE_BUDGET_MS);
+});
+
 test("Application 500 is not converted into a successful ACK", async () => {
   const client = router.createFeishuApplicationBoundaryClient({
     env: { FEISHU_APPLICATION_EVENT_URL: "https://example.test/api/feishu/event", FEISHU_APP_SECRET: TEST_APPLICATION_SECRET },
-    fetchImpl: async () => new Response('{"code":500}', { status: 500 }),
+    fetchImpl: async () => new Response('{"code":500}', {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    }),
   });
-  await assert.rejects(client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }), (error) => error.code === "FEISHU_APPLICATION_ACCEPTANCE_REJECTED" && error.status === 500);
+  await assert.rejects(client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }), (error) => error.code === "FEISHU_APPLICATION_HTTP_REJECTED" && error.status === 500);
 });
 
 test("Application network failure is not converted into a successful ACK", async () => {
@@ -214,7 +381,7 @@ test("Application network failure is not converted into a successful ACK", async
     env: { FEISHU_APPLICATION_EVENT_URL: "https://example.test/api/feishu/event", FEISHU_APP_SECRET: TEST_APPLICATION_SECRET },
     fetchImpl: async () => { throw Object.assign(new Error("offline"), { code: "ENETUNREACH" }); },
   });
-  await assert.rejects(client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }), /offline/);
+  await assert.rejects(client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }), (error) => error.code === "FEISHU_APPLICATION_NETWORK_FAILURE" && error.causeCode === "ENETUNREACH");
 });
 
 test("hung Application request is deterministically aborted at 1500ms", async () => {
@@ -227,7 +394,7 @@ test("hung Application request is deterministically aborted at 1500ms", async ()
       options.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
     }),
   });
-  await assert.rejects(client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }), (error) => error.code === "FEISHU_APPLICATION_BOUNDARY_TIMEOUT" && error.status === 504);
+  await assert.rejects(client.dispatch({ rawBody: CALLBACK_BODY, headers: callbackHeaders() }), (error) => error.code === "FEISHU_APPLICATION_TIMEOUT" && error.status === 504);
   assert.equal(scheduledMs, 1500);
 });
 
@@ -277,10 +444,11 @@ test("Application route uses supported after lifecycle, not bare fire-and-forget
   assert.match(routeSource, /after\(async \(\) =>/);
   assert.doesNotMatch(routeSource, /void\s+processAcceptedFeishuEvent|setTimeout\(processAcceptedFeishuEvent/);
   assert.ok(routeSource.indexOf("prepareFeishuCallbackAcceptance") < routeSource.indexOf("after(async () =>"));
+  assert.ok(routeSource.indexOf("buildFeishuApplicationAcceptanceResponse(accepted.event_id)") < routeSource.indexOf("after(async () =>"));
 });
 
 test("transport acceptance is explicitly separate from task success", () => {
-  assert.match(routeSource, /transport_acceptance: true/);
+  assert.match(routeSource, /buildFeishuApplicationAcceptanceResponse\(accepted\.event_id\)/);
   assert.doesNotMatch(routeSource.slice(routeSource.indexOf("export async function POST")), /task_goal_status\s*:\s*["']succeeded/);
 });
 
@@ -311,6 +479,20 @@ test("manifest records the complete callback safety contract", () => {
     "content-type",
   ]);
   assert.equal(manifest.shared_application_boundary.background_execution_primitive, "next/server.after");
+  assert.deepEqual(manifest.application_response_contract, {
+    schema: "feishu_application_acceptance_v1",
+    allowed_http_status: "2xx",
+    content_type: "application/json",
+    required_fields: {
+      code: 0,
+      accepted: true,
+      transport_acceptance: true,
+      event_id: "non_empty_string",
+    },
+    malformed_response_policy: "FAIL_CLOSED",
+    default_response_policy: "REJECT",
+    transport_acceptance_is_not_business_success: true,
+  });
 });
 
 test("real Application route accepts a valid callback and registers background work", async () => {
@@ -325,6 +507,7 @@ test("real Application route accepts a valid callback and registers background w
     (id) => {
       if (id === "next/server") return { after(task) { afterTasks.push(task); }, NextResponse: MockNextResponse, NextRequest: class {} };
       if (id === "@/lib/feishu-callback-application") return acceptance;
+      if (id === "@/lib/feishu-canonical-gateway-envelope") return envelopeMock;
       return genericMock;
     }
   );
@@ -334,7 +517,7 @@ test("real Application route accepts a valid callback and registers background w
   try {
     const response = await route.POST({ headers: callbackHeaders(), async arrayBuffer() { return CALLBACK_BODY; } });
     assert.equal(response.status, 200);
-    assert.equal(response.body.transport_acceptance, true);
+    assert.deepEqual(response.body, router.buildFeishuApplicationAcceptanceResponse("event-fixture"));
     assert.equal(afterTasks.length, 1);
   } finally {
     if (previous.secret === undefined) delete process.env.FEISHU_APP_SECRET; else process.env.FEISHU_APP_SECRET = previous.secret;
@@ -354,6 +537,7 @@ test("real Application route rejects missing signature before background registr
     (id) => {
       if (id === "next/server") return { after(task) { afterTasks.push(task); }, NextResponse: MockNextResponse, NextRequest: class {} };
       if (id === "@/lib/feishu-callback-application") return acceptance;
+      if (id === "@/lib/feishu-canonical-gateway-envelope") return envelopeMock;
       return genericMock;
     }
   );
@@ -385,6 +569,7 @@ test("real Application route rejects a body mutation before background registrat
     (id) => {
       if (id === "next/server") return { after(task) { afterTasks.push(task); }, NextResponse: MockNextResponse, NextRequest: class {} };
       if (id === "@/lib/feishu-callback-application") return acceptance;
+      if (id === "@/lib/feishu-canonical-gateway-envelope") return envelopeMock;
       return genericMock;
     }
   );

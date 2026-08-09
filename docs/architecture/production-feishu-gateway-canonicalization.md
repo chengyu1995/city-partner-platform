@@ -14,6 +14,8 @@ The canonical context rules remain implemented once in `infra/tencent-worker/fei
 
 Feishu's external callback deadline is 3000ms. The Gateway reserves transport margin by limiting the Application acceptance request to 1500ms and its own response budget to 2000ms. A timeout, network failure, authentication rejection, or Application 5xx is returned as a non-2xx response so Feishu can retry; it is never converted into a successful acknowledgement.
 
+An Application HTTP 2xx is necessary but not sufficient for acceptance. The response must use `application/json`, parse successfully, and match `feishu_application_acceptance_v1`: `code=0`, `accepted=true`, `transport_acceptance=true`, and a non-empty `event_id`. Wrong content types, invalid or empty JSON, incomplete schemas, and explicit rejection all fail closed. The default response policy is `REJECT`; no fallback object can convert an unknown response into a successful Feishu ACK.
+
 The Gateway reads the callback body once as bytes and forwards those exact bytes with the original `X-Lark-Request-Timestamp`, `X-Lark-Request-Nonce`, `X-Lark-Signature`, and `Content-Type` values. It does not forward cookies, authorization headers, or runtime credentials. The Application verifies both the Gateway envelope and the Feishu signature against the raw body before parsing or performing any business action.
 
 `src/app/api/feishu/event/route.ts` returns only a transport acceptance after authentication and envelope validation. Long-running work is registered with the Next.js `after()` lifecycle primitive and continues through the existing shared Application Boundary. A transport 2xx does not represent Hermes, Worker, terminal, or task success.

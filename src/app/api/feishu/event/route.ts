@@ -15,6 +15,7 @@
 import { after, NextResponse, NextRequest } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { prepareFeishuCallbackAcceptance } from "@/lib/feishu-callback-application";
+import { buildFeishuApplicationAcceptanceResponse } from "@/lib/feishu-canonical-gateway-envelope";
 import {
   buildCanonicalApprovalContext,
   buildCanonicalWorkerContextPayload,
@@ -3823,6 +3824,7 @@ export async function POST(req: NextRequest) {
   }
 
   const accepted = acceptance.accepted;
+  const acceptanceResponse = buildFeishuApplicationAcceptanceResponse(accepted.event_id);
   after(async () => {
     console.log("[feishu-event] background_started", {
       event_id: accepted.event_id,
@@ -3847,12 +3849,7 @@ export async function POST(req: NextRequest) {
     }
   });
 
-  return NextResponse.json({
-    code: 0,
-    accepted: true,
-    transport_acceptance: true,
-    event_id: accepted.event_id,
-  });
+  return NextResponse.json(acceptanceResponse);
 }
 
 export async function GET() {

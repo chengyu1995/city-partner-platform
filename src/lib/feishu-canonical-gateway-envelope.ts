@@ -10,6 +10,21 @@ export const FEISHU_SIGNATURE_HEADER = gatewayBoundary.FEISHU_SIGNATURE_HEADER a
 
 export type FeishuRawBody = string | Uint8Array | ArrayBuffer;
 
+export interface FeishuApplicationAcceptanceResponse {
+  code: 0;
+  accepted: true;
+  transport_acceptance: true;
+  event_id: string;
+}
+
+export function buildFeishuApplicationAcceptanceResponse(
+  eventId: string
+): FeishuApplicationAcceptanceResponse {
+  return gatewayBoundary.buildFeishuApplicationAcceptanceResponse(
+    eventId
+  ) as FeishuApplicationAcceptanceResponse;
+}
+
 export function verifyFeishuApplicationBoundaryRequest(input: {
   rawBody: FeishuRawBody;
   signature: string | null;
