@@ -16,6 +16,7 @@ import {
   HERMES_CANONICAL_ORCHESTRATION_ENV,
   resolveHermesCanonicalCutoverConfig,
 } from "./cutover-control.ts";
+import type { CanonicalCanaryAdmissionEvidence } from "./canonical-canary-scope.ts";
 
 export const HERMES_CANONICAL_ORCHESTRATION_ENABLED_DEFAULT = false;
 export { HERMES_CANONICAL_ORCHESTRATION_ENV };
@@ -85,6 +86,7 @@ export interface CanonicalJobCommand {
     git_push_required: boolean;
     deployment_required: boolean;
     approval_context: HermesApprovalContext;
+    canonical_canary_admission: CanonicalCanaryAdmissionEvidence;
   };
 }
 
@@ -150,9 +152,13 @@ export async function planApprovedRequest(
   return plan;
 }
 
-export function buildCanonicalJobCommands(plan: HermesExecutionPlan): CanonicalJobCommand[] {
+export function buildCanonicalJobCommands(
+  plan: HermesExecutionPlan,
+  admission: CanonicalCanaryAdmissionEvidence
+): CanonicalJobCommand[] {
   const validation = validateExecutionPlan(plan, plan.requested_mode);
   if (!validation.ok) throw new Error(validation.errors.join(";"));
+  if (plan.subtasks.length !== 1) throw new Error("CANONICAL_CANARY_SINGLE_JOB_REQUIRED");
   return plan.subtasks.map((subtask) => ({
     source: "hermes_canonical_orchestration",
     request_text: `${subtask.title}\n\n${subtask.objective}\n\nOriginal request:\n${plan.original_request_text}`,
@@ -184,16 +190,18 @@ export function buildCanonicalJobCommands(plan: HermesExecutionPlan): CanonicalJ
       git_push_required: subtask.git_push_required,
       deployment_required: subtask.deployment_required,
       approval_context: { ...plan.approval_context },
+      canonical_canary_admission: { ...admission },
     },
   }));
 }
 
 export async function createCanonicalJobsForPlan(
   plan: HermesExecutionPlan,
-  canonicalCreateJob: CanonicalJobCreator
+  canonicalCreateJob: CanonicalJobCreator,
+  admission: CanonicalCanaryAdmissionEvidence
 ): Promise<unknown[]> {
   const results: unknown[] = [];
-  for (const command of buildCanonicalJobCommands(plan)) {
+  for (const command of buildCanonicalJobCommands(plan, admission)) {
     results.push(await canonicalCreateJob(command));
   }
   return results;

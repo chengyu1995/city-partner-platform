@@ -9,6 +9,7 @@ const orchestration = await import("../../../src/lib/hermes/orchestration-adapte
 const capabilities = await import("../../../src/lib/openclaw/capability-gateway.ts");
 
 const source = (file) => readFileSync(join(root, file), "utf8");
+const allowedAdmission = { allowed: true, reason_code: "ALLOW" };
 
 test("production cutover defaults keep Canonical and Shadow off", () => {
   const config = cutover.resolveHermesCanonicalCutoverConfig({ NODE_ENV: "production" });
@@ -61,6 +62,7 @@ test("Canonical and Shadow flag conflict fails closed to Legacy", async () => {
 test("successful cutover records canonical authoritative writes", async () => {
   const result = await cutover.attemptHermesCanonicalCutover({
     env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
+    canaryAdmission: allowedAdmission,
     async executeCanonical(guard) {
       guard.recordAuthoritativeWrite(2);
       return { jobs: 2 };
@@ -74,6 +76,7 @@ test("successful cutover records canonical authoritative writes", async () => {
 test("canonical prewrite failure safely falls back to Legacy", async () => {
   const result = await cutover.attemptHermesCanonicalCutover({
     env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
+    canaryAdmission: allowedAdmission,
     async executeCanonical() {
       throw new Error("planner unavailable");
     },
@@ -87,6 +90,7 @@ test("canonical failure after an authoritative write cannot fall back", async ()
   await assert.rejects(
     () => cutover.attemptHermesCanonicalCutover({
       env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
+      canaryAdmission: allowedAdmission,
       async executeCanonical(guard) {
         guard.recordAuthoritativeWrite();
         throw new Error("second subtask failed");
@@ -94,6 +98,18 @@ test("canonical failure after an authoritative write cannot fall back", async ()
     }),
     /CANONICAL_CUTOVER_PARTIAL_WRITE_FAIL_CLOSED/
   );
+});
+
+test("global Canonical flag alone cannot enter the Canonical executor", async () => {
+  let canonicalCalled = false;
+  const result = await cutover.attemptHermesCanonicalCutover({
+    env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
+    async executeCanonical() { canonicalCalled = true; },
+  });
+  assert.equal(result.path, "legacy_primary");
+  assert.equal(result.reason, "canary_admission_denied");
+  assert.equal(result.canonical_authoritative_writes, 0);
+  assert.equal(canonicalCalled, false);
 });
 
 test("Feishu production path uses guarded cutover and canonicalCreateJob", () => {

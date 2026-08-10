@@ -22,6 +22,17 @@ const feishuSource = source("src/app/api/feishu/event/route.ts");
 const hermesAgentSource = source("src/lib/hermes-agent.ts");
 const workerJobsSource = source("src/lib/worker-jobs.ts");
 
+Object.assign(process.env, {
+  HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true",
+  CANONICAL_DATABASE_PERSISTENCE_ENABLED: "true",
+  HERMES_CANONICAL_CANARY_SCOPE_ENABLED: "true",
+  HERMES_CANONICAL_CANARY_DURABLE_ADMISSION_ENABLED: "true",
+  HERMES_CANONICAL_CANARY_ALLOWED_OWNER_IDS: "ou_owner123",
+  HERMES_CANONICAL_CANARY_ALLOWED_BATCH_CODES: "BATCH-CANARY-01",
+  HERMES_CANONICAL_CANARY_ALLOWED_MODES: "worker_read_only",
+  HERMES_CANONICAL_CANARY_POLICY_ID: "CANARY-01",
+});
+
 function exportedFunctionBlock(sourceText, name) {
   const start = sourceText.indexOf(`export async function ${name}(`);
   assert.notEqual(start, -1, `${name} must exist`);
@@ -76,7 +87,13 @@ function fixture(options = {}) {
     plan_id: "plan-03c1",
     subtask_id: "subtask-1",
     created_at: "2026-08-05T00:00:00.000Z",
-    payload: { dependencies: [], execution_intent: "verification", allowed_paths: [], acceptance_criteria: [] },
+    payload: {
+      dependencies: [], execution_intent: "verification", allowed_paths: [], acceptance_criteria: [],
+      canonical_canary_admission: {
+        policy_id: "CANARY-01", trusted_owner_id: "ou_owner123", batch_code: "BATCH-CANARY-01",
+        requested_mode: "worker_read_only", event_id: "event-1", request_id: "request-1",
+      },
+    },
   };
   const tables = {
     hermes_jobs: [job],
@@ -330,9 +347,10 @@ test("canonicalCreateJob never calls the legacy createHermesJob helper", () => {
   assert.doesNotMatch(block, /\bcreateHermesJob\s*\(/);
 });
 
-test("canonicalCreateJob uses one strict canonical persistence insert", () => {
+test("canonicalCreateJob uses one strict Canary admission RPC", () => {
   const block = exportedFunctionBlock(workerJobsSource, "canonicalCreateJob");
-  assert.match(block, /\.from\("hermes_jobs"\)[\s\S]*\.insert\(\[canonicalRow\]\)/);
+  assert.match(block, /supabase\.rpc\("canonical_admit_canary_job"/);
+  assert.doesNotMatch(block, /\.from\("hermes_jobs"\)[\s\S]*\.insert\(/);
   assert.doesNotMatch(block, /isMissingColumnError|shouldRetryPendingStatus|shouldRetryTextPriority/);
 });
 
@@ -440,18 +458,27 @@ test("Hermes plan payload preserves aggregation inputs", () => {
       git_commit_required: false, git_push_required: false, deployment_required: false,
     }],
   }, "worker_read_only");
-  const [command] = adapter.buildCanonicalJobCommands(plan);
+  const admission = {
+    policy_id: "CANARY-01", trusted_owner_id: "ou_owner", batch_code: "BATCH-CANARY-01",
+    requested_mode: "worker_read_only", event_id: "event-1", request_id: "request-1",
+  };
+  const [command] = adapter.buildCanonicalJobCommands(plan, admission);
   assert.equal(command.payload.original_request_text, "request");
   assert.equal(command.payload.plan_objective, "objective");
   assert.equal(command.payload.aggregation_policy, "all_required");
+  assert.deepEqual(command.payload.canonical_canary_admission, admission);
 });
 test("canonical runtime delegation fails closed without persistence", async () => {
   await assert.rejects(() => delegation.runApprovedRequestThroughCanonicalHermes(
     {}, {}, {}, async () => null,
-    { env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" }, canonicalPersistenceReady: false }
+    {
+      env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
+      canonicalPersistenceReady: false,
+      canaryAdmission: { allowed: true, reason_code: "ALLOW" },
+    }
   ), /CANONICAL_PERSISTENCE_RUNTIME_REQUIRED/);
 });
-test("GM approval creates every Hermes subtask through the canonical creator", async () => {
+test("first Canary approval creates exactly one admitted Hermes job", async () => {
   const created = [];
   const result = await delegation.runApprovedRequestThroughCanonicalHermes(
     {
@@ -463,7 +490,6 @@ test("GM approval creates every Hermes subtask through the canonical creator", a
       objective: "verify runtime", aggregation_policy: "all_required",
       subtasks: [
         { subtask_id: "inspect", title: "Inspect", objective: "Inspect", dependencies: [], recommended_agent: "test_agent", required_capabilities: ["test"], execution_intent: "verification", allowed_paths: [], forbidden_paths: [], acceptance_criteria: ["ok"], validation_requirements: ["tests"], git_commit_required: false, git_push_required: false, deployment_required: false },
-        { subtask_id: "report", title: "Report", objective: "Report", dependencies: ["inspect"], recommended_agent: "documentation_agent", required_capabilities: ["documentation"], execution_intent: "documentation", allowed_paths: [], forbidden_paths: [], acceptance_criteria: ["ok"], validation_requirements: ["review"], git_commit_required: false, git_push_required: false, deployment_required: false },
       ],
     }; } },
     { async resolveAgentCapabilities(request) { return { selected_agent: request.required_capabilities[0] === "test" ? "test_agent" : "documentation_agent", provider: "registry", model: null, capabilities: request.required_capabilities, confidence: 1, reason: "test" }; } },
@@ -471,11 +497,18 @@ test("GM approval creates every Hermes subtask through the canonical creator", a
     {
       env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
       canonicalPersistenceReady: true,
+      canaryAdmission: {
+        allowed: true, reason_code: "ALLOW", policy_id: "CANARY-01",
+        trusted_owner_match: true, batch_match: true, mode_match: true, one_shot_available: true,
+        admission: {
+          policy_id: "CANARY-01", trusted_owner_id: "ou_owner", batch_code: "BATCH-CANARY-01",
+          requested_mode: "worker_read_only", event_id: "event-1", request_id: "approval-03c1",
+        },
+      },
     }
   );
   assert.equal(result.reason, "canonical_jobs_created");
-  assert.equal(created.length, 2);
-  assert.deepEqual(created[1].payload.dependencies, ["inspect"]);
+  assert.equal(created.length, 1);
   assert.equal(created.every((command) => command.source === "hermes_canonical_orchestration"), true);
 });
 test("canonical direct bypass only permits explicit maintenance", () => {

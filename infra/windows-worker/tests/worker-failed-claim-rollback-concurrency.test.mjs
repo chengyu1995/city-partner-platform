@@ -55,6 +55,7 @@ const workerJobs = loadTypeScriptModule(path.join(root, "src", "lib", "worker-jo
   "./hermes/result-aggregator": {},
   "./hermes/execution-plan": {},
   "./hermes/shadow-runtime": { getCompletedHermesShadowObservation: () => null },
+  "./hermes/canonical-canary-scope": { evaluateCanonicalCanaryAdmission: () => ({ allowed: true }) },
   "./project-director-final-report": {},
 });
 
@@ -64,7 +65,7 @@ function queuedJob() {
     status: "queued",
     claimed_by: null,
     updated_at: CLAIMED_AT,
-    payload: { payload_marker: "current" },
+    payload: { payload_marker: "current", canonical_canary_admission: { policy_id: "CANARY-TEST" } },
     result: {
       audit_marker: "current",
       job_state_machine: {

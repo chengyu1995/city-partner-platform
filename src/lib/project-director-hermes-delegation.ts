@@ -9,6 +9,10 @@ import {
 import type { AgentCapabilityGateway } from "./openclaw/capability-gateway.ts";
 import type { HermesExecutionPlan } from "./hermes/execution-plan.ts";
 import {
+  requireAllowedCanonicalCanaryAdmission,
+  type CanonicalCanaryAdmissionDecision,
+} from "./hermes/canonical-canary-scope.ts";
+import {
   scheduleApprovedRequestInHermesShadow,
   type HermesShadowLaunchResult,
   type HermesShadowTaskScheduler,
@@ -17,6 +21,7 @@ import {
 
 export type GMHermesDelegationResult =
   | { delegated: false; reason: "feature_disabled"; plan: null }
+  | { delegated: false; reason: "canary_admission_denied"; plan: null }
   | { delegated: true; reason: "canonical_plan_created"; plan: HermesExecutionPlan };
 
 export interface GMHermesRuntimeResult {
@@ -30,10 +35,14 @@ export async function delegateApprovedRequestToHermes(
   request: GMApprovedRequest,
   planner: HermesPlanningProvider,
   capabilityGateway: AgentCapabilityGateway,
-  env: Record<string, string | undefined> = process.env
+  env: Record<string, string | undefined> = process.env,
+  canaryAdmission?: CanonicalCanaryAdmissionDecision
 ): Promise<GMHermesDelegationResult> {
   if (!isHermesCanonicalOrchestrationEnabled(env)) {
     return { delegated: false, reason: "feature_disabled", plan: null };
+  }
+  if (!canaryAdmission?.allowed) {
+    return { delegated: false, reason: "canary_admission_denied", plan: null };
   }
   const plan = await planApprovedRequest(request, planner, capabilityGateway);
   return { delegated: true, reason: "canonical_plan_created", plan };
@@ -47,6 +56,7 @@ export async function runApprovedRequestThroughCanonicalHermes(
   options: {
     env?: Record<string, string | undefined>;
     canonicalPersistenceReady: boolean;
+    canaryAdmission: CanonicalCanaryAdmissionDecision;
   }
 ): Promise<GMHermesRuntimeResult | GMHermesDelegationResult> {
   const env = options.env ?? process.env;
@@ -56,9 +66,10 @@ export async function runApprovedRequestThroughCanonicalHermes(
   if (!options.canonicalPersistenceReady) {
     throw new Error("CANONICAL_PERSISTENCE_RUNTIME_REQUIRED");
   }
+  const admission = requireAllowedCanonicalCanaryAdmission(options.canaryAdmission);
 
   const plan = await planApprovedRequest(request, planner, capabilityGateway);
-  const jobs = await createCanonicalJobsForPlan(plan, canonicalCreateJob);
+  const jobs = await createCanonicalJobsForPlan(plan, canonicalCreateJob, admission);
   return { delegated: true, reason: "canonical_jobs_created", plan, jobs };
 }
 

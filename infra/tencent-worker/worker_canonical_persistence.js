@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const crypto = require("crypto");
+const { evaluateCanonicalCanaryAdmission } = require("./canonical-canary-scope-core");
 
 const CANONICAL_DATABASE_PERSISTENCE_ENV = "CANONICAL_DATABASE_PERSISTENCE_ENABLED";
 
@@ -19,6 +20,20 @@ function text(value) {
 
 function isCanonicalJob(job) {
   return Boolean(job && text(job.canonical_job_state) && Number.isSafeInteger(Number(job.canonical_revision)));
+}
+
+function canaryAdmissionAllowsClaim(job, env = process.env) {
+  const payload = job && job.payload && typeof job.payload === "object" ? job.payload : {};
+  const evidence = payload.canonical_canary_admission;
+  if (!evidence || typeof evidence !== "object") return false;
+  return evaluateCanonicalCanaryAdmission({
+    trusted_owner_id: text(evidence.trusted_owner_id),
+    batch_code: text(evidence.batch_code),
+    requested_mode: text(evidence.requested_mode),
+    event_id: text(evidence.event_id) || "",
+    request_id: text(evidence.request_id) || "",
+    expected_policy_id: text(evidence.policy_id),
+  }, env).allowed;
 }
 
 const TERMINAL_SEMANTIC_FIELDS = [
@@ -109,6 +124,7 @@ async function claimNext(client, workerId, now = new Date()) {
     .order("created_at", { ascending: true }).limit(50);
   if (error) throw new Error(`CANONICAL_JOB_SELECTION_FAILED:${error.message}`);
   for (const job of data || []) {
+    if (!canaryAdmissionAllowsClaim(job)) continue;
     if (!(await dependenciesReady(client, job))) continue;
     const attemptId = `attempt:${job.id}:${workerId}:${crypto.randomUUID()}`;
     const leaseId = `lease:${attemptId}`;
@@ -228,6 +244,7 @@ async function recoverExpired(client, now = new Date().toISOString(), limit = 10
 module.exports = {
   enabled,
   isCanonicalJob,
+  canaryAdmissionAllowsClaim,
   claimNext,
   recordSignal,
   finalize,

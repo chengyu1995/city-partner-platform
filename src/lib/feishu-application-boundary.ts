@@ -1,4 +1,5 @@
 import { resolveHermesCanonicalCutoverConfig } from "./hermes/cutover-control.ts";
+import { resolveCanonicalCanaryScopeConfig } from "./hermes/canonical-canary-scope.ts";
 
 export const FEISHU_APPLICATION_BOUNDARY_ID = "nextjs_feishu_event_application_v1";
 
@@ -15,13 +16,15 @@ export function resolveFeishuApplicationFeatureRoute(
   env: Record<string, string | undefined> = process.env
 ): FeishuApplicationFeatureRoute {
   const config = resolveHermesCanonicalCutoverConfig(env);
-  const mode = config.canonical_enabled ? "canonical" : config.shadow_enabled ? "shadow" : "legacy";
+  const canaryScope = resolveCanonicalCanaryScopeConfig(env);
+  const canonicalEnabled = config.canonical_enabled && canaryScope.ok;
+  const mode = canonicalEnabled ? "canonical" : config.shadow_enabled ? "shadow" : "legacy";
   return {
     boundary_id: FEISHU_APPLICATION_BOUNDARY_ID,
     mode,
-    legacy_primary: config.legacy_primary,
+    legacy_primary: !canonicalEnabled,
     shadow_enabled: config.shadow_enabled,
-    canonical_enabled: config.canonical_enabled,
+    canonical_enabled: canonicalEnabled,
     configuration_conflict: config.configuration_conflict,
   };
 }

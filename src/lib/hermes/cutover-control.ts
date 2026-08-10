@@ -20,9 +20,10 @@ export interface CanonicalWriteGuard {
 export type HermesCanonicalCutoverResult<T> =
   | {
       path: "legacy_primary";
-      reason: "canonical_disabled" | "rollback_switch_enabled" | "flag_conflict";
+      reason: "canonical_disabled" | "rollback_switch_enabled" | "flag_conflict" | "canary_admission_denied";
       canonical_result: null;
       canonical_authoritative_writes: 0;
+      canary_denial_reason?: string;
     }
   | {
       path: "legacy_fallback";
@@ -70,6 +71,7 @@ function legacyReason(config: HermesCanonicalCutoverConfig): "canonical_disabled
 
 export async function attemptHermesCanonicalCutover<T>(input: {
   env?: Record<string, string | undefined>;
+  canaryAdmission?: { allowed: boolean; reason_code: string };
   executeCanonical(guard: CanonicalWriteGuard): Promise<T>;
 }): Promise<HermesCanonicalCutoverResult<T>> {
   const config = resolveHermesCanonicalCutoverConfig(input.env ?? process.env);
@@ -77,6 +79,15 @@ export async function attemptHermesCanonicalCutover<T>(input: {
     return {
       path: "legacy_primary",
       reason: legacyReason(config),
+      canonical_result: null,
+      canonical_authoritative_writes: 0,
+    };
+  }
+  if (!input.canaryAdmission?.allowed) {
+    return {
+      path: "legacy_primary",
+      reason: "canary_admission_denied",
+      canary_denial_reason: input.canaryAdmission?.reason_code ?? "CANARY_ADMISSION_REQUIRED",
       canonical_result: null,
       canonical_authoritative_writes: 0,
     };

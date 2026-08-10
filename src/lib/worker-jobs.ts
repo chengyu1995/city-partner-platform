@@ -46,6 +46,10 @@ import {
   buildProjectDirectorFinalReport,
 } from "./project-director-final-report";
 import { getCompletedHermesShadowObservation } from "./hermes/shadow-runtime";
+import {
+  evaluateCanonicalCanaryAdmission,
+  type CanonicalCanaryAdmissionEvidence,
+} from "./hermes/canonical-canary-scope";
 
 type JobRecord = Record<string, unknown>;
 
@@ -4306,6 +4310,7 @@ const CANONICAL_JOB_CREATION_FORBIDDEN_FIELDS = [
 export async function canonicalCreateJob(
   supabase: SupabaseClient,
   row: JobRecord,
+  admission: CanonicalCanaryAdmissionEvidence,
   failureLabel = "canonical create job failed"
 ): Promise<HermesJobInsertResult> {
   const forbidden = CANONICAL_JOB_CREATION_FORBIDDEN_FIELDS.filter((field) => {
@@ -4334,20 +4339,35 @@ export async function canonicalCreateJob(
     subtask_id: readString(row.subtask_id) ?? readString(payload.subtask_id),
     terminal_at: null,
     source: readString(row.source) ?? "canonical_orchestration",
+    payload: {
+      ...payload,
+      canonical_canary_admission: { ...admission },
+    },
   };
-  const { data, error } = await supabase
-    .from("hermes_jobs")
-    .insert([canonicalRow])
-    .select("id, job_id");
+  const { data, error } = await supabase.rpc("canonical_admit_canary_job", {
+    p_policy_id: admission.policy_id,
+    p_owner_open_id: admission.trusted_owner_id,
+    p_batch_code: admission.batch_code,
+    p_requested_mode: admission.requested_mode,
+    p_event_id: admission.event_id,
+    p_request_id: admission.request_id,
+    p_job: canonicalRow,
+  });
   if (error) {
     throw new Error(formatHermesJobInsertError(failureLabel, error, [canonicalRow], [], []));
   }
-  const jobIds = Array.isArray(data)
-    ? data
-        .map((inserted) => inserted?.job_id ?? inserted?.id)
-        .filter((value): value is string => typeof value === "string" && value.length > 0)
-    : [];
-  return { insertedCount: 1, skippedColumns: [], adjustedFields: [], jobIds };
+  const result = readRecord(data);
+  if (!result || result.allowed !== true) {
+    throw new Error(`CANONICAL_CANARY_PERSISTENCE_DENIED:${readString(result?.reason_code) ?? "INVALID_RESPONSE"}`);
+  }
+  const jobId = readString(result.job_id);
+  if (!jobId) throw new Error("CANONICAL_CANARY_PERSISTENCE_JOB_ID_REQUIRED");
+  return {
+    insertedCount: result.idempotent === true ? 0 : 1,
+    skippedColumns: [],
+    adjustedFields: [],
+    jobIds: [jobId],
+  };
 }
 
 export interface CanonicalWorkerProtocolResult {
@@ -4384,6 +4404,22 @@ function canonicalRevision(value: unknown): number {
 
 function canonicalPayload(job: JobRecord): JobRecord {
   return readRecord(job.payload) ?? {};
+}
+
+export function canonicalCanaryAdmissionAllowsWorkerClaim(
+  job: JobRecord,
+  env: Record<string, string | undefined> = process.env
+): boolean {
+  const evidence = readRecord(canonicalPayload(job).canonical_canary_admission);
+  if (!evidence) return false;
+  return evaluateCanonicalCanaryAdmission({
+    trusted_owner_id: readString(evidence.trusted_owner_id),
+    batch_code: readString(evidence.batch_code),
+    requested_mode: readString(evidence.requested_mode),
+    event_id: readString(evidence.event_id) ?? "",
+    request_id: readString(evidence.request_id) ?? "",
+    expected_policy_id: readString(evidence.policy_id),
+  }, env).allowed;
 }
 
 export function isCanonicalPersistenceJob(job: JobRecord | null | undefined): boolean {
@@ -4527,6 +4563,7 @@ export async function claimNextCanonicalHermesJob(
   if (error) throw new Error(`CANONICAL_JOB_SELECTION_FAILED:${error.message}`);
 
   for (const candidate of (data as JobRecord[] | null) ?? []) {
+    if (!canonicalCanaryAdmissionAllowsWorkerClaim(candidate)) continue;
     if (!(await canonicalDependenciesReady(supabase, candidate))) continue;
     const jobId = readString(candidate.id);
     if (!jobId) continue;

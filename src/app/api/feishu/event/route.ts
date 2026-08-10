@@ -28,6 +28,10 @@ import {
   scheduleApprovedRequestThroughHermesShadow,
 } from "@/lib/project-director-hermes-delegation";
 import { attemptHermesCanonicalCutover } from "@/lib/hermes/cutover-control";
+import {
+  buildCanonicalCanaryAuditRecord,
+  evaluateCanonicalCanaryAdmission,
+} from "@/lib/hermes/canonical-canary-scope";
 import { buildLegacyShadowPlan } from "@/lib/hermes/shadow-runtime";
 import {
   createProductionCapabilityGateway,
@@ -2945,7 +2949,17 @@ async function processAcceptedFeishuEvent(payload: any) {
             });
           }
 
+          const canaryAdmission = evaluateCanonicalCanaryAdmission({
+            trusted_owner_id: userId,
+            batch_code: canonicalContext.batch_code,
+            requested_mode: canonicalContext.requested_mode,
+            event_id: eventId,
+            request_id: ev.message.message_id,
+          });
+          console.info("[canonical-canary-admission]", buildCanonicalCanaryAuditRecord(canaryAdmission));
+
           const canonicalCutover = await attemptHermesCanonicalCutover({
+            canaryAdmission,
             executeCanonical: async (writeGuard) => {
               const result = await runApprovedRequestThroughCanonicalHermes(
                 {
@@ -2985,11 +2999,14 @@ async function processAcceptedFeishuEvent(payload: any) {
                       legacy_context_builder_used: false,
                     },
                     status: "queued",
-                  });
+                  }, canaryAdmission.admission!);
                   writeGuard.recordAuthoritativeWrite(created.insertedCount);
                   return created;
                 },
-                { canonicalPersistenceReady: canonicalPersistenceRuntimeEnabled() }
+                {
+                  canonicalPersistenceReady: canonicalPersistenceRuntimeEnabled(),
+                  canaryAdmission,
+                }
               );
               if (!result.delegated || result.reason !== "canonical_jobs_created") {
                 throw new Error("HERMES_CANONICAL_DELEGATION_NOT_APPLIED");
@@ -3102,9 +3119,28 @@ async function processAcceptedFeishuEvent(payload: any) {
         });
       }
 
+      const requestedMode = approvedHermesMode(`${recentDraft.originalDemand}\n${text}`);
+      const recentDraftCanonicalContext = buildCanonicalApprovalContext({
+        approval_text: text,
+        original_request_text: recentDraft.originalDemand,
+        request_id: ev.message.message_id,
+        approved_by: userId,
+        approved_at: new Date().toISOString(),
+        feishu_chat_id: ev.message.chat_id,
+        feishu_event_id: eventId,
+      });
+      const canaryAdmission = evaluateCanonicalCanaryAdmission({
+        trusted_owner_id: userId,
+        batch_code: recentDraftCanonicalContext.batch_code,
+        requested_mode: requestedMode ?? recentDraftCanonicalContext.requested_mode,
+        event_id: eventId,
+        request_id: ev.message.message_id,
+      });
+      console.info("[canonical-canary-admission]", buildCanonicalCanaryAuditRecord(canaryAdmission));
+
       const canonicalCutover = await attemptHermesCanonicalCutover({
+        canaryAdmission,
         executeCanonical: async (writeGuard) => {
-          const requestedMode = approvedHermesMode(`${recentDraft.originalDemand}\n${text}`);
           if (!requestedMode) throw new Error("HERMES_APPROVED_REQUEST_MODE_REQUIRED");
           const result = await runApprovedRequestThroughCanonicalHermes(
             {
@@ -3133,11 +3169,14 @@ async function processAcceptedFeishuEvent(payload: any) {
                 subtask_id: command.payload.subtask_id,
                 payload: command.payload,
                 status: "queued",
-              });
+              }, canaryAdmission.admission!);
               writeGuard.recordAuthoritativeWrite(created.insertedCount);
               return created;
             },
-            { canonicalPersistenceReady: canonicalPersistenceRuntimeEnabled() }
+            {
+              canonicalPersistenceReady: canonicalPersistenceRuntimeEnabled(),
+              canaryAdmission,
+            }
           );
           if (!result.delegated || result.reason !== "canonical_jobs_created") {
             throw new Error("HERMES_CANONICAL_DELEGATION_NOT_APPLIED");
