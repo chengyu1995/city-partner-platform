@@ -7,8 +7,10 @@ const root = process.cwd();
 const core = await import("../../tencent-worker/canonical-canary-scope-core.js");
 const boundary = await import("../../../src/lib/feishu-application-boundary.ts");
 const cutover = await import("../../../src/lib/hermes/cutover-control.ts");
+const jobInsert = await import("../../../src/lib/hermes/canonical-job-insert-contract.ts");
 const tencentPersistence = await import("../../tencent-worker/worker_canonical_persistence.js");
 const workerJobsSource = readFileSync(join(root, "src/lib/worker-jobs.ts"), "utf8");
+const migrationSource = readFileSync(join(root, "supabase/migrations/202608110001_canonical_canary_admission_control.sql"), "utf8");
 
 const OWNER = "ou_owner123";
 const BATCH = "BATCH-ARCH-COMPLETE-03C-3B-CANARY-01";
@@ -30,6 +32,36 @@ function env(overrides = {}) {
 
 function candidate(overrides = {}) {
   return {
+    trusted_owner_id: OWNER,
+    batch_code: BATCH,
+    requested_mode: "worker_read_only",
+    event_id: "event-1",
+    request_id: "message-1",
+    ...overrides,
+  };
+}
+
+function canonicalRow(overrides = {}) {
+  return {
+    source: "hermes_canonical_orchestration",
+    title: "Inspect package metadata",
+    request_text: "Read package.json and report its name.",
+    requested_mode: "worker_read_only",
+    plan_id: "plan-1",
+    subtask_id: "subtask-1",
+    payload: {
+      canonical_runtime: true,
+      plan_id: "plan-1",
+      subtask_id: "subtask-1",
+    },
+    result: { job_state: "queued" },
+    ...overrides,
+  };
+}
+
+function admission(overrides = {}) {
+  return {
+    policy_id: POLICY,
     trusted_owner_id: OWNER,
     batch_code: BATCH,
     requested_mode: "worker_read_only",
@@ -242,6 +274,78 @@ test("Canary scope does not enable or couple Shadow", () => {
   assert.equal(route.canonical_enabled, false);
   assert.equal(route.shadow_enabled, true);
   assert.equal(route.mode, "shadow");
+});
+
+test("real 03K job shape builds the explicit persistence contract", () => {
+  const contract = jobInsert.buildCanonicalJobInsertContract(canonicalRow(), admission());
+  assert.equal(contract.schema, "canonical_canary_job_insert_v1");
+  assert.equal(contract.title, "Inspect package metadata");
+  assert.equal(contract.requested_mode, "worker_read_only");
+  assert.deepEqual(contract.payload.canonical_canary_admission, admission());
+});
+
+test("canonical title is deterministic and normalized before persistence", () => {
+  const first = jobInsert.buildCanonicalJobInsertContract(canonicalRow({ title: "  Inspect package metadata  " }), admission());
+  const second = jobInsert.buildCanonicalJobInsertContract(canonicalRow(), admission());
+  assert.equal(first.title, second.title);
+});
+
+test("missing or empty canonical title fails before RPC persistence", () => {
+  assert.throws(
+    () => jobInsert.buildCanonicalJobInsertContract(canonicalRow({ title: "" }), admission()),
+    /CANONICAL_JOB_TITLE_REQUIRED/
+  );
+  assert.throws(
+    () => jobInsert.buildCanonicalJobInsertContract(canonicalRow({ title: undefined }), admission()),
+    /CANONICAL_JOB_TITLE_REQUIRED/
+  );
+});
+
+test("missing request context and identifiers fail before persistence", () => {
+  assert.throws(
+    () => jobInsert.buildCanonicalJobInsertContract(canonicalRow({ request_text: "" }), admission()),
+    /CANONICAL_JOB_REQUEST_TEXT_REQUIRED/
+  );
+  assert.throws(
+    () => jobInsert.buildCanonicalJobInsertContract(canonicalRow({ plan_id: "", payload: { canonical_runtime: true, subtask_id: "subtask-1" } }), admission()),
+    /CANONICAL_JOB_PLAN_ID_REQUIRED/
+  );
+  assert.throws(
+    () => jobInsert.buildCanonicalJobInsertContract(canonicalRow(), admission({ event_id: "" })),
+    /CANONICAL_JOB_EVENT_ID_REQUIRED/
+  );
+});
+
+test("write_allowed cannot enter the canonical insert contract", () => {
+  assert.throws(
+    () => jobInsert.buildCanonicalJobInsertContract(canonicalRow({ requested_mode: "write_allowed" }), admission()),
+    /CANONICAL_JOB_REQUESTED_MODE_INVALID/
+  );
+});
+
+test("migration uses explicit columns and never whole-row JSON conversion", () => {
+  assert.doesNotMatch(migrationSource, /jsonb_populate_record/i);
+  assert.match(migrationSource, /insert into public\.hermes_jobs \(\s*id,\s*source,\s*title,\s*request_text,/i);
+  assert.match(migrationSource, /p_job->>'request_text',\s*'pending',/i);
+  assert.match(migrationSource, /p_job->'state_snapshot',\s*'queued',\s*0,/i);
+});
+
+test("migration validates the job contract before consuming admission", () => {
+  const validationAt = migrationSource.indexOf("MALFORMED_CANONICAL_JOB_PAYLOAD");
+  const admissionInsertAt = migrationSource.indexOf("insert into public.hermes_canonical_canary_admissions");
+  assert.notEqual(validationAt, -1);
+  assert.ok(validationAt < admissionInsertAt);
+  assert.match(migrationSource, /CANARY_JOB_ADMISSION_MISMATCH/);
+  assert.match(migrationSource, /p_job->>'schema' is distinct from 'canonical_canary_job_insert_v1'/i);
+  assert.match(migrationSource, /payload,canonical_runtime[^\n]+is distinct from 'true'/i);
+  assert.match(migrationSource, /INVALID_CANARY_ADMISSION_IDENTITY/);
+});
+
+test("tracked runtime columns are additive and the migration remains inert", () => {
+  assert.match(migrationSource, /add column if not exists request_text text null/i);
+  assert.match(migrationSource, /add column if not exists payload jsonb null/i);
+  assert.doesNotMatch(migrationSource, /HERMES_CANONICAL_ORCHESTRATION_ENABLED\s*=|CANONICAL_DATABASE_PERSISTENCE_ENABLED\s*=/);
+  assert.doesNotMatch(migrationSource, /insert into public\.hermes_canonical_canary_policy_rules/);
 });
 
 test("admission migration introduces no second attempt, lease, or terminal state machine", () => {

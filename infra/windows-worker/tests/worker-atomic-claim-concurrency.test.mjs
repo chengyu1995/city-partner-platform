@@ -40,6 +40,7 @@ const workerJobs = loadTypeScriptModule(path.join(root, "src", "lib", "worker-jo
   "./hermes/execution-plan": {},
   "./hermes/shadow-runtime": { getCompletedHermesShadowObservation: () => null },
   "./hermes/canonical-canary-scope": { evaluateCanonicalCanaryAdmission: () => ({ allowed: true }) },
+  "./hermes/canonical-job-insert-contract": { buildCanonicalJobInsertContract: () => ({}) },
   "./project-director-final-report": {},
 });
 

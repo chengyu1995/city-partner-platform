@@ -1,6 +1,10 @@
 -- Durable, one-shot admission for the first production Canonical canary.
 -- This migration is an artifact only until a separately approved production migration batch.
 
+alter table public.hermes_jobs
+  add column if not exists request_text text null,
+  add column if not exists payload jsonb null;
+
 create table if not exists public.hermes_canonical_canary_policy_rules (
   policy_id text not null,
   owner_open_id text not null,
@@ -50,10 +54,43 @@ as $$
 declare
   v_admission public.hermes_canonical_canary_admissions%rowtype;
   v_job_id uuid;
-  v_job jsonb;
 begin
-  if p_requested_mode <> 'worker_read_only' then
+  if nullif(btrim(p_policy_id), '') is null
+    or nullif(btrim(p_owner_open_id), '') is null
+    or nullif(btrim(p_batch_code), '') is null
+    or nullif(btrim(p_event_id), '') is null
+    or nullif(btrim(p_request_id), '') is null
+  then
+    return jsonb_build_object('allowed', false, 'reason_code', 'INVALID_CANARY_ADMISSION_IDENTITY');
+  end if;
+
+  if p_requested_mode is distinct from 'worker_read_only' then
     return jsonb_build_object('allowed', false, 'reason_code', 'MODE_NOT_ALLOWED');
+  end if;
+
+  if jsonb_typeof(p_job) is distinct from 'object'
+    or p_job->>'schema' is distinct from 'canonical_canary_job_insert_v1'
+    or p_job->>'source' is distinct from 'hermes_canonical_orchestration'
+    or nullif(btrim(p_job->>'title'), '') is null
+    or nullif(btrim(p_job->>'request_text'), '') is null
+    or p_job->>'requested_mode' is distinct from p_requested_mode
+    or nullif(btrim(p_job->>'plan_id'), '') is null
+    or nullif(btrim(p_job->>'subtask_id'), '') is null
+    or jsonb_typeof(p_job->'payload') is distinct from 'object'
+    or p_job#>>'{payload,canonical_runtime}' is distinct from 'true'
+    or jsonb_typeof(p_job->'state_snapshot') is distinct from 'object'
+  then
+    return jsonb_build_object('allowed', false, 'reason_code', 'MALFORMED_CANONICAL_JOB_PAYLOAD');
+  end if;
+
+  if p_job#>>'{payload,canonical_canary_admission,policy_id}' is distinct from p_policy_id
+    or p_job#>>'{payload,canonical_canary_admission,trusted_owner_id}' is distinct from p_owner_open_id
+    or p_job#>>'{payload,canonical_canary_admission,batch_code}' is distinct from p_batch_code
+    or p_job#>>'{payload,canonical_canary_admission,requested_mode}' is distinct from p_requested_mode
+    or p_job#>>'{payload,canonical_canary_admission,event_id}' is distinct from p_event_id
+    or p_job#>>'{payload,canonical_canary_admission,request_id}' is distinct from p_request_id
+  then
+    return jsonb_build_object('allowed', false, 'reason_code', 'CANARY_JOB_ADMISSION_MISMATCH');
   end if;
 
   if not exists (
@@ -99,27 +136,35 @@ begin
   end if;
 
   v_job_id := gen_random_uuid();
-  v_job := (p_job
-    - 'id'
-    - 'claimed_by'
-    - 'claimed_at'
-    - 'attempt_id'
-    - 'active_attempt_id'
-    - 'lease_id'
-    - 'active_lease_id'
-    - 'terminal_state'
-    - 'terminal_at') || jsonb_build_object(
-      'id', v_job_id,
-      'canonical_job_state', 'queued',
-      'canonical_revision', 0,
-      'terminal_at', null,
-      'claimed_by', null,
-      'claimed_at', null,
-      'status', 'queued'
-    );
-
-  insert into public.hermes_jobs
-  select (jsonb_populate_record(null::public.hermes_jobs, v_job)).*;
+  insert into public.hermes_jobs (
+    id,
+    source,
+    title,
+    request_text,
+    status,
+    payload,
+    result,
+    canonical_job_state,
+    canonical_revision,
+    requested_mode,
+    plan_id,
+    subtask_id,
+    terminal_at
+  ) values (
+    v_job_id,
+    p_job->>'source',
+    btrim(p_job->>'title'),
+    p_job->>'request_text',
+    'pending',
+    p_job->'payload',
+    p_job->'state_snapshot',
+    'queued',
+    0,
+    p_requested_mode,
+    p_job->>'plan_id',
+    p_job->>'subtask_id',
+    null
+  );
 
   update public.hermes_canonical_canary_admissions
   set job_id = v_job_id, consumed_at = now()

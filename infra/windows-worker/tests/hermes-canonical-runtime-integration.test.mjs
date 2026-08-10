@@ -463,6 +463,7 @@ test("Hermes plan payload preserves aggregation inputs", () => {
     requested_mode: "worker_read_only", event_id: "event-1", request_id: "request-1",
   };
   const [command] = adapter.buildCanonicalJobCommands(plan, admission);
+  assert.equal(command.title, "One");
   assert.equal(command.payload.original_request_text, "request");
   assert.equal(command.payload.plan_objective, "objective");
   assert.equal(command.payload.aggregation_policy, "all_required");

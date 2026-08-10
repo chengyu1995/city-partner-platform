@@ -57,6 +57,7 @@ export interface HermesPlanningContext {
 
 export interface CanonicalJobCommand {
   source: "hermes_canonical_orchestration";
+  title: string;
   request_text: string;
   project_domain: string;
   requested_mode: HermesRequestedMode;
@@ -161,6 +162,7 @@ export function buildCanonicalJobCommands(
   if (plan.subtasks.length !== 1) throw new Error("CANONICAL_CANARY_SINGLE_JOB_REQUIRED");
   return plan.subtasks.map((subtask) => ({
     source: "hermes_canonical_orchestration",
+    title: subtask.title.trim(),
     request_text: `${subtask.title}\n\n${subtask.objective}\n\nOriginal request:\n${plan.original_request_text}`,
     project_domain: plan.project_domain,
     requested_mode: plan.requested_mode,

@@ -2987,6 +2987,7 @@ async function processAcceptedFeishuEvent(payload: any) {
                   });
                   const created = await canonicalCreateJob(supabase, {
                     source: command.source,
+                    title: command.title,
                     request_text: command.request_text,
                     project_domain: command.project_domain,
                     requested_mode: command.requested_mode,
@@ -3162,6 +3163,7 @@ async function processAcceptedFeishuEvent(payload: any) {
             async (command) => {
               const created = await canonicalCreateJob(supabase, {
                 source: command.source,
+                title: command.title,
                 request_text: command.request_text,
                 project_domain: command.project_domain,
                 requested_mode: command.requested_mode,

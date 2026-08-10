@@ -50,6 +50,7 @@ import {
   evaluateCanonicalCanaryAdmission,
   type CanonicalCanaryAdmissionEvidence,
 } from "./hermes/canonical-canary-scope";
+import { buildCanonicalJobInsertContract } from "./hermes/canonical-job-insert-contract";
 
 type JobRecord = Record<string, unknown>;
 
@@ -4339,11 +4340,9 @@ export async function canonicalCreateJob(
     subtask_id: readString(row.subtask_id) ?? readString(payload.subtask_id),
     terminal_at: null,
     source: readString(row.source) ?? "canonical_orchestration",
-    payload: {
-      ...payload,
-      canonical_canary_admission: { ...admission },
-    },
+    payload,
   };
+  const insertContract = buildCanonicalJobInsertContract(canonicalRow, admission);
   const { data, error } = await supabase.rpc("canonical_admit_canary_job", {
     p_policy_id: admission.policy_id,
     p_owner_open_id: admission.trusted_owner_id,
@@ -4351,10 +4350,10 @@ export async function canonicalCreateJob(
     p_requested_mode: admission.requested_mode,
     p_event_id: admission.event_id,
     p_request_id: admission.request_id,
-    p_job: canonicalRow,
+    p_job: insertContract,
   });
   if (error) {
-    throw new Error(formatHermesJobInsertError(failureLabel, error, [canonicalRow], [], []));
+    throw new Error(formatHermesJobInsertError(failureLabel, error, [insertContract], [], []));
   }
   const result = readRecord(data);
   if (!result || result.allowed !== true) {
