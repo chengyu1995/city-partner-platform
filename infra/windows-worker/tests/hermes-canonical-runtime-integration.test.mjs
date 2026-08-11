@@ -212,6 +212,16 @@ test("claim returns approved execution contract", async () => {
   assert.equal(claim.execution_intent, "verification");
 });
 
+test("Production result.canonical_context projects a consumable Worker payload", async () => {
+  const state = fixture();
+  state.job.result = { canonical_context: state.job.payload };
+  delete state.job.payload;
+  const claim = await canonical.claimNext(state.client, "worker-03c1", new Date("2026-08-05T00:00:00.000Z"));
+  assert.equal(claim.requested_mode, "worker_read_only");
+  assert.equal(claim.execution_intent, "verification");
+  assert.equal(claim.job.payload.canonical_canary_admission.policy_id, "CANARY-01");
+});
+
 test("unmet DAG dependency is not claimed", async () => {
   const state = fixture();
   state.job.payload.dependencies = ["missing"];

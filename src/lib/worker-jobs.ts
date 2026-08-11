@@ -4402,7 +4402,8 @@ function canonicalRevision(value: unknown): number {
 }
 
 function canonicalPayload(job: JobRecord): JobRecord {
-  return readRecord(job.payload) ?? {};
+  const result = readRecord(job.result);
+  return readRecord(job.payload) ?? readRecord(result?.canonical_context) ?? {};
 }
 
 export function canonicalCanaryAdmissionAllowsWorkerClaim(
@@ -4585,6 +4586,7 @@ export async function claimNextCanonicalHermesJob(
       return {
         job: {
           ...candidate,
+          payload,
           canonical_job_state: "claimed",
           canonical_revision: revision,
           status: "running",

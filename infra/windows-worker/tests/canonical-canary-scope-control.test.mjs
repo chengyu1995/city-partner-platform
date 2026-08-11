@@ -45,7 +45,7 @@ function canonicalRow(overrides = {}) {
   return {
     source: "hermes_canonical_orchestration",
     title: "Inspect package metadata",
-    request_text: "Read package.json and report its name.",
+    request_text: "Inspect package metadata\n\nRead package.json and report its name.",
     requested_mode: "worker_read_only",
     plan_id: "plan-1",
     subtask_id: "subtask-1",
@@ -191,14 +191,16 @@ test("audit record hashes trusted identities and emits no raw owner or event", (
 
 test("Worker claim defense requires the same exact policy", () => {
   const job = {
-    payload: {
-      canonical_canary_admission: {
-        policy_id: POLICY,
-        trusted_owner_id: OWNER,
-        batch_code: BATCH,
-        requested_mode: "worker_read_only",
-        event_id: "event-1",
-        request_id: "message-1",
+    result: {
+      canonical_context: {
+        canonical_canary_admission: {
+          policy_id: POLICY,
+          trusted_owner_id: OWNER,
+          batch_code: BATCH,
+          requested_mode: "worker_read_only",
+          event_id: "event-1",
+          request_id: "message-1",
+        },
       },
     },
   };
@@ -279,15 +281,15 @@ test("Canary scope does not enable or couple Shadow", () => {
 test("real 03K job shape builds the explicit persistence contract", () => {
   const contract = jobInsert.buildCanonicalJobInsertContract(canonicalRow(), admission());
   assert.equal(contract.schema, "canonical_canary_job_insert_v1");
-  assert.equal(contract.title, "Inspect package metadata");
+  assert.equal(Object.hasOwn(contract, "title"), false);
   assert.equal(contract.requested_mode, "worker_read_only");
-  assert.deepEqual(contract.payload.canonical_canary_admission, admission());
+  assert.deepEqual(contract.canonical_context.canonical_canary_admission, admission());
 });
 
 test("canonical title is deterministic and normalized before persistence", () => {
   const first = jobInsert.buildCanonicalJobInsertContract(canonicalRow({ title: "  Inspect package metadata  " }), admission());
   const second = jobInsert.buildCanonicalJobInsertContract(canonicalRow(), admission());
-  assert.equal(first.title, second.title);
+  assert.equal(first.request_text, second.request_text);
 });
 
 test("missing or empty canonical title fails before RPC persistence", () => {
@@ -325,9 +327,11 @@ test("write_allowed cannot enter the canonical insert contract", () => {
 
 test("migration uses explicit columns and never whole-row JSON conversion", () => {
   assert.doesNotMatch(migrationSource, /jsonb_populate_record/i);
-  assert.match(migrationSource, /insert into public\.hermes_jobs \(\s*id,\s*source,\s*title,\s*request_text,/i);
-  assert.match(migrationSource, /p_job->>'request_text',\s*'pending',/i);
-  assert.match(migrationSource, /p_job->'state_snapshot',\s*'queued',\s*0,/i);
+  assert.match(migrationSource, /insert into public\.hermes_jobs \(\s*id,\s*source,\s*request_text,\s*status,\s*result,/i);
+  assert.match(migrationSource, /p_job->>'request_text',\s*'queued',/i);
+  assert.match(migrationSource, /jsonb_build_object\('canonical_context', p_job->'canonical_context'\)/i);
+  assert.doesNotMatch(migrationSource, /\btitle\b/i);
+  assert.doesNotMatch(migrationSource, /^\s*payload,?\s*$/im);
 });
 
 test("migration validates the job contract before consuming admission", () => {
@@ -337,13 +341,12 @@ test("migration validates the job contract before consuming admission", () => {
   assert.ok(validationAt < admissionInsertAt);
   assert.match(migrationSource, /CANARY_JOB_ADMISSION_MISMATCH/);
   assert.match(migrationSource, /p_job->>'schema' is distinct from 'canonical_canary_job_insert_v1'/i);
-  assert.match(migrationSource, /payload,canonical_runtime[^\n]+is distinct from 'true'/i);
+  assert.match(migrationSource, /canonical_context,canonical_runtime[^\n]+is distinct from 'true'/i);
   assert.match(migrationSource, /INVALID_CANARY_ADMISSION_IDENTITY/);
 });
 
 test("tracked runtime columns are additive and the migration remains inert", () => {
-  assert.match(migrationSource, /add column if not exists request_text text null/i);
-  assert.match(migrationSource, /add column if not exists payload jsonb null/i);
+  assert.doesNotMatch(migrationSource, /alter table public\.hermes_jobs/i);
   assert.doesNotMatch(migrationSource, /HERMES_CANONICAL_ORCHESTRATION_ENABLED\s*=|CANONICAL_DATABASE_PERSISTENCE_ENABLED\s*=/);
   assert.doesNotMatch(migrationSource, /insert into public\.hermes_canonical_canary_policy_rules/);
 });

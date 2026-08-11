@@ -17,7 +17,7 @@ Message text supplies candidate batch and mode metadata only. It is never the au
 
 The Application evaluator runs after Feishu signature verification and before orchestration. The cutover guard and orchestration boundary require the resulting admission decision. `canonicalCreateJob` then calls the service-role-only `canonical_admit_canary_job` RPC, which validates the same policy tuple and atomically consumes the one-shot scope while creating one queued Canonical job.
 
-Canonical job persistence uses the explicit `canonical_canary_job_insert_v1` contract. Its title is the validated Hermes subtask title, and the RPC validates every required field before consuming admission. The SQL insert names only approved columns and uses Legacy `status=pending` as a compatibility projection while `canonical_job_state=queued` remains authoritative. It never converts arbitrary JSON into a complete `hermes_jobs` row.
+Canonical job persistence uses the explicit `canonical_canary_job_insert_v1` contract. The validated Hermes subtask title is folded into `request_text`; Production has no separate `title` column. The full execution context is stored under the existing `result.canonical_context` JSON envelope and projected back to `payload` at the Worker boundary. The SQL insert names only columns observed in the Production catalog, uses `status=queued`, and never converts arbitrary JSON into a complete `hermes_jobs` row or adds compatibility columns.
 
 The durable key is `(policy_id, owner_open_id, batch_code, requested_mode)`. A retry with the same `event_id` returns the existing job. A second distinct event for that scope is denied with `CANARY_ALREADY_CONSUMED`. The database transaction and unique constraint select at most one winner under concurrency.
 

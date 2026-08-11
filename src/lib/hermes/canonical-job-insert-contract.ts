@@ -5,12 +5,11 @@ export const CANONICAL_JOB_INSERT_SCHEMA = "canonical_canary_job_insert_v1" as c
 export interface CanonicalJobInsertContract extends Record<string, unknown> {
   schema: typeof CANONICAL_JOB_INSERT_SCHEMA;
   source: "hermes_canonical_orchestration";
-  title: string;
   request_text: string;
   requested_mode: "worker_read_only";
   plan_id: string;
   subtask_id: string;
-  payload: Record<string, unknown>;
+  canonical_context: Record<string, unknown>;
   state_snapshot: Record<string, unknown>;
 }
 
@@ -52,16 +51,20 @@ export function buildCanonicalJobInsertContract(
   const stateSnapshot = requiredRecord(row.result, "CANONICAL_JOB_STATE_SNAPSHOT_REQUIRED");
   const planId = requiredText(row.plan_id ?? payload.plan_id, "CANONICAL_JOB_PLAN_ID_REQUIRED");
   const subtaskId = requiredText(row.subtask_id ?? payload.subtask_id, "CANONICAL_JOB_SUBTASK_ID_REQUIRED");
+  const title = requiredText(row.title, "CANONICAL_JOB_TITLE_REQUIRED");
+  const requestText = requiredText(row.request_text, "CANONICAL_JOB_REQUEST_TEXT_REQUIRED");
+  if (requestText !== title && !requestText.startsWith(`${title}\n`)) {
+    throw new Error("CANONICAL_JOB_TITLE_NOT_IN_REQUEST_TEXT");
+  }
 
   return {
     schema: CANONICAL_JOB_INSERT_SCHEMA,
     source: "hermes_canonical_orchestration",
-    title: requiredText(row.title, "CANONICAL_JOB_TITLE_REQUIRED"),
-    request_text: requiredText(row.request_text, "CANONICAL_JOB_REQUEST_TEXT_REQUIRED"),
+    request_text: requestText,
     requested_mode: "worker_read_only",
     plan_id: planId,
     subtask_id: subtaskId,
-    payload: {
+    canonical_context: {
       ...payload,
       canonical_canary_admission: { ...admission },
     },

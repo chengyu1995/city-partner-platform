@@ -22,8 +22,16 @@ function isCanonicalJob(job) {
   return Boolean(job && text(job.canonical_job_state) && Number.isSafeInteger(Number(job.canonical_revision)));
 }
 
+function canonicalPayload(job) {
+  if (job && job.payload && typeof job.payload === "object" && !Array.isArray(job.payload)) return job.payload;
+  const result = job && job.result && typeof job.result === "object" && !Array.isArray(job.result) ? job.result : {};
+  return result.canonical_context && typeof result.canonical_context === "object" && !Array.isArray(result.canonical_context)
+    ? result.canonical_context
+    : {};
+}
+
 function canaryAdmissionAllowsClaim(job, env = process.env) {
-  const payload = job && job.payload && typeof job.payload === "object" ? job.payload : {};
+  const payload = canonicalPayload(job);
   const evidence = payload.canonical_canary_admission;
   if (!evidence || typeof evidence !== "object") return false;
   return evaluateCanonicalCanaryAdmission({
@@ -106,7 +114,7 @@ function assertIdentity(ownership, input) {
 }
 
 async function dependenciesReady(client, job) {
-  const payload = job.payload && typeof job.payload === "object" ? job.payload : {};
+  const payload = canonicalPayload(job);
   const dependencies = Array.isArray(payload.dependencies) ? payload.dependencies.filter(text) : [];
   if (!dependencies.length) return true;
   const planId = text(job.plan_id) || text(payload.plan_id);
@@ -139,9 +147,9 @@ async function claimNext(client, workerId, now = new Date()) {
         p_now: now.toISOString(),
         p_expires_at: expiresAt,
       });
-      const payload = job.payload && typeof job.payload === "object" ? job.payload : {};
+      const payload = canonicalPayload(job);
       return {
-        job: { ...job, canonical_job_state: "claimed", canonical_revision: revision(result.revision), projection_only: true },
+        job: { ...job, payload, canonical_job_state: "claimed", canonical_revision: revision(result.revision), projection_only: true },
         job_id: job.id,
         worker_task_id: job.job_id || job.id,
         attempt_id: attemptId,
