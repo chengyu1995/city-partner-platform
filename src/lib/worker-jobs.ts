@@ -47,6 +47,7 @@ import {
 } from "./project-director-final-report";
 import { getCompletedHermesShadowObservation } from "./hermes/shadow-runtime";
 import {
+  buildCanonicalCanaryPersistenceAuditRecord,
   evaluateCanonicalCanaryAdmission,
   type CanonicalCanaryAdmissionEvidence,
 } from "./hermes/canonical-canary-scope";
@@ -4353,11 +4354,25 @@ export async function canonicalCreateJob(
     p_job: insertContract,
   });
   if (error) {
-    throw new Error(formatHermesJobInsertError(failureLabel, error, [insertContract], [], []));
+    console.warn(
+      "[canonical-canary-persistence-admission]",
+      buildCanonicalCanaryPersistenceAuditRecord(admission, {
+        allowed: false,
+        reason_code: "CANONICAL_AUTHORITATIVE_WRITE_OUTCOME_UNKNOWN",
+      })
+    );
+    throw new Error(
+      `${failureLabel}:CANONICAL_AUTHORITATIVE_WRITE_OUTCOME_UNKNOWN:${readString(error.code) ?? "RPC_FAILED"}`
+    );
   }
   const result = readRecord(data);
   if (!result || result.allowed !== true) {
-    throw new Error(`CANONICAL_CANARY_PERSISTENCE_DENIED:${readString(result?.reason_code) ?? "INVALID_RESPONSE"}`);
+    const reasonCode = readString(result?.reason_code) ?? "INVALID_RESPONSE";
+    console.warn(
+      "[canonical-canary-persistence-admission]",
+      buildCanonicalCanaryPersistenceAuditRecord(admission, { allowed: false, reason_code: reasonCode })
+    );
+    throw new Error(`CANONICAL_CANARY_PERSISTENCE_DENIED:${reasonCode}`);
   }
   const jobId = readString(result.job_id);
   if (!jobId) throw new Error("CANONICAL_CANARY_PERSISTENCE_JOB_ID_REQUIRED");

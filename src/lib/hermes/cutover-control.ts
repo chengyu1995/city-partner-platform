@@ -13,6 +13,8 @@ export interface HermesCanonicalCutoverConfig {
 }
 
 export interface CanonicalWriteGuard {
+  enterAuthoritativeWriteBoundary(): void;
+  authoritativeBoundaryEntered(): boolean;
   recordAuthoritativeWrite(count?: number): void;
   authoritativeWriteCount(): number;
 }
@@ -23,6 +25,7 @@ export type HermesCanonicalCutoverResult<T> =
       reason: "canonical_disabled" | "rollback_switch_enabled" | "flag_conflict" | "canary_admission_denied";
       canonical_result: null;
       canonical_authoritative_writes: 0;
+      canonical_authoritative_boundary_entered: false;
       canary_denial_reason?: string;
     }
   | {
@@ -30,6 +33,7 @@ export type HermesCanonicalCutoverResult<T> =
       reason: "canonical_prewrite_failure";
       canonical_result: null;
       canonical_authoritative_writes: 0;
+      canonical_authoritative_boundary_entered: false;
       failure_code: "CANONICAL_PREWRITE_FAILURE";
     }
   | {
@@ -37,6 +41,7 @@ export type HermesCanonicalCutoverResult<T> =
       reason: "canonical_completed";
       canonical_result: T;
       canonical_authoritative_writes: number;
+      canonical_authoritative_boundary_entered: boolean;
     };
 
 function enabled(value: string | undefined): boolean {
@@ -81,6 +86,7 @@ export async function attemptHermesCanonicalCutover<T>(input: {
       reason: legacyReason(config),
       canonical_result: null,
       canonical_authoritative_writes: 0,
+      canonical_authoritative_boundary_entered: false,
     };
   }
   if (!input.canaryAdmission?.allowed) {
@@ -90,14 +96,25 @@ export async function attemptHermesCanonicalCutover<T>(input: {
       canary_denial_reason: input.canaryAdmission?.reason_code ?? "CANARY_ADMISSION_REQUIRED",
       canonical_result: null,
       canonical_authoritative_writes: 0,
+      canonical_authoritative_boundary_entered: false,
     };
   }
 
+  let authoritativeBoundaryEntered = false;
   let authoritativeWrites = 0;
   const guard: CanonicalWriteGuard = {
+    enterAuthoritativeWriteBoundary() {
+      authoritativeBoundaryEntered = true;
+    },
+    authoritativeBoundaryEntered() {
+      return authoritativeBoundaryEntered;
+    },
     recordAuthoritativeWrite(count = 1) {
       if (!Number.isSafeInteger(count) || count < 0) {
         throw new Error("CANONICAL_WRITE_COUNT_INVALID");
+      }
+      if (!authoritativeBoundaryEntered) {
+        throw new Error("CANONICAL_AUTHORITATIVE_WRITE_BOUNDARY_REQUIRED");
       }
       authoritativeWrites += count;
     },
@@ -113,16 +130,21 @@ export async function attemptHermesCanonicalCutover<T>(input: {
       reason: "canonical_completed",
       canonical_result: canonicalResult,
       canonical_authoritative_writes: authoritativeWrites,
+      canonical_authoritative_boundary_entered: authoritativeBoundaryEntered,
     };
   } catch (error) {
     if (authoritativeWrites > 0) {
       throw new Error("CANONICAL_CUTOVER_PARTIAL_WRITE_FAIL_CLOSED", { cause: error });
+    }
+    if (authoritativeBoundaryEntered) {
+      throw new Error("CANONICAL_AUTHORITATIVE_WRITE_OUTCOME_UNKNOWN", { cause: error });
     }
     return {
       path: "legacy_fallback",
       reason: "canonical_prewrite_failure",
       canonical_result: null,
       canonical_authoritative_writes: 0,
+      canonical_authoritative_boundary_entered: false,
       failure_code: "CANONICAL_PREWRITE_FAILURE",
     };
   }

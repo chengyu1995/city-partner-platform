@@ -189,6 +189,70 @@ test("audit record hashes trusted identities and emits no raw owner or event", (
   assert.equal(JSON.stringify(record).includes(OWNER), false);
 });
 
+test("DENY audit preserves pseudonymous owner batch mode and event correlation", () => {
+  const candidates = [
+    candidate({ trusted_owner_id: "ou_wrong", event_id: "event-denied" }),
+    candidate({ batch_code: "BATCH-DENIED", event_id: "event-denied" }),
+    candidate({ requested_mode: "write_allowed", event_id: "event-denied" }),
+  ];
+  const records = candidates.map((value) => core.buildCanonicalCanaryAuditRecord(
+    core.evaluateCanonicalCanaryAdmission(value, env())
+  ));
+  for (const record of records) {
+    assert.match(record.owner_id_hash, /^[a-f0-9]{16}$/);
+    assert.match(record.batch_code_hash, /^[a-f0-9]{16}$/);
+    assert.match(record.event_id_hash, /^[a-f0-9]{16}$/);
+    assert.match(record.requested_mode_hash, /^[a-f0-9]{16}$/);
+  }
+  assert.equal(records[0].event_id_hash, records[1].event_id_hash);
+  assert.equal(records[1].event_id_hash, records[2].event_id_hash);
+});
+
+test("policy and malformed configuration DENY records retain candidate hashes", () => {
+  for (const inputEnv of [
+    env({ HERMES_CANONICAL_CANARY_SCOPE_ENABLED: "false" }),
+    env({ HERMES_CANONICAL_CANARY_ALLOWED_OWNER_IDS: "" }),
+    env({ HERMES_CANONICAL_CANARY_POLICY_ID: "CANARY-02" }),
+  ]) {
+    const value = candidate({ expected_policy_id: POLICY });
+    const record = core.buildCanonicalCanaryAuditRecord(core.evaluateCanonicalCanaryAdmission(value, inputEnv));
+    assert.match(record.owner_id_hash, /^[a-f0-9]{16}$/);
+    assert.match(record.batch_code_hash, /^[a-f0-9]{16}$/);
+    assert.match(record.event_id_hash, /^[a-f0-9]{16}$/);
+  }
+});
+
+test("DENY audit never exposes raw owner event request or batch", () => {
+  const value = candidate({ trusted_owner_id: "ou_denied_owner", event_id: "event-secret", request_id: "message-secret" });
+  const record = core.buildCanonicalCanaryAuditRecord(core.evaluateCanonicalCanaryAdmission(value, env()));
+  const serialized = JSON.stringify(record);
+  for (const raw of [value.trusted_owner_id, value.event_id, value.request_id, value.batch_code]) {
+    assert.equal(serialized.includes(raw), false, raw);
+  }
+});
+
+test("durable admission rejection has the same private correlation contract", () => {
+  const evidence = admission({ event_id: "event-second", request_id: "message-second" });
+  const record = core.buildCanonicalCanaryPersistenceAuditRecord(evidence, {
+    allowed: false,
+    reason_code: "CANARY_ALREADY_CONSUMED",
+  });
+  assert.equal(record.reason_code, "CANARY_ALREADY_CONSUMED");
+  assert.match(record.owner_id_hash, /^[a-f0-9]{16}$/);
+  assert.match(record.batch_code_hash, /^[a-f0-9]{16}$/);
+  assert.match(record.event_id_hash, /^[a-f0-9]{16}$/);
+  const serialized = JSON.stringify(record);
+  assert.equal(serialized.includes(evidence.trusted_owner_id), false);
+  assert.equal(serialized.includes(evidence.event_id), false);
+  assert.match(workerJobsSource, /buildCanonicalCanaryPersistenceAuditRecord\(admission/);
+  assert.match(workerJobsSource, /CANONICAL_AUTHORITATIVE_WRITE_OUTCOME_UNKNOWN/);
+  const canonicalCreateBlock = workerJobsSource.slice(
+    workerJobsSource.indexOf("export async function canonicalCreateJob"),
+    workerJobsSource.indexOf("export interface CanonicalWorkerProtocolResult")
+  );
+  assert.doesNotMatch(canonicalCreateBlock, /error\.(?:message|details|hint)/);
+});
+
 test("Worker claim defense requires the same exact policy", () => {
   const job = {
     result: {

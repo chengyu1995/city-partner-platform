@@ -2985,6 +2985,7 @@ async function processAcceptedFeishuEvent(payload: any) {
                     original_request_text: canonicalContext.original_request_text,
                     approval_context: canonicalContext.approval_context,
                   });
+                  writeGuard.enterAuthoritativeWriteBoundary();
                   const created = await canonicalCreateJob(supabase, {
                     source: command.source,
                     title: command.title,
@@ -3161,6 +3162,7 @@ async function processAcceptedFeishuEvent(payload: any) {
             createCanonicalHermesPlanningProvider(),
             createProductionCapabilityGateway(),
             async (command) => {
+              writeGuard.enterAuthoritativeWriteBoundary();
               const created = await canonicalCreateJob(supabase, {
                 source: command.source,
                 title: command.title,

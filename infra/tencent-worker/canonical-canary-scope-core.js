@@ -18,6 +18,7 @@ const OWNER_PATTERN = /^ou_[A-Za-z0-9_-]+$/;
 const BATCH_PATTERN = /^BATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*$/;
 const POLICY_PATTERN = /^[A-Z0-9][A-Z0-9._-]{2,127}$/;
 const CANARY_MODE = "worker_read_only";
+const AUDITABLE_MODES = new Set(["worker_read_only", "manager_read_only", "write_allowed"]);
 
 function strictTrue(value) {
   return value === "true";
@@ -34,6 +35,24 @@ function parseExactList(value, validator) {
     return { ok: false, values: [] };
   }
   return { ok: true, values };
+}
+
+function hashAuditValue(value) {
+  return typeof value === "string" && value
+    ? crypto.createHash("sha256").update(value).digest("hex").slice(0, 16)
+    : null;
+}
+
+function buildCanonicalCanaryCandidateAuditContext(input = {}) {
+  const requestedMode = typeof input.requested_mode === "string" ? input.requested_mode : null;
+  return Object.freeze({
+    owner_id_hash: hashAuditValue(input.trusted_owner_id),
+    batch_code_hash: hashAuditValue(input.batch_code),
+    requested_mode: requestedMode && AUDITABLE_MODES.has(requestedMode) ? requestedMode : requestedMode ? "unrecognized" : null,
+    requested_mode_hash: hashAuditValue(requestedMode),
+    event_id_hash: hashAuditValue(input.event_id),
+    request_id_hash: hashAuditValue(input.request_id),
+  });
 }
 
 function resolveCanonicalCanaryScopeConfig(env = process.env) {
@@ -62,7 +81,7 @@ function resolveCanonicalCanaryScopeConfig(env = process.env) {
   };
 }
 
-function denied(reasonCode, config, matches = {}) {
+function denied(reasonCode, config, auditContext, matches = {}) {
   return {
     allowed: false,
     reason_code: reasonCode,
@@ -72,20 +91,22 @@ function denied(reasonCode, config, matches = {}) {
     mode_match: matches.mode_match === true,
     one_shot_available: false,
     admission: null,
+    audit_context: auditContext,
   };
 }
 
 function evaluateCanonicalCanaryAdmission(input, env = process.env) {
+  const auditContext = buildCanonicalCanaryCandidateAuditContext(input);
   if (!strictTrue(env[ENV.globalOrchestration])) {
-    return denied("GLOBAL_CANONICAL_DISABLED", null);
+    return denied("GLOBAL_CANONICAL_DISABLED", null, auditContext);
   }
   const config = resolveCanonicalCanaryScopeConfig(env);
-  if (!config.ok) return denied(config.reason_code, config);
+  if (!config.ok) return denied(config.reason_code, config, auditContext);
   if (!strictTrue(env[ENV.globalPersistence])) {
-    return denied("GLOBAL_PERSISTENCE_DISABLED", config);
+    return denied("GLOBAL_PERSISTENCE_DISABLED", config, auditContext);
   }
   if (input.expected_policy_id && input.expected_policy_id !== config.policy_id) {
-    return denied("POLICY_MISMATCH", config);
+    return denied("POLICY_MISMATCH", config, auditContext);
   }
 
   const ownerMatch = typeof input.trusted_owner_id === "string" && config.allowed_owner_ids.includes(input.trusted_owner_id);
@@ -96,11 +117,11 @@ function evaluateCanonicalCanaryAdmission(input, env = process.env) {
     batch_match: batchMatch,
     mode_match: modeMatch,
   };
-  if (!ownerMatch) return denied("OWNER_NOT_ALLOWED", config, matches);
-  if (!batchMatch) return denied("BATCH_NOT_ALLOWED", config, matches);
-  if (!modeMatch) return denied("MODE_NOT_ALLOWED", config, matches);
+  if (!ownerMatch) return denied("OWNER_NOT_ALLOWED", config, auditContext, matches);
+  if (!batchMatch) return denied("BATCH_NOT_ALLOWED", config, auditContext, matches);
+  if (!modeMatch) return denied("MODE_NOT_ALLOWED", config, auditContext, matches);
   if (typeof input.event_id !== "string" || !input.event_id || typeof input.request_id !== "string" || !input.request_id) {
-    return denied("ADMISSION_IDENTITY_INCOMPLETE", config, matches);
+    return denied("ADMISSION_IDENTITY_INCOMPLETE", config, auditContext, matches);
   }
 
   const admission = Object.freeze({
@@ -120,23 +141,28 @@ function evaluateCanonicalCanaryAdmission(input, env = process.env) {
     mode_match: true,
     one_shot_available: true,
     admission,
+    audit_context: auditContext,
   };
 }
 
 function buildCanonicalCanaryAuditRecord(decision) {
-  const admission = decision && decision.admission;
-  const hash = (value) => value
-    ? crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 16)
-    : null;
+  const auditContext = decision && decision.audit_context || buildCanonicalCanaryCandidateAuditContext(decision && decision.admission || {});
   return {
     event: "canonical_canary_admission",
     allowed: decision && decision.allowed === true,
     reason_code: decision && decision.reason_code || "INVALID_DECISION",
     policy_id: decision && decision.policy_id || null,
-    owner_id_hash: hash(admission && admission.trusted_owner_id),
-    batch_code: admission && admission.batch_code || null,
-    requested_mode: admission && admission.requested_mode || null,
-    event_id_hash: hash(admission && admission.event_id),
+    ...auditContext,
+  };
+}
+
+function buildCanonicalCanaryPersistenceAuditRecord(admission, outcome = {}) {
+  return {
+    event: "canonical_canary_persistence_admission",
+    allowed: outcome.allowed === true,
+    reason_code: outcome.reason_code || "INVALID_PERSISTENCE_DECISION",
+    policy_id: admission && admission.policy_id || null,
+    ...buildCanonicalCanaryCandidateAuditContext(admission || {}),
   };
 }
 
@@ -145,5 +171,7 @@ module.exports = {
   CANONICAL_CANARY_MODE: CANARY_MODE,
   resolveCanonicalCanaryScopeConfig,
   evaluateCanonicalCanaryAdmission,
+  buildCanonicalCanaryCandidateAuditContext,
   buildCanonicalCanaryAuditRecord,
+  buildCanonicalCanaryPersistenceAuditRecord,
 };

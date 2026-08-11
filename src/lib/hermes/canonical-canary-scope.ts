@@ -22,6 +22,15 @@ export interface CanonicalCanaryAdmissionEvidence {
   request_id: string;
 }
 
+export interface CanonicalCanaryAuditContext {
+  owner_id_hash: string | null;
+  batch_code_hash: string | null;
+  requested_mode: string | null;
+  requested_mode_hash: string | null;
+  event_id_hash: string | null;
+  request_id_hash: string | null;
+}
+
 export interface CanonicalCanaryAdmissionDecision {
   allowed: boolean;
   reason_code: string;
@@ -31,6 +40,7 @@ export interface CanonicalCanaryAdmissionDecision {
   mode_match: boolean;
   one_shot_available: boolean;
   admission: CanonicalCanaryAdmissionEvidence | null;
+  audit_context: CanonicalCanaryAuditContext;
 }
 
 export interface CanonicalCanaryScopeConfig {
@@ -60,6 +70,11 @@ export const evaluateCanonicalCanaryAdmission = canaryCore.evaluateCanonicalCana
 
 export const buildCanonicalCanaryAuditRecord = canaryCore.buildCanonicalCanaryAuditRecord as (
   decision: CanonicalCanaryAdmissionDecision
+) => Record<string, unknown>;
+
+export const buildCanonicalCanaryPersistenceAuditRecord = canaryCore.buildCanonicalCanaryPersistenceAuditRecord as (
+  admission: CanonicalCanaryAdmissionEvidence,
+  outcome: { allowed: boolean; reason_code: string }
 ) => Record<string, unknown>;
 
 export function requireAllowedCanonicalCanaryAdmission(

@@ -64,6 +64,7 @@ test("successful cutover records canonical authoritative writes", async () => {
     env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
     canaryAdmission: allowedAdmission,
     async executeCanonical(guard) {
+      guard.enterAuthoritativeWriteBoundary();
       guard.recordAuthoritativeWrite(2);
       return { jobs: 2 };
     },
@@ -92,6 +93,7 @@ test("canonical failure after an authoritative write cannot fall back", async ()
       env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
       canaryAdmission: allowedAdmission,
       async executeCanonical(guard) {
+        guard.enterAuthoritativeWriteBoundary();
         guard.recordAuthoritativeWrite();
         throw new Error("second subtask failed");
       },
@@ -117,8 +119,135 @@ test("Feishu production path uses guarded cutover and canonicalCreateJob", () =>
   assert.match(route, /attemptHermesCanonicalCutover\(\{/);
   assert.match(route, /runApprovedRequestThroughCanonicalHermes\(/);
   assert.match(route, /canonicalCreateJob\(supabase/);
+  assert.equal((route.match(/writeGuard\.enterAuthoritativeWriteBoundary\(\)/g) || []).length, 2);
+  assert.equal(
+    (route.match(/writeGuard\.enterAuthoritativeWriteBoundary\(\);\s*const created = await canonicalCreateJob\(supabase/g) || []).length,
+    2
+  );
   assert.match(route, /writeGuard\.recordAuthoritativeWrite\(created\.insertedCount\)/);
   assert.match(route, /canonicalCutover\.path === "canonical_primary"/);
+});
+
+async function runCutoverWithLegacy(executeCanonical, options = {}) {
+  const state = { legacy_creator_calls: 0 };
+  const result = await cutover.attemptHermesCanonicalCutover({
+    env: options.env ?? { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
+    canaryAdmission: options.canaryAdmission ?? allowedAdmission,
+    executeCanonical,
+  });
+  if (result.path !== "canonical_primary") state.legacy_creator_calls += 1;
+  return { result, state };
+}
+
+test("commit success and response success stays Canonical with zero Legacy calls", async () => {
+  const order = [];
+  const { result, state } = await runCutoverWithLegacy(async (guard) => {
+    guard.enterAuthoritativeWriteBoundary();
+    order.push("enter_boundary");
+    order.push("canonical_rpc");
+    guard.recordAuthoritativeWrite();
+    return { job_id: "job-1" };
+  });
+  assert.deepEqual(order, ["enter_boundary", "canonical_rpc"]);
+  assert.equal(result.path, "canonical_primary");
+  assert.equal(result.canonical_authoritative_boundary_entered, true);
+  assert.equal(state.legacy_creator_calls, 0);
+});
+
+test("commit success with response lost fails closed before Legacy", async () => {
+  let databaseCommitted = false;
+  let legacyCreatorCalls = 0;
+  await assert.rejects(
+    async () => {
+      const result = await cutover.attemptHermesCanonicalCutover({
+        env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
+        canaryAdmission: allowedAdmission,
+        async executeCanonical(guard) {
+          guard.enterAuthoritativeWriteBoundary();
+          databaseCommitted = true;
+          throw new Error("response lost after commit");
+        },
+      });
+      if (result.path !== "canonical_primary") legacyCreatorCalls += 1;
+    },
+    /CANONICAL_AUTHORITATIVE_WRITE_OUTCOME_UNKNOWN/
+  );
+  assert.equal(databaseCommitted, true);
+  assert.equal(legacyCreatorCalls, 0);
+});
+
+for (const [name, error] of [
+  ["timeout outcome unknown", new Error("RPC timeout")],
+  ["transport failure outcome unknown", new TypeError("fetch failed")],
+  ["explicit RPC rejection after boundary", new Error("RPC rejected")],
+]) {
+  test(`${name} fails closed with zero Legacy calls`, async () => {
+    let legacyCreatorCalls = 0;
+    await assert.rejects(
+      async () => {
+        const result = await cutover.attemptHermesCanonicalCutover({
+          env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
+          canaryAdmission: allowedAdmission,
+          async executeCanonical(guard) {
+            guard.enterAuthoritativeWriteBoundary();
+            throw error;
+          },
+        });
+        if (result.path !== "canonical_primary") legacyCreatorCalls += 1;
+      },
+      /CANONICAL_AUTHORITATIVE_WRITE_OUTCOME_UNKNOWN/
+    );
+    assert.equal(legacyCreatorCalls, 0);
+  });
+}
+
+test("scope deny remains before the write boundary and preserves Legacy policy", async () => {
+  let canonicalRpcCalls = 0;
+  const { result, state } = await runCutoverWithLegacy(
+    async () => { canonicalRpcCalls += 1; },
+    { canaryAdmission: { allowed: false, reason_code: "OWNER_NOT_ALLOWED" } }
+  );
+  assert.equal(result.reason, "canary_admission_denied");
+  assert.equal(result.canonical_authoritative_boundary_entered, false);
+  assert.equal(canonicalRpcCalls, 0);
+  assert.equal(state.legacy_creator_calls, 1);
+});
+
+test("global Canonical disabled never enters the boundary and preserves Legacy", async () => {
+  let canonicalRpcCalls = 0;
+  const { result, state } = await runCutoverWithLegacy(
+    async () => { canonicalRpcCalls += 1; },
+    { env: {}, canaryAdmission: allowedAdmission }
+  );
+  assert.equal(result.reason, "canonical_disabled");
+  assert.equal(result.canonical_authoritative_boundary_entered, false);
+  assert.equal(canonicalRpcCalls, 0);
+  assert.equal(state.legacy_creator_calls, 1);
+});
+
+test("same-event external retry remains Canonical and idempotent", async () => {
+  const durable = { job_id: null };
+  let legacyCreatorCalls = 0;
+  async function invoke() {
+    const result = await cutover.attemptHermesCanonicalCutover({
+      env: { HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true" },
+      canaryAdmission: allowedAdmission,
+      async executeCanonical(guard) {
+        guard.enterAuthoritativeWriteBoundary();
+        const idempotent = durable.job_id !== null;
+        durable.job_id ??= "job-stable";
+        guard.recordAuthoritativeWrite(idempotent ? 0 : 1);
+        return { job_id: durable.job_id, idempotent };
+      },
+    });
+    if (result.path !== "canonical_primary") legacyCreatorCalls += 1;
+    return result;
+  }
+  const first = await invoke();
+  const retry = await invoke();
+  assert.equal(first.canonical_result.job_id, retry.canonical_result.job_id);
+  assert.equal(retry.canonical_result.idempotent, true);
+  assert.equal(legacyCreatorCalls, 0);
 });
 
 test("Windows and Tencent Worker protocols carry canonical ownership identity", () => {
