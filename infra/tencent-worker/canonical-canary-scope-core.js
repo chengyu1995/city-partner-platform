@@ -19,6 +19,26 @@ const BATCH_PATTERN = /^BATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*$/;
 const POLICY_PATTERN = /^[A-Z0-9][A-Z0-9._-]{2,127}$/;
 const CANARY_MODE = "worker_read_only";
 const AUDITABLE_MODES = new Set(["worker_read_only", "manager_read_only", "write_allowed"]);
+const POLICY_CORRELATION_SOURCE = "SERVER_SIDE_CONFIG_CANDIDATE";
+const DENY_REASON_CODES = Object.freeze([
+  "GLOBAL_CANONICAL_DISABLED",
+  "MISSING_CONFIGURATION",
+  "MALFORMED_CONFIGURATION",
+  "CANARY_SCOPE_DISABLED",
+  "DURABLE_ADMISSION_DISABLED",
+  "EMPTY_OWNER_ALLOWLIST",
+  "EMPTY_BATCH_ALLOWLIST",
+  "EMPTY_MODE_ALLOWLIST",
+  "GLOBAL_PERSISTENCE_DISABLED",
+  "OWNER_NOT_ALLOWED",
+  "BATCH_NOT_ALLOWED",
+  "MODE_NOT_ALLOWED",
+  "POLICY_MISMATCH",
+  "ADMISSION_IDENTITY_INCOMPLETE",
+  "DURABLE_ADMISSION_REJECTED",
+  "CANARY_ALREADY_CONSUMED",
+  "CANONICAL_AUTHORITATIVE_WRITE_OUTCOME_UNKNOWN",
+]);
 
 function strictTrue(value) {
   return value === "true";
@@ -37,13 +57,35 @@ function parseExactList(value, validator) {
   return { ok: true, values };
 }
 
-function hashAuditValue(value) {
+function hashAuditValue(value, length = 16) {
   return typeof value === "string" && value
-    ? crypto.createHash("sha256").update(value).digest("hex").slice(0, 16)
+    ? crypto.createHash("sha256").update(value).digest("hex").slice(0, length)
     : null;
 }
 
-function buildCanonicalCanaryCandidateAuditContext(input = {}) {
+function configSlotFingerprint(value) {
+  if (typeof value !== "string") return Object.freeze({ state: "missing" });
+  if (!value) return Object.freeze({ state: "empty" });
+  return Object.freeze({ state: "present", value_hash: hashAuditValue(value, 32) });
+}
+
+function buildCanonicalCanaryPolicyAuditContext(env = process.env) {
+  const descriptor = {
+    contract: "canonical_canary_policy_config_v1",
+    scope_enabled: configSlotFingerprint(env[ENV.scopeEnabled]),
+    durable_admission_enabled: configSlotFingerprint(env[ENV.durableAdmissionEnabled]),
+    owner_allowlist: configSlotFingerprint(env[ENV.allowedOwnerIds]),
+    batch_allowlist: configSlotFingerprint(env[ENV.allowedBatchCodes]),
+    mode_allowlist: configSlotFingerprint(env[ENV.allowedModes]),
+    policy_id: configSlotFingerprint(env[ENV.policyId]),
+  };
+  return Object.freeze({
+    policy_correlation_source: POLICY_CORRELATION_SOURCE,
+    policy_correlation_hash: hashAuditValue(JSON.stringify(descriptor), 32),
+  });
+}
+
+function buildCanonicalCanaryCandidateAuditContext(input = {}, env = process.env) {
   const requestedMode = typeof input.requested_mode === "string" ? input.requested_mode : null;
   return Object.freeze({
     owner_id_hash: hashAuditValue(input.trusted_owner_id),
@@ -52,23 +94,60 @@ function buildCanonicalCanaryCandidateAuditContext(input = {}) {
     requested_mode_hash: hashAuditValue(requestedMode),
     event_id_hash: hashAuditValue(input.event_id),
     request_id_hash: hashAuditValue(input.request_id),
+    ...buildCanonicalCanaryPolicyAuditContext(env),
   });
 }
 
+function validPolicyId(value) {
+  return typeof value === "string" && POLICY_PATTERN.test(value) ? value : null;
+}
+
 function resolveCanonicalCanaryScopeConfig(env = process.env) {
-  if (!strictTrue(env[ENV.scopeEnabled])) {
-    return { ok: false, reason_code: "CANARY_SCOPE_DISABLED" };
+  const policyId = validPolicyId(env[ENV.policyId]);
+  const scopeEnabled = env[ENV.scopeEnabled];
+  if (typeof scopeEnabled !== "string") {
+    return { ok: false, reason_code: "MISSING_CONFIGURATION", policy_id: policyId };
   }
-  if (!strictTrue(env[ENV.durableAdmissionEnabled])) {
-    return { ok: false, reason_code: "DURABLE_ADMISSION_DISABLED" };
+  if (scopeEnabled !== "true" && scopeEnabled !== "false") {
+    return { ok: false, reason_code: "MALFORMED_CONFIGURATION", policy_id: policyId };
+  }
+  if (!strictTrue(scopeEnabled)) {
+    return { ok: false, reason_code: "CANARY_SCOPE_DISABLED", policy_id: policyId };
   }
 
+  const requiredValues = [
+    env[ENV.durableAdmissionEnabled],
+    env[ENV.allowedOwnerIds],
+    env[ENV.allowedBatchCodes],
+    env[ENV.allowedModes],
+    env[ENV.policyId],
+  ];
+  if (requiredValues.some((value) => typeof value !== "string")) {
+    return { ok: false, reason_code: "MISSING_CONFIGURATION", policy_id: policyId };
+  }
+
+  const durableAdmissionEnabled = env[ENV.durableAdmissionEnabled];
+  if (durableAdmissionEnabled !== "true" && durableAdmissionEnabled !== "false") {
+    return { ok: false, reason_code: "MALFORMED_CONFIGURATION", policy_id: policyId };
+  }
+  if (!strictTrue(durableAdmissionEnabled)) {
+    return { ok: false, reason_code: "DURABLE_ADMISSION_DISABLED", policy_id: policyId };
+  }
+
+  if (env[ENV.allowedOwnerIds] === "") {
+    return { ok: false, reason_code: "EMPTY_OWNER_ALLOWLIST", policy_id: policyId };
+  }
+  if (env[ENV.allowedBatchCodes] === "") {
+    return { ok: false, reason_code: "EMPTY_BATCH_ALLOWLIST", policy_id: policyId };
+  }
+  if (env[ENV.allowedModes] === "") {
+    return { ok: false, reason_code: "EMPTY_MODE_ALLOWLIST", policy_id: policyId };
+  }
   const owners = parseExactList(env[ENV.allowedOwnerIds], (value) => OWNER_PATTERN.test(value));
   const batches = parseExactList(env[ENV.allowedBatchCodes], (value) => BATCH_PATTERN.test(value));
   const modes = parseExactList(env[ENV.allowedModes], (value) => value === CANARY_MODE);
-  const policyId = env[ENV.policyId];
-  if (!owners.ok || !batches.ok || !modes.ok || typeof policyId !== "string" || !POLICY_PATTERN.test(policyId)) {
-    return { ok: false, reason_code: "MALFORMED_POLICY" };
+  if (!owners.ok || !batches.ok || !modes.ok || !policyId) {
+    return { ok: false, reason_code: "MALFORMED_CONFIGURATION", policy_id: policyId };
   }
 
   return {
@@ -85,7 +164,7 @@ function denied(reasonCode, config, auditContext, matches = {}) {
   return {
     allowed: false,
     reason_code: reasonCode,
-    policy_id: config && config.ok ? config.policy_id : null,
+    policy_id: config && config.policy_id || null,
     trusted_owner_match: matches.trusted_owner_match === true,
     batch_match: matches.batch_match === true,
     mode_match: matches.mode_match === true,
@@ -96,9 +175,10 @@ function denied(reasonCode, config, auditContext, matches = {}) {
 }
 
 function evaluateCanonicalCanaryAdmission(input, env = process.env) {
-  const auditContext = buildCanonicalCanaryCandidateAuditContext(input);
+  const auditContext = buildCanonicalCanaryCandidateAuditContext(input, env);
+  const policyIdentity = { policy_id: validPolicyId(env[ENV.policyId]) };
   if (!strictTrue(env[ENV.globalOrchestration])) {
-    return denied("GLOBAL_CANONICAL_DISABLED", null, auditContext);
+    return denied("GLOBAL_CANONICAL_DISABLED", policyIdentity, auditContext);
   }
   const config = resolveCanonicalCanaryScopeConfig(env);
   if (!config.ok) return denied(config.reason_code, config, auditContext);
@@ -126,6 +206,7 @@ function evaluateCanonicalCanaryAdmission(input, env = process.env) {
 
   const admission = Object.freeze({
     policy_id: config.policy_id,
+    policy_correlation_hash: auditContext.policy_correlation_hash,
     trusted_owner_id: input.trusted_owner_id,
     batch_code: input.batch_code,
     requested_mode: input.requested_mode,
@@ -157,20 +238,34 @@ function buildCanonicalCanaryAuditRecord(decision) {
 }
 
 function buildCanonicalCanaryPersistenceAuditRecord(admission, outcome = {}) {
+  const policyCorrelationHash = admission && typeof admission.policy_correlation_hash === "string"
+    ? admission.policy_correlation_hash
+    : hashAuditValue(JSON.stringify({
+      contract: "canonical_canary_admission_evidence_v1",
+      policy_id: configSlotFingerprint(admission && admission.policy_id),
+      owner_id: configSlotFingerprint(admission && admission.trusted_owner_id),
+      batch_code: configSlotFingerprint(admission && admission.batch_code),
+      requested_mode: configSlotFingerprint(admission && admission.requested_mode),
+    }), 32);
   return {
     event: "canonical_canary_persistence_admission",
     allowed: outcome.allowed === true,
-    reason_code: outcome.reason_code || "INVALID_PERSISTENCE_DECISION",
+    reason_code: outcome.reason_code || "DURABLE_ADMISSION_REJECTED",
     policy_id: admission && admission.policy_id || null,
-    ...buildCanonicalCanaryCandidateAuditContext(admission || {}),
+    ...buildCanonicalCanaryCandidateAuditContext(admission || {}, {}),
+    policy_correlation_source: POLICY_CORRELATION_SOURCE,
+    policy_correlation_hash: policyCorrelationHash,
   };
 }
 
 module.exports = {
   CANONICAL_CANARY_ENV: ENV,
   CANONICAL_CANARY_MODE: CANARY_MODE,
+  CANONICAL_CANARY_DENY_REASON_CODES: DENY_REASON_CODES,
+  CANONICAL_CANARY_POLICY_CORRELATION_SOURCE: POLICY_CORRELATION_SOURCE,
   resolveCanonicalCanaryScopeConfig,
   evaluateCanonicalCanaryAdmission,
+  buildCanonicalCanaryPolicyAuditContext,
   buildCanonicalCanaryCandidateAuditContext,
   buildCanonicalCanaryAuditRecord,
   buildCanonicalCanaryPersistenceAuditRecord,

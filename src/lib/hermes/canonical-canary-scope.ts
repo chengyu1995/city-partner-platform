@@ -12,9 +12,12 @@ export const CANONICAL_CANARY_ENV = canaryCore.CANONICAL_CANARY_ENV as Readonly<
 }>;
 
 export const CANONICAL_CANARY_MODE = "worker_read_only" as const;
+export const CANONICAL_CANARY_DENY_REASON_CODES = canaryCore.CANONICAL_CANARY_DENY_REASON_CODES as readonly string[];
+export const CANONICAL_CANARY_POLICY_CORRELATION_SOURCE = "SERVER_SIDE_CONFIG_CANDIDATE" as const;
 
 export interface CanonicalCanaryAdmissionEvidence {
   policy_id: string;
+  policy_correlation_hash?: string;
   trusted_owner_id: string;
   batch_code: string;
   requested_mode: typeof CANONICAL_CANARY_MODE;
@@ -29,6 +32,8 @@ export interface CanonicalCanaryAuditContext {
   requested_mode_hash: string | null;
   event_id_hash: string | null;
   request_id_hash: string | null;
+  policy_correlation_source: typeof CANONICAL_CANARY_POLICY_CORRELATION_SOURCE;
+  policy_correlation_hash: string;
 }
 
 export interface CanonicalCanaryAdmissionDecision {
@@ -51,6 +56,10 @@ export interface CanonicalCanaryScopeConfig {
   allowed_batch_codes?: string[];
   allowed_modes?: string[];
 }
+
+export const buildCanonicalCanaryPolicyAuditContext = canaryCore.buildCanonicalCanaryPolicyAuditContext as (
+  env?: Record<string, string | undefined>
+) => Pick<CanonicalCanaryAuditContext, "policy_correlation_source" | "policy_correlation_hash">;
 
 export const resolveCanonicalCanaryScopeConfig = canaryCore.resolveCanonicalCanaryScopeConfig as (
   env?: Record<string, string | undefined>

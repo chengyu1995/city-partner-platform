@@ -84,6 +84,26 @@ test("scope environment contract is explicit and server controlled", () => {
   ]);
 });
 
+test("DENY reason taxonomy exposes distinct configuration mismatch and durable classes", () => {
+  const reasons = core.CANONICAL_CANARY_DENY_REASON_CODES;
+  assert.equal(new Set(reasons).size, reasons.length);
+  for (const reason of [
+    "MISSING_CONFIGURATION",
+    "MALFORMED_CONFIGURATION",
+    "EMPTY_OWNER_ALLOWLIST",
+    "EMPTY_BATCH_ALLOWLIST",
+    "EMPTY_MODE_ALLOWLIST",
+    "OWNER_NOT_ALLOWED",
+    "BATCH_NOT_ALLOWED",
+    "MODE_NOT_ALLOWED",
+    "POLICY_MISMATCH",
+    "DURABLE_ADMISSION_REJECTED",
+    "CANARY_ALREADY_CONSUMED",
+  ]) {
+    assert.equal(reasons.includes(reason), true, reason);
+  }
+});
+
 test("global flag alone cannot route Canonical", () => {
   const route = boundary.resolveFeishuApplicationFeatureRoute({
     HERMES_CANONICAL_ORCHESTRATION_ENABLED: "true",
@@ -113,6 +133,72 @@ test("missing scope configuration defaults deny", () => {
     delete inputEnv[key];
     assert.equal(core.evaluateCanonicalCanaryAdmission(candidate(), inputEnv).allowed, false, key);
   }
+});
+
+test("missing configuration has a distinct reason and private policy correlation", () => {
+  for (const key of [
+    "HERMES_CANONICAL_CANARY_SCOPE_ENABLED",
+    "HERMES_CANONICAL_CANARY_DURABLE_ADMISSION_ENABLED",
+    "HERMES_CANONICAL_CANARY_ALLOWED_OWNER_IDS",
+    "HERMES_CANONICAL_CANARY_ALLOWED_BATCH_CODES",
+    "HERMES_CANONICAL_CANARY_ALLOWED_MODES",
+    "HERMES_CANONICAL_CANARY_POLICY_ID",
+  ]) {
+    const inputEnv = env();
+    delete inputEnv[key];
+    const decision = core.evaluateCanonicalCanaryAdmission(candidate(), inputEnv);
+    const record = core.buildCanonicalCanaryAuditRecord(decision);
+    assert.equal(decision.reason_code, "MISSING_CONFIGURATION", key);
+    assert.match(record.policy_correlation_hash, /^[a-f0-9]{32}$/);
+    assert.equal(record.policy_correlation_source, "SERVER_SIDE_CONFIG_CANDIDATE");
+    assert.equal(decision.admission, null);
+    if (key === "HERMES_CANONICAL_CANARY_POLICY_ID") assert.equal(record.policy_id, null);
+  }
+});
+
+test("malformed configuration has a distinct reason and no raw config", () => {
+  const malformed = [
+    ["HERMES_CANONICAL_CANARY_SCOPE_ENABLED", "TRUE"],
+    ["HERMES_CANONICAL_CANARY_DURABLE_ADMISSION_ENABLED", "enabled"],
+    ["HERMES_CANONICAL_CANARY_ALLOWED_OWNER_IDS", `${OWNER},`],
+    ["HERMES_CANONICAL_CANARY_ALLOWED_BATCH_CODES", ` ${BATCH}`],
+    ["HERMES_CANONICAL_CANARY_ALLOWED_MODES", "worker_read_only,write_allowed"],
+    ["HERMES_CANONICAL_CANARY_POLICY_ID", "raw malformed policy"],
+  ];
+  for (const [key, value] of malformed) {
+    const decision = core.evaluateCanonicalCanaryAdmission(candidate(), env({ [key]: value }));
+    const record = core.buildCanonicalCanaryAuditRecord(decision);
+    assert.equal(decision.reason_code, "MALFORMED_CONFIGURATION", `${key}=${value}`);
+    assert.match(record.policy_correlation_hash, /^[a-f0-9]{32}$/);
+    if (key === "HERMES_CANONICAL_CANARY_POLICY_ID") assert.equal(record.policy_id, null);
+    assert.equal(JSON.stringify(record).includes(value), false);
+  }
+});
+
+test("empty allowlists have field-specific reasons and policy correlation", () => {
+  for (const [key, reason] of [
+    ["HERMES_CANONICAL_CANARY_ALLOWED_OWNER_IDS", "EMPTY_OWNER_ALLOWLIST"],
+    ["HERMES_CANONICAL_CANARY_ALLOWED_BATCH_CODES", "EMPTY_BATCH_ALLOWLIST"],
+    ["HERMES_CANONICAL_CANARY_ALLOWED_MODES", "EMPTY_MODE_ALLOWLIST"],
+  ]) {
+    const decision = core.evaluateCanonicalCanaryAdmission(candidate(), env({ [key]: "" }));
+    const record = core.buildCanonicalCanaryAuditRecord(decision);
+    assert.equal(decision.reason_code, reason);
+    assert.equal(record.policy_id, POLICY);
+    assert.match(record.policy_correlation_hash, /^[a-f0-9]{32}$/);
+  }
+});
+
+test("scope disabled remains distinct and correlated without admission", () => {
+  const decision = core.evaluateCanonicalCanaryAdmission(
+    candidate(),
+    env({ HERMES_CANONICAL_CANARY_SCOPE_ENABLED: "false" })
+  );
+  const record = core.buildCanonicalCanaryAuditRecord(decision);
+  assert.equal(decision.reason_code, "CANARY_SCOPE_DISABLED");
+  assert.equal(decision.admission, null);
+  assert.equal(record.policy_id, POLICY);
+  assert.match(record.policy_correlation_hash, /^[a-f0-9]{32}$/);
 });
 
 test("empty and malformed allowlists fail closed", () => {
@@ -219,7 +305,76 @@ test("policy and malformed configuration DENY records retain candidate hashes", 
     assert.match(record.owner_id_hash, /^[a-f0-9]{16}$/);
     assert.match(record.batch_code_hash, /^[a-f0-9]{16}$/);
     assert.match(record.event_id_hash, /^[a-f0-9]{16}$/);
+    assert.match(record.policy_correlation_hash, /^[a-f0-9]{32}$/);
   }
+});
+
+test("mismatch reasons remain distinct and share the evaluated policy correlation", () => {
+  const decisions = [
+    core.evaluateCanonicalCanaryAdmission(candidate({ trusted_owner_id: "ou_other" }), env()),
+    core.evaluateCanonicalCanaryAdmission(candidate({ batch_code: "BATCH-OTHER" }), env()),
+    core.evaluateCanonicalCanaryAdmission(candidate({ requested_mode: "write_allowed" }), env()),
+    core.evaluateCanonicalCanaryAdmission(candidate({ expected_policy_id: "CANARY-02" }), env()),
+  ];
+  assert.deepEqual(decisions.map((decision) => decision.reason_code), [
+    "OWNER_NOT_ALLOWED",
+    "BATCH_NOT_ALLOWED",
+    "MODE_NOT_ALLOWED",
+    "POLICY_MISMATCH",
+  ]);
+  assert.equal(new Set(decisions.map((decision) => decision.audit_context.policy_correlation_hash)).size, 1);
+});
+
+test("policy and candidate audit hashes are deterministic and context-sensitive", () => {
+  const first = core.evaluateCanonicalCanaryAdmission(candidate(), env()).audit_context;
+  const repeated = core.evaluateCanonicalCanaryAdmission(candidate(), env()).audit_context;
+  const otherOwner = core.evaluateCanonicalCanaryAdmission(candidate({ trusted_owner_id: "ou_other" }), env()).audit_context;
+  const otherEvent = core.evaluateCanonicalCanaryAdmission(candidate({ event_id: "event-2" }), env()).audit_context;
+  const otherPolicyConfig = core.evaluateCanonicalCanaryAdmission(
+    candidate(),
+    env({ HERMES_CANONICAL_CANARY_ALLOWED_BATCH_CODES: `${BATCH},BATCH-OTHER` })
+  ).audit_context;
+  assert.deepEqual(first, repeated);
+  assert.notEqual(first.owner_id_hash, otherOwner.owner_id_hash);
+  assert.notEqual(first.event_id_hash, otherEvent.event_id_hash);
+  assert.notEqual(first.policy_correlation_hash, otherPolicyConfig.policy_correlation_hash);
+});
+
+test("DENY audit omits raw candidate and malformed server configuration values", () => {
+  const value = candidate({
+    trusted_owner_id: "ou_private_owner",
+    event_id: "event-private",
+    request_id: "message-private",
+  });
+  const privateConfig = "ou_private_config,";
+  const secretValues = ["feishu-app-secret-private", "verification-token-private", "supabase-key-private"];
+  const record = core.buildCanonicalCanaryAuditRecord(core.evaluateCanonicalCanaryAdmission(
+    value,
+    env({
+      HERMES_CANONICAL_CANARY_ALLOWED_OWNER_IDS: privateConfig,
+      FEISHU_APP_SECRET: secretValues[0],
+      FEISHU_VERIFICATION_TOKEN: secretValues[1],
+      SUPABASE_SERVICE_ROLE_KEY: secretValues[2],
+    })
+  ));
+  const serialized = JSON.stringify(record);
+  for (const raw of [value.trusted_owner_id, value.event_id, value.request_id, value.batch_code, privateConfig, ...secretValues]) {
+    assert.equal(serialized.includes(raw), false, raw);
+  }
+  assert.deepEqual(Object.keys(record).sort(), [
+    "allowed",
+    "batch_code_hash",
+    "event",
+    "event_id_hash",
+    "owner_id_hash",
+    "policy_correlation_hash",
+    "policy_correlation_source",
+    "policy_id",
+    "reason_code",
+    "request_id_hash",
+    "requested_mode",
+    "requested_mode_hash",
+  ]);
 });
 
 test("DENY audit never exposes raw owner event request or batch", () => {
@@ -241,6 +396,7 @@ test("durable admission rejection has the same private correlation contract", ()
   assert.match(record.owner_id_hash, /^[a-f0-9]{16}$/);
   assert.match(record.batch_code_hash, /^[a-f0-9]{16}$/);
   assert.match(record.event_id_hash, /^[a-f0-9]{16}$/);
+  assert.match(record.policy_correlation_hash, /^[a-f0-9]{32}$/);
   const serialized = JSON.stringify(record);
   assert.equal(serialized.includes(evidence.trusted_owner_id), false);
   assert.equal(serialized.includes(evidence.event_id), false);
@@ -251,6 +407,18 @@ test("durable admission rejection has the same private correlation contract", ()
     workerJobsSource.indexOf("export interface CanonicalWorkerProtocolResult")
   );
   assert.doesNotMatch(canonicalCreateBlock, /error\.(?:message|details|hint)/);
+});
+
+test("generic durable rejection and already-consumed scope use distinct reasons", () => {
+  const evidence = admission();
+  const generic = core.buildCanonicalCanaryPersistenceAuditRecord(evidence, { allowed: false });
+  const consumed = core.buildCanonicalCanaryPersistenceAuditRecord(evidence, {
+    allowed: false,
+    reason_code: "CANARY_ALREADY_CONSUMED",
+  });
+  assert.equal(generic.reason_code, "DURABLE_ADMISSION_REJECTED");
+  assert.equal(consumed.reason_code, "CANARY_ALREADY_CONSUMED");
+  assert.equal(generic.policy_correlation_hash, consumed.policy_correlation_hash);
 });
 
 test("Worker claim defense requires the same exact policy", () => {
