@@ -21,7 +21,8 @@ const migration = readFileSync(migrationPath, "utf8");
 const functionBody = migration.split("as $function$")[1]?.split("$function$;")[0] ?? "";
 
 test("audit migration uses the exact additive function signature", () => {
-  assert.match(migration, /create or replace function public\.audit_canonical_canary_scope_state\(\s*p_policy_id text,\s*p_owner_open_id_sha256 text,\s*p_batch_code_sha256 text,\s*p_requested_mode text,\s*p_event_id_sha256 text\s*\)/i);
+  assert.match(migration, /create function public\.audit_canonical_canary_scope_state\(\s*p_policy_id text,\s*p_owner_open_id_sha256 text,\s*p_batch_code_sha256 text,\s*p_requested_mode text,\s*p_event_id_sha256 text\s*\)/i);
+  assert.doesNotMatch(migration, /create or replace function/i);
   assert.doesNotMatch(migration, /alter table public\./i);
 });
 
@@ -77,6 +78,18 @@ test("audit query binds policy owner batch mode and event", () => {
   ]) assert.match(functionBody, binding);
 });
 
+test("scope and event jobs are reachable only through admission job identities", () => {
+  assert.match(functionBody, /scope_jobs as \(\s*select distinct j\.id\s*from scope_admissions a\s*join public\.hermes_jobs j on j\.id = a\.job_id/i);
+  assert.match(functionBody, /event_jobs as \(\s*select distinct j\.id\s*from matching_admissions a\s*join public\.hermes_jobs j on j\.id = a\.job_id/i);
+  assert.doesNotMatch(functionBody, /digest\(coalesce\(j\.requester_id/i);
+  assert.doesNotMatch(functionBody, /event_jobs as \([\s\S]*?from public\.hermes_jobs j\s*cross join input_scope/i);
+});
+
+test("duplicate job detection is exact-event admission bound", () => {
+  assert.match(functionBody, /\(select pg_catalog\.count\(\*\) from event_jobs\) > 1\s*from input_scope/i);
+  assert.doesNotMatch(functionBody, /count\(\*\) from scope_jobs\) > 1\s*or/i);
+});
+
 test("invalid scope returns a zero-state row instead of raising", () => {
   assert.match(functionBody, /case when i\.scope_input_valid then i\.policy_id else null end/i);
   assert.match(functionBody, /from input_scope i/i);
@@ -107,10 +120,27 @@ test("audit migration carries preconditions and transactional postconditions", (
   assert.match(migration, /^begin;/i);
   assert.match(migration, /AUDIT_FUNCTION_PRECHECK_FAILED/g);
   assert.match(migration, /AUDIT_FUNCTION_POSTCHECK_FAILED/g);
-  assert.match(migration, /required columns missing/i);
+  assert.match(migration, /column contract mismatch/i);
+  assert.match(migration, /required objects must be ordinary tables/i);
   assert.match(migration, /target function already exists/i);
   assert.match(migration, /function ACL mismatch/i);
   assert.match(migration, /commit;\s*$/i);
+});
+
+test("preconditions bind every referenced Production column type and nullability", () => {
+  const contracts = migration.match(/\('hermes_[^\r\n]+', '(?:text|uuid|boolean|bigint|timestamp with time zone)', (?:true|false)\)/g) ?? [];
+  assert.equal(contracts.length, 30);
+  assert.match(migration, /pg_catalog\.format_type\(a\.atttypid, a\.atttypmod\) <> required\.formatted_type/i);
+  assert.match(migration, /a\.attnotnull is distinct from required\.expected_not_null/i);
+  assert.match(migration, /\('hermes_canonical_canary_admissions', 'job_id', 'uuid', false\)/i);
+  assert.match(migration, /\('hermes_jobs', 'canonical_revision', 'bigint', false\)/i);
+  assert.doesNotMatch(migration, /\('hermes_jobs', 'requester_id'/i);
+});
+
+test("preconditions verify ordinary tables and the exact digest dependency", () => {
+  assert.match(migration, /c\.relkind <> 'r'/i);
+  assert.match(migration, /to_regprocedure\('extensions\.digest\(text,text\)'\)/i);
+  assert.match(migration, /pg_get_function_result\(p\.oid\) = 'bytea'/i);
 });
 
 test("audit rollback drops only the additive function", () => {

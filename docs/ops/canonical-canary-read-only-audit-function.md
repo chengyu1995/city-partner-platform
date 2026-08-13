@@ -19,12 +19,24 @@ All table names use the `public` schema explicitly. SHA-256 uses
 `extensions.digest` explicitly. The function contains no dynamic SQL or
 mutation statement.
 
+Every visible job is admission-bound. Scope jobs are reached through
+`scope_admissions.job_id`; event jobs are reached through
+`matching_admissions.job_id`. Owner, event, or mode hashes never authorize a
+direct scan of `hermes_jobs`, and a null admission `job_id` cannot fall back to
+an event lookup.
+
+Before creating the function, the migration verifies that all seven source
+objects are ordinary tables and that all 30 referenced columns match the
+Production formatted type and required nullability contract. It also verifies
+the exact `extensions.digest(text,text) -> bytea` dependency and required
+roles.
+
 ## Owner package
 
-The migration file itself is the owner execution package draft. It contains a
-single transaction with identity, role, extension, table, column, function
-identity, and ACL checks. A future controlled Production batch must lock its
-SHA-256 and independently audit the exact bytes before an owner runs it once.
+The migration is transactional input to a future owner execution package; it
+is not the final C2 package by itself. C2 must wrap the independently approved
+exact SHA-256 with Production identity checks, pre/post evidence capture, and
+rollback instructions before an owner runs it once.
 
 Do not run the migration from an application credential or service-role API.
 Do not add policy, admission, job, attempt, lease, terminal, or result fixture
@@ -73,6 +85,12 @@ After a future owner transaction commits, establish a fresh
    supplied.
 
 Do not call any write RPC as part of verification.
+
+Local verification uses both static Node tests and a clean PostgreSQL 18
+fixture. The fixture includes cross-policy, cross-batch, cross-owner,
+different-event, true-positive duplicate-job, missing dependency, conflicting
+function, wrong relation kind, missing object, missing column, wrong type, and
+wrong nullability cases.
 
 ## Rollback
 
