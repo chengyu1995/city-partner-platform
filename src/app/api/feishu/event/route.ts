@@ -15,6 +15,11 @@
 import { after, NextResponse, NextRequest } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { prepareFeishuCallbackAcceptance } from "@/lib/feishu-callback-application";
+import {
+  buildIdentityDiscoveryAuditRecord,
+  captureAcceptedIdentityDiscovery,
+  inspectAcceptedIdentityDiscovery,
+} from "@/lib/feishu-owner-identity-discovery";
 import { buildFeishuApplicationAcceptanceResponse } from "@/lib/feishu-canonical-gateway-envelope";
 import {
   buildCanonicalApprovalContext,
@@ -3868,6 +3873,16 @@ export async function POST(req: NextRequest) {
 
   const accepted = acceptance.accepted;
   const acceptanceResponse = buildFeishuApplicationAcceptanceResponse(accepted.event_id);
+  const identityDiscovery = inspectAcceptedIdentityDiscovery(accepted);
+  if (identityDiscovery?.reserved) {
+    const captureResult = await captureAcceptedIdentityDiscovery(identityDiscovery, sb());
+    console.info(
+      "[feishu-event] identity_discovery",
+      buildIdentityDiscoveryAuditRecord(identityDiscovery, captureResult)
+    );
+    return NextResponse.json(acceptanceResponse);
+  }
+
   after(async () => {
     console.log("[feishu-event] background_started", {
       event_id: accepted.event_id,
