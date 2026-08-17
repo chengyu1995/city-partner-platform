@@ -14,7 +14,10 @@
  */
 import { after, NextResponse, NextRequest } from "next/server";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { prepareFeishuCallbackAcceptance } from "@/lib/feishu-callback-application";
+import {
+  buildFeishuCallbackAuthenticationAuditRecord,
+  prepareFeishuCallbackAcceptance,
+} from "@/lib/feishu-callback-application";
 import {
   buildIdentityDiscoveryAuditRecord,
   captureAcceptedIdentityDiscovery,
@@ -3865,6 +3868,10 @@ export async function POST(req: NextRequest) {
     env: process.env,
   });
   if (!acceptance.ok) {
+    console.warn(
+      "[feishu-event] callback_authentication_rejected",
+      buildFeishuCallbackAuthenticationAuditRecord(acceptance)
+    );
     return NextResponse.json(
       { code: acceptance.status, msg: "Feishu callback rejected", failure_code: acceptance.failure_code },
       { status: acceptance.status }

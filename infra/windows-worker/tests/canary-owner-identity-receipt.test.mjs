@@ -91,7 +91,18 @@ function routeHarness({ acceptedCallback, rpcImpl }) {
     }
     if (id === "@supabase/supabase-js") return { createClient() { return supabase; } };
     if (id === "@/lib/feishu-callback-application") {
-      return { prepareFeishuCallbackAcceptance() { return { ok: true, accepted: acceptedCallback }; } };
+      return {
+        prepareFeishuCallbackAcceptance() { return { ok: true, accepted: acceptedCallback }; },
+        buildFeishuCallbackAuthenticationAuditRecord() {
+          return {
+            failure_code: "NONE",
+            authentication_layer: "ACCEPTED",
+            authentication_stage: "COMPLETE",
+            internal_gateway_auth_passed: true,
+            feishu_callback_auth_passed: true,
+          };
+        },
+      };
     }
     if (id === "@/lib/feishu-canonical-gateway-envelope") {
       return { buildFeishuApplicationAcceptanceResponse(eventId) { return { code: 0, accepted: true, event_id: eventId }; } };

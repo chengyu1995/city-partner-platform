@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -22,6 +23,21 @@ const TEST_TIMESTAMP = "1786200000";
 const TEST_NONCE = "synthetic-nonce";
 const CALLBACK_BODY = Buffer.from('{\n  "header":{"event_id":"event-fixture","event_type":"im.message.receive_v1"},\n  "event":{"message":{"message_id":"message-fixture"}}\n}\n');
 
+function encryptSyntheticFeishuPayload(payload, encryptKey = TEST_ENCRYPT_KEY) {
+  const key = crypto.createHash("sha256").update(encryptKey).digest();
+  const iv = Buffer.alloc(16, 7);
+  const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(payload), "utf8"), cipher.final()]);
+  return Buffer.concat([iv, encrypted]).toString("base64");
+}
+
+function decryptSyntheticFeishuPayload(encrypted, encryptKey = TEST_ENCRYPT_KEY) {
+  const key = crypto.createHash("sha256").update(encryptKey).digest();
+  const ciphertext = Buffer.from(encrypted, "base64");
+  const decipher = crypto.createDecipheriv("aes-256-cbc", key, ciphertext.subarray(0, 16));
+  return Buffer.concat([decipher.update(ciphertext.subarray(16)), decipher.final()]).toString("utf8");
+}
+
 function loadTypeScriptModule(file, resolveMock) {
   const source = fs.readFileSync(file, "utf8");
   const output = ts.transpileModule(source, {
@@ -41,6 +57,7 @@ function loadTypeScriptModule(file, resolveMock) {
 const envelopeMock = {
   FEISHU_APPLICATION_BOUNDARY_SIGNATURE_HEADER: router.SIGNATURE_HEADER,
   FEISHU_APPLICATION_BOUNDARY_SOURCE_HEADER: router.SOURCE_HEADER,
+  FEISHU_APPLICATION_BOUNDARY_SOURCE_ID: router.SOURCE_ID,
   FEISHU_TRANSPORT_REQUEST_ID_HEADER: router.TRANSPORT_REQUEST_ID_HEADER,
   FEISHU_TIMESTAMP_HEADER: router.FEISHU_TIMESTAMP_HEADER,
   FEISHU_NONCE_HEADER: router.FEISHU_NONCE_HEADER,
@@ -58,7 +75,7 @@ const acceptance = loadTypeScriptModule(
   path.join(root, "src", "lib", "feishu-callback-application.ts"),
   (id) => {
     if (id === "@/lib/feishu-canonical-gateway-envelope") return envelopeMock;
-    if (id === "@/lib/feishu-crypto") return { decryptFeishuEvent() { throw new Error("not used by plain fixture"); } };
+    if (id === "@/lib/feishu-crypto") return { decryptFeishuEvent: decryptSyntheticFeishuPayload };
     return require(id);
   }
 );
@@ -77,13 +94,14 @@ function callbackHeaders(rawBody = CALLBACK_BODY, overrides = {}) {
   });
 }
 
-function accept(rawBody = CALLBACK_BODY, overrides = {}) {
+function accept(rawBody = CALLBACK_BODY, overrides = {}, envOverrides = {}) {
   return acceptance.prepareFeishuCallbackAcceptance({
     rawBody: new Uint8Array(rawBody),
     headers: callbackHeaders(rawBody, overrides),
     env: {
       FEISHU_APP_SECRET: TEST_APPLICATION_SECRET,
       FEISHU_ENCRYPT_KEY: TEST_ENCRYPT_KEY,
+      ...envOverrides,
     },
   });
 }
@@ -181,9 +199,30 @@ test("Application accepts a valid doubly authenticated callback", () => {
   assert.equal(result.accepted.transport_request_id, "transport-fixture");
 });
 
-test("Application fails closed when a Feishu signature header is missing", () => {
-  const result = accept(CALLBACK_BODY, { "X-Lark-Request-Nonce": "" });
-  assert.deepEqual(result, { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_SIGNATURE_CONTEXT_MISSING" });
+test("Application reports each missing Feishu signature header independently", () => {
+  assert.deepEqual(
+    accept(CALLBACK_BODY, { "X-Lark-Request-Timestamp": "" }),
+    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TIMESTAMP_MISSING" }
+  );
+  assert.deepEqual(
+    accept(CALLBACK_BODY, { "X-Lark-Request-Nonce": "" }),
+    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_NONCE_MISSING" }
+  );
+  assert.deepEqual(
+    accept(CALLBACK_BODY, { "X-Lark-Signature": "" }),
+    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_SIGNATURE_MISSING" }
+  );
+});
+
+test("Application distinguishes missing internal and Feishu authentication configuration", () => {
+  assert.deepEqual(
+    accept(CALLBACK_BODY, {}, { FEISHU_APP_SECRET: "" }),
+    { ok: false, status: 503, failure_code: "FEISHU_APPLICATION_AUTH_SECRET_MISSING" }
+  );
+  assert.deepEqual(
+    accept(CALLBACK_BODY, {}, { FEISHU_ENCRYPT_KEY: "" }),
+    { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_ENCRYPT_KEY_MISSING" }
+  );
 });
 
 test("Application fails closed for an invalid Feishu signature", () => {
@@ -191,9 +230,88 @@ test("Application fails closed for an invalid Feishu signature", () => {
   assert.deepEqual(result, { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_SIGNATURE_INVALID" });
 });
 
-test("Application fails closed before parsing when the Gateway envelope is invalid", () => {
-  const result = accept(CALLBACK_BODY, { [router.SIGNATURE_HEADER]: "0".repeat(64) });
-  assert.deepEqual(result, { ok: false, status: 401, failure_code: "FEISHU_APPLICATION_BOUNDARY_SIGNATURE_INVALID" });
+test("Application distinguishes missing and invalid Gateway authentication inputs", () => {
+  assert.deepEqual(
+    accept(CALLBACK_BODY, { [router.SOURCE_HEADER]: "" }),
+    { ok: false, status: 401, failure_code: "FEISHU_APPLICATION_BOUNDARY_SOURCE_MISSING" }
+  );
+  assert.deepEqual(
+    accept(CALLBACK_BODY, { [router.SIGNATURE_HEADER]: "" }),
+    { ok: false, status: 401, failure_code: "FEISHU_APPLICATION_BOUNDARY_SIGNATURE_MISSING" }
+  );
+  assert.deepEqual(
+    accept(CALLBACK_BODY, { [router.SOURCE_HEADER]: "unknown-gateway" }),
+    { ok: false, status: 401, failure_code: "FEISHU_APPLICATION_BOUNDARY_SOURCE_INVALID" }
+  );
+  assert.deepEqual(
+    accept(CALLBACK_BODY, { [router.SIGNATURE_HEADER]: "0".repeat(64) }),
+    { ok: false, status: 401, failure_code: "FEISHU_APPLICATION_BOUNDARY_SIGNATURE_INVALID" }
+  );
+});
+
+test("Application authentication audit records expose only stable non-sensitive fields", () => {
+  const rejected = accept(CALLBACK_BODY, { "X-Lark-Signature": "f".repeat(64) });
+  assert.deepEqual(acceptance.buildFeishuCallbackAuthenticationAuditRecord(rejected), {
+    failure_code: "FEISHU_CALLBACK_SIGNATURE_INVALID",
+    authentication_layer: "FEISHU_CALLBACK",
+    authentication_stage: "SIGNATURE_VERIFICATION",
+    internal_gateway_auth_passed: true,
+    feishu_callback_auth_passed: false,
+  });
+  assert.deepEqual(acceptance.buildFeishuCallbackAuthenticationAuditRecord(accept()), {
+    failure_code: "NONE",
+    authentication_layer: "ACCEPTED",
+    authentication_stage: "COMPLETE",
+    internal_gateway_auth_passed: true,
+    feishu_callback_auth_passed: true,
+  });
+  const serialized = JSON.stringify(acceptance.buildFeishuCallbackAuthenticationAuditRecord(rejected));
+  assert.doesNotMatch(serialized, new RegExp(TEST_APPLICATION_SECRET));
+  assert.doesNotMatch(serialized, new RegExp(TEST_ENCRYPT_KEY));
+  assert.doesNotMatch(serialized, /event-fixture|synthetic-nonce/);
+});
+
+test("Application rejects a verification token mismatch after valid signatures", () => {
+  const body = Buffer.from(JSON.stringify({
+    token: "callback-token",
+    header: { event_id: "event-token", event_type: "im.message.receive_v1" },
+    event: {},
+  }));
+  assert.deepEqual(
+    accept(body, {}, { FEISHU_VERIFICATION_TOKEN: "different-token" }),
+    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TOKEN_INVALID" }
+  );
+});
+
+test("Application accepts a valid encrypted callback and rejects invalid ciphertext", () => {
+  const encrypted = encryptSyntheticFeishuPayload({
+    token: "fixture-token",
+    header: { event_id: "event-encrypted", event_type: "im.message.receive_v1" },
+    event: {},
+  });
+  const encryptedBody = Buffer.from(JSON.stringify({ encrypt: encrypted }));
+  const accepted = accept(encryptedBody, {}, { FEISHU_VERIFICATION_TOKEN: "fixture-token" });
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.accepted.event_id, "event-encrypted");
+
+  const invalidBody = Buffer.from(JSON.stringify({ encrypt: Buffer.alloc(32, 9).toString("base64") }));
+  assert.deepEqual(
+    accept(invalidBody),
+    { ok: false, status: 400, failure_code: "FEISHU_CALLBACK_DECRYPT_FAILED" }
+  );
+});
+
+test("duplicate security headers fail closed", () => {
+  for (const name of [router.FEISHU_TIMESTAMP_HEADER, router.FEISHU_NONCE_HEADER, router.FEISHU_SIGNATURE_HEADER]) {
+    const headers = callbackHeaders();
+    headers.append(name, "duplicate-value");
+    const result = acceptance.prepareFeishuCallbackAcceptance({
+      rawBody: new Uint8Array(CALLBACK_BODY),
+      headers,
+      env: { FEISHU_APP_SECRET: TEST_APPLICATION_SECRET, FEISHU_ENCRYPT_KEY: TEST_ENCRYPT_KEY },
+    });
+    assert.deepEqual(result, { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_SIGNATURE_INVALID" });
+  }
 });
 
 test("Application acceptance has no business persistence imports", () => {
@@ -465,7 +583,9 @@ test("durable Feishu receipt remains the retry idempotency boundary", () => {
 
 test("callback observability excludes raw authentication data", () => {
   assert.match(gatewaySource + routeSource, /application_accept_latency_ms|background_started/);
+  assert.match(routeSource, /callback_authentication_rejected/);
   assert.doesNotMatch(gatewaySource, /console\.[a-z]+\([^\n]*(?:rawBody|x-lark-signature|FEISHU_APP_SECRET)/i);
+  assert.doesNotMatch(acceptanceSource + routeSource, /console\.[a-z]+\([^\n]*(?:rawBody|raw nonce|owner_open_id|x-lark-signature|FEISHU_APP_SECRET|FEISHU_ENCRYPT_KEY|FEISHU_VERIFICATION_TOKEN)/i);
 });
 
 test("manifest records the complete callback safety contract", () => {
