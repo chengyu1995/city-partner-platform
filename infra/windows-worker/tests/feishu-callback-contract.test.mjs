@@ -19,6 +19,9 @@ const manifest = JSON.parse(fs.readFileSync(path.join(root, "infra", "tencent-wo
 
 const TEST_APPLICATION_SECRET = "synthetic-application-secret";
 const TEST_ENCRYPT_KEY = "synthetic-feishu-encrypt-key";
+const TEST_VERIFICATION_TOKEN = "synthetic-verification-token";
+const ENCRYPTED_SIGNATURE_MODE = "encrypted_signature";
+const UNENCRYPTED_VERIFICATION_TOKEN_MODE = "unencrypted_verification_token";
 const TEST_TIMESTAMP = "1786200000";
 const TEST_NONCE = "synthetic-nonce";
 const CALLBACK_BODY = Buffer.from('{\n  "header":{"event_id":"event-fixture","event_type":"im.message.receive_v1"},\n  "event":{"message":{"message_id":"message-fixture"}}\n}\n');
@@ -101,6 +104,31 @@ function accept(rawBody = CALLBACK_BODY, overrides = {}, envOverrides = {}) {
     env: {
       FEISHU_APP_SECRET: TEST_APPLICATION_SECRET,
       FEISHU_ENCRYPT_KEY: TEST_ENCRYPT_KEY,
+      FEISHU_CALLBACK_ENCRYPTION_MODE: ENCRYPTED_SIGNATURE_MODE,
+      ...envOverrides,
+    },
+  });
+}
+
+function unencryptedHeaders(rawBody, overrides = {}) {
+  return new Headers({
+    "Content-Type": "application/json; charset=utf-8",
+    [router.SIGNATURE_HEADER]: router.signApplicationPayload(rawBody, TEST_APPLICATION_SECRET),
+    [router.SOURCE_HEADER]: router.SOURCE_ID,
+    [router.TRANSPORT_REQUEST_ID_HEADER]: "transport-unencrypted-fixture",
+    ...overrides,
+  });
+}
+
+function acceptUnencrypted(payload, headerOverrides = {}, envOverrides = {}) {
+  const rawBody = Buffer.from(JSON.stringify(payload));
+  return acceptance.prepareFeishuCallbackAcceptance({
+    rawBody: new Uint8Array(rawBody),
+    headers: unencryptedHeaders(rawBody, headerOverrides),
+    env: {
+      FEISHU_APP_SECRET: TEST_APPLICATION_SECRET,
+      FEISHU_CALLBACK_ENCRYPTION_MODE: UNENCRYPTED_VERIFICATION_TOKEN_MODE,
+      FEISHU_VERIFICATION_TOKEN: TEST_VERIFICATION_TOKEN,
       ...envOverrides,
     },
   });
@@ -223,6 +251,115 @@ test("Application distinguishes missing internal and Feishu authentication confi
     accept(CALLBACK_BODY, {}, { FEISHU_ENCRYPT_KEY: "" }),
     { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_ENCRYPT_KEY_MISSING" }
   );
+  assert.deepEqual(
+    accept(CALLBACK_BODY, {}, { FEISHU_CALLBACK_ENCRYPTION_MODE: "" }),
+    { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_MODE_MISSING" }
+  );
+  assert.deepEqual(
+    accept(CALLBACK_BODY, {}, { FEISHU_CALLBACK_ENCRYPTION_MODE: "automatic" }),
+    { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_MODE_INVALID" }
+  );
+});
+
+test("unencrypted mode accepts valid internal HMAC and exact Verification Token without Feishu signature headers", () => {
+  const result = acceptUnencrypted({
+    schema: "2.0",
+    header: {
+      event_id: "event-unencrypted",
+      event_type: "im.message.receive_v1",
+      token: TEST_VERIFICATION_TOKEN,
+    },
+    event: { sender: { sender_id: { open_id: "synthetic-owner" } } },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.accepted.event_id, "event-unencrypted");
+  assert.equal(result.accepted.payload.event.sender.sender_id.open_id, "synthetic-owner");
+});
+
+test("unencrypted mode rejects wrong or missing Verification Token", () => {
+  const basePayload = {
+    schema: "2.0",
+    header: { event_id: "event-unencrypted", event_type: "im.message.receive_v1" },
+    event: { sender: { sender_id: { open_id: "untrusted-owner" } } },
+  };
+  assert.deepEqual(
+    acceptUnencrypted({ ...basePayload, header: { ...basePayload.header, token: "wrong-token" } }),
+    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TOKEN_INVALID" }
+  );
+  assert.deepEqual(
+    acceptUnencrypted(basePayload),
+    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TOKEN_INVALID" }
+  );
+  assert.deepEqual(
+    acceptUnencrypted({
+      ...basePayload,
+      header: { ...basePayload.header, token: TEST_VERIFICATION_TOKEN },
+    }, {}, { FEISHU_VERIFICATION_TOKEN: "" }),
+    { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_VERIFICATION_TOKEN_MISSING" }
+  );
+});
+
+test("unencrypted mode still requires valid Gateway internal HMAC before payload trust", () => {
+  const payload = {
+    schema: "2.0",
+    header: {
+      event_id: "event-untrusted",
+      event_type: "im.message.receive_v1",
+      token: TEST_VERIFICATION_TOKEN,
+    },
+    event: { sender: { sender_id: { open_id: "untrusted-owner" } } },
+  };
+  assert.deepEqual(
+    acceptUnencrypted(payload, { [router.SIGNATURE_HEADER]: "0".repeat(64) }),
+    { ok: false, status: 401, failure_code: "FEISHU_APPLICATION_BOUNDARY_SIGNATURE_INVALID" }
+  );
+});
+
+test("verification token accepts legacy root placement but rejects conflicting root and v2 header values", () => {
+  const legacy = acceptUnencrypted({
+    token: TEST_VERIFICATION_TOKEN,
+    event_id: "legacy-event",
+    event_type: "im.message.receive_v1",
+    event: {},
+  });
+  assert.equal(legacy.ok, true);
+
+  assert.deepEqual(
+    acceptUnencrypted({
+      token: TEST_VERIFICATION_TOKEN,
+      schema: "2.0",
+      header: {
+        event_id: "conflicting-event",
+        event_type: "im.message.receive_v1",
+        token: "different-header-token",
+      },
+      event: {},
+    }),
+    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TOKEN_INVALID" }
+  );
+});
+
+test("explicit encrypted mode cannot downgrade when signature headers are stripped", () => {
+  const body = Buffer.from(JSON.stringify({
+    token: TEST_VERIFICATION_TOKEN,
+    header: { event_id: "event-downgrade", event_type: "im.message.receive_v1" },
+    event: {},
+  }));
+  assert.deepEqual(
+    accept(body, {
+      "X-Lark-Request-Timestamp": "",
+      "X-Lark-Request-Nonce": "",
+      "X-Lark-Signature": "",
+    }, { FEISHU_VERIFICATION_TOKEN: TEST_VERIFICATION_TOKEN }),
+    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TIMESTAMP_MISSING" }
+  );
+});
+
+test("unencrypted mode rejects encrypted envelopes instead of guessing authentication mode", () => {
+  assert.deepEqual(
+    acceptUnencrypted({ encrypt: "synthetic-encrypted-envelope", token: TEST_VERIFICATION_TOKEN }),
+    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_MODE_PAYLOAD_MISMATCH" }
+  );
 });
 
 test("Application fails closed for an invalid Feishu signature", () => {
@@ -308,7 +445,11 @@ test("duplicate security headers fail closed", () => {
     const result = acceptance.prepareFeishuCallbackAcceptance({
       rawBody: new Uint8Array(CALLBACK_BODY),
       headers,
-      env: { FEISHU_APP_SECRET: TEST_APPLICATION_SECRET, FEISHU_ENCRYPT_KEY: TEST_ENCRYPT_KEY },
+      env: {
+        FEISHU_APP_SECRET: TEST_APPLICATION_SECRET,
+        FEISHU_ENCRYPT_KEY: TEST_ENCRYPT_KEY,
+        FEISHU_CALLBACK_ENCRYPTION_MODE: ENCRYPTED_SIGNATURE_MODE,
+      },
     });
     assert.deepEqual(result, { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_SIGNATURE_INVALID" });
   }
@@ -316,7 +457,10 @@ test("duplicate security headers fail closed", () => {
 
 test("Application acceptance has no business persistence imports", () => {
   assert.doesNotMatch(acceptanceSource, /supabase|canonicalCreateJob|createHermesJob|feishu_event_receipts/i);
-  assert.ok(acceptanceSource.indexOf("verifyFeishuCallbackRequestSignature") < acceptanceSource.indexOf("JSON.parse"));
+  assert.match(acceptanceSource, /FEISHU_CALLBACK_MODE_ENCRYPTED_SIGNATURE/);
+  assert.match(acceptanceSource, /FEISHU_CALLBACK_MODE_UNENCRYPTED_VERIFICATION_TOKEN/);
+  assert.ok(acceptanceSource.indexOf("verifyFeishuApplicationBoundaryRequest") < acceptanceSource.indexOf("FEISHU_CALLBACK_ENCRYPTION_MODE"));
+  assert.doesNotMatch(acceptanceSource, /if\s*\(\s*!input\.headers\.get\(FEISHU_SIGNATURE_HEADER\)\s*\)[\s\S]{0,200}UNENCRYPTED_VERIFICATION_TOKEN/);
 });
 
 test("Gateway forwards exact bytes and original signature values", async () => {
@@ -615,7 +759,7 @@ test("manifest records the complete callback safety contract", () => {
   });
 });
 
-test("real Application route accepts a valid callback and registers background work", async () => {
+test("real Application route accepts an authenticated unencrypted callback and registers business work", async () => {
   const afterTasks = [];
   class MockNextResponse {
     constructor(body, status) { this.body = body; this.status = status; }
@@ -631,17 +775,32 @@ test("real Application route accepts a valid callback and registers background w
       return genericMock;
     }
   );
-  const previous = { secret: process.env.FEISHU_APP_SECRET, key: process.env.FEISHU_ENCRYPT_KEY };
+  const rawBody = Buffer.from(JSON.stringify({
+    schema: "2.0",
+    header: {
+      event_id: "event-unencrypted-route",
+      event_type: "im.message.receive_v1",
+      token: TEST_VERIFICATION_TOKEN,
+    },
+    event: { message: { message_id: "message-unencrypted-route" } },
+  }));
+  const previous = {
+    secret: process.env.FEISHU_APP_SECRET,
+    mode: process.env.FEISHU_CALLBACK_ENCRYPTION_MODE,
+    token: process.env.FEISHU_VERIFICATION_TOKEN,
+  };
   process.env.FEISHU_APP_SECRET = TEST_APPLICATION_SECRET;
-  process.env.FEISHU_ENCRYPT_KEY = TEST_ENCRYPT_KEY;
+  process.env.FEISHU_CALLBACK_ENCRYPTION_MODE = UNENCRYPTED_VERIFICATION_TOKEN_MODE;
+  process.env.FEISHU_VERIFICATION_TOKEN = TEST_VERIFICATION_TOKEN;
   try {
-    const response = await route.POST({ headers: callbackHeaders(), async arrayBuffer() { return CALLBACK_BODY; } });
+    const response = await route.POST({ headers: unencryptedHeaders(rawBody), async arrayBuffer() { return rawBody; } });
     assert.equal(response.status, 200);
-    assert.deepEqual(response.body, router.buildFeishuApplicationAcceptanceResponse("event-fixture"));
+    assert.deepEqual(response.body, router.buildFeishuApplicationAcceptanceResponse("event-unencrypted-route"));
     assert.equal(afterTasks.length, 1);
   } finally {
     if (previous.secret === undefined) delete process.env.FEISHU_APP_SECRET; else process.env.FEISHU_APP_SECRET = previous.secret;
-    if (previous.key === undefined) delete process.env.FEISHU_ENCRYPT_KEY; else process.env.FEISHU_ENCRYPT_KEY = previous.key;
+    if (previous.mode === undefined) delete process.env.FEISHU_CALLBACK_ENCRYPTION_MODE; else process.env.FEISHU_CALLBACK_ENCRYPTION_MODE = previous.mode;
+    if (previous.token === undefined) delete process.env.FEISHU_VERIFICATION_TOKEN; else process.env.FEISHU_VERIFICATION_TOKEN = previous.token;
   }
 });
 
@@ -665,8 +824,10 @@ test("real Application route rejects missing signature before background registr
   headers.delete(router.FEISHU_SIGNATURE_HEADER);
   const oldSecret = process.env.FEISHU_APP_SECRET;
   const oldKey = process.env.FEISHU_ENCRYPT_KEY;
+  const oldMode = process.env.FEISHU_CALLBACK_ENCRYPTION_MODE;
   process.env.FEISHU_APP_SECRET = TEST_APPLICATION_SECRET;
   process.env.FEISHU_ENCRYPT_KEY = TEST_ENCRYPT_KEY;
+  process.env.FEISHU_CALLBACK_ENCRYPTION_MODE = ENCRYPTED_SIGNATURE_MODE;
   try {
     const response = await route.POST({ headers, async arrayBuffer() { return CALLBACK_BODY; } });
     assert.equal(response.status, 401);
@@ -674,6 +835,7 @@ test("real Application route rejects missing signature before background registr
   } finally {
     if (oldSecret === undefined) delete process.env.FEISHU_APP_SECRET; else process.env.FEISHU_APP_SECRET = oldSecret;
     if (oldKey === undefined) delete process.env.FEISHU_ENCRYPT_KEY; else process.env.FEISHU_ENCRYPT_KEY = oldKey;
+    if (oldMode === undefined) delete process.env.FEISHU_CALLBACK_ENCRYPTION_MODE; else process.env.FEISHU_CALLBACK_ENCRYPTION_MODE = oldMode;
   }
 });
 
@@ -696,8 +858,10 @@ test("real Application route rejects a body mutation before background registrat
   const mutated = Buffer.from(CALLBACK_BODY.toString("utf8").replace("event-fixture", "event-changed"));
   const oldSecret = process.env.FEISHU_APP_SECRET;
   const oldKey = process.env.FEISHU_ENCRYPT_KEY;
+  const oldMode = process.env.FEISHU_CALLBACK_ENCRYPTION_MODE;
   process.env.FEISHU_APP_SECRET = TEST_APPLICATION_SECRET;
   process.env.FEISHU_ENCRYPT_KEY = TEST_ENCRYPT_KEY;
+  process.env.FEISHU_CALLBACK_ENCRYPTION_MODE = ENCRYPTED_SIGNATURE_MODE;
   try {
     const response = await route.POST({ headers: callbackHeaders(), async arrayBuffer() { return mutated; } });
     assert.equal(response.status, 401);
@@ -705,6 +869,7 @@ test("real Application route rejects a body mutation before background registrat
   } finally {
     if (oldSecret === undefined) delete process.env.FEISHU_APP_SECRET; else process.env.FEISHU_APP_SECRET = oldSecret;
     if (oldKey === undefined) delete process.env.FEISHU_ENCRYPT_KEY; else process.env.FEISHU_ENCRYPT_KEY = oldKey;
+    if (oldMode === undefined) delete process.env.FEISHU_CALLBACK_ENCRYPTION_MODE; else process.env.FEISHU_CALLBACK_ENCRYPTION_MODE = oldMode;
   }
 });
 

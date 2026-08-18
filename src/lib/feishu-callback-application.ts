@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { decryptFeishuEvent } from "@/lib/feishu-crypto";
 import {
   FEISHU_APPLICATION_BOUNDARY_SIGNATURE_HEADER,
@@ -30,6 +31,13 @@ export interface FeishuCallbackAuthenticationAuditRecord {
   feishu_callback_auth_passed: boolean;
 }
 
+export const FEISHU_CALLBACK_MODE_ENCRYPTED_SIGNATURE = "encrypted_signature";
+export const FEISHU_CALLBACK_MODE_UNENCRYPTED_VERIFICATION_TOKEN = "unencrypted_verification_token";
+
+type FeishuCallbackMode =
+  | typeof FEISHU_CALLBACK_MODE_ENCRYPTED_SIGNATURE
+  | typeof FEISHU_CALLBACK_MODE_UNENCRYPTED_VERIFICATION_TOKEN;
+
 const FAILURE_AUDIT: Record<string, Omit<FeishuCallbackAuthenticationAuditRecord, "failure_code">> = {
   FEISHU_APPLICATION_AUTH_SECRET_MISSING: {
     authentication_layer: "GATEWAY_APPLICATION",
@@ -41,6 +49,30 @@ const FAILURE_AUDIT: Record<string, Omit<FeishuCallbackAuthenticationAuditRecord
     authentication_layer: "FEISHU_CALLBACK",
     authentication_stage: "ENCRYPT_KEY_CONFIGURATION",
     internal_gateway_auth_passed: false,
+    feishu_callback_auth_passed: false,
+  },
+  FEISHU_CALLBACK_MODE_MISSING: {
+    authentication_layer: "FEISHU_CALLBACK",
+    authentication_stage: "MODE_CONFIGURATION",
+    internal_gateway_auth_passed: true,
+    feishu_callback_auth_passed: false,
+  },
+  FEISHU_CALLBACK_MODE_INVALID: {
+    authentication_layer: "FEISHU_CALLBACK",
+    authentication_stage: "MODE_CONFIGURATION",
+    internal_gateway_auth_passed: true,
+    feishu_callback_auth_passed: false,
+  },
+  FEISHU_CALLBACK_VERIFICATION_TOKEN_MISSING: {
+    authentication_layer: "FEISHU_CALLBACK",
+    authentication_stage: "VERIFICATION_TOKEN_CONFIGURATION",
+    internal_gateway_auth_passed: true,
+    feishu_callback_auth_passed: false,
+  },
+  FEISHU_CALLBACK_MODE_PAYLOAD_MISMATCH: {
+    authentication_layer: "FEISHU_CALLBACK",
+    authentication_stage: "MODE_PAYLOAD_BINDING",
+    internal_gateway_auth_passed: true,
     feishu_callback_auth_passed: false,
   },
   FEISHU_APPLICATION_BOUNDARY_SOURCE_MISSING: {
@@ -101,13 +133,13 @@ const FAILURE_AUDIT: Record<string, Omit<FeishuCallbackAuthenticationAuditRecord
     authentication_layer: "CALLBACK_PAYLOAD",
     authentication_stage: "BODY_PARSE",
     internal_gateway_auth_passed: true,
-    feishu_callback_auth_passed: true,
+    feishu_callback_auth_passed: false,
   },
   FEISHU_CALLBACK_DECRYPT_FAILED: {
     authentication_layer: "CALLBACK_PAYLOAD",
     authentication_stage: "DECRYPTION",
     internal_gateway_auth_passed: true,
-    feishu_callback_auth_passed: true,
+    feishu_callback_auth_passed: false,
   },
   FEISHU_CALLBACK_IDENTITY_INCOMPLETE: {
     authentication_layer: "CALLBACK_PAYLOAD",
@@ -143,6 +175,29 @@ function stringValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function literalString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function callbackMode(value: unknown): FeishuCallbackMode | null {
+  const mode = stringValue(value);
+  if (
+    mode === FEISHU_CALLBACK_MODE_ENCRYPTED_SIGNATURE
+    || mode === FEISHU_CALLBACK_MODE_UNENCRYPTED_VERIFICATION_TOKEN
+  ) {
+    return mode;
+  }
+  return null;
+}
+
+function constantTimeStringEqual(expected: string, actual: string): boolean {
+  const expectedBytes = Buffer.from(expected, "utf8");
+  const actualBytes = Buffer.from(actual, "utf8");
+  const expectedDigest = createHash("sha256").update(expectedBytes).digest();
+  const actualDigest = createHash("sha256").update(actualBytes).digest();
+  return timingSafeEqual(expectedDigest, actualDigest) && expectedBytes.length === actualBytes.length;
+}
+
 function nestedRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
 }
@@ -161,18 +216,23 @@ function callbackIdentity(payload: Record<string, unknown>): { eventId: string; 
   };
 }
 
+function callbackVerificationToken(payload: Record<string, unknown>): string {
+  const rootToken = literalString(payload.token);
+  const headerToken = literalString(nestedRecord(payload.header).token);
+  if (rootToken && headerToken && !constantTimeStringEqual(rootToken, headerToken)) {
+    return "";
+  }
+  return headerToken || rootToken;
+}
+
 export function prepareFeishuCallbackAcceptance(input: {
   rawBody: Uint8Array;
   headers: Headers;
   env: Record<string, string | undefined>;
 }): FeishuCallbackAcceptance {
   const applicationSecret = stringValue(input.env.FEISHU_APP_SECRET);
-  const encryptKey = stringValue(input.env.FEISHU_ENCRYPT_KEY);
   if (!applicationSecret) {
     return { ok: false, status: 503, failure_code: "FEISHU_APPLICATION_AUTH_SECRET_MISSING" };
-  }
-  if (!encryptKey) {
-    return { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_ENCRYPT_KEY_MISSING" };
   }
 
   const boundarySource = input.headers.get(FEISHU_APPLICATION_BOUNDARY_SOURCE_HEADER);
@@ -197,21 +257,36 @@ export function prepareFeishuCallbackAcceptance(input: {
     return { ok: false, status: 401, failure_code: "FEISHU_APPLICATION_BOUNDARY_SIGNATURE_INVALID" };
   }
 
-  if (!input.headers.get(FEISHU_TIMESTAMP_HEADER)) {
-    return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TIMESTAMP_MISSING" };
+  const configuredMode = stringValue(input.env.FEISHU_CALLBACK_ENCRYPTION_MODE);
+  const mode = callbackMode(configuredMode);
+  if (!configuredMode) {
+    return { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_MODE_MISSING" };
   }
-  if (!input.headers.get(FEISHU_NONCE_HEADER)) {
-    return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_NONCE_MISSING" };
+  if (!mode) {
+    return { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_MODE_INVALID" };
   }
-  if (!input.headers.get(FEISHU_SIGNATURE_HEADER)) {
-    return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_SIGNATURE_MISSING" };
-  }
-  if (!verifyFeishuCallbackRequestSignature({
-    rawBody: input.rawBody,
-    headers: input.headers,
-    encryptKey,
-  })) {
-    return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_SIGNATURE_INVALID" };
+
+  const encryptKey = stringValue(input.env.FEISHU_ENCRYPT_KEY);
+  if (mode === FEISHU_CALLBACK_MODE_ENCRYPTED_SIGNATURE) {
+    if (!encryptKey) {
+      return { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_ENCRYPT_KEY_MISSING" };
+    }
+    if (!input.headers.get(FEISHU_TIMESTAMP_HEADER)) {
+      return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TIMESTAMP_MISSING" };
+    }
+    if (!input.headers.get(FEISHU_NONCE_HEADER)) {
+      return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_NONCE_MISSING" };
+    }
+    if (!input.headers.get(FEISHU_SIGNATURE_HEADER)) {
+      return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_SIGNATURE_MISSING" };
+    }
+    if (!verifyFeishuCallbackRequestSignature({
+      rawBody: input.rawBody,
+      headers: input.headers,
+      encryptKey,
+    })) {
+      return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_SIGNATURE_INVALID" };
+    }
   }
 
   let body: Record<string, unknown>;
@@ -223,16 +298,26 @@ export function prepareFeishuCallbackAcceptance(input: {
 
   let payload: Record<string, unknown> = body;
   const encryptedBody = stringValue(body.encrypt);
-  if (encryptedBody) {
-    try {
-      payload = JSON.parse(decryptFeishuEvent(encryptedBody, encryptKey));
-    } catch {
-      return { ok: false, status: 400, failure_code: "FEISHU_CALLBACK_DECRYPT_FAILED" };
+  if (mode === FEISHU_CALLBACK_MODE_ENCRYPTED_SIGNATURE) {
+    if (encryptedBody) {
+      try {
+        payload = JSON.parse(decryptFeishuEvent(encryptedBody, encryptKey));
+      } catch {
+        return { ok: false, status: 400, failure_code: "FEISHU_CALLBACK_DECRYPT_FAILED" };
+      }
     }
+  } else if (encryptedBody) {
+    return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_MODE_PAYLOAD_MISMATCH" };
   }
 
-  const verificationToken = stringValue(input.env.FEISHU_VERIFICATION_TOKEN);
-  if (verificationToken && stringValue(payload.token) !== verificationToken) {
+  const verificationToken = literalString(input.env.FEISHU_VERIFICATION_TOKEN);
+  if (mode === FEISHU_CALLBACK_MODE_UNENCRYPTED_VERIFICATION_TOKEN && !verificationToken) {
+    return { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_VERIFICATION_TOKEN_MISSING" };
+  }
+  if (
+    verificationToken
+    && !constantTimeStringEqual(verificationToken, callbackVerificationToken(payload))
+  ) {
     return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TOKEN_INVALID" };
   }
 
