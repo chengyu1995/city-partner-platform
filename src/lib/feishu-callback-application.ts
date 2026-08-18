@@ -19,9 +19,23 @@ export interface AcceptedFeishuCallback {
   transport_request_id: string;
 }
 
+export type FeishuVerificationTokenSource = "HEADER_V2" | "ROOT_V1" | "NONE" | "CONFLICT";
+
+interface FeishuVerificationTokenAuditContext {
+  token_present: boolean;
+  token_source: FeishuVerificationTokenSource;
+  runtime_token_present: boolean;
+  constant_time_compare_result: boolean | null;
+}
+
 export type FeishuCallbackAcceptance =
   | { ok: true; accepted: AcceptedFeishuCallback }
-  | { ok: false; status: 400 | 401 | 503; failure_code: string };
+  | {
+      ok: false;
+      status: 400 | 401 | 503;
+      failure_code: string;
+      verification_token_audit?: FeishuVerificationTokenAuditContext;
+    };
 
 export interface FeishuCallbackAuthenticationAuditRecord {
   failure_code: string;
@@ -29,6 +43,10 @@ export interface FeishuCallbackAuthenticationAuditRecord {
   authentication_stage: string;
   internal_gateway_auth_passed: boolean;
   feishu_callback_auth_passed: boolean;
+  token_present: boolean;
+  token_source: FeishuVerificationTokenSource;
+  runtime_token_present: boolean;
+  constant_time_compare_result: boolean | null;
 }
 
 export const FEISHU_CALLBACK_MODE_ENCRYPTED_SIGNATURE = "encrypted_signature";
@@ -38,7 +56,13 @@ type FeishuCallbackMode =
   | typeof FEISHU_CALLBACK_MODE_ENCRYPTED_SIGNATURE
   | typeof FEISHU_CALLBACK_MODE_UNENCRYPTED_VERIFICATION_TOKEN;
 
-const FAILURE_AUDIT: Record<string, Omit<FeishuCallbackAuthenticationAuditRecord, "failure_code">> = {
+const FAILURE_AUDIT: Record<
+  string,
+  Pick<
+    FeishuCallbackAuthenticationAuditRecord,
+    "authentication_layer" | "authentication_stage" | "internal_gateway_auth_passed" | "feishu_callback_auth_passed"
+  >
+> = {
   FEISHU_APPLICATION_AUTH_SECRET_MISSING: {
     authentication_layer: "GATEWAY_APPLICATION",
     authentication_stage: "HMAC_SECRET_CONFIGURATION",
@@ -63,7 +87,7 @@ const FAILURE_AUDIT: Record<string, Omit<FeishuCallbackAuthenticationAuditRecord
     internal_gateway_auth_passed: true,
     feishu_callback_auth_passed: false,
   },
-  FEISHU_CALLBACK_VERIFICATION_TOKEN_MISSING: {
+  FEISHU_CALLBACK_TOKEN_RUNTIME_CONFIG_MISSING: {
     authentication_layer: "FEISHU_CALLBACK",
     authentication_stage: "VERIFICATION_TOKEN_CONFIGURATION",
     internal_gateway_auth_passed: true,
@@ -123,9 +147,27 @@ const FAILURE_AUDIT: Record<string, Omit<FeishuCallbackAuthenticationAuditRecord
     internal_gateway_auth_passed: true,
     feishu_callback_auth_passed: false,
   },
-  FEISHU_CALLBACK_TOKEN_INVALID: {
+  FEISHU_CALLBACK_TOKEN_MISSING: {
     authentication_layer: "FEISHU_CALLBACK",
-    authentication_stage: "VERIFICATION_TOKEN",
+    authentication_stage: "VERIFICATION_TOKEN_MISSING",
+    internal_gateway_auth_passed: true,
+    feishu_callback_auth_passed: false,
+  },
+  FEISHU_CALLBACK_TOKEN_SOURCE_INVALID: {
+    authentication_layer: "FEISHU_CALLBACK",
+    authentication_stage: "VERIFICATION_TOKEN_SOURCE",
+    internal_gateway_auth_passed: true,
+    feishu_callback_auth_passed: false,
+  },
+  FEISHU_CALLBACK_TOKEN_CONFLICT: {
+    authentication_layer: "FEISHU_CALLBACK",
+    authentication_stage: "VERIFICATION_TOKEN_CONFLICT",
+    internal_gateway_auth_passed: true,
+    feishu_callback_auth_passed: false,
+  },
+  FEISHU_CALLBACK_TOKEN_MISMATCH: {
+    authentication_layer: "FEISHU_CALLBACK",
+    authentication_stage: "VERIFICATION_TOKEN_COMPARISON",
     internal_gateway_auth_passed: true,
     feishu_callback_auth_passed: false,
   },
@@ -159,6 +201,10 @@ export function buildFeishuCallbackAuthenticationAuditRecord(
       authentication_stage: "COMPLETE",
       internal_gateway_auth_passed: true,
       feishu_callback_auth_passed: true,
+      token_present: false,
+      token_source: "NONE",
+      runtime_token_present: false,
+      constant_time_compare_result: null,
     };
   }
   const audit = FAILURE_AUDIT[acceptance.failure_code];
@@ -168,6 +214,10 @@ export function buildFeishuCallbackAuthenticationAuditRecord(
     authentication_stage: audit?.authentication_stage ?? "UNKNOWN",
     internal_gateway_auth_passed: audit?.internal_gateway_auth_passed ?? false,
     feishu_callback_auth_passed: audit?.feishu_callback_auth_passed ?? false,
+    token_present: acceptance.verification_token_audit?.token_present ?? false,
+    token_source: acceptance.verification_token_audit?.token_source ?? "NONE",
+    runtime_token_present: acceptance.verification_token_audit?.runtime_token_present ?? false,
+    constant_time_compare_result: acceptance.verification_token_audit?.constant_time_compare_result ?? null,
   };
 }
 
@@ -216,13 +266,41 @@ function callbackIdentity(payload: Record<string, unknown>): { eventId: string; 
   };
 }
 
-function callbackVerificationToken(payload: Record<string, unknown>): string {
+interface CallbackVerificationTokenResolution {
+  value: string;
+  source: FeishuVerificationTokenSource;
+  source_valid: boolean;
+}
+
+function verificationTokenAudit(
+  resolution: CallbackVerificationTokenResolution,
+  runtimeTokenPresent: boolean,
+  constantTimeCompareResult: boolean | null
+): FeishuVerificationTokenAuditContext {
+  return {
+    token_present: resolution.source !== "NONE",
+    token_source: resolution.source,
+    runtime_token_present: runtimeTokenPresent,
+    constant_time_compare_result: constantTimeCompareResult,
+  };
+}
+
+function callbackVerificationToken(payload: Record<string, unknown>): CallbackVerificationTokenResolution {
   const rootToken = literalString(payload.token);
-  const headerToken = literalString(nestedRecord(payload.header).token);
+  const header = nestedRecord(payload.header);
+  const headerToken = literalString(header.token);
   if (rootToken && headerToken && !constantTimeStringEqual(rootToken, headerToken)) {
-    return "";
+    return { value: "", source: "CONFLICT", source_valid: false };
   }
-  return headerToken || rootToken;
+  const isV2 = literalString(payload.schema) === "2.0";
+  if (isV2) {
+    if (headerToken) return { value: headerToken, source: "HEADER_V2", source_valid: true };
+    if (rootToken) return { value: rootToken, source: "ROOT_V1", source_valid: false };
+    return { value: "", source: "NONE", source_valid: true };
+  }
+  if (rootToken) return { value: rootToken, source: "ROOT_V1", source_valid: true };
+  if (headerToken) return { value: headerToken, source: "HEADER_V2", source_valid: false };
+  return { value: "", source: "NONE", source_valid: true };
 }
 
 export function prepareFeishuCallbackAcceptance(input: {
@@ -311,14 +389,50 @@ export function prepareFeishuCallbackAcceptance(input: {
   }
 
   const verificationToken = literalString(input.env.FEISHU_VERIFICATION_TOKEN);
-  if (mode === FEISHU_CALLBACK_MODE_UNENCRYPTED_VERIFICATION_TOKEN && !verificationToken) {
-    return { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_VERIFICATION_TOKEN_MISSING" };
+  const tokenResolution = callbackVerificationToken(payload);
+  const runtimeTokenPresent = verificationToken.length > 0;
+  if (mode === FEISHU_CALLBACK_MODE_UNENCRYPTED_VERIFICATION_TOKEN && !runtimeTokenPresent) {
+    return {
+      ok: false,
+      status: 503,
+      failure_code: "FEISHU_CALLBACK_TOKEN_RUNTIME_CONFIG_MISSING",
+      verification_token_audit: verificationTokenAudit(tokenResolution, false, null),
+    };
   }
-  if (
-    verificationToken
-    && !constantTimeStringEqual(verificationToken, callbackVerificationToken(payload))
-  ) {
-    return { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TOKEN_INVALID" };
+  if (tokenResolution.source === "CONFLICT") {
+    return {
+      ok: false,
+      status: 401,
+      failure_code: "FEISHU_CALLBACK_TOKEN_CONFLICT",
+      verification_token_audit: verificationTokenAudit(tokenResolution, runtimeTokenPresent, false),
+    };
+  }
+  if (mode === FEISHU_CALLBACK_MODE_UNENCRYPTED_VERIFICATION_TOKEN && tokenResolution.source === "NONE") {
+    return {
+      ok: false,
+      status: 401,
+      failure_code: "FEISHU_CALLBACK_TOKEN_MISSING",
+      verification_token_audit: verificationTokenAudit(tokenResolution, runtimeTokenPresent, false),
+    };
+  }
+  if (mode === FEISHU_CALLBACK_MODE_UNENCRYPTED_VERIFICATION_TOKEN && !tokenResolution.source_valid) {
+    return {
+      ok: false,
+      status: 401,
+      failure_code: "FEISHU_CALLBACK_TOKEN_SOURCE_INVALID",
+      verification_token_audit: verificationTokenAudit(tokenResolution, runtimeTokenPresent, false),
+    };
+  }
+  if (runtimeTokenPresent) {
+    const tokenMatches = constantTimeStringEqual(verificationToken, tokenResolution.value);
+    if (!tokenMatches) {
+      return {
+        ok: false,
+        status: 401,
+        failure_code: "FEISHU_CALLBACK_TOKEN_MISMATCH",
+        verification_token_audit: verificationTokenAudit(tokenResolution, true, false),
+      };
+    }
   }
 
   const identity = callbackIdentity(payload);

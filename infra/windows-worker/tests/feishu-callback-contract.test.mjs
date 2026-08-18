@@ -134,6 +134,26 @@ function acceptUnencrypted(payload, headerOverrides = {}, envOverrides = {}) {
   });
 }
 
+function tokenFailure(failureCode, {
+  source,
+  tokenPresent = source !== "NONE",
+  runtimeTokenPresent = true,
+  compareResult = false,
+  status = 401,
+}) {
+  return {
+    ok: false,
+    status,
+    failure_code: failureCode,
+    verification_token_audit: {
+      token_present: tokenPresent,
+      token_source: source,
+      runtime_token_present: runtimeTokenPresent,
+      constant_time_compare_result: compareResult,
+    },
+  };
+}
+
 function validApplicationResponse(status = 200, eventId = "event-fixture") {
   return new Response(JSON.stringify(router.buildFeishuApplicationAcceptanceResponse(eventId)), {
     status,
@@ -284,18 +304,23 @@ test("unencrypted mode rejects wrong or missing Verification Token", () => {
   };
   assert.deepEqual(
     acceptUnencrypted({ ...basePayload, header: { ...basePayload.header, token: "wrong-token" } }),
-    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TOKEN_INVALID" }
+    tokenFailure("FEISHU_CALLBACK_TOKEN_MISMATCH", { source: "HEADER_V2" })
   );
   assert.deepEqual(
     acceptUnencrypted(basePayload),
-    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TOKEN_INVALID" }
+    tokenFailure("FEISHU_CALLBACK_TOKEN_MISSING", { source: "NONE", tokenPresent: false })
   );
   assert.deepEqual(
     acceptUnencrypted({
       ...basePayload,
       header: { ...basePayload.header, token: TEST_VERIFICATION_TOKEN },
     }, {}, { FEISHU_VERIFICATION_TOKEN: "" }),
-    { ok: false, status: 503, failure_code: "FEISHU_CALLBACK_VERIFICATION_TOKEN_MISSING" }
+    tokenFailure("FEISHU_CALLBACK_TOKEN_RUNTIME_CONFIG_MISSING", {
+      source: "HEADER_V2",
+      runtimeTokenPresent: false,
+      compareResult: null,
+      status: 503,
+    })
   );
 });
 
@@ -315,7 +340,7 @@ test("unencrypted mode still requires valid Gateway internal HMAC before payload
   );
 });
 
-test("verification token accepts legacy root placement but rejects conflicting root and v2 header values", () => {
+test("verification token accepts exact schema sources and rejects invalid or conflicting placement", () => {
   const legacy = acceptUnencrypted({
     token: TEST_VERIFICATION_TOKEN,
     event_id: "legacy-event",
@@ -323,6 +348,50 @@ test("verification token accepts legacy root placement but rejects conflicting r
     event: {},
   });
   assert.equal(legacy.ok, true);
+
+  assert.deepEqual(
+    acceptUnencrypted({
+      token: "wrong-legacy-token",
+      event_id: "wrong-legacy-event",
+      event_type: "im.message.receive_v1",
+      event: {},
+    }),
+    tokenFailure("FEISHU_CALLBACK_TOKEN_MISMATCH", { source: "ROOT_V1" })
+  );
+
+  const v2SameToken = acceptUnencrypted({
+    token: TEST_VERIFICATION_TOKEN,
+    schema: "2.0",
+    header: {
+      event_id: "same-token-event",
+      event_type: "im.message.receive_v1",
+      token: TEST_VERIFICATION_TOKEN,
+    },
+    event: {},
+  });
+  assert.equal(v2SameToken.ok, true);
+
+  assert.deepEqual(
+    acceptUnencrypted({
+      schema: "2.0",
+      token: TEST_VERIFICATION_TOKEN,
+      header: { event_id: "v2-root-only", event_type: "im.message.receive_v1" },
+      event: {},
+    }),
+    tokenFailure("FEISHU_CALLBACK_TOKEN_SOURCE_INVALID", { source: "ROOT_V1" })
+  );
+
+  assert.deepEqual(
+    acceptUnencrypted({
+      header: {
+        event_id: "v1-header-only",
+        event_type: "im.message.receive_v1",
+        token: TEST_VERIFICATION_TOKEN,
+      },
+      event: {},
+    }),
+    tokenFailure("FEISHU_CALLBACK_TOKEN_SOURCE_INVALID", { source: "HEADER_V2" })
+  );
 
   assert.deepEqual(
     acceptUnencrypted({
@@ -335,8 +404,25 @@ test("verification token accepts legacy root placement but rejects conflicting r
       },
       event: {},
     }),
-    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TOKEN_INVALID" }
+    tokenFailure("FEISHU_CALLBACK_TOKEN_CONFLICT", { source: "CONFLICT" })
   );
+});
+
+test("verification token comparison preserves exact UTF-8 bytes", () => {
+  for (const token of [` ${TEST_VERIFICATION_TOKEN}`, `${TEST_VERIFICATION_TOKEN} `]) {
+    assert.deepEqual(
+      acceptUnencrypted({
+        schema: "2.0",
+        header: {
+          event_id: "whitespace-token-event",
+          event_type: "im.message.receive_v1",
+          token,
+        },
+        event: {},
+      }),
+      tokenFailure("FEISHU_CALLBACK_TOKEN_MISMATCH", { source: "HEADER_V2" })
+    );
+  }
 });
 
 test("explicit encrypted mode cannot downgrade when signature headers are stripped", () => {
@@ -394,6 +480,10 @@ test("Application authentication audit records expose only stable non-sensitive 
     authentication_stage: "SIGNATURE_VERIFICATION",
     internal_gateway_auth_passed: true,
     feishu_callback_auth_passed: false,
+    token_present: false,
+    token_source: "NONE",
+    runtime_token_present: false,
+    constant_time_compare_result: null,
   });
   assert.deepEqual(acceptance.buildFeishuCallbackAuthenticationAuditRecord(accept()), {
     failure_code: "NONE",
@@ -401,6 +491,10 @@ test("Application authentication audit records expose only stable non-sensitive 
     authentication_stage: "COMPLETE",
     internal_gateway_auth_passed: true,
     feishu_callback_auth_passed: true,
+    token_present: false,
+    token_source: "NONE",
+    runtime_token_present: false,
+    constant_time_compare_result: null,
   });
   const serialized = JSON.stringify(acceptance.buildFeishuCallbackAuthenticationAuditRecord(rejected));
   assert.doesNotMatch(serialized, new RegExp(TEST_APPLICATION_SECRET));
@@ -416,8 +510,33 @@ test("Application rejects a verification token mismatch after valid signatures",
   }));
   assert.deepEqual(
     accept(body, {}, { FEISHU_VERIFICATION_TOKEN: "different-token" }),
-    { ok: false, status: 401, failure_code: "FEISHU_CALLBACK_TOKEN_INVALID" }
+    tokenFailure("FEISHU_CALLBACK_TOKEN_MISMATCH", { source: "ROOT_V1" })
   );
+});
+
+test("verification token audit records expose only presence, source, and comparison result", () => {
+  const rejected = acceptUnencrypted({
+    schema: "2.0",
+    header: {
+      event_id: "audit-token-event",
+      event_type: "im.message.receive_v1",
+      token: "synthetic-wrong-token",
+    },
+    event: {},
+  });
+  assert.deepEqual(acceptance.buildFeishuCallbackAuthenticationAuditRecord(rejected), {
+    failure_code: "FEISHU_CALLBACK_TOKEN_MISMATCH",
+    authentication_layer: "FEISHU_CALLBACK",
+    authentication_stage: "VERIFICATION_TOKEN_COMPARISON",
+    internal_gateway_auth_passed: true,
+    feishu_callback_auth_passed: false,
+    token_present: true,
+    token_source: "HEADER_V2",
+    runtime_token_present: true,
+    constant_time_compare_result: false,
+  });
+  const serialized = JSON.stringify(acceptance.buildFeishuCallbackAuthenticationAuditRecord(rejected));
+  assert.doesNotMatch(serialized, /synthetic-wrong-token|synthetic-verification-token/);
 });
 
 test("Application accepts a valid encrypted callback and rejects invalid ciphertext", () => {
