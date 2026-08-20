@@ -26,7 +26,7 @@ accepted.payload.event.sender.sender_id.open_id
 
 The command nonce proves operator intent. It never supplies owner identity.
 
-The route handles any exact reserved namespace before `next/server.after()` registration. A malformed command, wrong/expired/consumed nonce, non-P2P message, non-user sender, RPC failure, timeout, or unknown RPC result receives the same transport acknowledgement and cannot enter Legacy or Canonical routing.
+The route handles any exact reserved namespace before `next/server.after()` registration. A malformed command, wrong/expired/consumed nonce, unsupported chat type, non-user sender, RPC failure, timeout, or unknown RPC result receives the same transport acknowledgement and cannot enter Legacy or Canonical routing. The supported chat types are Feishu `p2p` and `group`; both still use the verified Feishu user sender as the owner authority and the one-time nonce as operator intent.
 
 ## Data Security
 

@@ -8,6 +8,7 @@ export const IDENTITY_DISCOVERY_COMMAND_REGEX =
   /^总管 身份验证 ([0-9a-f]{64})$/;
 
 const IDENTITY_DISCOVERY_NAMESPACE_REGEX = /^\s*总管 身份验证(?:\s|$)/;
+const ACCEPTED_IDENTITY_DISCOVERY_CHAT_TYPES = new Set(["p2p", "group"]);
 type IdentityDiscoveryCandidate = {
   reserved: true;
   commandValid: true;
@@ -93,7 +94,7 @@ export function inspectAcceptedIdentityDiscovery(
       reasonCode: "IDENTITY_DISCOVERY_EVENT_TYPE_DENIED",
     };
   }
-  if (stringValue(message.chat_type) !== "p2p") {
+  if (!ACCEPTED_IDENTITY_DISCOVERY_CHAT_TYPES.has(stringValue(message.chat_type))) {
     return {
       reserved: true,
       commandValid: false,

@@ -263,10 +263,9 @@ test("ordinary text that mentions the namespace does not false-positive", () => 
   }
 });
 
-test("event type, p2p, and user sender gates fail closed", () => {
+test("event type, supported chat type, and user sender gates fail closed", () => {
   for (const value of [
     accepted({ eventType: "url_verification" }),
-    accepted({ chatType: "group" }),
     accepted({ chatType: "topic" }),
     accepted({ senderType: "bot" }),
     accepted({ senderType: "app" }),
@@ -274,6 +273,17 @@ test("event type, p2p, and user sender gates fail closed", () => {
     const result = helper.inspectAcceptedIdentityDiscovery(value);
     assert.equal(result.reserved, true);
     assert.equal(result.commandValid, false);
+  }
+});
+
+test("parser accepts p2p and group owner discovery callbacks", () => {
+  for (const chatType of ["p2p", "group"]) {
+    const result = helper.inspectAcceptedIdentityDiscovery(accepted({ chatType }));
+    assert.equal(result.reserved, true);
+    assert.equal(result.commandValid, true);
+    assert.equal(result.nonceSha256, NONCE_SHA256);
+    assert.equal(result.verifiedOwnerOpenId, "ou_synthetic_owner");
+    assert.equal(result.verifiedEventId, "event-fixture");
   }
 });
 
@@ -345,9 +355,9 @@ test("malformed reserved command never calls RPC or registers business backgroun
   assert.equal(harness.afterTasks.length, 0);
 });
 
-test("group, non-user, and wrong-event reserved callbacks never call RPC or business routing", async () => {
+test("unsupported chat, non-user, and wrong-event reserved callbacks never call RPC or business routing", async () => {
   for (const callback of [
-    accepted({ chatType: "group" }),
+    accepted({ chatType: "topic" }),
     accepted({ senderType: "bot" }),
     accepted({ eventType: "other.event" }),
   ]) {
@@ -357,6 +367,21 @@ test("group, non-user, and wrong-event reserved callbacks never call RPC or busi
     assert.equal(rpcCalls, 0);
     assert.equal(harness.afterTasks.length, 0);
   }
+});
+
+test("group reserved callback is captured synchronously without business routing", async () => {
+  let rpcCalls = 0;
+  const harness = routeHarness({
+    acceptedCallback: accepted({ chatType: "group" }),
+    rpcImpl: async function rpc() {
+      rpcCalls += 1;
+      return { data: [{ receipt_id: "receipt-1", capture_outcome: "CAPTURED" }], error: null };
+    },
+  });
+  await callRoute(harness);
+  assert.equal(rpcCalls, 1);
+  assert.equal(harness.afterTasks.length, 0);
+  assert.equal(harness.logs[0][1].reason_code, "CAPTURED");
 });
 
 test("no challenge, consumed challenge, and conflict outcomes share one external ACK", async () => {
