@@ -3995,7 +3995,16 @@ export function assertWorkerAuthorized(req: NextRequest): NextResponse | null {
     process.env.WORKER_API_TOKEN?.trim() ??
     process.env.HERMES_WORKER_TOKEN?.trim() ??
     "";
-  if (!expected) return null;
+  if (!expected) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "worker token not configured",
+        failure_code: "WORKER_TOKEN_NOT_CONFIGURED",
+      },
+      { status: 503 }
+    );
+  }
 
   const auth = req.headers.get("authorization") ?? "";
   if (auth !== `Bearer ${expected}`) {

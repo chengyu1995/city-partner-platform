@@ -439,6 +439,10 @@ test("production canonical helper never updates legacy job status", () => {
 test("Next claim route calls canonical production boundary", () => assert.match(nextSource, /claimNextCanonicalHermesJob/));
 test("Next legacy selector excludes canonical jobs", () => assert.match(nextSource, /\.is\("canonical_job_state", null\)/));
 test("Tencent legacy selector excludes canonical jobs", () => assert.match(workerApiSource, /\.is\("canonical_job_state", null\)/));
+test("Worker API fails closed when worker token is not configured", () => {
+  assert.match(workerJobsSource, /WORKER_TOKEN_NOT_CONFIGURED/);
+  assert.doesNotMatch(workerJobsSource, /if \(!expected\) return null/);
+});
 test("heartbeat route requires lease and revision", () => assert.match(heartbeatSource, /lease_id[\s\S]*expected_revision/));
 test("progress route requires lease and revision", () => assert.match(progressSource, /lease_id[\s\S]*expected_revision/));
 test("report route uses canonical terminal RPC boundary", () => assert.match(reportSource, /finalizeCanonicalPersistenceJobSafely/));
