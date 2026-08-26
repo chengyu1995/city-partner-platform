@@ -24,6 +24,7 @@ create table if not exists hermes_messages (
   id uuid primary key default gen_random_uuid(),
   conversation_id uuid not null references hermes_conversations(id) on delete cascade,
   role text not null check (role in ('user', 'assistant', 'system', 'tool')),
+  name text,
   content text not null,
   tool_calls jsonb,                  -- assistant 调的工具
   tool_call_id text,                 -- tool 结果的 id
