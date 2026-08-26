@@ -31,11 +31,15 @@ import {
 import { resolveFeishuApplicationFeatureRoute } from "@/lib/feishu-application-boundary";
 import {
   createCanonicalHermesPlanningProvider,
-  restoreAgentMessage,
   runAgent,
   serializeAgentMessage,
   type AgentMessage,
 } from "@/lib/hermes-agent";
+import {
+  hermesHistoryCandidateLimit,
+  readHermesHistoryLimit,
+  restoreHermesHistoryRows,
+} from "@/lib/hermes-history";
 import {
   canonicalHermesAllowsDirectWorkerBypass,
   runApprovedRequestThroughCanonicalHermes,
@@ -531,18 +535,23 @@ async function getOrCreateConversation(
 
 async function loadHistory(
   supabase: SupabaseClient,
-  convId: string,
-  limit = 20
+  convId: string
 ): Promise<AgentMessage[]> {
-  const { data } = await supabase
+  const historyLimit = readHermesHistoryLimit();
+  const { data, error } = await supabase
     .from("hermes_messages")
-    .select("role, content, tool_call_id, name, tool_calls")
+    .select("role, content, tool_call_id, name, tool_calls, message_seq")
     .eq("conversation_id", convId)
-    .order("created_at", { ascending: false })
-    .limit(limit);
+    .order("message_seq", { ascending: false, nullsFirst: false })
+    .limit(hermesHistoryCandidateLimit(historyLimit));
+  if (error) {
+    console.error("[feishu-event] Hermes history load failed:", {
+      code: typeof error.code === "string" ? error.code : "unknown",
+    });
+    throw new Error("HERMES_HISTORY_LOAD_FAILED");
+  }
   if (!data) return [];
-  // 倒序变正序
-  return data.reverse().map(restoreAgentMessage);
+  return restoreHermesHistoryRows(data, historyLimit);
 }
 
 async function saveDirectReply(
