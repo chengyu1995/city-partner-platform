@@ -29,7 +29,13 @@ import {
   buildCanonicalWorkerContextPayload,
 } from "@/lib/feishu-canonical-context";
 import { resolveFeishuApplicationFeatureRoute } from "@/lib/feishu-application-boundary";
-import { createCanonicalHermesPlanningProvider, runAgent, AgentMessage } from "@/lib/hermes-agent";
+import {
+  createCanonicalHermesPlanningProvider,
+  restoreAgentMessage,
+  runAgent,
+  serializeAgentMessage,
+  type AgentMessage,
+} from "@/lib/hermes-agent";
 import {
   canonicalHermesAllowsDirectWorkerBypass,
   runApprovedRequestThroughCanonicalHermes,
@@ -530,18 +536,13 @@ async function loadHistory(
 ): Promise<AgentMessage[]> {
   const { data } = await supabase
     .from("hermes_messages")
-    .select("role, content, tool_call_id, name")
+    .select("role, content, tool_call_id, name, tool_calls")
     .eq("conversation_id", convId)
     .order("created_at", { ascending: false })
     .limit(limit);
   if (!data) return [];
   // 倒序变正序
-  return data.reverse().map((m) => {
-    const msg: AgentMessage = { role: m.role as AgentMessage["role"], content: m.content };
-    if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
-    if (m.name) msg.name = m.name;
-    return msg;
-  });
+  return data.reverse().map(restoreAgentMessage);
 }
 
 async function saveDirectReply(
@@ -3802,14 +3803,9 @@ async function processAcceptedFeishuEvent(payload: any) {
 
     // 9. 存 user + assistant 消息
     await supabase.from("hermes_messages").insert(
-      newMessages.map((m) => ({
-        conversation_id: convId,
-        role: m.role,
-        content: m.content,
-        tool_call_id: m.tool_call_id ?? null,
-        // tool_calls 字段 (jsonb) 暂不存
-        feishu_message_id: m.role === "user" ? ev.message.message_id : null,
-      }))
+      newMessages.map((message) =>
+        serializeAgentMessage(message, convId, ev.message.message_id)
+      )
     );
 
     // 10. 回复飞书
