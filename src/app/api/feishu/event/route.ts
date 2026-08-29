@@ -29,7 +29,17 @@ import {
   buildCanonicalWorkerContextPayload,
 } from "@/lib/feishu-canonical-context";
 import { resolveFeishuApplicationFeatureRoute } from "@/lib/feishu-application-boundary";
-import { createCanonicalHermesPlanningProvider, runAgent, AgentMessage } from "@/lib/hermes-agent";
+import {
+  createCanonicalHermesPlanningProvider,
+  runAgent,
+  serializeAgentMessage,
+  type AgentMessage,
+} from "@/lib/hermes-agent";
+import {
+  hermesHistoryCandidateLimit,
+  readHermesHistoryLimit,
+  restoreHermesHistoryRows,
+} from "@/lib/hermes-history";
 import {
   canonicalHermesAllowsDirectWorkerBypass,
   runApprovedRequestThroughCanonicalHermes,
@@ -525,23 +535,23 @@ async function getOrCreateConversation(
 
 async function loadHistory(
   supabase: SupabaseClient,
-  convId: string,
-  limit = 20
+  convId: string
 ): Promise<AgentMessage[]> {
-  const { data } = await supabase
+  const historyLimit = readHermesHistoryLimit();
+  const { data, error } = await supabase
     .from("hermes_messages")
-    .select("role, content, tool_call_id, name")
+    .select("role, content, tool_call_id, name, tool_calls, message_seq")
     .eq("conversation_id", convId)
-    .order("created_at", { ascending: false })
-    .limit(limit);
+    .order("message_seq", { ascending: false, nullsFirst: false })
+    .limit(hermesHistoryCandidateLimit(historyLimit));
+  if (error) {
+    console.error("[feishu-event] Hermes history load failed:", {
+      code: typeof error.code === "string" ? error.code : "unknown",
+    });
+    throw new Error("HERMES_HISTORY_LOAD_FAILED");
+  }
   if (!data) return [];
-  // 倒序变正序
-  return data.reverse().map((m) => {
-    const msg: AgentMessage = { role: m.role as AgentMessage["role"], content: m.content };
-    if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
-    if (m.name) msg.name = m.name;
-    return msg;
-  });
+  return restoreHermesHistoryRows(data, historyLimit);
 }
 
 async function saveDirectReply(
@@ -3802,14 +3812,9 @@ async function processAcceptedFeishuEvent(payload: any) {
 
     // 9. 存 user + assistant 消息
     await supabase.from("hermes_messages").insert(
-      newMessages.map((m) => ({
-        conversation_id: convId,
-        role: m.role,
-        content: m.content,
-        tool_call_id: m.tool_call_id ?? null,
-        // tool_calls 字段 (jsonb) 暂不存
-        feishu_message_id: m.role === "user" ? ev.message.message_id : null,
-      }))
+      newMessages.map((message) =>
+        serializeAgentMessage(message, convId, ev.message.message_id)
+      )
     );
 
     // 10. 回复飞书

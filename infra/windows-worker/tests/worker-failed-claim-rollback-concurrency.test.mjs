@@ -57,6 +57,16 @@ const workerJobs = loadTypeScriptModule(path.join(root, "src", "lib", "worker-jo
   "./hermes/shadow-runtime": { getCompletedHermesShadowObservation: () => null },
   "./hermes/canonical-canary-scope": { evaluateCanonicalCanaryAdmission: () => ({ allowed: true }) },
   "./hermes/canonical-job-insert-contract": { buildCanonicalJobInsertContract: () => ({}) },
+  "./hermes/worker-requested-mode-admission": {
+    resolveWorkerRequestedModeAdmissionPolicy: () => ({
+      configured: false,
+      enforced: false,
+      valid: true,
+      reason_code: "LEGACY_COMPATIBILITY",
+      allowed_modes: [],
+    }),
+    workerRequestedModeAllowed: () => true,
+  },
   "./project-director-final-report": {},
 });
 
@@ -334,6 +344,17 @@ test("production next handler preserves a concurrent terminal report", async () 
       "next/server": nextServer,
       "@/lib/feishu-worker-sync": { syncWorkerStatusToFeishu: async () => ({ ok: true }) },
       "@/lib/worker-jobs": routeWorkerJobs,
+      "@/lib/hermes/worker-requested-mode-admission": {
+        readWorkerRequestedMode: (job) => job?.requested_mode ?? null,
+        resolveWorkerRequestedModeAdmissionPolicy: () => ({
+          configured: false,
+          enforced: false,
+          valid: true,
+          reason_code: "LEGACY_COMPATIBILITY",
+          allowed_modes: [],
+        }),
+        workerRequestedModeAllowed: () => true,
+      },
     }
   );
   const response = await route.POST({});

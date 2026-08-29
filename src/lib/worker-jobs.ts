@@ -52,6 +52,11 @@ import {
   type CanonicalCanaryAdmissionEvidence,
 } from "./hermes/canonical-canary-scope";
 import { buildCanonicalJobInsertContract } from "./hermes/canonical-job-insert-contract";
+import {
+  resolveWorkerRequestedModeAdmissionPolicy,
+  workerRequestedModeAllowed,
+  type WorkerRequestedModeAdmissionPolicy,
+} from "./hermes/worker-requested-mode-admission";
 
 type JobRecord = Record<string, unknown>;
 
@@ -4575,18 +4580,27 @@ async function canonicalDependenciesReady(supabase: SupabaseClient, job: JobReco
 export async function claimNextCanonicalHermesJob(
   supabase: SupabaseClient,
   workerId: string,
-  now = new Date()
+  now = new Date(),
+  requestedModePolicy: WorkerRequestedModeAdmissionPolicy =
+    resolveWorkerRequestedModeAdmissionPolicy()
 ): Promise<CanonicalWorkerProtocolResult | null> {
-  const { data, error } = await supabase
+  if (!requestedModePolicy.valid) return null;
+
+  let query = supabase
     .from("hermes_jobs")
     .select("*")
     .eq("canonical_job_state", "queued")
-    .is("terminal_at", null)
+    .is("terminal_at", null);
+  if (requestedModePolicy.enforced) {
+    query = query.in("requested_mode", [...requestedModePolicy.allowed_modes]);
+  }
+  const { data, error } = await query
     .order("created_at", { ascending: true })
     .limit(50);
   if (error) throw new Error(`CANONICAL_JOB_SELECTION_FAILED:${error.message}`);
 
   for (const candidate of (data as JobRecord[] | null) ?? []) {
+    if (!workerRequestedModeAllowed(candidate, requestedModePolicy)) continue;
     if (!canonicalCanaryAdmissionAllowsWorkerClaim(candidate)) continue;
     if (!(await canonicalDependenciesReady(supabase, candidate))) continue;
     const jobId = readString(candidate.id);
@@ -5097,7 +5111,7 @@ export async function claimHermesJob(
   jobId: string,
   workerId: string,
   fields: JobRecord,
-  expected: { updated_at?: string | null } = {}
+  expected: { updated_at?: string | null; requested_mode?: string | null } = {}
 ): Promise<{ data: JobRecord | null; error: SupabaseWriteError | null; skippedColumns: string[] }> {
   const claimedFields = { ...fields };
   const skippedColumns: string[] = [];
@@ -5110,6 +5124,7 @@ export async function claimHermesJob(
       .in("status", ["queued", "pending"]);
 
     if (expected.updated_at) query = query.eq("updated_at", expected.updated_at);
+    if (expected.requested_mode) query = query.eq("requested_mode", expected.requested_mode);
 
     query = isSafePostgrestFilterValue(workerId)
       ? query.or(`claimed_by.is.null,claimed_by.eq.${workerId}`)

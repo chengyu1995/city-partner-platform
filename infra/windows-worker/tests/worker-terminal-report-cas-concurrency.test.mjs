@@ -47,6 +47,11 @@ const nextServer = {
   NextResponse: MockNextResponse,
 };
 
+const workerRequestedModeAdmission = loadTypeScriptModule(
+  path.join(root, "src", "lib", "hermes", "worker-requested-mode-admission.ts"),
+  {},
+);
+
 const workerJobs = loadTypeScriptModule(path.join(root, "src", "lib", "worker-jobs.ts"), {
   "next/server": nextServer,
   "@/lib/env": { getSupabaseService: async () => null },
@@ -58,6 +63,7 @@ const workerJobs = loadTypeScriptModule(path.join(root, "src", "lib", "worker-jo
   "./hermes/shadow-runtime": { getCompletedHermesShadowObservation: () => null },
   "./hermes/canonical-canary-scope": { evaluateCanonicalCanaryAdmission: () => ({ allowed: true }) },
   "./hermes/canonical-job-insert-contract": { buildCanonicalJobInsertContract: () => ({}) },
+  "./hermes/worker-requested-mode-admission": workerRequestedModeAdmission,
   "./project-director-final-report": {},
 });
 

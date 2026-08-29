@@ -11,7 +11,7 @@
  *   - send_group_message: 推飞书群通知
  */
 
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import * as fs from "fs";
 import * as path from "path";
 import type {
@@ -62,12 +62,72 @@ export interface AgentMessage {
   content: string;
   tool_call_id?: string;
   name?: string;
+  tool_calls?: AgentToolCall[];
 }
 
 export interface AgentToolCall {
   id: string;
   type: "function";
   function: { name: string; arguments: string };
+}
+
+export interface AgentMessageHistoryRow {
+  role: string;
+  content: string;
+  tool_call_id?: string | null;
+  name?: string | null;
+  tool_calls?: unknown;
+}
+
+function isAgentToolCall(value: unknown): value is AgentToolCall {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+
+  const candidate = value as Record<string, unknown>;
+  const fn = candidate.function;
+  if (!fn || typeof fn !== "object" || Array.isArray(fn)) return false;
+
+  const functionCandidate = fn as Record<string, unknown>;
+  return (
+    typeof candidate.id === "string" &&
+    candidate.type === "function" &&
+    typeof functionCandidate.name === "string" &&
+    typeof functionCandidate.arguments === "string"
+  );
+}
+
+export function normalizeAgentToolCalls(value: unknown): AgentToolCall[] | undefined {
+  if (value == null) return undefined;
+  if (!Array.isArray(value) || !value.every(isAgentToolCall)) return undefined;
+  return value;
+}
+
+export function restoreAgentMessage(row: AgentMessageHistoryRow): AgentMessage {
+  const message: AgentMessage = {
+    role: row.role as AgentMessage["role"],
+    content: row.content,
+  };
+  if (row.tool_call_id) message.tool_call_id = row.tool_call_id;
+  if (row.name) message.name = row.name;
+
+  const toolCalls = normalizeAgentToolCalls(row.tool_calls);
+  if (toolCalls) message.tool_calls = toolCalls;
+  return message;
+}
+
+export function serializeAgentMessage(
+  message: AgentMessage,
+  conversationId: string,
+  feishuMessageId: string
+) {
+  return {
+    conversation_id: conversationId,
+    role: message.role,
+    content: message.content,
+    tool_call_id: message.tool_call_id ?? null,
+    name: message.name ?? null,
+    tool_calls: message.tool_calls ?? null,
+    feishu_message_id: message.role === "user" ? feishuMessageId : null,
+  };
 }
 
 export interface AgentResponse {
@@ -374,7 +434,7 @@ export async function runAgent(
       content: resp.content,
     };
     if (resp.tool_calls.length > 0) {
-      (assistantMsg as AgentMessage & { tool_calls?: AgentToolCall[] }).tool_calls = resp.tool_calls;
+      assistantMsg.tool_calls = resp.tool_calls;
     }
     newMessages.push(assistantMsg);
     messages.push(assistantMsg);

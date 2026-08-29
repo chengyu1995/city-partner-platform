@@ -41,6 +41,16 @@ const workerJobs = loadTypeScriptModule(path.join(root, "src", "lib", "worker-jo
   "./hermes/shadow-runtime": { getCompletedHermesShadowObservation: () => null },
   "./hermes/canonical-canary-scope": { evaluateCanonicalCanaryAdmission: () => ({ allowed: true }) },
   "./hermes/canonical-job-insert-contract": { buildCanonicalJobInsertContract: () => ({}) },
+  "./hermes/worker-requested-mode-admission": {
+    resolveWorkerRequestedModeAdmissionPolicy: () => ({
+      configured: false,
+      enforced: false,
+      valid: true,
+      reason_code: "LEGACY_COMPATIBILITY",
+      allowed_modes: [],
+    }),
+    workerRequestedModeAllowed: () => true,
+  },
   "./project-director-final-report": {},
 });
 
@@ -48,6 +58,7 @@ function createQueuedJob(round) {
   return {
     id: `atomic-claim-${round}`,
     status: "queued",
+    requested_mode: "worker_read_only",
     claimed_by: null,
     attempt_id: null,
     active_attempt_id: null,
@@ -182,7 +193,10 @@ test("real production atomic claim gives two workers one winner", async () => {
       initialJob.id,
       workerId,
       buildProductionClaim(initialJob, workerId, attempts[index]),
-      { updated_at: initialJob.updated_at }
+      {
+        updated_at: initialJob.updated_at,
+        requested_mode: initialJob.requested_mode,
+      }
     ));
 
     const settled = await Promise.allSettled(claims);
@@ -208,9 +222,43 @@ test("real production atomic claim gives two workers one winner", async () => {
     assert.equal(snapshot.active_lease.worker_id, snapshot.claimed_by);
     assert.equal(snapshot.active_lease.attempt_id, snapshot.active_attempt.id);
     assert.equal(machine.isCanonicalClaimPersisted(finalJob, snapshot.active_attempt.id), true);
+    assert.equal(finalJob.requested_mode, "worker_read_only");
 
     const winningIndex = workers.indexOf(snapshot.claimed_by);
     assert.equal(snapshot.active_attempt.id, attempts[winningIndex]);
     assert.equal(snapshot.active_lease.id, `lease:${attempts[winningIndex]}`);
   }
+});
+
+test("requested mode compare-and-set denies a concurrent mode change", async () => {
+  const initialJob = createQueuedJob("mode-guard");
+  const store = createAtomicPostgrestStore(initialJob);
+  const allowedClaim = workerJobs.claimHermesJob(
+    store,
+    initialJob.id,
+    "worker-read-only",
+    buildProductionClaim(initialJob, "worker-read-only", "attempt-mode-allowed"),
+    {
+      updated_at: initialJob.updated_at,
+      requested_mode: "worker_read_only",
+    }
+  );
+  const deniedClaim = workerJobs.claimHermesJob(
+    store,
+    initialJob.id,
+    "worker-write",
+    buildProductionClaim(initialJob, "worker-write", "attempt-mode-denied"),
+    {
+      updated_at: initialJob.updated_at,
+      requested_mode: "write_allowed",
+    }
+  );
+
+  const [allowed, denied] = await Promise.all([allowedClaim, deniedClaim]);
+  assert.ok(allowed.data);
+  assert.equal(allowed.error, null);
+  assert.equal(denied.data, null);
+  assert.equal(denied.error, null);
+  assert.equal(store.row.claimed_by, "worker-read-only");
+  assert.equal(store.row.requested_mode, "worker_read_only");
 });

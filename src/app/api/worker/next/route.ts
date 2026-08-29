@@ -23,6 +23,11 @@ import {
   updateHermesJob,
   validateJobStateInvariant,
 } from "@/lib/worker-jobs";
+import {
+  readWorkerRequestedMode,
+  resolveWorkerRequestedModeAdmissionPolicy,
+  workerRequestedModeAllowed,
+} from "@/lib/hermes/worker-requested-mode-admission";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -48,9 +53,24 @@ async function handleNext(req: NextRequest) {
   if (responseFromMaybe(supabase)) return supabase;
 
   const workerId = getWorkerIdFromRequest(req);
+  const requestedModePolicy = resolveWorkerRequestedModeAdmissionPolicy();
+  if (!requestedModePolicy.valid) {
+    return NextResponse.json({
+      ok: true,
+      job: null,
+      skipped: "requested_mode_policy_invalid",
+      failure_code: requestedModePolicy.reason_code,
+      worker_next_returned: false,
+    });
+  }
   if (canonicalPersistenceRuntimeEnabled()) {
     try {
-      const claimed = await claimNextCanonicalHermesJob(supabase, workerId);
+      const claimed = await claimNextCanonicalHermesJob(
+        supabase,
+        workerId,
+        new Date(),
+        requestedModePolicy
+      );
       if (!claimed) return NextResponse.json({ ok: true, job: null });
       return NextResponse.json({
         ok: true,
@@ -76,12 +96,18 @@ async function handleNext(req: NextRequest) {
     }
   }
 
-  const { data: queuedJobs, error } = await supabase
+  let queuedJobsQuery = supabase
     .from("hermes_jobs")
     .select("*")
     .in("status", ["queued", "pending"])
     .is("canonical_job_state", null)
-    .is("claimed_by", null)
+    .is("claimed_by", null);
+  if (requestedModePolicy.enforced) {
+    queuedJobsQuery = queuedJobsQuery.in("requested_mode", [
+      ...requestedModePolicy.allowed_modes,
+    ]);
+  }
+  const { data: queuedJobs, error } = await queuedJobsQuery
     .order("created_at", { ascending: true })
     .limit(50);
 
@@ -90,6 +116,7 @@ async function handleNext(req: NextRequest) {
   }
   let job: (Record<string, unknown> & { id: string }) | null = null;
   for (const queuedJob of (queuedJobs ?? []) as Record<string, unknown>[]) {
+    if (!workerRequestedModeAllowed(queuedJob, requestedModePolicy)) continue;
     const terminalStatus = getCanonicalTerminalWorkerJobStatus(queuedJob);
     const invariant = validateJobStateInvariant(queuedJob);
     if (!invariant.ok) {
@@ -164,6 +191,14 @@ async function handleNext(req: NextRequest) {
   }
 
   const preClaimInvariant = validateJobStateInvariant(preClaimJob ?? job);
+  if (!workerRequestedModeAllowed(preClaimJob ?? job, requestedModePolicy)) {
+    return NextResponse.json({
+      ok: true,
+      job: null,
+      skipped: "requested_mode_not_allowed_before_claim",
+      worker_next_returned: false,
+    });
+  }
   if (!preClaimInvariant.ok || !isJobSelectable(preClaimJob ?? job)) {
     return NextResponse.json(
       {
@@ -226,7 +261,10 @@ async function handleNext(req: NextRequest) {
       }),
       updated_at: now,
     },
-    { updated_at: String((preClaimJob ?? job).updated_at ?? "") || null }
+    {
+      updated_at: String((preClaimJob ?? job).updated_at ?? "") || null,
+      requested_mode: readWorkerRequestedMode(preClaimJob ?? job),
+    }
   );
 
   if (updateError) {
