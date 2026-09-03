@@ -42,24 +42,6 @@ jobs:
       - name: Hermes message roundtrip test
         run: node --test infra/windows-worker/tests/hermes-message-roundtrip.test.mjs
 
-      - name: Full worker node suite
-        run: node --test infra/windows-worker/tests/*.test.mjs infra/windows-worker/tests/*.test.js
-
-      - name: Install worker dependencies
-        working-directory: infra/windows-worker
-        run: npm ci
-
-      - name: Prepare PowerShell command
-        run: |
-          if ! command -v powershell.exe >/dev/null 2>&1; then
-            sudo ln -s "$(command -v pwsh)" /usr/local/bin/powershell.exe
-          fi
-          powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
-
-      - name: Worker verification
-        working-directory: infra/windows-worker
-        run: npm run verify
-
       - name: TypeScript
         run: npx tsc --noEmit --incremental false
 
@@ -87,12 +69,6 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24.x
-          cache: npm
-
       - name: Verify migration bytes
         shell: pwsh
         run: |
@@ -117,6 +93,34 @@ jobs:
             if ($actual -ne $expected[$path]) {
               throw "$path SHA-256 mismatch: $actual"
             }
+          }
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Full worker node suite
+        shell: pwsh
+        run: |
+          $testFiles = @(
+            Get-ChildItem 'infra/windows-worker/tests' -File -Filter '*.test.mjs'
+            Get-ChildItem 'infra/windows-worker/tests' -File -Filter '*.test.js'
+          ) | Sort-Object FullName | ForEach-Object { $_.FullName }
+
+          if ($testFiles.Count -eq 0) {
+            throw 'No worker test files found'
+          }
+
+          Write-Host "Worker test files: $($testFiles.Count)"
+          & node --test @testFiles
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
           }
 
       - name: Install worker dependencies
