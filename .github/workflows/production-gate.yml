@@ -1,0 +1,142 @@
+name: production-gate
+
+on:
+  pull_request:
+    branches:
+      - production
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate-linux:
+    name: validate-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Configure Git line endings
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Hermes history window test
+        run: node --test infra/windows-worker/tests/hermes-history-window.test.mjs
+
+      - name: Hermes message roundtrip test
+        run: node --test infra/windows-worker/tests/hermes-message-roundtrip.test.mjs
+
+      - name: TypeScript
+        run: npx tsc --noEmit --incremental false
+
+      - name: ESLint
+        run: npx eslint .
+
+      - name: Build
+        run: npm run build
+
+      - name: Whitespace diff check
+        run: git diff --check "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
+  verify-windows:
+    name: verify-windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Configure Git line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify migration bytes
+        shell: pwsh
+        run: |
+          $expected = @{
+            "supabase/migrations/202608110001_canonical_canary_admission_control.sql" = "d1f92f4f56bd1a83a301dff950c20965eacc4b4dbb9ab0fefdd02286d962eac9"
+            "supabase/migrations/202608130001_canonical_canary_read_only_audit_function.sql" = "7547cf283995c2dae5b4f69b2b61fe1e2f334a2543cea48d266f95d823605d03"
+          }
+
+          foreach ($path in $expected.Keys) {
+            $eol = git ls-files --eol -- $path
+            if ($eol -notmatch "i/lf\s+w/lf") {
+              throw "$path line ending state is not i/lf w/lf: $eol"
+            }
+
+            $resolved = (Resolve-Path -LiteralPath $path).ProviderPath
+            $bytes = [System.IO.File]::ReadAllBytes($resolved)
+            if ($bytes -contains 13) {
+              throw "$path contains CR bytes"
+            }
+
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+            if ($actual -ne $expected[$path]) {
+              throw "$path SHA-256 mismatch: $actual"
+            }
+          }
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Full worker node suite
+        shell: pwsh
+        run: |
+          $testFiles = @(
+            Get-ChildItem 'infra/windows-worker/tests' -File -Filter '*.test.mjs'
+            Get-ChildItem 'infra/windows-worker/tests' -File -Filter '*.test.js'
+          ) | Sort-Object FullName | ForEach-Object { $_.FullName }
+
+          if ($testFiles.Count -eq 0) {
+            throw 'No worker test files found'
+          }
+
+          Write-Host "Worker test files: $($testFiles.Count)"
+          & node --test @testFiles
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Install worker dependencies
+        working-directory: infra/windows-worker
+        run: npm ci
+
+      - name: Worker verification
+        working-directory: infra/windows-worker
+        shell: pwsh
+        run: |
+          $output = npm run verify 2>&1
+          $output
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          if (($output -join "`n") -notmatch "WORKER_VERIFICATION_PASSED") {
+            throw "Worker verification marker was not found"
+          }
