@@ -16,15 +16,36 @@ This version has breaking changes — APIs, conventions, and file structure may 
 - Next.js 16 (Turbopack) + React 19 + TypeScript + Tailwind CSS v4
 - 经典 shadcn/ui (slate 主题, Radix Slot, asChild) — **不是**新 shadcn 4.x base-nova
 - Supabase 数据访问层双轨 (env 缺失 → MOCK 模式; env 配齐 → 真 Supabase)
-- 3 个 Git 分支: main (生产) / staging (验收) / dev (开发)
+- 当前治理主线: `develop` (日常开发集成) / `production` (唯一 Production Git 发布源)
+- Legacy/frozen 分支: `main` / `master` / `dev` / `staging`，均不作为新功能开发、PR 或发布路径
 - 部署: Vercel (生产域名 `city-partner-platform.vercel.app`)
+
+## 分支职责
+
+- `develop`
+  - 当前日常开发集成分支
+  - 所有新功能和 bugfix 的默认 PR base
+  - 受 develop Ruleset 保护
+  - Required checks: `development-gate / validate-linux`、`development-gate / verify-windows`
+- `production`
+  - 唯一 Production Git 发布源
+  - Vercel Production Branch Tracking 指向 `production`
+  - 禁止普通功能分支直接合入
+  - 任何 `develop` -> `production` 发布必须经过独立发布审计和明确人类批准
+  - Required checks: `production-gate / validate-linux`、`production-gate / verify-windows`
+- `main`、`master`、`dev`、`staging`
+  - 当前均为 legacy/frozen 分支
+  - 不作为新功能开发 base
+  - 不作为新 PR target
+  - 不作为 Production 发布路径
+  - 未经单独治理审计不得合并到 `develop` 或 `production`
 
 ## 禁止事项 (违反任何一条 = 拒绝合并)
 
 | 类别 | 禁止 | 后果 |
 |---|---|---|
-| **分支** | 直接 push `main` | GitHub 保护规则拒绝, push 失败 |
-| **分支** | 直接合并 PR 到 `main` | 需人类 review + 至少 1 approve |
+| **分支** | 直接 push `production` | agent 不得直接更新唯一 Production Git 发布源 |
+| **分支** | 自行合并 PR 到 `production` | 必须经过独立发布审计和明确人类批准 |
 | **基础设施** | 删除 GitHub 仓库 | Codex 无此权限 (PAT scope 限制) |
 | **基础设施** | 删除 Supabase 项目 / 表 / 数据 | service_role key 不给 agent, 走 RLS 限定操作 |
 | **基础设施** | 修改生产环境变量 | Vercel env vars 不在仓库, agent 看不到 |
@@ -39,9 +60,9 @@ This version has breaking changes — APIs, conventions, and file structure may 
 ## 允许事项
 
 - 读取仓库 (读所有 .md / 源码)
-- 创建分支 (必须基于 `dev`, 命名 `codex/feature-name`)
+- 创建分支 (必须基于 `develop`, 命名 `codex/feature-name`)
 - 提交代码 (在自己的 feature 分支)
-- 创建 PR (PR target = `dev`, 不直接对 main)
+- 创建 PR (base = `develop`, head = `codex/<short-task-name>`)
 - 评论 PR / 写 review
 - 修复 bug
 - 写测试 (单测 / 端到端)
@@ -51,10 +72,10 @@ This version has breaking changes — APIs, conventions, and file structure may 
 
 每个 Codex 任务必须**严格**按这个流程:
 
-1. **从 `dev` 创建 feature 分支**:
+1. **从 `develop` 创建 feature 分支**:
    ```bash
-   git checkout dev
-   git pull origin dev
+   git checkout develop
+   git pull origin develop
    git checkout -b codex/<short-task-name>
    ```
 
@@ -76,9 +97,11 @@ This version has breaking changes — APIs, conventions, and file structure may 
    git push -u origin codex/<short-task-name>
    ```
 
-5. **创建 PR (target = `dev`)**:
+5. **创建 PR (base = `develop`, head = `codex/<short-task-name>`)**:
    - 标题简短 (50 字符内)
    - 描述**必须**填 PR 模板的 6 个字段
+   - 不得直接向 `production`、`main`、`master`、`dev` 或 `staging` 创建普通功能 PR
+   - 必须等待 `development-gate / validate-linux` 与 `development-gate / verify-windows` 通过
    - 等 review (人类或 Codex 自身)
    - review approve 后**人类**合并
 
@@ -87,6 +110,15 @@ This version has breaking changes — APIs, conventions, and file structure may 
    git branch -d codex/<short-task-name>
    git push origin --delete codex/<short-task-name>
    ```
+
+## Production 发布契约
+
+- agent 不得直接 push `production`
+- agent 不得自行合并到 `production`
+- agent 不得自行执行 Production deploy、promote 或 rollback
+- `develop` PR 合并只属于开发集成，不等于 Production 发布
+- Vercel Preview 不得直接视为 Production
+- Production 发布必须单独取得人类批准
 
 ## Codex 必读文件 (接到任务前先读这些)
 
@@ -142,7 +174,7 @@ This version has breaking changes — APIs, conventions, and file structure may 
 
 ---
 
-**Last updated**: 2026-06-13
+**Last updated**: 2026-09-18
 
 ---
 
@@ -193,9 +225,9 @@ This version has breaking changes — APIs, conventions, and file structure may 
 
 | 规则 | 说明 |
 |---|---|
-| **每次任务必须新建分支** | 从 `dev` 拉 feature 分支, 命名 `codex/<short-name>` |
-| **每次任务必须提交 PR** | PR target = `dev` (永远不是 main) |
-| **不允许直接修改 main** | main 受 GitHub 分支保护, push 会失败 |
+| **每次任务必须新建分支** | 从 `develop` 拉 feature 分支, 命名 `codex/<short-name>` |
+| **每次任务必须提交 PR** | base = `develop`, head = `codex/<short-name>`；普通功能 PR 不得指向 `production` 或 legacy/frozen 分支 |
+| **不允许直接修改 production** | `production` 是唯一 Production Git 发布源，agent 不得直接 push 或自行合并 |
 | **不允许删除已有功能** | 重构要保留所有 API 兼容 |
 | **不允许修改生产数据库** | Supabase RLS 限定, agent 看不到 service_role |
 | **不允许引入不必要的大型依赖** | 走 PR review, 解释必要性 |
@@ -252,9 +284,9 @@ This version has breaking changes — APIs, conventions, and file structure may 
 | # | 权限 | 备注 |
 |---|---|---|
 | 1 | **读取仓库** | 所有 .md / 源码 / docs / AGENTS.md |
-| 2 | **创建分支** | 必须从 `dev` 拉, 命名 `codex/<short-name>` |
+| 2 | **创建分支** | 必须从 `develop` 拉, 命名 `codex/<short-name>` |
 | 3 | **提交代码** | 在自己的 feature 分支, 多次 commit 可以 |
-| 4 | **创建 PR** | target = `dev`, 6 字段必填 |
+| 4 | **创建 PR** | base = `develop`, head = `codex/<short-name>`, 6 字段必填 |
 | 5 | **评论 PR** | 包括自己 / 别人的 PR, 提改进建议 |
 | 6 | **review PR** | 检查 13 禁止 + 11 原则 + 测试覆盖 |
 | 7 | **修复 bug** | 在自己的 PR / 别人 PR 下游修 |
@@ -265,12 +297,12 @@ This version has breaking changes — APIs, conventions, and file structure may 
 
 | # | 禁止 | 原因 |
 |---|---|---|
-| 1 | **直接 push `main`** | main 受保护, push 会失败 |
-| 2 | **直接合并 PR 到 `main`** | 必须人类 review + approve (Codex 只开 PR, 不合) |
+| 1 | **直接 push `production`** | `production` 是唯一 Production Git 发布源 |
+| 2 | **自行合并 PR 到 `production`** | 必须独立发布审计并由人类明确批准 (Codex 只开 PR, 不合) |
 | 3 | **删除 GitHub 仓库** | Codex 无此权限, 走保护 |
 | 4 | **删除 Supabase 项目 / 表 / 数据** | service_role 不给 agent, RLS 限定 |
 | 5 | **修改生产环境变量 (Vercel env)** | env vars 不在仓库, agent 看不到 |
-| 6 | **正式上线生产环境** | Codex 只触发 preview deploy, production 由人触发 |
+| 6 | **正式上线生产环境** | agent 不得 deploy、promote 或 rollback；Production 发布必须单独取得人类批准 |
 | 7 | **改支付逻辑** | 本项目暂无, 但规则保留 |
 | 8 | **批量群发用户消息 (飞书)** | 不能改 `notify.py` 任何循环发送逻辑 |
 | 9 | **引入大型依赖 (>1MB)** | 走 PR review, 解释必要性 |
