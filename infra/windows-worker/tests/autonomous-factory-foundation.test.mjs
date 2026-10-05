@@ -285,6 +285,48 @@ test("formal migration creates the control plane, memory, RLS, and service-only 
   assert.doesNotMatch(sql, /\b(drop|truncate|delete from)\b/i);
 });
 
+test("constraint parity migration upgrades only the three legacy checks", () => {
+  const sql = readFileSync(
+    join(root, "supabase/migrations/202610050003_hermes_v2_constraint_parity.sql"),
+    "utf8"
+  );
+  const expectedTables = new Set([
+    "hermes_v2_tasks",
+    "hermes_v2_task_events",
+    "hermes_v2_feishu_sync_outbox",
+  ]);
+  const alteredTables = new Set(
+    [...sql.matchAll(/alter table\s+public\.(\w+)/gi)].map((match) => match[1])
+  );
+
+  assert.match(sql, /^begin;[\s\S]*commit;\s*$/im);
+  assert.deepEqual(alteredTables, expectedTables);
+  assert.equal([...sql.matchAll(/drop constraint if exists/gi)].length, 3);
+  assert.equal([...sql.matchAll(/\)\) not valid;/gi)].length, 3);
+  assert.equal([...sql.matchAll(/validate constraint/gi)].length, 3);
+
+  assert.match(sql, /drop constraint if exists hermes_v2_tasks_status_check/i);
+  assert.match(sql, /drop constraint if exists hermes_v2_task_events_type_check/i);
+  assert.match(sql, /drop constraint if exists hermes_v2_feishu_sync_outbox_sync_type_check/i);
+
+  for (const value of ["'ready'", "'dispatched'", "'approved'", "'rejected'"]) {
+    assert.ok(sql.includes(value), `missing task status ${value}`);
+  }
+  for (const value of [
+    "'task.plan_stored'",
+    "'task.dispatched'",
+    "'task.reviewed'",
+    "'canonical_job.observed'",
+    "'memory.updated'",
+  ]) {
+    assert.ok(sql.includes(value), `missing task event ${value}`);
+  }
+  assert.match(sql, /'review_packet'/i);
+
+  assert.doesNotMatch(sql, /\bdrop\s+(table|column|schema|database)\b/i);
+  assert.doesNotMatch(sql, /^\s*(insert|update|delete|truncate)\b/im);
+});
+
 test("Feishu receipt migration matches the live route contract and is RLS protected", () => {
   const sql = readFileSync(
     join(root, "supabase/migrations/202610050001_feishu_event_receipts.sql"),
