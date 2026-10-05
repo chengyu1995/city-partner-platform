@@ -246,7 +246,6 @@ test("formal migration creates the control plane, memory, RLS, and service-only 
     "projects",
     "tasks",
     "agents",
-    "task_attempts",
     "task_checkpoints",
     "human_decisions",
     "deployments",
@@ -263,6 +262,9 @@ test("formal migration creates the control plane, memory, RLS, and service-only 
   assert.match(sql, /default_base_branch text not null default 'develop'/i);
   assert.doesNotMatch(sql, /default_base_branch text not null default 'master'/i);
   assert.match(sql, /create unique index if not exists idx_hermes_v2_tasks_source_external_id_unique/i);
+  assert.match(sql, /canonical_hermes_job_id uuid references hermes_jobs\(id\) on delete restrict/i);
+  assert.doesNotMatch(sql, /create table if not exists hermes_v2_task_attempts/i);
+  assert.doesNotMatch(sql, /\b(claim_token|lease_expires_at|claimed_by)\b/i);
   assert.match(sql, /create or replace function public\.hermes_v2_create_requirement_v1/i);
   assert.match(sql, /create or replace function public\.hermes_v2_store_plan_v1/i);
   assert.match(sql, /create or replace function public\.hermes_v2_capture_requirement_plan_v1/i);

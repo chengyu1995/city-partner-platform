@@ -14,7 +14,8 @@ explicit human approval.
 2. Store the original requirement as the root task.
 3. Build a dependency-aware task plan and assign every task to a registered capability.
 4. Execute each task in an isolated branch or worktree with a bounded file scope.
-5. Store attempts, checkpoints, artifacts, test evidence, reviews, and failures.
+5. Store planning checkpoints, artifacts, test evidence, reviews, and failures while the
+   existing Hermes job aggregate remains the only execution state machine.
 6. Create a Draft PR and Preview deployment after all automatic gates pass.
 7. Send one final review packet to the owner in Feishu.
 8. After human approval, merge through the protected branch workflow.
@@ -24,7 +25,9 @@ explicit human approval.
 
 - GitHub `develop`: current development integration source.
 - GitHub `production`: only Production Git release source.
-- Supabase Hermes V2 tables: task state, attempts, evidence, approvals, and memory.
+- Supabase Hermes V2 tables: requirements, plans, evidence, approvals, and memory.
+- Supabase `hermes_jobs`, `hermes_job_attempts`, and `hermes_job_leases`: the only Worker
+  execution state machine.
 - GitHub Actions: deterministic test and policy gates.
 - Vercel: Preview and Production deployment state.
 - Feishu: owner request, progress summary, decision request, and final review surface.
@@ -37,7 +40,7 @@ workflow state. Git branches are not a substitute for task or approval records.
 The versioned Hermes V2 migration creates additive tables for:
 
 - projects and dependency-aware tasks;
-- registered agents, attempts, leases, and checkpoints;
+- registered logical agents and planning checkpoints;
 - human decisions and deployment observations;
 - append-oriented task events and a Feishu sync outbox;
 - immutable artifact references and structured reviews;
@@ -47,6 +50,10 @@ The public intake RPC stores a requirement and its complete plan in one transact
 Feishu event identifiers and plan task keys provide idempotency. Internal helper RPCs use
 the same schema contract. RLS is enabled with no public policies; only the server-side
 service role can call the RPCs.
+
+V2 planning tasks may link to one `canonical_hermes_job_id`. V2 does not claim work and
+does not own attempt, lease, heartbeat, progress, retry, or terminal execution state. This
+prevents a second state machine from disagreeing with the existing Worker aggregate.
 
 ## Runtime modes
 
@@ -90,6 +97,7 @@ single final owner review after automatic tests and Preview verification pass.
 - No agent may execute a migration or production release without explicit approval.
 - No task may edit outside its approved path set.
 - A failed or missing test is never converted into success.
-- Every result must link to its task, attempt, commit, checks, Preview, and review evidence.
+- Every result must link its planning task to the canonical Hermes job, attempt, commit,
+  checks, Preview, and review evidence.
 - Memory is written only from reviewed outcomes; raw model guesses are not promoted to
   durable project guidance.
