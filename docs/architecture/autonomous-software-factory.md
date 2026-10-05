@@ -55,6 +55,11 @@ V2 planning tasks may link to one `canonical_hermes_job_id`. V2 does not claim w
 does not own attempt, lease, heartbeat, progress, retry, or terminal execution state. This
 prevents a second state machine from disagreeing with the existing Worker aggregate.
 
+The production database may contain the earlier `hermes_v2_task_attempts` draft and its
+historical rows. The versioned migration preserves those rows as audit evidence, adds and
+backfills `canonical_hermes_job_id` from valid legacy job links, and never dispatches new
+work through the legacy table.
+
 ## Runtime modes
 
 `HERMES_AUTONOMOUS_FACTORY_MODE` has three fail-closed values:

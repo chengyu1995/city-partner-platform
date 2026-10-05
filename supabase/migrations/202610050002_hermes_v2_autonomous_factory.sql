@@ -1,9 +1,12 @@
 -- Hermes V2 autonomous software factory control plane.
 --
 -- Safety scope:
--- - This migration only creates additive Hermes V2 objects with the `hermes_v2_` prefix.
+-- - This migration creates additive Hermes V2 control-plane objects and upgrades the
+--   previously approved V2 draft in place when those tables already exist.
 -- - This file does not modify `hermes_jobs`.
 -- - This file does not remove, rename, or clear any table or data.
+-- - Legacy V2 attempt rows are retained as historical evidence and are not used as a
+--   runnable state machine by the autonomous factory.
 -- - RLS is enabled without public policies; server-side service-role access is required.
 -- - A human must review this migration before manually running it.
 -- - Codex, Worker, and other agents must not execute this SQL automatically.
@@ -94,7 +97,7 @@ create table if not exists hermes_v2_tasks (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint hermes_v2_tasks_source_check check (source in ('feishu_event', 'feishu_bitable', 'manual', 'api', 'system')),
-  constraint hermes_v2_tasks_status_check check (status in ('draft', 'awaiting_human', 'ready', 'dispatched', 'awaiting_review', 'approved', 'rejected', 'cancelled')),
+  constraint hermes_v2_tasks_status_check check (status in ('draft', 'queued', 'running', 'awaiting_human', 'ready', 'dispatched', 'awaiting_review', 'retrying', 'approved', 'rejected', 'succeeded', 'failed', 'cancelled')),
   constraint hermes_v2_tasks_task_type_check check (task_type in ('requirement', 'parent_task', 'phase', 'task', 'subtask', 'bugfix', 'review', 'maintenance')),
   constraint hermes_v2_tasks_task_level_check check (task_level in ('project', 'phase', 'task', 'subtask', 'checkpoint')),
   constraint hermes_v2_tasks_risk_level_check check (risk_level in ('low', 'medium', 'high', 'critical')),
@@ -102,7 +105,6 @@ create table if not exists hermes_v2_tasks (
 );
 
 comment on table hermes_v2_tasks is 'Requirement and plan nodes. Runtime execution state remains canonical in hermes_jobs.';
-comment on column hermes_v2_tasks.canonical_hermes_job_id is 'Optional link to the one canonical Worker job aggregate. V2 never owns attempts, leases, claims, or terminal execution state.';
 comment on column hermes_v2_tasks.dependency_task_ids is 'JSONB array of V2 planning-task UUID strings. The dispatcher validates existence and acyclicity before creating canonical Hermes jobs.';
 
 create table if not exists hermes_v2_agents (
@@ -233,12 +235,21 @@ create table if not exists hermes_v2_task_events (
   updated_at timestamptz not null default now(),
   constraint hermes_v2_task_events_type_check check (event_type in (
     'task.created',
+    'task.queued',
+    'task.claimed',
+    'task.progressed',
     'task.plan_stored',
     'task.awaiting_human',
     'task.dispatched',
     'task.review_requested',
     'task.reviewed',
+    'task.succeeded',
+    'task.failed',
     'task.cancelled',
+    'attempt.heartbeat',
+    'attempt.progressed',
+    'attempt.failed',
+    'attempt.timed_out',
     'canonical_job.observed',
     'human_decision.requested',
     'human_decision.resolved',
@@ -246,6 +257,7 @@ create table if not exists hermes_v2_task_events (
     'feishu.sync_queued',
     'feishu.sync_failed',
     'feishu.sync_succeeded',
+    'retry.scheduled',
     'memory.updated',
     'error.recorded'
   )),
@@ -282,7 +294,7 @@ create table if not exists hermes_v2_feishu_sync_outbox (
   idempotency_key text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  constraint hermes_v2_feishu_sync_outbox_sync_type_check check (sync_type in ('task_status', 'deployment_status', 'decision_request', 'message_reply', 'review_packet')),
+  constraint hermes_v2_feishu_sync_outbox_sync_type_check check (sync_type in ('task_status', 'attempt_progress', 'deployment_status', 'decision_request', 'message_reply', 'heartbeat_health', 'review_packet')),
   constraint hermes_v2_feishu_sync_outbox_target_type_check check (target_type in ('bitable_record', 'chat_message', 'comment', 'unknown')),
   constraint hermes_v2_feishu_sync_outbox_operation_check check (operation in ('create_record', 'upsert_record', 'update_record', 'send_message', 'update_message', 'cancel_sync')),
   constraint hermes_v2_feishu_sync_outbox_status_check check (sync_status in ('pending', 'processing', 'succeeded', 'failed', 'cancelled')),
@@ -293,6 +305,98 @@ create table if not exists hermes_v2_feishu_sync_outbox (
 comment on table hermes_v2_feishu_sync_outbox is 'Durable asynchronous Feishu and Bitable writeback queue. Feishu sync failure must not block canonical task execution.';
 comment on column hermes_v2_feishu_sync_outbox.sync_status is 'Outbox status: pending, processing, succeeded, failed, or cancelled.';
 comment on column hermes_v2_feishu_sync_outbox.retry_count is 'Number of async sync attempts already made.';
+
+-- Compatibility upgrade for the earlier manually applied V2 draft. PostgreSQL does
+-- not reconcile columns when CREATE TABLE IF NOT EXISTS finds an existing table, so
+-- every control-plane column used below is added explicitly before indexes and RPCs.
+-- Existing constraints remain untouched; runtime writes use values accepted by both
+-- the earlier draft and the fresh-install definitions above.
+alter table hermes_v2_projects
+  alter column default_base_branch set default 'develop';
+
+update hermes_v2_projects
+   set default_base_branch = 'develop',
+       updated_at = now()
+ where default_base_branch in ('main', 'master', 'dev', 'staging');
+
+alter table hermes_v2_tasks
+  add column if not exists canonical_hermes_job_id uuid,
+  add column if not exists dispatched_at timestamptz,
+  add column if not exists reviewed_at timestamptz;
+
+do $$
+begin
+  if not exists (
+    select 1
+      from pg_constraint
+     where conrelid = 'public.hermes_v2_tasks'::regclass
+       and conname = 'hermes_v2_tasks_canonical_hermes_job_id_fkey'
+  ) then
+    alter table hermes_v2_tasks
+      add constraint hermes_v2_tasks_canonical_hermes_job_id_fkey
+      foreign key (canonical_hermes_job_id)
+      references hermes_jobs(id)
+      on delete restrict;
+  end if;
+
+  if exists (
+    select 1
+      from information_schema.columns
+     where table_schema = 'public'
+       and table_name = 'hermes_v2_tasks'
+       and column_name = 'legacy_hermes_job_id'
+  ) then
+    execute $backfill$
+      update public.hermes_v2_tasks t
+         set canonical_hermes_job_id = t.legacy_hermes_job_id,
+             updated_at = now()
+        from public.hermes_jobs j
+       where t.canonical_hermes_job_id is null
+         and t.legacy_hermes_job_id = j.id
+    $backfill$;
+  end if;
+end;
+$$;
+
+comment on column hermes_v2_tasks.canonical_hermes_job_id is
+  'Optional link to the one canonical Worker job aggregate. V2 never owns attempts, leases, claims, or terminal execution state.';
+
+alter table hermes_v2_agents
+  add column if not exists planning_agent text,
+  add column if not exists runtime_executor text default 'codex_agent',
+  add column if not exists enabled boolean default true;
+
+update hermes_v2_agents
+   set planning_agent = coalesce(planning_agent, role, name),
+       runtime_executor = coalesce(runtime_executor, 'codex_agent'),
+       enabled = coalesce(enabled, true)
+ where planning_agent is null
+    or runtime_executor is null
+    or enabled is null;
+
+alter table hermes_v2_agents
+  alter column planning_agent set not null,
+  alter column runtime_executor set default 'codex_agent',
+  alter column runtime_executor set not null,
+  alter column enabled set default true,
+  alter column enabled set not null;
+
+alter table hermes_v2_task_checkpoints
+  add column if not exists canonical_hermes_job_id uuid
+    references hermes_jobs(id) on delete restrict;
+
+alter table hermes_v2_deployments
+  add column if not exists canonical_hermes_job_id uuid
+    references hermes_jobs(id) on delete restrict;
+
+do $$
+begin
+  if to_regclass('public.hermes_v2_task_attempts') is not null then
+    comment on table hermes_v2_task_attempts is
+      'Legacy V2 execution history retained for audit only. New execution state belongs to hermes_jobs.';
+  end if;
+end;
+$$;
 
 create index if not exists idx_hermes_v2_projects_status on hermes_v2_projects (status);
 create index if not exists idx_hermes_v2_projects_key on hermes_v2_projects (key);
@@ -342,6 +446,7 @@ create index if not exists idx_hermes_v2_task_events_agent_id on hermes_v2_task_
 create index if not exists idx_hermes_v2_task_events_event_type on hermes_v2_task_events (event_type);
 create index if not exists idx_hermes_v2_task_events_created_at on hermes_v2_task_events (created_at);
 create unique index if not exists idx_hermes_v2_task_events_idempotency_key on hermes_v2_task_events (idempotency_key) where idempotency_key is not null;
+create unique index if not exists uq_hermes_v2_task_events_idempotency_key on hermes_v2_task_events (idempotency_key) where idempotency_key is not null;
 
 create index if not exists idx_hermes_v2_feishu_sync_outbox_project_id on hermes_v2_feishu_sync_outbox (project_id);
 create index if not exists idx_hermes_v2_feishu_sync_outbox_task_id on hermes_v2_feishu_sync_outbox (task_id);
@@ -836,7 +941,7 @@ begin
   values (
     p_project_id,
     p_root_task_id,
-    'task.plan_stored',
+    'task.progressed',
     'awaiting_human',
     'awaiting_human',
     'Implementation plan captured; explicit approval is still required.',
