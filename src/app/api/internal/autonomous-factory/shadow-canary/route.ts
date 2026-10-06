@@ -6,19 +6,12 @@ import {
   isPreviewShadowCanaryAuthorized,
   readPreviewShadowCanaryDatabaseConfig,
   readPreviewShadowCanaryRuntime,
-  type PreviewShadowCanaryDecisionRow,
-  type PreviewShadowCanaryEventRow,
-  type PreviewShadowCanaryRootRow,
-  type PreviewShadowCanaryTaskRow,
+  readPreviewShadowCanarySnapshot,
 } from "@/lib/autonomous-factory/preview-shadow-canary";
 import { captureAutonomousFactoryPlan } from "@/lib/autonomous-factory/control-plane";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-
-function safeErrorCode(error: { code?: string } | null): string {
-  return typeof error?.code === "string" ? error.code : "unknown";
-}
 
 export async function POST(req: NextRequest) {
   const runtimeState = readPreviewShadowCanaryRuntime();
@@ -61,35 +54,16 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const [rootResult, taskResult, decisionResult, eventResult] = await Promise.all([
-    supabase
-      .from("hermes_v2_tasks")
-      .select("id, parent_task_id, task_type, role, status, stage, metadata")
-      .eq("id", capture.root_task_id)
-      .maybeSingle(),
-    supabase
-      .from("hermes_v2_tasks")
-      .select(
-        "id, parent_task_id, task_type, role, title, status, stage, risk_level, need_human_decision, dependency_task_ids, metadata"
-      )
-      .eq("parent_task_id", capture.root_task_id),
-    supabase
-      .from("hermes_v2_human_decisions")
-      .select("decision_type, decision_status, external_channel, metadata")
-      .eq("task_id", capture.root_task_id),
-    supabase
-      .from("hermes_v2_task_events")
-      .select("event_type, from_status, to_status, payload")
-      .eq("task_id", capture.root_task_id),
-  ]);
-
-  const readError = rootResult.error ?? taskResult.error ?? decisionResult.error ?? eventResult.error;
-  if (readError) {
+  const readback = await readPreviewShadowCanarySnapshot({
+    client: supabase,
+    sourceExternalId: canary.context.eventId,
+  });
+  if (!readback.ok) {
     console.error("[autonomous-factory-canary] readback failed", {
-      code: safeErrorCode(readError),
+      code: readback.database_code,
     });
     return NextResponse.json(
-      { ok: false, failure_code: "AUTONOMOUS_FACTORY_CANARY_READBACK_FAILED" },
+      { ok: false, failure_code: readback.error_code },
       { status: 502 }
     );
   }
@@ -97,10 +71,10 @@ export async function POST(req: NextRequest) {
   const comparison = comparePreviewShadowCanary({
     rootTaskId: capture.root_task_id,
     canary,
-    root: (rootResult.data as PreviewShadowCanaryRootRow | null) ?? null,
-    tasks: (taskResult.data as PreviewShadowCanaryTaskRow[] | null) ?? [],
-    decisions: (decisionResult.data as PreviewShadowCanaryDecisionRow[] | null) ?? [],
-    events: (eventResult.data as PreviewShadowCanaryEventRow[] | null) ?? [],
+    root: readback.snapshot.root,
+    tasks: readback.snapshot.tasks,
+    decisions: readback.snapshot.decisions,
+    events: readback.snapshot.events,
   });
 
   return NextResponse.json(

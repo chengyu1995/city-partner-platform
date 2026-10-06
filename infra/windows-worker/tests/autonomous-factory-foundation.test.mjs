@@ -22,6 +22,7 @@ import {
   isPreviewShadowCanaryAuthorized,
   readPreviewShadowCanaryDatabaseConfig,
   readPreviewShadowCanaryRuntime,
+  readPreviewShadowCanarySnapshot,
 } from "../../../src/lib/autonomous-factory/preview-shadow-canary.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -324,6 +325,79 @@ test("preview shadow canary only accepts its dedicated Supabase secret", () => {
   );
 });
 
+test("preview shadow canary readback uses one scoped RPC and fails closed", async () => {
+  const sourceExternalId = `preview-shadow-planning-canary-v1:${"d".repeat(40)}`;
+  const calls = [];
+  const success = await readPreviewShadowCanarySnapshot({
+    client: {
+      async rpc(functionName, args) {
+        calls.push({ functionName, args });
+        return {
+          data: {
+            scope_input_valid: true,
+            root: null,
+            tasks: [],
+            decisions: [],
+            events: [],
+          },
+          error: null,
+        };
+      },
+    },
+    sourceExternalId,
+  });
+  assert.equal(success.ok, true);
+  assert.deepEqual(calls, [
+    {
+      functionName: "hermes_v2_read_preview_shadow_canary_v1",
+      args: { p_source_external_id: sourceExternalId },
+    },
+  ]);
+
+  const databaseFailure = await readPreviewShadowCanarySnapshot({
+    client: {
+      async rpc() {
+        return {
+          data: null,
+          error: { code: "42501", message: "postgres secret message body token=private" },
+        };
+      },
+    },
+    sourceExternalId,
+  });
+  assert.deepEqual(databaseFailure, {
+    ok: false,
+    error_code: "AUTONOMOUS_FACTORY_CANARY_READBACK_FAILED",
+    database_code: "42501",
+  });
+  assert.doesNotMatch(JSON.stringify(databaseFailure), /postgres|secret|message body|private/i);
+
+  const unsafeCode = await readPreviewShadowCanarySnapshot({
+    client: {
+      async rpc() {
+        return { data: null, error: { code: "token=private database detail" } };
+      },
+    },
+    sourceExternalId,
+  });
+  assert.equal(unsafeCode.ok, false);
+  assert.equal(unsafeCode.database_code, "unknown");
+
+  const malformed = await readPreviewShadowCanarySnapshot({
+    client: {
+      async rpc() {
+        return { data: { scope_input_valid: true, tasks: "not-an-array" }, error: null };
+      },
+    },
+    sourceExternalId,
+  });
+  assert.deepEqual(malformed, {
+    ok: false,
+    error_code: "AUTONOMOUS_FACTORY_CANARY_READBACK_FAILED",
+    database_code: "invalid_payload",
+  });
+});
+
 test("preview shadow canary builds one deterministic non-sensitive planning fixture", () => {
   const commitSha = "b".repeat(40);
   const first = buildPreviewShadowCanary(commitSha);
@@ -427,12 +501,62 @@ test("preview shadow canary route cannot send Feishu messages or create worker j
   assert.match(route, /isPreviewShadowCanaryAuthorized/);
   assert.match(route, /readPreviewShadowCanaryDatabaseConfig\(\)/);
   assert.match(route, /captureAutonomousFactoryPlan/);
+  assert.match(route, /readPreviewShadowCanarySnapshot/);
   assert.match(route, /comparePreviewShadowCanary/);
   assert.doesNotMatch(route, /getSupabaseService|SUPABASE_SERVICE_ROLE_KEY/);
   assert.doesNotMatch(route, /sendFeishuMessage|getFeishuToken|hermes_messages|hermes_jobs|canonicalCreateJob/);
+  assert.doesNotMatch(route, /\.from\(["']hermes_v2_/);
   assert.doesNotMatch(route, /req\.json\(|req\.text\(|req\.arrayBuffer\(/);
   assert.match(appRoute, /export \{ POST \} from/);
   assert.match(appRoute, /src\/app\/api\/internal\/autonomous-factory\/shadow-canary\/route/);
+});
+
+test("canary readback migration exposes one scoped service-role-only read function", () => {
+  const sql = readFileSync(
+    join(root, "supabase/migrations/202610070001_hermes_v2_canary_readback.sql"),
+    "utf8"
+  );
+  const referencedTables = new Set(
+    [...sql.matchAll(/(?:from|join)\s+public\.(hermes_v2_\w+)/gi)].map((match) => match[1])
+  );
+
+  assert.match(sql, /^begin;[\s\S]*commit;\s*$/im);
+  assert.match(
+    sql,
+    /create function public\.hermes_v2_read_preview_shadow_canary_v1\(\s*p_source_external_id text\s*\)/i
+  );
+  assert.match(sql, /returns jsonb\s+language sql\s+stable\s+security definer\s+set search_path = pg_catalog/i);
+  assert.match(sql, /\^preview-shadow-planning-canary-v1:\[0-9a-f\]\{40\}\$/i);
+  assert.equal([...sql.matchAll(/create\s+(?:or replace\s+)?function/gi)].length, 1);
+  assert.deepEqual(
+    referencedTables,
+    new Set(["hermes_v2_tasks", "hermes_v2_human_decisions", "hermes_v2_task_events"])
+  );
+  for (const field of [
+    "scope_input_valid",
+    "parent_task_id",
+    "dependency_task_ids",
+    "need_human_decision",
+    "decision_status",
+    "external_channel",
+    "event_type",
+  ]) {
+    assert.match(sql, new RegExp(`'${field}'`, "i"));
+  }
+  assert.match(sql, /revoke all on function public\.hermes_v2_read_preview_shadow_canary_v1\(text\)\s+from public/i);
+  assert.match(sql, /revoke all on function public\.hermes_v2_read_preview_shadow_canary_v1\(text\)\s+from anon/i);
+  assert.match(sql, /revoke all on function public\.hermes_v2_read_preview_shadow_canary_v1\(text\)\s+from authenticated/i);
+  assert.match(sql, /revoke all on function public\.hermes_v2_read_preview_shadow_canary_v1\(text\)\s+from authenticator/i);
+  assert.match(sql, /grant execute on function public\.hermes_v2_read_preview_shadow_canary_v1\(text\)\s+to service_role/i);
+  assert.deepEqual(
+    [...sql.matchAll(/grant\s+execute[\s\S]*?\s+to\s+(\w+)\s*;/gi)].map((match) => match[1]),
+    ["service_role"]
+  );
+  assert.match(sql, /alter function public\.hermes_v2_read_preview_shadow_canary_v1\(text\)\s+owner to postgres/i);
+  assert.doesNotMatch(sql, /\b(?:create|alter|drop)\s+table\b/i);
+  assert.doesNotMatch(sql, /grant\s+select\s+on/i);
+  assert.doesNotMatch(sql, /\b(insert\s+into|update\s+public\.|delete\s+from|truncate|merge\s+into)\b/i);
+  assert.doesNotMatch(sql, /\b(request_text|feishu_event_id|feishu_message_id|feishu_chat_id|feishu_user_id|external_message_id|decision_text)\b/i);
 });
 
 test("all project director roles have one real Codex runtime executor", () => {

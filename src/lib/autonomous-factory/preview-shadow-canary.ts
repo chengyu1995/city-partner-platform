@@ -4,6 +4,7 @@ import { buildProjectDirectorTaskTreeDraft } from "../project-director-task-tree
 import {
   buildAutonomousFactoryPlannedTasks,
   readAutonomousFactoryMode,
+  type AutonomousFactoryRpcClient,
   type AutonomousFactoryIntakeContext,
 } from "./control-plane.ts";
 
@@ -13,6 +14,8 @@ export const AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV =
   "HERMES_AUTONOMOUS_FACTORY_SUPABASE_SECRET_KEY";
 export const PREVIEW_SHADOW_CANARY_ID = "preview-shadow-planning-canary-v1";
 export const PREVIEW_SHADOW_CANARY_BRANCH = "codex/g2-autonomous-foundation";
+export const PREVIEW_SHADOW_CANARY_READBACK_RPC =
+  "hermes_v2_read_preview_shadow_canary_v1";
 
 export type PreviewShadowCanaryFailureCode =
   | "AUTONOMOUS_FACTORY_CANARY_PREVIEW_ONLY"
@@ -76,10 +79,28 @@ export interface PreviewShadowCanaryDatabaseConfig {
   secretKey: string;
 }
 
+export interface PreviewShadowCanaryReadback {
+  scope_input_valid: true;
+  root: PreviewShadowCanaryRootRow | null;
+  tasks: PreviewShadowCanaryTaskRow[];
+  decisions: PreviewShadowCanaryDecisionRow[];
+  events: PreviewShadowCanaryEventRow[];
+}
+
+export type PreviewShadowCanaryReadbackResult =
+  | { ok: true; snapshot: PreviewShadowCanaryReadback }
+  | {
+      ok: false;
+      error_code: "AUTONOMOUS_FACTORY_CANARY_READBACK_FAILED";
+      database_code: string;
+    };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function recordValue(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
+  return isRecord(value) ? value : {};
 }
 
 function stringArray(value: unknown): string[] {
@@ -94,6 +115,109 @@ function equalJson(left: unknown, right: unknown): boolean {
 
 function digest(value: string): Buffer {
   return createHash("sha256").update(value, "utf8").digest();
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isRootRow(value: unknown): value is PreviewShadowCanaryRootRow {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    isNullableString(value.parent_task_id) &&
+    typeof value.task_type === "string" &&
+    typeof value.role === "string" &&
+    typeof value.status === "string" &&
+    typeof value.stage === "string" &&
+    isRecord(value.metadata)
+  );
+}
+
+function isTaskRow(value: unknown): value is PreviewShadowCanaryTaskRow {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    isNullableString(value.parent_task_id) &&
+    typeof value.task_type === "string" &&
+    typeof value.role === "string" &&
+    typeof value.title === "string" &&
+    typeof value.status === "string" &&
+    typeof value.stage === "string" &&
+    typeof value.risk_level === "string" &&
+    typeof value.need_human_decision === "boolean" &&
+    Array.isArray(value.dependency_task_ids) &&
+    value.dependency_task_ids.every((item) => typeof item === "string") &&
+    isRecord(value.metadata)
+  );
+}
+
+function isDecisionRow(value: unknown): value is PreviewShadowCanaryDecisionRow {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.decision_type === "string" &&
+    typeof value.decision_status === "string" &&
+    typeof value.external_channel === "string" &&
+    isRecord(value.metadata)
+  );
+}
+
+function isEventRow(value: unknown): value is PreviewShadowCanaryEventRow {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.event_type === "string" &&
+    isNullableString(value.from_status) &&
+    isNullableString(value.to_status) &&
+    isRecord(value.payload)
+  );
+}
+
+function parsePreviewShadowCanaryReadback(data: unknown): PreviewShadowCanaryReadback | null {
+  const value = Array.isArray(data) && data.length === 1 ? data[0] : data;
+  if (!isRecord(value) || value.scope_input_valid !== true) return null;
+  if (value.root !== null && !isRootRow(value.root)) return null;
+  if (!Array.isArray(value.tasks) || !value.tasks.every(isTaskRow)) return null;
+  if (!Array.isArray(value.decisions) || !value.decisions.every(isDecisionRow)) return null;
+  if (!Array.isArray(value.events) || !value.events.every(isEventRow)) return null;
+  return value as unknown as PreviewShadowCanaryReadback;
+}
+
+function safeDatabaseCode(error: unknown): string {
+  if (!isRecord(error) || typeof error.code !== "string") return "unknown";
+  return /^[a-z0-9_]{1,32}$/i.test(error.code) ? error.code : "unknown";
+}
+
+export async function readPreviewShadowCanarySnapshot(input: {
+  client: AutonomousFactoryRpcClient;
+  sourceExternalId: string;
+}): Promise<PreviewShadowCanaryReadbackResult> {
+  try {
+    const result = await input.client.rpc(PREVIEW_SHADOW_CANARY_READBACK_RPC, {
+      p_source_external_id: input.sourceExternalId,
+    });
+    if (result.error) {
+      return {
+        ok: false,
+        error_code: "AUTONOMOUS_FACTORY_CANARY_READBACK_FAILED",
+        database_code: safeDatabaseCode(result.error),
+      };
+    }
+    const snapshot = parsePreviewShadowCanaryReadback(result.data);
+    if (!snapshot) {
+      return {
+        ok: false,
+        error_code: "AUTONOMOUS_FACTORY_CANARY_READBACK_FAILED",
+        database_code: "invalid_payload",
+      };
+    }
+    return { ok: true, snapshot };
+  } catch {
+    return {
+      ok: false,
+      error_code: "AUTONOMOUS_FACTORY_CANARY_READBACK_FAILED",
+      database_code: "unknown",
+    };
+  }
 }
 
 export function readPreviewShadowCanaryRuntime(
