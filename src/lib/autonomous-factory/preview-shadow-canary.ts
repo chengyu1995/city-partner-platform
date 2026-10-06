@@ -9,6 +9,8 @@ import {
 
 export const AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV =
   "HERMES_AUTONOMOUS_FACTORY_CANARY_TOKEN";
+export const AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV =
+  "HERMES_AUTONOMOUS_FACTORY_SUPABASE_SECRET_KEY";
 export const PREVIEW_SHADOW_CANARY_ID = "preview-shadow-planning-canary-v1";
 export const PREVIEW_SHADOW_CANARY_BRANCH = "codex/g2-autonomous-foundation";
 
@@ -67,6 +69,11 @@ export interface PreviewShadowCanaryEventRow {
   from_status: string | null;
   to_status: string | null;
   payload: unknown;
+}
+
+export interface PreviewShadowCanaryDatabaseConfig {
+  url: string;
+  secretKey: string;
 }
 
 function recordValue(value: unknown): Record<string, unknown> {
@@ -158,6 +165,15 @@ export function isPreviewShadowCanaryAuthorized(
   const candidate = authorization.slice(prefix.length);
   if (!candidate || candidate !== candidate.trim()) return false;
   return timingSafeEqual(digest(candidate), digest(expectedToken));
+}
+
+export function readPreviewShadowCanaryDatabaseConfig(
+  env: Record<string, string | undefined> = process.env
+): PreviewShadowCanaryDatabaseConfig | null {
+  const url = env.NEXT_PUBLIC_SUPABASE_URL?.trim() ?? "";
+  const secretKey = env[AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]?.trim() ?? "";
+  if (!url || secretKey.length < 32) return null;
+  return { url, secretKey };
 }
 
 export function buildPreviewShadowCanary(commitSha: string) {

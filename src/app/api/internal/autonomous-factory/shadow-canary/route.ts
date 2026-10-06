@@ -4,6 +4,7 @@ import {
   buildPreviewShadowCanary,
   comparePreviewShadowCanary,
   isPreviewShadowCanaryAuthorized,
+  readPreviewShadowCanaryDatabaseConfig,
   readPreviewShadowCanaryRuntime,
   type PreviewShadowCanaryDecisionRow,
   type PreviewShadowCanaryEventRow,
@@ -11,7 +12,6 @@ import {
   type PreviewShadowCanaryTaskRow,
 } from "@/lib/autonomous-factory/preview-shadow-canary";
 import { captureAutonomousFactoryPlan } from "@/lib/autonomous-factory/control-plane";
-import { getSupabaseService } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -35,13 +35,17 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const supabase = await getSupabaseService();
-  if (!supabase) {
+  const databaseConfig = readPreviewShadowCanaryDatabaseConfig();
+  if (!databaseConfig) {
     return NextResponse.json(
       { ok: false, failure_code: "AUTONOMOUS_FACTORY_CANARY_SERVICE_UNAVAILABLE" },
       { status: 503 }
     );
   }
+  const { createClient } = await import("@supabase/supabase-js");
+  const supabase = createClient(databaseConfig.url, databaseConfig.secretKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
 
   const canary = buildPreviewShadowCanary(runtimeState.commit_sha);
   const capture = await captureAutonomousFactoryPlan({

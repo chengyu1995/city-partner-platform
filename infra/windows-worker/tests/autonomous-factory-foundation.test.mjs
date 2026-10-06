@@ -14,11 +14,13 @@ import {
   getAutonomousFactoryAgent,
 } from "../../../src/lib/autonomous-factory/agent-registry.ts";
 import {
+  AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV,
   AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV,
   PREVIEW_SHADOW_CANARY_BRANCH,
   buildPreviewShadowCanary,
   comparePreviewShadowCanary,
   isPreviewShadowCanaryAuthorized,
+  readPreviewShadowCanaryDatabaseConfig,
   readPreviewShadowCanaryRuntime,
 } from "../../../src/lib/autonomous-factory/preview-shadow-canary.ts";
 
@@ -294,6 +296,34 @@ test("preview shadow canary requires an exact bearer token", () => {
   assert.equal(isPreviewShadowCanaryAuthorized(`Bearer ${token}`, {}), false);
 });
 
+test("preview shadow canary only accepts its dedicated Supabase secret", () => {
+  const secretKey = "sb_secret_" + "s".repeat(40);
+  const productionKey = "legacy-production-" + "p".repeat(32);
+  const url = "https://example.supabase.co";
+
+  assert.deepEqual(
+    readPreviewShadowCanaryDatabaseConfig({
+      NEXT_PUBLIC_SUPABASE_URL: ` ${url} `,
+      [AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]: ` ${secretKey} `,
+      SUPABASE_SERVICE_ROLE_KEY: productionKey,
+    }),
+    { url, secretKey }
+  );
+  assert.equal(
+    readPreviewShadowCanaryDatabaseConfig({
+      NEXT_PUBLIC_SUPABASE_URL: url,
+      SUPABASE_SERVICE_ROLE_KEY: productionKey,
+    }),
+    null
+  );
+  assert.equal(
+    readPreviewShadowCanaryDatabaseConfig({
+      [AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]: secretKey,
+    }),
+    null
+  );
+});
+
 test("preview shadow canary builds one deterministic non-sensitive planning fixture", () => {
   const commitSha = "b".repeat(40);
   const first = buildPreviewShadowCanary(commitSha);
@@ -395,8 +425,10 @@ test("preview shadow canary route cannot send Feishu messages or create worker j
   );
   assert.match(route, /readPreviewShadowCanaryRuntime\(\)/);
   assert.match(route, /isPreviewShadowCanaryAuthorized/);
+  assert.match(route, /readPreviewShadowCanaryDatabaseConfig\(\)/);
   assert.match(route, /captureAutonomousFactoryPlan/);
   assert.match(route, /comparePreviewShadowCanary/);
+  assert.doesNotMatch(route, /getSupabaseService|SUPABASE_SERVICE_ROLE_KEY/);
   assert.doesNotMatch(route, /sendFeishuMessage|getFeishuToken|hermes_messages|hermes_jobs|canonicalCreateJob/);
   assert.doesNotMatch(route, /req\.json\(|req\.text\(|req\.arrayBuffer\(/);
   assert.match(appRoute, /export \{ POST \} from/);
