@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  buildAutonomousFactoryPlannedTasks,
   captureAutonomousFactoryPlan,
   readAutonomousFactoryMode,
 } from "../../../src/lib/autonomous-factory/control-plane.ts";
@@ -12,6 +13,14 @@ import {
   AUTONOMOUS_FACTORY_AGENT_REGISTRY,
   getAutonomousFactoryAgent,
 } from "../../../src/lib/autonomous-factory/agent-registry.ts";
+import {
+  AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV,
+  PREVIEW_SHADOW_CANARY_BRANCH,
+  buildPreviewShadowCanary,
+  comparePreviewShadowCanary,
+  isPreviewShadowCanaryAuthorized,
+  readPreviewShadowCanaryRuntime,
+} from "../../../src/lib/autonomous-factory/preview-shadow-canary.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -224,6 +233,174 @@ test("transaction failures are never reported as captured", async () => {
     mode: "shadow",
     error_code: "AUTONOMOUS_FACTORY_CAPTURE_FAILED",
   });
+});
+
+test("preview shadow canary fails closed outside its exact runtime", () => {
+  const token = "t".repeat(32);
+  const commitSha = "a".repeat(40);
+  const base = {
+    VERCEL_ENV: "preview",
+    HERMES_AUTONOMOUS_FACTORY_MODE: "shadow",
+    HERMES_AUTONOMOUS_FACTORY_CANARY_TOKEN: token,
+    VERCEL_GIT_COMMIT_REF: PREVIEW_SHADOW_CANARY_BRANCH,
+    VERCEL_GIT_COMMIT_SHA: commitSha,
+  };
+
+  assert.deepEqual(readPreviewShadowCanaryRuntime({ ...base, VERCEL_ENV: "production" }), {
+    ok: false,
+    status: 403,
+    failure_code: "AUTONOMOUS_FACTORY_CANARY_PREVIEW_ONLY",
+  });
+  assert.deepEqual(
+    readPreviewShadowCanaryRuntime({ ...base, HERMES_AUTONOMOUS_FACTORY_MODE: "disabled" }),
+    {
+      ok: false,
+      status: 503,
+      failure_code: "AUTONOMOUS_FACTORY_CANARY_SHADOW_REQUIRED",
+    }
+  );
+  assert.deepEqual(
+    readPreviewShadowCanaryRuntime({
+      ...base,
+      [AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV]: "short",
+    }),
+    {
+      ok: false,
+      status: 503,
+      failure_code: "AUTONOMOUS_FACTORY_CANARY_TOKEN_MISSING",
+    }
+  );
+  assert.deepEqual(readPreviewShadowCanaryRuntime(base), {
+    ok: true,
+    commit_sha: commitSha,
+  });
+  assert.deepEqual(
+    readPreviewShadowCanaryRuntime({ ...base, VERCEL_GIT_COMMIT_REF: "other-branch" }),
+    {
+      ok: false,
+      status: 403,
+      failure_code: "AUTONOMOUS_FACTORY_CANARY_BRANCH_MISMATCH",
+    }
+  );
+});
+
+test("preview shadow canary requires an exact bearer token", () => {
+  const token = "canary-token-" + "x".repeat(32);
+  const env = { [AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV]: token };
+  assert.equal(isPreviewShadowCanaryAuthorized(`Bearer ${token}`, env), true);
+  assert.equal(isPreviewShadowCanaryAuthorized(`Bearer ${token} `, env), false);
+  assert.equal(isPreviewShadowCanaryAuthorized("Bearer wrong", env), false);
+  assert.equal(isPreviewShadowCanaryAuthorized(null, env), false);
+  assert.equal(isPreviewShadowCanaryAuthorized(`Bearer ${token}`, {}), false);
+});
+
+test("preview shadow canary builds one deterministic non-sensitive planning fixture", () => {
+  const commitSha = "b".repeat(40);
+  const first = buildPreviewShadowCanary(commitSha);
+  const second = buildPreviewShadowCanary(commitSha.toUpperCase());
+
+  assert.deepEqual(first, second);
+  assert.equal(first.context.eventId, `preview-shadow-planning-canary-v1:${commitSha}`);
+  assert.equal(first.draft.execution_mode, "planning_only");
+  assert.equal(first.draft.current_status, "waiting_boss_approval");
+  assert.ok(first.planned_tasks.length > 0);
+  assert.deepEqual(first.planned_tasks, buildAutonomousFactoryPlannedTasks(first.draft));
+  assert.doesNotMatch(JSON.stringify(first), /open_id|chat_[0-9]|password|secret|token=/i);
+});
+
+test("preview shadow canary compares the persisted V2 plan with the V1 draft", () => {
+  const canary = buildPreviewShadowCanary("c".repeat(40));
+  const rootTaskId = "root-task-id";
+  const taskIds = new Map(
+    canary.planned_tasks.map((task, index) => [task.task_key, `task-id-${index + 1}`])
+  );
+  const tasks = canary.planned_tasks.map((task) => ({
+    id: taskIds.get(task.task_key),
+    parent_task_id: rootTaskId,
+    task_type: task.task_type,
+    role: task.agent_role,
+    title: task.title,
+    status: "draft",
+    stage: task.stage,
+    risk_level: task.risk_level,
+    need_human_decision: task.requires_boss_approval,
+    dependency_task_ids: task.dependency_keys.map((key) => taskIds.get(key)),
+    metadata: task,
+  }));
+  const input = {
+    rootTaskId,
+    canary,
+    root: {
+      id: rootTaskId,
+      parent_task_id: null,
+      task_type: "requirement",
+      role: "project_director",
+      status: "awaiting_human",
+      stage: "intake",
+      metadata: {
+        capture_mode: "shadow",
+        plan_id: canary.draft.plan_id,
+        plan: {
+          boss_request_id: canary.draft.boss_request_id,
+          task_tree_id: canary.draft.task_tree_id,
+          project: canary.draft.project,
+          requires_boss_approval: canary.draft.requires_boss_approval,
+          execution_mode: canary.draft.execution_mode,
+        },
+      },
+    },
+    tasks,
+    decisions: [
+      {
+        decision_type: "approval",
+        decision_status: "waiting",
+        external_channel: "feishu",
+        metadata: { plan_id: canary.draft.plan_id },
+      },
+    ],
+    events: [
+      { event_type: "task.created", from_status: null, to_status: "awaiting_human", payload: {} },
+      {
+        event_type: "task.progressed",
+        from_status: "awaiting_human",
+        to_status: "awaiting_human",
+        payload: {
+          plan_id: canary.draft.plan_id,
+          task_count: canary.planned_tasks.length,
+        },
+      },
+    ],
+  };
+
+  assert.deepEqual(comparePreviewShadowCanary(input), {
+    matches: true,
+    expected_task_count: canary.planned_tasks.length,
+    persisted_task_count: canary.planned_tasks.length,
+    mismatch_codes: [],
+  });
+
+  const partial = comparePreviewShadowCanary({ ...input, tasks: tasks.slice(1) });
+  assert.equal(partial.matches, false);
+  assert.ok(partial.mismatch_codes.includes("TASK_COUNT_MISMATCH"));
+});
+
+test("preview shadow canary route cannot send Feishu messages or create worker jobs", () => {
+  const route = readFileSync(
+    join(root, "src/app/api/internal/autonomous-factory/shadow-canary/route.ts"),
+    "utf8"
+  );
+  const appRoute = readFileSync(
+    join(root, "app/api/internal/autonomous-factory/shadow-canary/route.ts"),
+    "utf8"
+  );
+  assert.match(route, /readPreviewShadowCanaryRuntime\(\)/);
+  assert.match(route, /isPreviewShadowCanaryAuthorized/);
+  assert.match(route, /captureAutonomousFactoryPlan/);
+  assert.match(route, /comparePreviewShadowCanary/);
+  assert.doesNotMatch(route, /sendFeishuMessage|getFeishuToken|hermes_messages|hermes_jobs|canonicalCreateJob/);
+  assert.doesNotMatch(route, /req\.json\(|req\.text\(|req\.arrayBuffer\(/);
+  assert.match(appRoute, /export \{ POST \} from/);
+  assert.match(appRoute, /src\/app\/api\/internal\/autonomous-factory\/shadow-canary\/route/);
 });
 
 test("all project director roles have one real Codex runtime executor", () => {

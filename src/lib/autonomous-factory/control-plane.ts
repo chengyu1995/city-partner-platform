@@ -72,16 +72,8 @@ export function readAutonomousFactoryMode(
   throw new Error("AUTONOMOUS_FACTORY_MODE_INVALID");
 }
 
-export async function captureAutonomousFactoryPlan(input: {
-  client: AutonomousFactoryRpcClient;
-  draft: ProjectDirectorTaskTreeDraft;
-  context: AutonomousFactoryIntakeContext;
-  mode?: AutonomousFactoryMode;
-}): Promise<AutonomousFactoryCaptureResult> {
-  const mode = input.mode ?? readAutonomousFactoryMode();
-  if (mode === "disabled") return { status: "disabled", mode };
-
-  const tasks = input.draft.child_tasks.map((task) => {
+export function buildAutonomousFactoryPlannedTasks(draft: ProjectDirectorTaskTreeDraft) {
+  return draft.child_tasks.map((task) => {
     const agent = getAutonomousFactoryAgent(task.agent_role);
     return {
       task_key: task.task_key,
@@ -104,6 +96,18 @@ export async function captureAutonomousFactoryPlan(input: {
       execution_mode: task.execution_mode,
     };
   });
+}
+
+export async function captureAutonomousFactoryPlan(input: {
+  client: AutonomousFactoryRpcClient;
+  draft: ProjectDirectorTaskTreeDraft;
+  context: AutonomousFactoryIntakeContext;
+  mode?: AutonomousFactoryMode;
+}): Promise<AutonomousFactoryCaptureResult> {
+  const mode = input.mode ?? readAutonomousFactoryMode();
+  if (mode === "disabled") return { status: "disabled", mode };
+
+  const tasks = buildAutonomousFactoryPlannedTasks(input.draft);
 
   const capture = await input.client.rpc("hermes_v2_capture_requirement_plan_v1", {
     p_project_key: input.context.projectKey,
