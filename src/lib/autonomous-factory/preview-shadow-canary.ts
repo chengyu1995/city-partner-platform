@@ -8,8 +8,8 @@ import {
   type AutonomousFactoryIntakeContext,
 } from "./control-plane.ts";
 
-export const AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV =
-  "HERMES_AUTONOMOUS_FACTORY_CANARY_TOKEN";
+export const AUTONOMOUS_FACTORY_CANARY_TOKEN_SHA256_ENV =
+  "HERMES_AUTONOMOUS_FACTORY_CANARY_TOKEN_SHA256";
 export const AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV =
   "HERMES_AUTONOMOUS_FACTORY_SUPABASE_SECRET_KEY";
 export const PREVIEW_SHADOW_CANARY_ID = "preview-shadow-planning-canary-v1";
@@ -115,6 +115,13 @@ function equalJson(left: unknown, right: unknown): boolean {
 
 function digest(value: string): Buffer {
   return createHash("sha256").update(value, "utf8").digest();
+}
+
+function readExpectedCanaryTokenDigest(
+  env: Record<string, string | undefined>
+): Buffer | null {
+  const value = env[AUTONOMOUS_FACTORY_CANARY_TOKEN_SHA256_ENV]?.trim().toLowerCase() ?? "";
+  return /^[0-9a-f]{64}$/.test(value) ? Buffer.from(value, "hex") : null;
 }
 
 function isNullableString(value: unknown): value is string | null {
@@ -249,8 +256,7 @@ export function readPreviewShadowCanaryRuntime(
     };
   }
 
-  const token = env[AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV] ?? "";
-  if (token.length < 32) {
+  if (!readExpectedCanaryTokenDigest(env)) {
     return {
       ok: false,
       status: 503,
@@ -282,13 +288,13 @@ export function isPreviewShadowCanaryAuthorized(
   authorization: string | null,
   env: Record<string, string | undefined> = process.env
 ): boolean {
-  const expectedToken = env[AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV] ?? "";
-  if (expectedToken.length < 32) return false;
+  const expectedDigest = readExpectedCanaryTokenDigest(env);
+  if (!expectedDigest) return false;
   const prefix = "Bearer ";
   if (!authorization?.startsWith(prefix)) return false;
   const candidate = authorization.slice(prefix.length);
   if (!candidate || candidate !== candidate.trim()) return false;
-  return timingSafeEqual(digest(candidate), digest(expectedToken));
+  return timingSafeEqual(digest(candidate), expectedDigest);
 }
 
 export function readPreviewShadowCanaryDatabaseConfig(

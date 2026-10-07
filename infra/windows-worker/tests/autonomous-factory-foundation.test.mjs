@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,7 +16,7 @@ import {
 } from "../../../src/lib/autonomous-factory/agent-registry.ts";
 import {
   AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV,
-  AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV,
+  AUTONOMOUS_FACTORY_CANARY_TOKEN_SHA256_ENV,
   PREVIEW_SHADOW_CANARY_BRANCH,
   buildPreviewShadowCanary,
   comparePreviewShadowCanary,
@@ -239,12 +240,12 @@ test("transaction failures are never reported as captured", async () => {
 });
 
 test("preview shadow canary fails closed outside its exact runtime", () => {
-  const token = "t".repeat(32);
+  const tokenSha256 = "a".repeat(64);
   const commitSha = "a".repeat(40);
   const base = {
     VERCEL_ENV: "preview",
     HERMES_AUTONOMOUS_FACTORY_MODE: "shadow",
-    HERMES_AUTONOMOUS_FACTORY_CANARY_TOKEN: token,
+    [AUTONOMOUS_FACTORY_CANARY_TOKEN_SHA256_ENV]: tokenSha256,
     VERCEL_GIT_COMMIT_REF: PREVIEW_SHADOW_CANARY_BRANCH,
     VERCEL_GIT_COMMIT_SHA: commitSha,
   };
@@ -265,7 +266,7 @@ test("preview shadow canary fails closed outside its exact runtime", () => {
   assert.deepEqual(
     readPreviewShadowCanaryRuntime({
       ...base,
-      [AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV]: "short",
+      [AUTONOMOUS_FACTORY_CANARY_TOKEN_SHA256_ENV]: "not-a-sha256-digest",
     }),
     {
       ok: false,
@@ -287,14 +288,27 @@ test("preview shadow canary fails closed outside its exact runtime", () => {
   );
 });
 
-test("preview shadow canary requires an exact bearer token", () => {
+test("preview shadow canary requires a bearer token matching its configured digest", () => {
   const token = "canary-token-" + "x".repeat(32);
-  const env = { [AUTONOMOUS_FACTORY_CANARY_TOKEN_ENV]: token };
+  const tokenSha256 = createHash("sha256").update(token, "utf8").digest("hex");
+  const env = { [AUTONOMOUS_FACTORY_CANARY_TOKEN_SHA256_ENV]: tokenSha256 };
   assert.equal(isPreviewShadowCanaryAuthorized(`Bearer ${token}`, env), true);
   assert.equal(isPreviewShadowCanaryAuthorized(`Bearer ${token} `, env), false);
   assert.equal(isPreviewShadowCanaryAuthorized("Bearer wrong", env), false);
   assert.equal(isPreviewShadowCanaryAuthorized(null, env), false);
   assert.equal(isPreviewShadowCanaryAuthorized(`Bearer ${token}`, {}), false);
+  assert.equal(
+    isPreviewShadowCanaryAuthorized(`Bearer ${token}`, {
+      HERMES_AUTONOMOUS_FACTORY_CANARY_TOKEN: token,
+    }),
+    false
+  );
+  assert.equal(
+    isPreviewShadowCanaryAuthorized(`Bearer ${token}`, {
+      [AUTONOMOUS_FACTORY_CANARY_TOKEN_SHA256_ENV]: "not-a-sha256-digest",
+    }),
+    false
+  );
 });
 
 test("preview shadow canary only accepts its dedicated Supabase secret", () => {
