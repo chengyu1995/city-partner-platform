@@ -79,6 +79,19 @@ export interface PreviewShadowCanaryDatabaseConfig {
   secretKey: string;
 }
 
+export function createPreviewShadowCanaryApiKeyFetch(
+  secretKey: string,
+  fetchImplementation: typeof fetch = fetch
+): typeof fetch {
+  return async (input, init) => {
+    const headers = new Headers(init?.headers);
+    if (headers.get("authorization") === `Bearer ${secretKey}`) {
+      headers.delete("authorization");
+    }
+    return fetchImplementation(input, { ...init, headers });
+  };
+}
+
 export interface PreviewShadowCanaryReadback {
   scope_input_valid: true;
   root: PreviewShadowCanaryRootRow | null;
@@ -302,7 +315,7 @@ export function readPreviewShadowCanaryDatabaseConfig(
 ): PreviewShadowCanaryDatabaseConfig | null {
   const url = env.NEXT_PUBLIC_SUPABASE_URL?.trim() ?? "";
   const secretKey = env[AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]?.trim() ?? "";
-  if (!url || secretKey.length < 32) return null;
+  if (!url || !secretKey.startsWith("sb_secret_") || secretKey.length < 32) return null;
   return { url, secretKey };
 }
 

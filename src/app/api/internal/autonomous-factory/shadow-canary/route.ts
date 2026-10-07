@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   buildPreviewShadowCanary,
   comparePreviewShadowCanary,
+  createPreviewShadowCanaryApiKeyFetch,
   isPreviewShadowCanaryAuthorized,
   readPreviewShadowCanaryDatabaseConfig,
   readPreviewShadowCanaryRuntime,
@@ -38,6 +39,9 @@ export async function POST(req: NextRequest) {
   const { createClient } = await import("@supabase/supabase-js");
   const supabase = createClient(databaseConfig.url, databaseConfig.secretKey, {
     auth: { persistSession: false, autoRefreshToken: false },
+    global: {
+      fetch: createPreviewShadowCanaryApiKeyFetch(databaseConfig.secretKey),
+    },
   });
 
   const canary = buildPreviewShadowCanary(runtimeState.commit_sha);

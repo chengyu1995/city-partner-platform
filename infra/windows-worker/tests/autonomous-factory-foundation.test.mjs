@@ -5,6 +5,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createClient } from "@supabase/supabase-js";
+
 import {
   buildAutonomousFactoryPlannedTasks,
   captureAutonomousFactoryPlan,
@@ -20,6 +22,7 @@ import {
   PREVIEW_SHADOW_CANARY_BRANCH,
   buildPreviewShadowCanary,
   comparePreviewShadowCanary,
+  createPreviewShadowCanaryApiKeyFetch,
   isPreviewShadowCanaryAuthorized,
   readPreviewShadowCanaryDatabaseConfig,
   readPreviewShadowCanaryRuntime,
@@ -337,6 +340,56 @@ test("preview shadow canary only accepts its dedicated Supabase secret", () => {
     }),
     null
   );
+  assert.equal(
+    readPreviewShadowCanaryDatabaseConfig({
+      NEXT_PUBLIC_SUPABASE_URL: url,
+      [AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]:
+        "sb_publishable_" + "p".repeat(40),
+    }),
+    null
+  );
+  assert.equal(
+    readPreviewShadowCanaryDatabaseConfig({
+      NEXT_PUBLIC_SUPABASE_URL: url,
+      [AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]: productionKey,
+    }),
+    null
+  );
+});
+
+test("preview shadow canary sends its Supabase secret as apikey only", async () => {
+  const secretKey = "sb_secret_" + "s".repeat(40);
+  const requests = [];
+  const apiKeyOnlyFetch = createPreviewShadowCanaryApiKeyFetch(
+    secretKey,
+    async (input, init) => {
+      requests.push({ input: String(input), headers: new Headers(init?.headers) });
+      return new Response(
+        JSON.stringify({
+          scope_input_valid: true,
+          root: null,
+          tasks: [],
+          decisions: [],
+          events: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+  );
+  const client = createClient("https://example.supabase.co", secretKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { fetch: apiKeyOnlyFetch },
+  });
+
+  const result = await client.rpc("hermes_v2_read_preview_shadow_canary_v1", {
+    p_source_external_id: `preview-shadow-planning-canary-v1:${"d".repeat(40)}`,
+  });
+
+  assert.equal(result.error, null);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].headers.get("apikey"), secretKey);
+  assert.equal(requests[0].headers.has("authorization"), false);
+  assert.match(requests[0].input, /\/rest\/v1\/rpc\/hermes_v2_read_preview_shadow_canary_v1$/);
 });
 
 test("preview shadow canary readback uses one scoped RPC and fails closed", async () => {
@@ -514,6 +567,7 @@ test("preview shadow canary route cannot send Feishu messages or create worker j
   assert.match(route, /readPreviewShadowCanaryRuntime\(\)/);
   assert.match(route, /isPreviewShadowCanaryAuthorized/);
   assert.match(route, /readPreviewShadowCanaryDatabaseConfig\(\)/);
+  assert.match(route, /createPreviewShadowCanaryApiKeyFetch\(databaseConfig\.secretKey\)/);
   assert.match(route, /captureAutonomousFactoryPlan/);
   assert.match(route, /readPreviewShadowCanarySnapshot/);
   assert.match(route, /comparePreviewShadowCanary/);
