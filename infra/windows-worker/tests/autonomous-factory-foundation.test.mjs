@@ -517,6 +517,23 @@ test("preview shadow canary route cannot send Feishu messages or create worker j
   assert.match(route, /captureAutonomousFactoryPlan/);
   assert.match(route, /readPreviewShadowCanarySnapshot/);
   assert.match(route, /comparePreviewShadowCanary/);
+  const preflightIndex = route.indexOf(
+    "const preflight = await readPreviewShadowCanarySnapshot"
+  );
+  const captureIndex = route.indexOf(
+    "const capture = await captureAutonomousFactoryPlan"
+  );
+  const readbackIndex = route.indexOf(
+    "const readback = await readPreviewShadowCanarySnapshot"
+  );
+  assert.ok(preflightIndex >= 0);
+  assert.ok(preflightIndex < captureIndex);
+  assert.ok(captureIndex < readbackIndex);
+  assert.match(route, /readback preflight failed[\s\S]*code: preflight\.database_code/);
+  assert.match(
+    route.slice(preflightIndex, captureIndex),
+    /AUTONOMOUS_FACTORY_CANARY_READBACK_FAILED|preflight\.error_code/
+  );
   assert.doesNotMatch(route, /getSupabaseService|SUPABASE_SERVICE_ROLE_KEY/);
   assert.doesNotMatch(route, /sendFeishuMessage|getFeishuToken|hermes_messages|hermes_jobs|canonicalCreateJob/);
   assert.doesNotMatch(route, /\.from\(["']hermes_v2_/);
@@ -571,6 +588,39 @@ test("canary readback migration exposes one scoped service-role-only read functi
   assert.doesNotMatch(sql, /grant\s+select\s+on/i);
   assert.doesNotMatch(sql, /\b(insert\s+into|update\s+public\.|delete\s+from|truncate|merge\s+into)\b/i);
   assert.doesNotMatch(sql, /\b(request_text|feishu_event_id|feishu_message_id|feishu_chat_id|feishu_user_id|external_message_id|decision_text)\b/i);
+});
+
+test("writer RPC ACL migration grants execute only to service_role", () => {
+  const sql = readFileSync(
+    join(root, "supabase/migrations/202610070002_hermes_v2_rpc_acl_hardening.sql"),
+    "utf8"
+  );
+  const functionNames = [
+    "hermes_v2_create_requirement_v1",
+    "hermes_v2_store_plan_v1",
+    "hermes_v2_capture_requirement_plan_v1",
+  ];
+
+  assert.match(sql, /^begin;[\s\S]*commit;\s*$/im);
+  for (const functionName of functionNames) {
+    assert.match(sql, new RegExp(`public\\.${functionName}\\(`, "i"));
+    for (const role of ["public", "anon", "authenticated", "authenticator", "service_role"]) {
+      assert.match(
+        sql,
+        new RegExp(`revoke all on function public\\.${functionName}\\([\\s\\S]*?\\)\\s+from ${role}\\s*;`, "i")
+      );
+    }
+    assert.match(
+      sql,
+      new RegExp(`grant execute on function public\\.${functionName}\\([\\s\\S]*?\\)\\s+to service_role\\s*;`, "i")
+    );
+  }
+  assert.match(sql, /pg_catalog\.has_function_privilege/i);
+  assert.match(sql, /pg_catalog\.aclexplode/i);
+  assert.match(sql, /notify pgrst, 'reload schema'/i);
+  assert.doesNotMatch(sql, /create\s+or\s+replace\s+function/i);
+  assert.doesNotMatch(sql, /\b(?:create|alter|drop)\s+table\b/i);
+  assert.doesNotMatch(sql, /\b(insert\s+into|update\s+public\.|delete\s+from|truncate|merge\s+into)\b/i);
 });
 
 test("all project director roles have one real Codex runtime executor", () => {

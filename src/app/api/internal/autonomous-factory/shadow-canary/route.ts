@@ -41,6 +41,20 @@ export async function POST(req: NextRequest) {
   });
 
   const canary = buildPreviewShadowCanary(runtimeState.commit_sha);
+  const preflight = await readPreviewShadowCanarySnapshot({
+    client: supabase,
+    sourceExternalId: canary.context.eventId,
+  });
+  if (!preflight.ok) {
+    console.error("[autonomous-factory-canary] readback preflight failed", {
+      code: preflight.database_code,
+    });
+    return NextResponse.json(
+      { ok: false, failure_code: preflight.error_code },
+      { status: 502 }
+    );
+  }
+
   const capture = await captureAutonomousFactoryPlan({
     client: supabase,
     draft: canary.draft,
