@@ -79,6 +79,13 @@ export interface PreviewShadowCanaryDatabaseConfig {
   secretKey: string;
 }
 
+export interface PreviewShadowCanaryDatabaseReadiness {
+  ready: boolean;
+  supabase_url_present: boolean;
+  supabase_secret_present: boolean;
+  supabase_secret_format_valid: boolean;
+}
+
 export function createPreviewShadowCanaryApiKeyFetch(
   secretKey: string,
   fetchImplementation: typeof fetch = fetch
@@ -315,8 +322,26 @@ export function readPreviewShadowCanaryDatabaseConfig(
 ): PreviewShadowCanaryDatabaseConfig | null {
   const url = env.NEXT_PUBLIC_SUPABASE_URL?.trim() ?? "";
   const secretKey = env[AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]?.trim() ?? "";
-  if (!url || !secretKey.startsWith("sb_secret_") || secretKey.length < 32) return null;
+  const readiness = readPreviewShadowCanaryDatabaseReadiness(env);
+  if (!readiness.ready) return null;
   return { url, secretKey };
+}
+
+export function readPreviewShadowCanaryDatabaseReadiness(
+  env: Record<string, string | undefined> = process.env
+): PreviewShadowCanaryDatabaseReadiness {
+  const url = env.NEXT_PUBLIC_SUPABASE_URL?.trim() ?? "";
+  const secretKey = env[AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]?.trim() ?? "";
+  const supabaseUrlPresent = Boolean(url);
+  const supabaseSecretPresent = Boolean(secretKey);
+  const supabaseSecretFormatValid = secretKey.startsWith("sb_secret_") && secretKey.length >= 32;
+
+  return {
+    ready: supabaseUrlPresent && supabaseSecretFormatValid,
+    supabase_url_present: supabaseUrlPresent,
+    supabase_secret_present: supabaseSecretPresent,
+    supabase_secret_format_valid: supabaseSecretFormatValid,
+  };
 }
 
 export function buildPreviewShadowCanary(commitSha: string) {

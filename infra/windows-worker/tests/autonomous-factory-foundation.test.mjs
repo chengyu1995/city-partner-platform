@@ -25,6 +25,7 @@ import {
   createPreviewShadowCanaryApiKeyFetch,
   isPreviewShadowCanaryAuthorized,
   readPreviewShadowCanaryDatabaseConfig,
+  readPreviewShadowCanaryDatabaseReadiness,
   readPreviewShadowCanaryRuntime,
   readPreviewShadowCanarySnapshot,
 } from "../../../src/lib/autonomous-factory/preview-shadow-canary.ts";
@@ -357,6 +358,54 @@ test("preview shadow canary only accepts its dedicated Supabase secret", () => {
   );
 });
 
+test("preview shadow canary readiness exposes only non-sensitive booleans", () => {
+  const secretKey = "sb_secret_" + "s".repeat(40);
+  const url = "https://example.supabase.co";
+
+  assert.deepEqual(readPreviewShadowCanaryDatabaseReadiness({}), {
+    ready: false,
+    supabase_url_present: false,
+    supabase_secret_present: false,
+    supabase_secret_format_valid: false,
+  });
+  assert.deepEqual(
+    readPreviewShadowCanaryDatabaseReadiness({
+      [AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]: secretKey,
+    }),
+    {
+      ready: false,
+      supabase_url_present: false,
+      supabase_secret_present: true,
+      supabase_secret_format_valid: true,
+    }
+  );
+  assert.deepEqual(
+    readPreviewShadowCanaryDatabaseReadiness({
+      NEXT_PUBLIC_SUPABASE_URL: url,
+      [AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]: "legacy-service-role-key",
+    }),
+    {
+      ready: false,
+      supabase_url_present: true,
+      supabase_secret_present: true,
+      supabase_secret_format_valid: false,
+    }
+  );
+
+  const readiness = readPreviewShadowCanaryDatabaseReadiness({
+    NEXT_PUBLIC_SUPABASE_URL: ` ${url} `,
+    [AUTONOMOUS_FACTORY_CANARY_SUPABASE_SECRET_ENV]: ` ${secretKey} `,
+  });
+  assert.deepEqual(readiness, {
+    ready: true,
+    supabase_url_present: true,
+    supabase_secret_present: true,
+    supabase_secret_format_valid: true,
+  });
+  assert.ok(Object.values(readiness).every((value) => typeof value === "boolean"));
+  assert.doesNotMatch(JSON.stringify(readiness), /example\.supabase\.co|sb_secret_/);
+});
+
 test("preview shadow canary sends its Supabase secret as apikey only", async () => {
   const secretKey = "sb_secret_" + "s".repeat(40);
   const requests = [];
@@ -567,6 +616,7 @@ test("preview shadow canary route cannot send Feishu messages or create worker j
   assert.match(route, /readPreviewShadowCanaryRuntime\(\)/);
   assert.match(route, /isPreviewShadowCanaryAuthorized/);
   assert.match(route, /readPreviewShadowCanaryDatabaseConfig\(\)/);
+  assert.match(route, /readPreviewShadowCanaryDatabaseReadiness\(\)/);
   assert.match(route, /createPreviewShadowCanaryApiKeyFetch\(databaseConfig\.secretKey\)/);
   assert.match(route, /captureAutonomousFactoryPlan/);
   assert.match(route, /readPreviewShadowCanarySnapshot/);
@@ -592,7 +642,20 @@ test("preview shadow canary route cannot send Feishu messages or create worker j
   assert.doesNotMatch(route, /sendFeishuMessage|getFeishuToken|hermes_messages|hermes_jobs|canonicalCreateJob/);
   assert.doesNotMatch(route, /\.from\(["']hermes_v2_/);
   assert.doesNotMatch(route, /req\.json\(|req\.text\(|req\.arrayBuffer\(/);
-  assert.match(appRoute, /export \{ POST \} from/);
+  const getIndex = route.indexOf("export async function GET");
+  const postIndex = route.indexOf("export async function POST");
+  assert.ok(getIndex >= 0);
+  assert.ok(getIndex < postIndex);
+  const getRoute = route.slice(getIndex, postIndex);
+  assert.match(getRoute, /readPreviewShadowCanaryRuntime\(\)/);
+  assert.match(getRoute, /isPreviewShadowCanaryAuthorized/);
+  assert.match(getRoute, /readPreviewShadowCanaryDatabaseReadiness\(\)/);
+  assert.match(getRoute, /NextResponse\.json\(readiness/);
+  assert.doesNotMatch(
+    getRoute,
+    /createClient|captureAutonomousFactoryPlan|readPreviewShadowCanarySnapshot|req\.json\(|req\.text\(/
+  );
+  assert.match(appRoute, /export \{ GET, POST \} from/);
   assert.match(appRoute, /src\/app\/api\/internal\/autonomous-factory\/shadow-canary\/route/);
 });
 

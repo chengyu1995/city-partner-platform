@@ -6,6 +6,7 @@ import {
   createPreviewShadowCanaryApiKeyFetch,
   isPreviewShadowCanaryAuthorized,
   readPreviewShadowCanaryDatabaseConfig,
+  readPreviewShadowCanaryDatabaseReadiness,
   readPreviewShadowCanaryRuntime,
   readPreviewShadowCanarySnapshot,
 } from "@/lib/autonomous-factory/preview-shadow-canary";
@@ -13,6 +14,25 @@ import { captureAutonomousFactoryPlan } from "@/lib/autonomous-factory/control-p
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+
+export async function GET(req: NextRequest) {
+  const runtimeState = readPreviewShadowCanaryRuntime();
+  if (!runtimeState.ok) {
+    return NextResponse.json(
+      { ok: false, failure_code: runtimeState.failure_code },
+      { status: runtimeState.status }
+    );
+  }
+  if (!isPreviewShadowCanaryAuthorized(req.headers.get("authorization"))) {
+    return NextResponse.json(
+      { ok: false, failure_code: "AUTONOMOUS_FACTORY_CANARY_UNAUTHORIZED" },
+      { status: 401 }
+    );
+  }
+
+  const readiness = readPreviewShadowCanaryDatabaseReadiness();
+  return NextResponse.json(readiness, { status: readiness.ready ? 200 : 503 });
+}
 
 export async function POST(req: NextRequest) {
   const runtimeState = readPreviewShadowCanaryRuntime();
