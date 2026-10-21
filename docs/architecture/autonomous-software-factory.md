@@ -86,15 +86,33 @@ single final owner review after automatic tests and Preview verification pass.
 
 ## Activation sequence
 
-1. Review and manually apply the Feishu receipt migration.
-2. Review and manually apply the Hermes V2 control-plane migration.
-3. Verify tables, RLS, indexes, functions, and existing data without reading message bodies.
-4. Set the mode to `shadow` in Preview only.
-5. Submit synthetic, non-sensitive Feishu requirements and compare V1/V2 plans.
-6. Add the task dispatcher, isolated executor, evidence collector, and final-review packet.
-7. Exercise failure recovery, duplicate delivery, lease expiry, and rollback drills.
-8. Enable `shadow` in Production and observe it before any authoritative cutover.
-9. Obtain explicit approval before setting `authoritative` or enabling automated merges.
+1. Confirm the exact Supabase project and environment. Record the project identifier in
+   the approval packet without copying connection strings or credentials.
+2. After explicit migration approval, manually apply the additive migrations in this exact
+   order:
+   1. `202610050001_feishu_event_receipts.sql`
+   2. `202610050002_hermes_v2_autonomous_factory.sql`
+   3. `202610050003_hermes_v2_constraint_parity.sql`
+   4. `202610070001_hermes_v2_canary_readback.sql`
+   5. `202610070002_hermes_v2_rpc_acl_hardening.sql`
+3. Run read-only postchecks for tables, RLS, indexes, constraints, function ownership,
+   fixed `search_path`, and execute ACLs. Confirm that `anon`, `authenticated`, and
+   `authenticator` cannot execute any Hermes V2 RPC and that only `service_role` can.
+   Report schema metadata and aggregate counts only; never read requirement or message
+   bodies during the migration gate.
+4. Confirm the existing canonical `hermes_jobs`, `hermes_job_attempts`, and
+   `hermes_job_leases` remain present and unchanged before enabling the new runtime path.
+5. Configure the dedicated Preview-only canary variables without exposing their values,
+   then set the mode to `shadow` on the exact approved Preview branch only.
+6. Run the synthetic Preview canary and verify requirement, task dependency, approval, and
+   event readback. Do not use a real Feishu message or Production database write as a
+   canary.
+7. Add the task dispatcher, isolated executor, evidence collector, and final-review packet
+   in separately reviewed changes.
+8. Exercise failure recovery, duplicate delivery, lease expiry, and rollback drills.
+9. Enable `shadow` in Production only after a separate production-change approval and
+   observe it before any authoritative cutover.
+10. Obtain explicit approval before setting `authoritative` or enabling automated merges.
 
 ## Non-negotiable gates
 
