@@ -122,6 +122,10 @@ import {
   type ProjectDirectorTaskTreeDraft,
 } from "@/lib/project-director-task-tree";
 import {
+  captureAutonomousFactoryPlan,
+  readAutonomousFactoryMode,
+} from "@/lib/autonomous-factory/control-plane";
+import {
   createHermesJob,
   createHermesJobs,
   canonicalCreateJob,
@@ -183,6 +187,18 @@ function sanitizeLogText(text: string): string {
   return text
     .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
     .replace(/(token|secret|password|key)["':=\s]+[^"',\s}]+/gi, "$1=[redacted]");
+}
+
+function safeFeishuProcessingErrorCode(error: unknown): string {
+  const message = errorToText(error);
+  for (const code of [
+    "HERMES_HISTORY_LOAD_FAILED",
+    "AUTONOMOUS_FACTORY_CAPTURE_FAILED",
+    "AUTONOMOUS_FACTORY_MODE_INVALID",
+  ]) {
+    if (message.includes(code)) return code;
+  }
+  return "FEISHU_EVENT_PROCESSING_FAILED";
 }
 
 const ROUTE_BATCH_CODE_PATTERN = /\bBATCH-[A-Z0-9]+(?:-[A-Z0-9]+)*\b/gi;
@@ -495,14 +511,16 @@ async function markReceiptCompleted(supabase: SupabaseClient, eventId: string): 
 async function markReceiptFailed(
   supabase: SupabaseClient,
   eventId: string,
-  errorText: string
+  errorCode: string
 ): Promise<void> {
   const now = new Date().toISOString();
   const { error } = await supabase
     .from("feishu_event_receipts")
-    .update({ status: "failed", error_text: errorText, updated_at: now })
+    .update({ status: "failed", error_text: errorCode, updated_at: now })
     .eq("event_id", eventId);
-  if (error) console.error("[feishu-event] receipt fail update failed:", error);
+  if (error) {
+    console.error("[feishu-event] receipt fail update failed:", error.code ?? "unknown");
+  }
 }
 
 async function getOrCreateConversation(
@@ -2783,6 +2801,24 @@ async function processAcceptedFeishuEvent(payload: any) {
         const draft = buildProjectDirectorTaskTreeDraft(originalDemand, "规划阶段", "planning_only");
         const reply = buildTaskTreeDraftSummary(draft);
         const draftRecord = buildTaskTreeDraftRecord(originalDemand, "规划阶段", draft, reply);
+        const factoryCapture = await captureAutonomousFactoryPlan({
+          client: supabase,
+          draft,
+          context: {
+            projectKey: "city-partner-platform",
+            projectName: "City Partner Platform",
+            conversationId: convId,
+            demandKind,
+            eventId,
+            messageId: ev.message.message_id,
+            chatId: ev.message.chat_id,
+            userId,
+          },
+          mode: readAutonomousFactoryMode(),
+        });
+        if (factoryCapture.status === "shadow_failed") {
+          console.error("[autonomous-factory]", factoryCapture.error_code);
+        }
         await savePlanningTaskTreeReply(
           supabase,
           convId,
@@ -2807,6 +2843,10 @@ async function processAcceptedFeishuEvent(payload: any) {
           demand_type: demandKind,
           state: "waiting_execution_approval",
           execution_mode: "planning_only",
+          autonomous_factory: {
+            mode: factoryCapture.mode,
+            status: factoryCapture.status,
+          },
         });
       }
 
@@ -3829,9 +3869,10 @@ async function processAcceptedFeishuEvent(payload: any) {
       await markReceiptCompleted(supabase, eventId);
     } catch (e) {
       const processingErrorText = errorToText(e);
-      console.error("[feishu-event] processing failed:", sanitizeLogText(processingErrorText));
+      const processingErrorCode = safeFeishuProcessingErrorCode(e);
+      console.error("[feishu-event] processing failed:", processingErrorCode);
       try {
-        await markReceiptFailed(supabase, eventId, processingErrorText);
+        await markReceiptFailed(supabase, eventId, processingErrorCode);
       } catch (receiptFailError) {
         console.error(
           "[feishu-event] receipt fail update failed:",
